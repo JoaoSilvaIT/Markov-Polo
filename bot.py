@@ -1,5 +1,12 @@
+#!/usr/bin/env python3
 import os
 import sys
+
+# Auto-re-exec into local virtualenv if run from system python
+_venv_python = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".venv", "bin", "python")
+if os.path.exists(_venv_python) and os.path.abspath(sys.executable) != os.path.abspath(_venv_python):
+    os.execv(_venv_python, [_venv_python] + sys.argv)
+
 import time
 import json
 import argparse
