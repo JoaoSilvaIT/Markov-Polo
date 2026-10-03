@@ -54,11 +54,14 @@ parser.add_argument("--once", action="store_true",
                     help="Run a single evaluation cycle and exit immediately")
 parser.add_argument("--status", action="store_true",
                     help="Show live account overview, active positions, P&L, and recent journal history, then exit.")
+parser.add_argument("--max-positions", type=int, default=int(os.getenv("MAX_OPEN_POSITIONS", 3)),
+                    help="Max simultaneous open positions allowed (default: 3)")
 args = parser.parse_args()
 
 MODE = args.mode
 BUDGET_PER_TRADE = args.budget
 LOOP_MINUTES = 0 if args.once else args.loop
+MAX_OPEN_POSITIONS = args.max_positions
 MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", 3.0))
 STATE_FILE = "crypto_state.json" if MODE == "crypto" else "stock_state.json"
 JOURNAL_MD = "trading_journal.md"
@@ -385,32 +388,58 @@ def scan_market_opportunities(max_budget: float = BUDGET_PER_TRADE) -> str:
                 close_px = float(sub.iloc[-1]["close"])
                 rsi_series = ta.momentum.RSIIndicator(close=sub["close"], window=14).rsi()
                 rsi_val = round(float(rsi_series.iloc[-1]), 1)
-                sma_series = ta.trend.SMAIndicator(close=sub["close"], window=min(50, len(sub))).sma_indicator()
-                sma_val = float(sma_series.iloc[-1])
-                trend_state = "bullish" if close_px > sma_val else "bearish"
+                
+                sma20_series = ta.trend.SMAIndicator(close=sub["close"], window=min(20, len(sub))).sma_indicator()
+                sma50_series = ta.trend.SMAIndicator(close=sub["close"], window=min(50, len(sub))).sma_indicator()
+                sma20_val = float(sma20_series.iloc[-1])
+                sma50_val = float(sma50_series.iloc[-1])
+
+                macd_obj = ta.trend.MACD(close=sub["close"])
+                macd_diff = float(macd_obj.macd_diff().iloc[-1])
+
+                if close_px > sma20_val and sma20_val > sma50_val:
+                    trend_state = "strong_bullish"
+                elif close_px > sma50_val:
+                    trend_state = "bullish"
+                elif close_px < sma20_val and sma20_val < sma50_val:
+                    trend_state = "strong_bearish"
+                else:
+                    trend_state = "bearish"
 
                 candidates.append({
                     "symbol": symbol,
                     "latest_price": round(close_px, 4),
                     "rsi_14": rsi_val,
                     "trend_state": trend_state,
+                    "macd_hist_positive": macd_diff > 0,
                     "timeframe": "1-Hour",
                     "affordable": True
                 })
 
-            bullish_setups = sorted([c for c in candidates if c["trend_state"] == "bullish" and c["rsi_14"] <= 65.0], key=lambda x: x["rsi_14"])
-            oversold_dips = sorted([c for c in candidates if c["rsi_14"] < 35.0], key=lambda x: x["rsi_14"])
+            # Strict Quantitative Confluence:
+            # 1. Aligned bullish trend (strong_bullish or bullish)
+            # 2. Positive momentum (MACD histogram > 0)
+            # 3. Healthy non-overbought RSI sweet spot (40.0 - 58.0)
+            high_conviction = [
+                c for c in candidates 
+                if c["trend_state"] in ("strong_bullish", "bullish") 
+                and c["macd_hist_positive"] 
+                and 40.0 <= c["rsi_14"] <= 58.0
+            ]
+            high_conviction.sort(key=lambda x: (0 if x["trend_state"] == "strong_bullish" else 1, abs(x["rsi_14"] - 50.0)))
+
+            oversold_dips = sorted([c for c in candidates if c["rsi_14"] < 32.0 and c["macd_hist_positive"]], key=lambda x: x["rsi_14"])
 
             result = {
                 "mode": MODE,
                 "total_scanned": len(candidates),
-                "bullish_momentum_count": len(bullish_setups),
-                "oversold_dip_count": len(oversold_dips),
-                "top_bullish_recommendations": bullish_setups[:8],
-                "top_oversold_recommendations": oversold_dips[:5],
-                "all_candidates": candidates
+                "high_conviction_count": len(high_conviction),
+                "oversold_bounce_count": len(oversold_dips),
+                "top_bullish_recommendations": high_conviction[:3],
+                "top_oversold_recommendations": oversold_dips[:2],
+                "all_candidates_summary": f"{len(candidates)} total monitored, only {len(high_conviction)} passed multi-indicator confluence filters."
             }
-            print(f"[TOOL RESULT] Scanned {len(candidates)} crypto pairs: {len(bullish_setups)} bullish, {len(oversold_dips)} oversold.")
+            print(f"[TOOL RESULT] Scanned {len(candidates)} crypto pairs: {len(high_conviction)} high-conviction setups found.")
             return json.dumps(result)
         else:
             # Stocks use daily candles over the past 90 days
@@ -822,6 +851,12 @@ def run_agent_cycle():
         print("Portfolio capital is fully deployed. Open positions are actively being monitored for Stop-Loss / Take-Profit triggers.")
         return
 
+    positions = trading_client.get_all_positions()
+    if len(positions) >= MAX_OPEN_POSITIONS:
+        print(f"\n[RISK GUARD] Portfolio currently holds {len(positions)}/{MAX_OPEN_POSITIONS} active positions (Max Limit).")
+        print("Capital preservation active. No new trades will be opened. Open positions are actively being monitored.")
+        return
+
     chat = ai_client.chats.create(
         model="gemini-2.5-flash",
         config=types.GenerateContentConfig(
@@ -831,26 +866,36 @@ def run_agent_cycle():
     )
 
     goal = f"""
-You are an autonomous Senior Quantitative Portfolio Manager operating in {MODE.upper()} mode with a ${BUDGET_PER_TRADE} budget.
-Your mission is to evaluate the 24/7 market state and execute high-probability trades ONLY when strict quantitative and sentiment criteria are met.
+You are an elite Quantitative Portfolio Manager managing risk in {MODE.upper()} mode with a ${BUDGET_PER_TRADE} budget.
+
+CORE PHILOSOPHY: STRICT BIAS TOWARDS INACTION.
+Cash is a profitable position. In over 85% of market evaluations, the mathematically superior decision is to do NOTHING (Decision: PASS).
+High-frequency entries and chasing mediocre setups destroy capital through churn and false breakouts.
+You must NEVER buy an asset simply because this evaluation cycle was triggered.
 
 Operational Directives:
-1. MARKET SCAN: Call 'scan_market_opportunities' with max_budget={BUDGET_PER_TRADE} to inspect live momentum and RSI across the entire universe.
-2. CANDIDATE SELECTION & PORTFOLIO AUDIT:
-   - Select the top candidate from the scan recommendations.
-   - You MUST call 'check_portfolio_status' for the chosen candidate. If an open position or pending order already exists, pick another candidate.
-   - You MUST call 'fetch_market_technicals' to calculate the exact ATR volatility and dynamic Take-Profit / Stop-Loss targets.
-   - BUY CRITERIA:
-     * Trend Regime is 'strong_bullish' OR 'bullish' (OR oversold near support with RSI-14 < 35.0).
-     * RSI-14 is below 65.0 (avoid chasing overextended tops).
-   - If technical criteria are not met, evaluate the next candidate.
+1. MARKET SCAN: Call 'scan_market_opportunities' with max_budget={BUDGET_PER_TRADE} to inspect multi-indicator confluence.
+   - If 'top_bullish_recommendations' is empty or contains zero high-conviction setups:
+     IMMEDIATELY conclude with "Decision: PASS (No High-Conviction Confluence Found)". Do NOT search for alternative coins.
+2. SINGLE-CANDIDATE AUDIT (Evaluate ONLY the #1 setup):
+   - You may evaluate ONLY the single top-ranked candidate from the scan.
+   - Call 'check_portfolio_status' for this asset.
+     * If an open position or pending order ALREADY exists: STOP and conclude with "Decision: PASS (Asset Already Held)".
+     * You are STRICTLY FORBIDDEN from hunting down the list to find another coin to buy!
+   - Call 'fetch_market_technicals' to compute exact ATR volatility and dynamic SL/TP brackets.
+   - STRICT ENTRY CRITERIA (Every single one must be satisfied):
+     * Trend Regime: 'strong_bullish' (Price > SMA-20 > SMA-50) OR 'bullish'.
+     * RSI-14 Sweet Spot: Between 40.0 and 58.0 (NOT overbought, not in downward momentum).
+     * Reward/Risk Ratio: >= 1.5.
+     * Bollinger Bandwidth: Not in extreme squeeze or excessive blow-off expansion.
+   - If ANY quantitative condition is not met, conclude with "Decision: PASS (Quantitative Criteria Not Met)".
 3. NEWS & CATALYST AUDIT:
-   - Once a qualified setup is identified, call 'fetch_market_news' to confirm there are NO catastrophic red flags.
+   - Only if all quantitative criteria align, call 'fetch_market_news' to confirm broad stability and ensure no negative catalysts exist.
 4. LIVE EXECUTION:
-   - If both the quantitative rules and news audit align:
-     * You MUST invoke the 'place_order' tool with usd_allocation={BUDGET_PER_TRADE} and the quant-recommended Take-Profit and Stop-Loss prices. Do NOT simply write that you are placing an order in text—execute it via the tool!
-   - If NO candidate qualifies, do NOT call place_order.
-5. REPORT: Deliver a structured Quantitative Investment Memo only after completing all necessary tool interactions.
+   - If and ONLY if the setup displays textbook 5-star confluence across Trend, Momentum, RSI, and News:
+     * Call 'place_order' with usd_allocation={BUDGET_PER_TRADE} and the quant SL/TP levels.
+   - Otherwise: Conclude with "Decision: PASS".
+5. REPORT: Deliver a structured Quantitative Investment Memo explaining your verdict.
 """
 
     print("\n" + "=" * 65)
