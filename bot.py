@@ -48,15 +48,17 @@ parser.add_argument("--mode", choices=["crypto", "stock"], default=os.getenv("AS
                     help="Asset class mode: 'crypto' (24/7 markets) or 'stock' (equities/ETFs)")
 parser.add_argument("--budget", type=float, default=float(os.getenv("BUDGET_PER_TRADE", 100.0)),
                     help="Max capital allocation per trade in USD ($100 budget)")
-parser.add_argument("--loop", type=int, default=int(os.getenv("LOOP_MINUTES", 0)),
-                    help="Run continuously every N minutes (0 for single evaluation run)")
+parser.add_argument("--loop", type=int, default=int(os.getenv("LOOP_MINUTES", 15)),
+                    help="Run continuously every N minutes (default: 15)")
+parser.add_argument("--once", action="store_true",
+                    help="Run a single evaluation cycle and exit immediately")
 parser.add_argument("--status", action="store_true",
                     help="Show live account overview, active positions, P&L, and recent journal history, then exit.")
 args = parser.parse_args()
 
 MODE = args.mode
 BUDGET_PER_TRADE = args.budget
-LOOP_MINUTES = args.loop
+LOOP_MINUTES = 0 if args.once else args.loop
 MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", 3.0))
 STATE_FILE = "crypto_state.json" if MODE == "crypto" else "stock_state.json"
 JOURNAL_MD = "trading_journal.md"
