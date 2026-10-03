@@ -311,9 +311,26 @@ def audit_and_manage_open_positions():
                 except Exception as e:
                     print(f"[ERROR] Failed to close position {sym}: {e}")
 
-            print(f"  * {sym:<10} | Qty: {float(pos.qty):.4f} | Entry: ${adaptive_round(avg_entry)} | Cur: ${adaptive_round(current_price)} | P&L: {pl_pct:+.2f}% (${unrealized_pl:+.2f}) | SL: ${adaptive_round(sl_price)} | TP: ${adaptive_round(tp_price)}")
+            dist_to_sl_pct = ((current_price - sl_price) / current_price) * 100
+            dist_to_tp_pct = ((tp_price - current_price) / current_price) * 100
+            total_range = tp_price - sl_price
+            progress_ratio = max(0.0, min(1.0, (current_price - sl_price) / total_range)) if total_range > 0 else 0.5
+            bar_len = 12
+            dot_pos = int(progress_ratio * bar_len)
+            meter = "".join("=" if i < dot_pos else ("●" if i == dot_pos else "-") for i in range(bar_len + 1))
+            
+            badge = "🟢 PROFIT" if pl_pct >= 0 else "🔴 DRAWDOWN"
+            proximity = ""
+            if progress_ratio >= 0.70:
+                proximity = f" 🔥 [NEAR TAKE-PROFIT! {progress_ratio*100:.0f}% there]"
+            elif progress_ratio <= 0.30:
+                proximity = f" ⚠️ [NEAR STOP-LOSS! {(1-progress_ratio)*100:.0f}% to SL]"
+
+            print(f"  * {sym:<8} | Cur: ${adaptive_round(current_price)} | Entry: ${adaptive_round(avg_entry)} | P&L: {pl_pct:+.2f}% (${unrealized_pl:+.2f}) {badge}")
+            print(f"    Target Track: [SL ${adaptive_round(sl_price)}] {meter} [TP ${adaptive_round(tp_price)}]{proximity}")
+            print(f"    Distance:     SL is -{dist_to_sl_pct:.2f}% away  |  TP is +{dist_to_tp_pct:.2f}% away\n")
         else:
-            print(f"  * {sym:<10} | Qty: {float(pos.qty):.4f} | Entry: ${adaptive_round(avg_entry)} | Cur: ${adaptive_round(current_price)} | P&L: {pl_pct:+.2f}% (${unrealized_pl:+.2f}) [Broker-Managed Bracket]")
+            print(f"  * {sym:<8} | Cur: ${adaptive_round(current_price)} | Entry: ${adaptive_round(avg_entry)} | P&L: {pl_pct:+.2f}% (${unrealized_pl:+.2f}) [Broker-Managed Bracket]\n")
 
         open_summary.append({
             "symbol": sym,
