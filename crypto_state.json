@@ -1,0 +1,32 @@
+{
+  "SOLUSD": {
+    "symbol": "SOL/USD",
+    "clean_symbol": "SOLUSD",
+    "order_id": "6ff8ef9f-43ea-4ca8-8e64-7a3744fb328b",
+    "entry_price": 119.935,
+    "allocation_usd": 100.0,
+    "stop_loss_price": 118.78,
+    "take_profit_price": 121.67,
+    "opened_at": "2026-10-03T17:52:41.766979+00:00"
+  },
+  "AVAXUSD": {
+    "symbol": "AVAX/USD",
+    "clean_symbol": "AVAXUSD",
+    "order_id": "dfa24399-f883-4776-872f-c7b8efe18988",
+    "entry_price": 11.1095,
+    "allocation_usd": 100.0,
+    "stop_loss_price": 10.86,
+    "take_profit_price": 11.48,
+    "opened_at": "2026-10-03T17:55:34.171971+00:00"
+  },
+  "SKYUSD": {
+    "symbol": "SKY/USD",
+    "clean_symbol": "SKYUSD",
+    "order_id": "d829339a-688c-4e3a-a27b-cfd7701aa681",
+    "entry_price": 0.0877775,
+    "allocation_usd": 100,
+    "stop_loss_price": 0.08499,
+    "take_profit_price": 0.09197,
+    "opened_at": "2026-10-03T18:17:51.298583+00:00"
+  }
+}
