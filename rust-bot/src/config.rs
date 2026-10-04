@@ -18,7 +18,7 @@ impl Config {
         Config {
             binance_api_key: env::var("BINANCE_API_KEY").expect("BINANCE_API_KEY must be set"),
             binance_secret_key: env::var("BINANCE_SECRET_KEY").expect("BINANCE_SECRET_KEY must be set"),
-            gemini_api_key: env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set"),
+            gemini_api_key: env::var("GEMINI_API_KEY").unwrap_or_default(),
             alpaca_api_key: env::var("ALPACA_API_KEY").ok(),
             alpaca_secret_key: env::var("ALPACA_SECRET_KEY").ok(),
             discord_webhook_url: env::var("DISCORD_WEBHOOK_URL").ok(),
