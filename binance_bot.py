@@ -361,7 +361,14 @@ if __name__ == "__main__":
     if args.once:
         run_agent_cycle()
     else:
+        last_heartbeat = 0
         while True:
+            current_time = time.time()
+            # Send heartbeat ping every 1 hour (3600 seconds)
+            if current_time - last_heartbeat >= 3600:
+                send_discord_alert("💓 **SYSTEM HEALTH:** Quant Bot is online, healthy, and actively scanning the markets.")
+                last_heartbeat = current_time
+                
             run_agent_cycle()
             print(f"\nSleeping for {args.loop} minutes...")
             time.sleep(args.loop * 60)
