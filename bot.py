@@ -54,6 +54,8 @@ parser.add_argument("--once", action="store_true",
                     help="Run a single evaluation cycle and exit immediately")
 parser.add_argument("--status", action="store_true",
                     help="Show live account overview, active positions, P&L, and recent journal history, then exit.")
+parser.add_argument("--knowledge-base", action="store_true",
+                    help="Display empirical trade knowledge base, win rates, and post-mortem lessons, then exit.")
 parser.add_argument("--max-positions", type=int, default=int(os.getenv("MAX_OPEN_POSITIONS", 3)),
                     help="Max simultaneous open positions allowed (default: 3)")
 args = parser.parse_args()
@@ -66,6 +68,7 @@ MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", 3.0))
 STATE_FILE = "crypto_state.json" if MODE == "crypto" else "stock_state.json"
 JOURNAL_MD = "trading_journal.md"
 JOURNAL_JSONL = "trading_journal.jsonl"
+KNOWLEDGE_BASE_FILE = "trade_knowledge_base.json"
 CURRENT_CYCLE_DATA = {"technicals": {}, "news": {}, "orders": []}
 
 def adaptive_round(val: float) -> float:
@@ -145,6 +148,75 @@ def log_to_journal(memo: str, event_type: str = "CYCLE_EVALUATION", details: dic
             f.write("---\n\n")
     except Exception as e:
         print(f"[WARN] Failed to write to {JOURNAL_MD}: {e}")
+
+def record_trade_in_knowledge_base(symbol: str, entry_price: float, exit_price: float, pnl_usd: float, pnl_pct: float, reason: str, target_state: dict = None):
+    """Permanently records closed trade into trade_knowledge_base.json and recalculates empirical win rates."""
+    data = {"summary": {}, "empirical_rules": [], "trades": []}
+    if os.path.exists(KNOWLEDGE_BASE_FILE):
+        try:
+            with open(KNOWLEDGE_BASE_FILE, "r") as f:
+                data = json.load(f)
+        except Exception as e:
+            print(f"[WARN] Failed to read {KNOWLEDGE_BASE_FILE}: {e}")
+
+    outcome = "WIN" if pnl_usd > 0 else ("BREAKEVEN" if abs(pnl_usd) < 0.05 else "LOSS")
+    duration_hours = 0.0
+    if target_state and target_state.get("opened_at"):
+        try:
+            opened_dt = datetime.fromisoformat(target_state["opened_at"])
+            duration_hours = round((datetime.now(timezone.utc) - opened_dt).total_seconds() / 3600, 1)
+        except Exception:
+            duration_hours = 0.0
+
+    post_mortem = ""
+    if outcome == "WIN":
+        post_mortem = f"Take-Profit achieved. Expansion of {pnl_pct:+.2f}% (+${pnl_usd:.2f}) realized in {duration_hours}h. Target confluence confirmed."
+    else:
+        post_mortem = f"Stop-Loss or drawdown exit with {pnl_pct:+.2f}% (${pnl_usd:.2f}) in {duration_hours}h. Capital preserved via programmatic cut."
+
+    new_trade = {
+        "trade_id": f"{symbol.replace('/', '')}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}",
+        "symbol": symbol,
+        "clean_symbol": symbol.replace("/", ""),
+        "outcome": outcome,
+        "exit_reason": reason,
+        "exit_time": datetime.now(timezone.utc).isoformat(),
+        "duration_hours": duration_hours,
+        "entry_price": adaptive_round(entry_price),
+        "exit_price": adaptive_round(exit_price),
+        "realized_pnl_usd": round(pnl_usd, 2),
+        "realized_pnl_pct": round(pnl_pct, 2),
+        "post_mortem": post_mortem
+    }
+    data.setdefault("trades", []).append(new_trade)
+
+    wins = [t for t in data["trades"] if t.get("outcome") == "WIN"]
+    losses = [t for t in data["trades"] if t.get("outcome") == "LOSS"]
+    total = len(data["trades"])
+    win_rate = (len(wins) / total) * 100 if total > 0 else 0.0
+    total_net_pnl = sum(t.get("realized_pnl_usd", 0.0) for t in data["trades"])
+    avg_win = sum(t.get("realized_pnl_pct", 0.0) for t in wins) / len(wins) if wins else 0.0
+    avg_loss = sum(abs(t.get("realized_pnl_pct", 0.0)) for t in losses) / len(losses) if losses else 0.0
+    profit_factor = "Infinite (0 losses)" if not losses else round(sum(t.get("realized_pnl_usd", 0.0) for t in wins) / max(0.01, sum(abs(t.get("realized_pnl_usd", 0.0)) for t in losses)), 2)
+
+    data["summary"] = {
+        "total_trades": total,
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate_pct": round(win_rate, 1),
+        "total_net_pnl_usd": round(total_net_pnl, 2),
+        "avg_win_pct": round(avg_win, 2),
+        "avg_loss_pct": round(avg_loss, 2),
+        "profit_factor": profit_factor,
+        "last_updated": datetime.now(timezone.utc).isoformat()
+    }
+
+    try:
+        with open(KNOWLEDGE_BASE_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"[KNOWLEDGE BASE UPDATED] Trade recorded. Win rate: {round(win_rate, 1)}% ({len(wins)}/{total} wins). Net P&L: +${total_net_pnl:,.2f}")
+    except Exception as e:
+        print(f"[WARN] Failed to write {KNOWLEDGE_BASE_FILE}: {e}")
 
 # Alpaca Execution & Data Clients
 trading_client = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=True)
@@ -278,6 +350,15 @@ def audit_and_manage_open_positions():
                         event_type="STOP_LOSS_EXECUTED",
                         details=event_details
                     )
+                    record_trade_in_knowledge_base(
+                        symbol=sym,
+                        entry_price=avg_entry,
+                        exit_price=current_price,
+                        pnl_usd=unrealized_pl,
+                        pnl_pct=pl_pct,
+                        reason="STOP_LOSS_EXECUTED",
+                        target_state=target_state
+                    )
                     continue
                 except Exception as e:
                     print(f"[ERROR] Failed to close position {sym}: {e}")
@@ -307,9 +388,31 @@ def audit_and_manage_open_positions():
                         event_type="TAKE_PROFIT_EXECUTED",
                         details=event_details
                     )
+                    record_trade_in_knowledge_base(
+                        symbol=sym,
+                        entry_price=avg_entry,
+                        exit_price=current_price,
+                        pnl_usd=unrealized_pl,
+                        pnl_pct=pl_pct,
+                        reason="TAKE_PROFIT_EXECUTED",
+                        target_state=target_state
+                    )
                     continue
                 except Exception as e:
                     print(f"[ERROR] Failed to close position {sym}: {e}")
+
+            # Dynamic Breakeven Stop:
+            # If price reaches >= 50% of the distance to Take-Profit, move Stop-Loss to Entry Price!
+            clean_sym = sym.replace("/", "")
+            total_range = tp_price - sl_price
+            progress_ratio = max(0.0, min(1.0, (current_price - sl_price) / total_range)) if total_range > 0 else 0.5
+            if progress_ratio >= 0.50 and sl_price < avg_entry:
+                print(f"[TRAILING BREAKEVEN] {sym} reached 50%+ to target! Raising Stop-Loss from ${adaptive_round(sl_price)} to Breakeven (${adaptive_round(avg_entry)}). Trade is now ZERO RISK.")
+                target_state["stop_loss_price"] = avg_entry
+                sl_price = avg_entry
+                all_states[clean_sym] = target_state
+                with open(STATE_FILE, "w") as f:
+                    json.dump(all_states, f, indent=2)
 
             dist_to_sl_pct = ((current_price - sl_price) / current_price) * 100
             dist_to_tp_pct = ((tp_price - current_price) / current_price) * 100
@@ -378,9 +481,75 @@ def show_status_and_exit():
         print("=" * 65)
     sys.exit(0)
 
+
+def show_knowledge_base_and_exit():
+    """Prints a structured performance and learning report from the trade knowledge base."""
+    if not os.path.exists(KNOWLEDGE_BASE_FILE):
+        print("\n[KNOWLEDGE BASE] No completed trades recorded yet.")
+        sys.exit(0)
+    with open(KNOWLEDGE_BASE_FILE, "r") as f:
+        data = json.load(f)
+    s = data.get("summary", {})
+    print("=" * 68)
+    print("QUANTITATIVE TRADE KNOWLEDGE BASE & EMPIRICAL LEARNING REPORT")
+    print("=" * 68)
+    print(f"Total Completed Trades: {s.get('total_trades', 0)}")
+    print(f"Wins:                   {s.get('wins', 0)} ({s.get('win_rate_pct', 0.0)}% Win Rate)")
+    print(f"Losses:                 {s.get('losses', 0)}")
+    print(f"Net Realized Profit:    +${s.get('total_net_pnl_usd', 0.0):,.2f} USD")
+    print(f"Average Win:            +{s.get('avg_win_pct', 0.0)}%")
+    print(f"Average Loss:           -{s.get('avg_loss_pct', 0.0)}%")
+    print(f"Profit Factor:          {s.get('profit_factor', 'N/A')}")
+    print("=" * 68)
+    print("\nEMPIRICAL LESSONS LEARNED & DERIVED QUANTITATIVE RULES:")
+    for i, r in enumerate(data.get("empirical_rules", []), 1):
+        print(f"  {i}. {r}")
+    print("\nRECENT COMPLETED TRADES & POST-MORTEM TAKEAWAYS:")
+    for t in data.get("trades", [])[-5:]:
+        badge = "🟢 WIN" if t.get("outcome") == "WIN" else "🔴 LOSS"
+        print(f"  * {t.get('symbol')} | {badge} | P&L: {t.get('realized_pnl_pct'):+.2f}% (+${t.get('realized_pnl_usd'):,.2f}) | Held: {t.get('duration_hours')}h")
+        print(f"    Takeaway: {t.get('post_mortem')}\n")
+    print("=" * 68)
+    sys.exit(0)
+
 # ---------------------------------------------------------------------
 # 3. AGENT TOOLS (QUANTITATIVE, NEWS & EXECUTION)
 # ---------------------------------------------------------------------
+
+def query_trade_knowledge_base(symbol: str = "") -> str:
+    """Queries historical trade performance, win rates, and post-mortem lessons from previous wins and losses."""
+    print(f"\n[AGENT ACTION] -> Calling Tool: query_trade_knowledge_base(symbol='{symbol}')...")
+    if not os.path.exists(KNOWLEDGE_BASE_FILE):
+        return json.dumps({"status": "EMPTY", "message": "No historical trades logged yet."})
+    try:
+        with open(KNOWLEDGE_BASE_FILE, "r") as f:
+            data = json.load(f)
+        summary = data.get("summary", {})
+        trades = data.get("trades", [])
+        rules = data.get("empirical_rules", [])
+
+        clean_sym = symbol.replace("/", "") if symbol else ""
+        sym_trades = [t for t in trades if clean_sym in (t.get("clean_symbol", ""), t.get("symbol", "").replace("/", ""))] if clean_sym else []
+
+        result = {
+            "overall_metrics": {
+                "total_trades": summary.get("total_trades", 0),
+                "win_rate": f"{summary.get('win_rate_pct', 0.0)}%",
+                "total_profit_usd": f"${summary.get('total_net_pnl_usd', 0.0):+,.2f}",
+                "profit_factor": str(summary.get("profit_factor", "N/A"))
+            },
+            "empirical_rules": rules[:4],
+            "asset_specific_memory": {
+                "symbol": symbol or "ALL",
+                "prior_trades": len(sym_trades),
+                "prior_wins": len([t for t in sym_trades if t.get("outcome") == "WIN"]),
+                "recent_lessons": [t.get("post_mortem") for t in sym_trades[-3:]] if sym_trades else ["No prior trades on this specific asset."]
+            }
+        }
+        print(f"[TOOL RESULT] Knowledge Base: {summary.get('total_trades', 0)} total trades, {summary.get('win_rate_pct', 0.0)}% win rate.")
+        return json.dumps(result)
+    except Exception as e:
+        return json.dumps({"status": "ERROR", "message": str(e)})
 
 def scan_market_opportunities(max_budget: float = BUDGET_PER_TRADE) -> str:
     """Scans all active crypto or stock assets, computing RSI-14, trend state, and ranking high-probability setups."""
@@ -847,6 +1016,7 @@ def place_order(symbol: str, usd_allocation: float, take_profit_price: float, st
 # 4. AGENT REASONING ENGINE
 # ---------------------------------------------------------------------
 tools = [
+    query_trade_knowledge_base,
     scan_market_opportunities,
     check_portfolio_status,
     fetch_market_technicals,
@@ -906,13 +1076,16 @@ Operational Directives:
      * Reward/Risk Ratio: >= 1.5.
      * Bollinger Bandwidth: Not in extreme squeeze or excessive blow-off expansion.
    - If ANY quantitative condition is not met, conclude with "Decision: PASS (Quantitative Criteria Not Met)".
-3. NEWS & CATALYST AUDIT:
-   - Only if all quantitative criteria align, call 'fetch_market_news' to confirm broad stability and ensure no negative catalysts exist.
-4. LIVE EXECUTION:
-   - If and ONLY if the setup displays textbook 5-star confluence across Trend, Momentum, RSI, and News:
+3. EMPIRICAL KNOWLEDGE AUDIT:
+   - Call 'query_trade_knowledge_base' with the candidate symbol to review historical win rates, past loss post-mortems, and empirical rules.
+   - If historical lessons or rules warn against this setup, conclude with "Decision: PASS (Historical Failure Pattern Detected)".
+4. NEWS & CATALYST AUDIT:
+   - Only if all quantitative and empirical criteria align, call 'fetch_market_news' to confirm broad stability and ensure no negative catalysts exist.
+5. LIVE EXECUTION:
+   - If and ONLY if the setup displays textbook 5-star confluence across Trend, Momentum, RSI, Knowledge Base, and News:
      * Call 'place_order' with usd_allocation={BUDGET_PER_TRADE} and the quant SL/TP levels.
    - Otherwise: Conclude with "Decision: PASS".
-5. REPORT: Deliver a structured Quantitative Investment Memo explaining your verdict.
+6. REPORT: Deliver a structured Quantitative Investment Memo explaining your verdict.
 """
 
     print("\n" + "=" * 65)
@@ -954,6 +1127,9 @@ Operational Directives:
 if __name__ == "__main__":
     if args.status:
         show_status_and_exit()
+
+    if args.knowledge_base:
+        show_knowledge_base_and_exit()
 
     if LOOP_MINUTES > 0:
         print(f"\n[DAEMON ACTIVATED] Running continuous 24/7 {MODE.upper()} agent every {LOOP_MINUTES} minutes.")

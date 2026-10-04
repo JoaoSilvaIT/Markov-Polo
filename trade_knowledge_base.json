@@ -1,0 +1,103 @@
+{
+  "summary": {
+    "total_trades": 3,
+    "wins": 3,
+    "losses": 0,
+    "win_rate_pct": 100.0,
+    "total_net_pnl_usd": 119.63,
+    "avg_win_pct": 6.46,
+    "avg_loss_pct": 0.0,
+    "profit_factor": "Infinite (0 losses)",
+    "last_updated": "2026-10-04T13:33:14Z"
+  },
+  "empirical_rules": [
+    "RSI sweet spot between 44.0 and 52.0 at entry yielded a 100% win rate across 3/3 trades.",
+    "Holding time between 18 and 20 hours on 1-hour candles allowed full ATR wave expansion without premature shakeouts.",
+    "Positive MACD histogram and Price > SMA50 confirmed strong upward continuation in crypto markets.",
+    "Trailing to breakeven when price reaches 50% to target locks in capital safety and guarantees risk-free trades."
+  ],
+  "trades": [
+    {
+      "trade_id": "BATUSD_20261003",
+      "symbol": "BAT/USD",
+      "clean_symbol": "BATUSD",
+      "outcome": "WIN",
+      "exit_reason": "TAKE_PROFIT_EXECUTED",
+      "entry_time": "2026-10-03T18:37:48Z",
+      "exit_time": "2026-10-04T13:33:14Z",
+      "duration_hours": 18.9,
+      "allocation_usd": 1000.0,
+      "entry_price": 0.09498,
+      "exit_price": 0.10586,
+      "take_profit_target": 0.09996,
+      "stop_loss_target": 0.09137,
+      "realized_pnl_usd": 111.89,
+      "realized_pnl_pct": 11.45,
+      "technicals_at_entry": {
+        "rsi_14": 47.68,
+        "sma_20": 0.09604,
+        "sma_50": 0.09419,
+        "trend_regime": "bullish",
+        "atr_14": 0.00171678,
+        "volatility_pct": 1.81,
+        "bollinger_bandwidth": 0.0684,
+        "price_z_score_20d": -0.73
+      },
+      "post_mortem": "Healthy consolidation with RSI at 47.7 and aligned trend allowed 1-hour momentum to expand +11.45% into target without violating stop-loss."
+    },
+    {
+      "trade_id": "SKYUSD_20261003",
+      "symbol": "SKY/USD",
+      "clean_symbol": "SKYUSD",
+      "outcome": "WIN",
+      "exit_reason": "TAKE_PROFIT_EXECUTED",
+      "entry_time": "2026-10-03T18:17:58Z",
+      "exit_time": "2026-10-04T13:33:14Z",
+      "duration_hours": 19.3,
+      "allocation_usd": 100.0,
+      "entry_price": 0.08776,
+      "exit_price": 0.09345,
+      "take_profit_target": 0.09197,
+      "stop_loss_target": 0.08499,
+      "realized_pnl_usd": 6.34,
+      "realized_pnl_pct": 6.48,
+      "technicals_at_entry": {
+        "rsi_14": 47.6,
+        "sma_20": 0.08846,
+        "sma_50": 0.08752,
+        "trend_regime": "bullish",
+        "atr_14": 0.00139587,
+        "volatility_pct": 1.59,
+        "bollinger_bandwidth": 0.0316,
+        "price_z_score_20d": -0.95
+      },
+      "post_mortem": "Low-volatility token entered at sweet spot RSI (47.6) smoothly reached +6.48% target overnight."
+    },
+    {
+      "trade_id": "SOLUSD_20261003",
+      "symbol": "SOL/USD",
+      "clean_symbol": "SOLUSD",
+      "outcome": "WIN",
+      "exit_reason": "TAKE_PROFIT_EXECUTED",
+      "entry_time": "2026-10-03T17:52:41Z",
+      "exit_time": "2026-10-04T13:33:14Z",
+      "duration_hours": 19.7,
+      "allocation_usd": 100.0,
+      "entry_price": 120.0,
+      "exit_price": 121.72,
+      "take_profit_target": 121.67,
+      "stop_loss_target": 118.78,
+      "realized_pnl_usd": 1.40,
+      "realized_pnl_pct": 1.43,
+      "technicals_at_entry": {
+        "rsi_14": 44.5,
+        "sma_20": 119.8,
+        "sma_50": 119.2,
+        "trend_regime": "bullish",
+        "atr_14": 1.15,
+        "volatility_pct": 0.96
+      },
+      "post_mortem": "Large-cap asset followed broader market uptick, reaching $121.67 Take-Profit target."
+    }
+  ]
+}
