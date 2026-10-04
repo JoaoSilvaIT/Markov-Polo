@@ -313,8 +313,17 @@ def place_order(symbol: str, take_profit_price: float, stop_loss_price: float, r
         fill_price = order.get('average') or order.get('price') or current_price
         
         # Place Native OCO Order
+        # Binance deducts fees from the received asset if not using BNB.
+        # We must fetch the actual base asset balance to avoid "insufficient balance" when selling.
+        time.sleep(1) # Give Binance matching engine 1 second to update balances
+        base_asset = symbol.split('/')[0]
+        actual_balance = exchange.fetch_balance().get(base_asset, {}).get('free', 0)
+        
+        # Sell whichever is smaller: the intended amount, or what we actually have left
+        qty_to_sell = min(float(amount_to_buy), actual_balance)
+        qty_precision = exchange.amount_to_precision(symbol, qty_to_sell)
+        
         market = exchange.market(symbol)
-        qty_precision = exchange.amount_to_precision(symbol, amount_to_buy)
         tp_precision = exchange.price_to_precision(symbol, take_profit_price)
         sl_precision = exchange.price_to_precision(symbol, stop_loss_price)
         sl_limit_precision = exchange.price_to_precision(symbol, stop_loss_price * 0.995)
