@@ -37,8 +37,9 @@ async fn main() {
     // Sentinel Daemon
     let sentinel_binance = binance.clone();
     let sentinel_state = state.clone();
+    let sentinel_discord = config.discord_webhook_url.clone();
     tokio::spawn(async move {
-        ws_sentinel::run_sentinel(sentinel_binance, sentinel_state).await;
+        ws_sentinel::run_sentinel(sentinel_binance, sentinel_state, sentinel_discord).await;
     });
 
     let mut last_ai_scan_minute = -1;
