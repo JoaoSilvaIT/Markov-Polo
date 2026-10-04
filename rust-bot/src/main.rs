@@ -39,23 +39,38 @@ async fn main() {
     let sentinel_state = state.clone();
     tokio::spawn(async move {
         loop {
-            // Simplified Sentinel: Check if open orders exist, if not, remove from state
+            // Local Sentinel: Actively monitor price and execute Market Sell to avoid OCO Flash Crash vulnerabilities
             let mut current_state = sentinel_state.lock().await;
             let keys: Vec<String> = current_state.keys().cloned().collect();
+            
             for symbol in keys {
-                if let Ok(orders) = sentinel_binance.fetch_open_orders(&symbol).await {
-                    if orders.is_empty() {
-                        println!("[AUDIT] Position {} closed (OCO triggered). Cleaning state.", symbol);
+                if let Ok(current_price) = sentinel_binance.fetch_ticker(&symbol).await {
+                    let pos = current_state.get(&symbol).unwrap();
+                    let tp = pos.take_profit_price;
+                    let sl = pos.stop_loss_price;
+                    let amount = pos.amount;
+                    
+                    if current_price >= tp {
+                        println!("[SENTINEL TRIGGER] {} hit Take Profit (${:.2} >= ${:.2}). Executing Market Sell.", symbol, current_price, tp);
+                        let _ = sentinel_binance.create_market_sell(&symbol, amount).await;
+                        current_state.remove(&symbol);
+                        let _ = save_state(&current_state);
+                    } else if current_price <= sl {
+                        println!("[SENTINEL TRIGGER] {} hit Stop Loss (${:.2} <= ${:.2}). Executing Emergency Market Sell.", symbol, current_price, sl);
+                        let _ = sentinel_binance.create_market_sell(&symbol, amount).await;
                         current_state.remove(&symbol);
                         let _ = save_state(&current_state);
                     }
                 }
             }
+            
             if current_state.is_empty() {
                 println!("[AUDIT] No open positions currently tracked.");
             }
             drop(current_state);
-            tokio::time::sleep(Duration::from_secs(15)).await;
+            
+            // Sub-millisecond yield, sleep 5 seconds
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
 
@@ -131,8 +146,15 @@ async fn main() {
                                         if let Ok(klines) = binance.fetch_ohlcv(sym, "15m", 100).await {
                                             if let Ok(funding) = binance.fetch_funding_rate(sym).await {
                                                 let closes: Vec<f64> = klines.iter().filter_map(|k| k[4].as_str().unwrap_or("0").parse().ok()).collect();
-                                                let regime = hmm::detect_hmm_regime(&closes);
-                                                let vol = garch::forecast_garch(&closes);
+                                                
+                                                // Offload heavy math to Tokio blocking pool to prevent async starvation
+                                                let closes_clone = closes.clone();
+                                                let (regime, vol) = tokio::task::spawn_blocking(move || {
+                                                    let r = hmm::detect_hmm_regime(&closes_clone);
+                                                    let v = garch::forecast_garch(&closes_clone);
+                                                    (r, v)
+                                                }).await.unwrap_or((0, 0.0));
+                                                
                                                 let tech = indicators::compute_indicators(sym, &klines, regime, vol, funding);
                                                 results.push(tech);
                                             }

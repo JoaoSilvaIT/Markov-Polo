@@ -96,21 +96,16 @@ pub async fn place_order(
 
     let qty_to_sell = amount_f.min(actual_balance);
     let qty_to_sell_str = format!("{:.5}", qty_to_sell);
-    
-    // Format prices (2 decimals for USDC pairs)
-    let tp_price = format!("{:.2}", take_profit_price).parse::<f64>().unwrap();
-    let sl_price = format!("{:.2}", stop_loss_price).parse::<f64>().unwrap();
-    let sl_limit = format!("{:.2}", stop_loss_price * 0.995).parse::<f64>().unwrap();
-
-    let oco_res = client.create_oco_sell(symbol, qty_to_sell_str.parse().unwrap(), tp_price, sl_price, sl_limit).await.map_err(|e| e.to_string())?;
+    // Refactored: We DO NOT place an OCO limit order here. 
+    // The Sentinel loop will actively monitor the price and fire a Market Sell
+    // to guarantee execution during flash crashes and bypass PRER restrictions.
 
     let order_id = buy_res["orderId"].as_u64().unwrap_or(0).to_string();
-    let oco_list_id = oco_res["orderListId"].as_u64().unwrap_or(0).to_string();
 
     let new_state = PositionState {
         symbol: symbol.to_string(),
         order_id,
-        oco_list_id,
+        oco_list_id: "".to_string(), // OCO deprecated
         entry_price: fill_price,
         amount: amount_f,
         stop_loss_price: sl_price,

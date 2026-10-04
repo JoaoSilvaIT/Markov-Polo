@@ -103,6 +103,22 @@ impl BinanceClient {
         Ok(res)
     }
 
+    pub async fn create_market_sell(&self, symbol: &str, quantity: f64) -> Result<Value, Box<dyn std::error::Error>> {
+        let mut params = vec![
+            ("symbol", symbol.replace("/", "")),
+            ("side", "SELL".to_string()),
+            ("type", "MARKET".to_string()),
+            ("quantity", quantity.to_string()),
+        ];
+        let query = self.sign_request(&mut params);
+        let url = format!("https://api.binance.com/api/v3/order?{}", query);
+        
+        let res: Value = self.client.post(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send().await?.json().await?;
+        Ok(res)
+    }
+
     pub async fn create_oco_sell(&self, symbol: &str, quantity: f64, price: f64, stop_price: f64, stop_limit_price: f64) -> Result<Value, Box<dyn std::error::Error>> {
         let mut params = vec![
             ("symbol", symbol.replace("/", "")),

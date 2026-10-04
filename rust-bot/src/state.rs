@@ -38,7 +38,10 @@ pub fn load_state() -> Result<StateMap, Box<dyn std::error::Error>> {
 
 pub fn save_state(state: &StateMap) -> Result<(), Box<dyn std::error::Error>> {
     let content = serde_json::to_string_pretty(state)?;
-    fs::write(STATE_FILE, content)?;
+    // Atomic file save to prevent corruption on panic/power loss
+    let temp_path = format!("{}.tmp", STATE_FILE);
+    fs::write(&temp_path, content)?;
+    fs::rename(&temp_path, STATE_FILE)?;
     Ok(())
 }
 
