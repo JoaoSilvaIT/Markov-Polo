@@ -94,10 +94,26 @@ async fn main() {
                 if let Ok(resp) = response {
                     if let Some(candidates) = resp["candidates"].as_array() {
                         if let Some(parts) = candidates[0]["content"]["parts"].as_array() {
-                            let part = &parts[0];
                             
-                            // If it's a function call
-                            if let Some(func_call) = part.get("functionCall") {
+                            // Find function_call or text
+                            let mut func_call = None;
+                            let mut text_output = None;
+                            
+                            for p in parts {
+                                if p.get("functionCall").is_some() {
+                                    func_call = p.get("functionCall");
+                                } else if p.get("text").is_some() {
+                                    text_output = p.get("text");
+                                }
+                            }
+                            
+                            // If we have text, print it
+                            if let Some(text) = text_output {
+                                println!("\nMEMO:\n{}", text.as_str().unwrap_or(""));
+                            }
+                            
+                            // If it's a function call, execute it and continue the loop
+                            if let Some(func_call) = func_call {
                                 let name = func_call["name"].as_str().unwrap_or("");
                                 println!("\n[AGENT ACTION] -> {}...", name);
                                 
@@ -161,11 +177,8 @@ async fn main() {
                                 continue;
                             }
                             
-                            // If it's text
-                            if let Some(text) = part.get("text") {
-                                println!("\nMEMO:\n{}", text.as_str().unwrap_or(""));
-                                break;
-                            }
+                            // If NO function call was made, the conversation is finished
+                            break;
                         } else {
                             println!("API Error: Missing parts in candidate. Raw: {}", candidates[0]);
                             break;
