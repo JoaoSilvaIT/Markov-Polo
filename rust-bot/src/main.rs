@@ -69,7 +69,6 @@ async fn main() {
                         println!("[SENTINEL HEARTBEAT] {} - Live Price: ${:.2} (TP: ${:.2} | SL: ${:.2})", symbol, current_price, tp, sl);
                     }
                 }
-            }
             
             if current_state.is_empty() {
                 println!("[AUDIT] No open positions currently tracked.");
