@@ -56,8 +56,8 @@ parser.add_argument("--status", action="store_true",
                     help="Show live account overview, active positions, P&L, and recent journal history, then exit.")
 parser.add_argument("--knowledge-base", action="store_true",
                     help="Display empirical trade knowledge base, win rates, and post-mortem lessons, then exit.")
-parser.add_argument("--max-positions", type=int, default=int(os.getenv("MAX_OPEN_POSITIONS", 3)),
-                    help="Max simultaneous open positions allowed (default: 3)")
+parser.add_argument("--max-positions", type=int, default=int(os.getenv("MAX_OPEN_POSITIONS", 0)),
+                    help="Max simultaneous open positions allowed (0 for unlimited, default: 0)")
 args = parser.parse_args()
 
 MODE = args.mode
@@ -248,7 +248,14 @@ def get_all_crypto_symbols():
         print(f"[WARN] Error fetching dynamic crypto universe: {e}")
         return ["BTC/USD", "ETH/USD", "SOL/USD", "AVAX/USD", "LINK/USD", "DOGE/USD", "XRP/USD", "ADA/USD", "LTC/USD", "BCH/USD", "UNI/USD", "DOT/USD", "AAVE/USD", "RENDER/USD", "ARB/USD"]
 
-STOCK_UNIVERSE = ["XLF", "GDX", "SLV", "BAC", "SOFI", "PFE", "KO", "F"]
+STOCK_UNIVERSE = [
+    # Benchmark Index & Major Sector ETFs
+    "SPY", "QQQ", "IWM", "DIA", "XLF", "XLK", "XLE", "XLV", "XLI", "GDX", "SLV", "TLT",
+    # Megacap Tech & Market Leaders
+    "AAPL", "MSFT", "NVDA", "TSLA", "AMD", "AMZN", "GOOGL", "META",
+    # High-Volume Momentum, Financials & Recovery
+    "PLTR", "COIN", "BAC", "JPM", "SOFI", "INTC", "PFE", "KO", "F", "DIS", "UBER"
+]
 ACTIVE_UNIVERSE = get_all_crypto_symbols() if MODE == "crypto" else STOCK_UNIVERSE
 
 # ---------------------------------------------------------------------
@@ -621,9 +628,9 @@ def scan_market_opportunities(max_budget: float = BUDGET_PER_TRADE) -> str:
                 "total_scanned": len(candidates),
                 "high_conviction_count": len(high_conviction),
                 "oversold_bounce_count": len(oversold_dips),
-                "top_bullish_recommendations": high_conviction[:3],
-                "top_oversold_recommendations": oversold_dips[:2],
-                "all_candidates_summary": f"{len(candidates)} total monitored, only {len(high_conviction)} passed multi-indicator confluence filters."
+                "top_bullish_recommendations": high_conviction,
+                "top_oversold_recommendations": oversold_dips,
+                "all_candidates_summary": f"{len(candidates)} total monitored, {len(high_conviction)} passed multi-indicator confluence filters."
             }
             print(f"[TOOL RESULT] Scanned {len(candidates)} crypto pairs: {len(high_conviction)} high-conviction setups found.")
             return json.dumps(result)
@@ -646,28 +653,56 @@ def scan_market_opportunities(max_budget: float = BUDGET_PER_TRADE) -> str:
                     continue
                 rsi_series = ta.momentum.RSIIndicator(close=sub["close"], window=14).rsi()
                 rsi_val = round(float(rsi_series.iloc[-1]), 1)
-                sma_series = ta.trend.SMAIndicator(close=sub["close"], window=min(50, len(sub))).sma_indicator()
-                sma_val = round(float(sma_series.iloc[-1]), 2)
-                trend_state = "bullish" if close_px > sma_val else "bearish"
-                max_whole_shares = int(max_budget / close_px)
+                
+                sma20_series = ta.trend.SMAIndicator(close=sub["close"], window=min(20, len(sub))).sma_indicator()
+                sma50_series = ta.trend.SMAIndicator(close=sub["close"], window=min(50, len(sub))).sma_indicator()
+                sma20_val = round(float(sma20_series.iloc[-1]), 2)
+                sma50_val = round(float(sma50_series.iloc[-1]), 2)
 
+                macd_obj = ta.trend.MACD(close=sub["close"])
+                macd_diff = float(macd_obj.macd_diff().iloc[-1])
+
+                if close_px > sma20_val and sma20_val > sma50_val:
+                    trend_state = "strong_bullish"
+                elif close_px > sma50_val:
+                    trend_state = "bullish"
+                elif close_px < sma20_val and sma20_val < sma50_val:
+                    trend_state = "strong_bearish"
+                else:
+                    trend_state = "bearish"
+
+                max_whole_shares = int(max_budget / close_px)
                 candidates.append({
                     "symbol": symbol,
                     "latest_price": close_px,
                     "rsi_14": rsi_val,
                     "trend_state": trend_state,
+                    "macd_hist_positive": macd_diff > 0,
                     "affordable_shares": max_whole_shares,
                     "estimated_cost": round(max_whole_shares * close_px, 2)
                 })
 
-        result = {
-            "mode": MODE,
-            "budget": max_budget,
-            "qualified_count": len(candidates),
-            "candidates": candidates
-        }
-        print(f"[TOOL RESULT] Scanned {len(candidates)} {MODE} assets with live indicators.")
-        return json.dumps(result)
+            high_conviction = [
+                c for c in candidates 
+                if c["trend_state"] in ("strong_bullish", "bullish") 
+                and c["macd_hist_positive"] 
+                and 40.0 <= c["rsi_14"] <= 58.0
+            ]
+            high_conviction.sort(key=lambda x: (0 if x["trend_state"] == "strong_bullish" else 1, abs(x["rsi_14"] - 50.0)))
+            oversold_dips = sorted([c for c in candidates if c["rsi_14"] < 35.0 and c["macd_hist_positive"]], key=lambda x: x["rsi_14"])
+
+            result = {
+                "mode": MODE,
+                "budget": max_budget,
+                "total_scanned": len(candidates),
+                "high_conviction_count": len(high_conviction),
+                "oversold_bounce_count": len(oversold_dips),
+                "top_bullish_recommendations": high_conviction,
+                "top_oversold_recommendations": oversold_dips,
+                "all_candidates": candidates
+            }
+            print(f"[TOOL RESULT] Scanned {len(candidates)} {MODE} assets: {len(high_conviction)} high-conviction setups found.")
+            return json.dumps(result)
     except Exception as e:
         error_res = {"status": "ERROR", "message": str(e)}
         print(f"[TOOL RESULT] Error in scan: {error_res}")
@@ -1039,7 +1074,7 @@ def run_agent_cycle():
         return
 
     positions = trading_client.get_all_positions()
-    if len(positions) >= MAX_OPEN_POSITIONS:
+    if MAX_OPEN_POSITIONS > 0 and len(positions) >= MAX_OPEN_POSITIONS:
         print(f"\n[RISK GUARD] Portfolio currently holds {len(positions)}/{MAX_OPEN_POSITIONS} active positions (Max Limit).")
         print("Capital preservation active. No new trades will be opened. Open positions are actively being monitored.")
         return
