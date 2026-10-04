@@ -250,7 +250,8 @@ def scan_market_opportunities() -> str:
         
     prompt_injection = (
         "Analyze the provided candidates using their HMM Regime and GARCH Volatility forecast. "
-        "Dynamically adapt your indicator thresholds (e.g. RSI, BB width) based on the regime. "
+        "Definitions: Regime 0 = Low-Vol Mean-Reverting. Regime 1 = High-Vol Trending. Regime 2 = Chaotic/Stochastic Chop. "
+        "Dynamically adapt your indicator thresholds (e.g. RSI, BB width) based on these specific regimes. "
         "Also, dynamically scale your position size risk_pct (instead of the hardcoded 1%) based on "
         "regime stability and GARCH expected volatility. Pass this risk_pct to the place_order tool."
     )
