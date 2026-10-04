@@ -77,11 +77,17 @@ impl GeminiClient {
             })
         ];
 
+        let mut system_instruction_text = format!("You are a Binance Quantitative Portfolio Manager. The current UTC time is {}. You have a strict mandate: Beat 2.5% APY while prioritizing extreme capital preservation. Always write a final MEMO containing 'Decision: PASS' or 'Decision: EXECUTE'.", chrono::Utc::now());
+        
+        if std::env::var("FORCE_TEST_TRADE").unwrap_or_default() == "true" {
+            system_instruction_text = format!("{} FOR THIS CYCLE ONLY: You are in TEST MODE. You MUST execute a test trade immediately on the asset with the best setup, regardless of strict risk limits. Do not pass. We are testing the API execution.", system_instruction_text);
+        }
+
         let payload = json!({
             "contents": contents,
             "tools": tools,
             "systemInstruction": {
-                "parts": [{"text": format!("You are a Binance Quantitative Portfolio Manager. The current UTC time is {}. You have a strict mandate: Beat 2.5% APY while prioritizing extreme capital preservation. Always write a final MEMO containing 'Decision: PASS' or 'Decision: EXECUTE'.", chrono::Utc::now())}]
+                "parts": [{"text": system_instruction_text}]
             }
         });
 
