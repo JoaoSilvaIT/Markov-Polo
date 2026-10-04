@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import pandas as pd
 import ta
 import ccxt
+import requests
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -19,6 +20,14 @@ from alpaca.data.requests import NewsRequest
 # 1. INITIALIZE CONFIGURATION & CLIENTS
 # ---------------------------------------------------------------------
 load_dotenv()
+
+def send_discord_alert(message: str):
+    webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
+    if not webhook_url: return
+    try:
+        requests.post(webhook_url, json={"content": message}, timeout=5)
+    except Exception:
+        pass
 
 BINANCE_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET = os.getenv("BINANCE_SECRET_KEY")
@@ -128,7 +137,9 @@ def audit_and_manage_open_positions():
             try:
                 exchange.create_order(sym, 'market', 'sell', amount)
                 del all_states[sym]
-                log_to_journal(f"Stop-Loss executed for {sym} at {current_price}. P&L: {pl_usd:.2f} USD ({pl_pct:.2f}%)", "STOP_LOSS")
+                msg = f"🚨 **STOP-LOSS EXECUTED** for {sym} at ${current_price:.2f}. P&L: {pl_usd:.2f} USDC ({pl_pct:.2f}%)"
+                send_discord_alert(msg)
+                log_to_journal(msg, "STOP_LOSS")
             except Exception as e:
                 print(f"[ERROR] Failed to close {sym}: {e}")
 
@@ -138,7 +149,9 @@ def audit_and_manage_open_positions():
             try:
                 exchange.create_order(sym, 'market', 'sell', amount)
                 del all_states[sym]
-                log_to_journal(f"Take-Profit executed for {sym} at {current_price}. P&L: {pl_usd:.2f} USD ({pl_pct:.2f}%)", "TAKE_PROFIT")
+                msg = f"✅ **TAKE-PROFIT EXECUTED** for {sym} at ${current_price:.2f}. P&L: +{pl_usd:.2f} USDC (+{pl_pct:.2f}%)"
+                send_discord_alert(msg)
+                log_to_journal(msg, "TAKE_PROFIT")
             except Exception as e:
                 print(f"[ERROR] Failed to close {sym}: {e}")
 
@@ -147,7 +160,9 @@ def audit_and_manage_open_positions():
             total_range = tp_price - sl_price
             progress = (current_price - sl_price) / total_range if total_range > 0 else 0
             if progress >= 0.35 and sl_price < entry_price:
-                print(f"[TRAILING BREAKEVEN] {sym} reached 35%+ to target. Stop-Loss moved to entry ({entry_price}).")
+                msg = f"🛡️ **TRAILING BREAKEVEN** for {sym}! Stop-Loss moved to entry (${entry_price:.2f})."
+                print(msg)
+                send_discord_alert(msg)
                 all_states[sym]['stop_loss_price'] = entry_price
 
             print(f"  * {sym:<8} | Cur: ${current_price:.2f} | Entry: ${entry_price:.2f} | P&L: {pl_pct:+.2f}%")
@@ -292,6 +307,7 @@ def place_order(symbol: str, take_profit_price: float, stop_loss_price: float) -
             "fill_price": fill_price,
             "risk_taken_usdc": risk_amount_usdc
         }
+        send_discord_alert(f"🚀 **NEW TRADE OPENED**\n**{symbol}** | Bought {amount_to_buy} at ${fill_price:.2f}\nRisk: ${risk_amount_usdc:.2f} (1.0%)\nSL: ${stop_loss_price:.2f} | TP: ${take_profit_price:.2f}")
         CURRENT_CYCLE_DATA["orders"].append(res)
         return json.dumps(res)
         
