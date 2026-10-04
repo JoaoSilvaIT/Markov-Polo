@@ -59,12 +59,16 @@ def get_klines(symbol, interval="15m", limit=100):
 def render_position_dashboard(bot_name, state_file):
     st.markdown(f"### {bot_name} Active Tracker")
     
-    if not os.path.exists(state_file):
+    if not os.path.exists(state_file) or os.path.isdir(state_file):
         st.info("No state file found. System is waiting for initial deployment.")
         return
 
-    with open(state_file, "r") as f:
-        state = json.load(f)
+    try:
+        with open(state_file, "r") as f:
+            state = json.load(f)
+    except Exception as e:
+        st.info(f"Could not read state file: {e}")
+        return
         
     if not state:
         st.success("🟢 System Online. Waiting for a high-probability setup...")
