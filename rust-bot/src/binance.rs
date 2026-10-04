@@ -25,6 +25,7 @@ impl BinanceClient {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH).unwrap()
             .as_millis().to_string();
+        params.push(("recvWindow", "10000".to_string()));
         params.push(("timestamp", timestamp));
         
         let query = params.iter()
