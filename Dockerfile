@@ -6,8 +6,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the bot script
-COPY binance_bot.py .
+# Copy the bot and dashboard scripts
+COPY binance_bot.py dashboard.py ./
 
 # Run the bot in unbuffered mode so logs appear instantly
 CMD ["python", "-u", "binance_bot.py", "--loop", "15"]
