@@ -8,6 +8,7 @@ mod hmm;
 mod indicators;
 mod order;
 mod state;
+mod ws_sentinel;
 
 use crate::config::Config;
 use crate::binance::BinanceClient;
@@ -17,6 +18,8 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use std::sync::Arc;
 use serde_json::{json, Value};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use futures_util::StreamExt;
 
 #[tokio::main]
 async fn main() {
@@ -38,46 +41,7 @@ async fn main() {
     let sentinel_binance = binance.clone();
     let sentinel_state = state.clone();
     tokio::spawn(async move {
-        loop {
-            // Local Sentinel: Actively monitor price and execute Market Sell to avoid OCO Flash Crash vulnerabilities
-            let mut current_state = sentinel_state.lock().await;
-            let keys: Vec<String> = current_state.keys().cloned().collect();
-            
-            for symbol in keys {
-                let current_price = match sentinel_binance.fetch_ticker(&symbol).await {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
-                
-                let pos = current_state.get(&symbol).unwrap();
-                let tp = pos.take_profit_price;
-                let sl = pos.stop_loss_price;
-                let amount = pos.amount;
-                
-                    if current_price >= tp {
-                        println!("[SENTINEL TRIGGER] {} hit Take Profit (${:.2} >= ${:.2}). Executing Market Sell.", symbol, current_price, tp);
-                        let _ = sentinel_binance.create_market_sell(&symbol, amount).await;
-                        current_state.remove(&symbol);
-                        let _ = save_state(&current_state);
-                    } else if current_price <= sl {
-                        println!("[SENTINEL TRIGGER] {} hit Stop Loss (${:.2} <= ${:.2}). Executing Emergency Market Sell.", symbol, current_price, sl);
-                        let _ = sentinel_binance.create_market_sell(&symbol, amount).await;
-                        current_state.remove(&symbol);
-                        let _ = save_state(&current_state);
-                    } else {
-                        // Print a heartbeat so the user knows the Sentinel is actively guarding the trade
-                        println!("[SENTINEL HEARTBEAT] {} - Live Price: ${:.2} (TP: ${:.2} | SL: ${:.2})", symbol, current_price, tp, sl);
-                    }
-                }
-            
-            if current_state.is_empty() {
-                println!("[AUDIT] No open positions currently tracked.");
-            }
-            drop(current_state);
-            
-            // Sub-millisecond yield, sleep 5 seconds
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        }
+        ws_sentinel::run_sentinel(sentinel_binance, sentinel_state).await;
     });
 
     let mut last_ai_scan_minute = -1;

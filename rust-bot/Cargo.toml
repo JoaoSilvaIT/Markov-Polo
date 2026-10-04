@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 # Async runtime
 tokio = { version = "1.37.0", features = ["full"] }
+tokio-tungstenite = { version = "0.21.0", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3.30"
 
 # HTTP & API
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
