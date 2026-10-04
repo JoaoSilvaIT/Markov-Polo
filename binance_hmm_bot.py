@@ -302,12 +302,16 @@ def place_order(symbol: str, take_profit_price: float, stop_loss_price: float, r
         amount_to_buy = risk_amount_usdc / distance_to_sl
         notional_value = amount_to_buy * current_price
         
+        # Spot Market Cash Clamping (Prevents Margin Rejections)
+        max_notional = balance.get('USDC', {}).get('free', 0) * 0.98
+        if notional_value > max_notional:
+            notional_value = max_notional
+            amount_to_buy = notional_value / current_price
+            risk_amount_usdc = amount_to_buy * distance_to_sl
+        
         # Binance requires minimum notional of typically 5 USDC
         if notional_value < 6.0:
             return json.dumps({"status": "REJECTED", "reason": f"Order size {notional_value:.2f} USDC is too small for Binance minimums."})
-            
-        if notional_value > balance.get('USDC', {}).get('free', 0):
-            return json.dumps({"status": "REJECTED", "reason": "Insufficient FREE USDC for this position size."})
 
         # 4. Execution
         exchange.load_markets()
