@@ -163,6 +163,14 @@ def fetch_market_technicals(symbol: str) -> str:
     bb = ta.volatility.BollingerBands(close=df["close"], window=20, window_dev=2)
     df["bb_width"] = (bb.bollinger_hband() - bb.bollinger_lband()) / bb.bollinger_mavg()
 
+    # Fetch Perpetual Funding Rate to gauge macro leverage
+    try:
+        # Convert Spot symbol (BTC/USDC) to USDT Perpetual symbol (BTC/USDT:USDT) for funding rate proxy
+        perp_symbol = symbol.replace('USDC', 'USDT') + ":USDT"
+        funding = float(exchange.fetch_funding_rate(perp_symbol)['fundingRate'])
+    except Exception as e:
+        funding = 0.0
+
     latest = df.iloc[-1]
     close_px = float(latest["close"])
     atr_val = float(latest["atr_14"])
@@ -176,6 +184,7 @@ def fetch_market_technicals(symbol: str) -> str:
         "trend": trend,
         "bb_width": round(float(latest["bb_width"]), 4),
         "volume_confirmed": float(latest["volume"]) > float(latest["vol_sma_20"]),
+        "perpetual_funding_rate": funding,
         "recommended_sl": adaptive_round(close_px - (1.5 * atr_val)),
         "recommended_tp": adaptive_round(close_px + (2.0 * atr_val))
     }
@@ -341,10 +350,11 @@ Max risk per trade is exactly 1.0% Fixed Fractional.
 Directives:
 1. Call 'scan_market_opportunities'. 
 2. If the array is empty, you MUST conclude "Decision: PASS".
-3. If a candidate exists, call 'fetch_market_news' for it. Assign a strict News Sentiment Score.
-4. If news is not distinctly Bullish, conclude "Decision: PASS".
-5. If confluence is perfect, call 'place_order' using the recommended_tp and recommended_sl from the scan.
-6. Write a brief memo summarizing the decision.
+3. Evaluate the 'perpetual_funding_rate'. If funding is heavily positive (> 0.01%), the market is dangerously over-leveraged Long, and breakouts are likely bull-traps. If so, conclude "Decision: PASS".
+4. If a candidate exists and funding is safe, call 'fetch_market_news' for it. Assign a strict News Sentiment Score.
+5. If news is not distinctly Bullish, conclude "Decision: PASS".
+6. If confluence is perfect, call 'place_order' using the recommended_tp and recommended_sl from the scan.
+7. Write a brief memo summarizing the decision.
 """
     print("\n[ALPHA DAEMON] STARTING BINANCE QUANTITATIVE CYCLE...")
     try:

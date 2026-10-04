@@ -193,6 +193,14 @@ def fetch_market_technicals(symbol: str) -> str:
     hmm_regime = detect_hmm_regime(df)
     garch_vol = forecast_garch(df)
 
+    # Fetch Perpetual Funding Rate to gauge macro leverage
+    try:
+        # Convert Spot symbol (BTC/USDC) to USDT Perpetual symbol (BTC/USDT:USDT) for funding rate proxy
+        perp_symbol = symbol.replace('USDC', 'USDT') + ":USDT"
+        funding = float(exchange.fetch_funding_rate(perp_symbol)['fundingRate'])
+    except Exception as e:
+        funding = 0.0
+
     latest = df.iloc[-1]
     close_px = float(latest["close"])
     atr_val = float(latest["atr_14"])
@@ -208,6 +216,7 @@ def fetch_market_technicals(symbol: str) -> str:
         "volume_confirmed": float(latest["volume"]) > float(latest["vol_sma_20"]),
         "hmm_regime": hmm_regime,
         "garch_vol_forecast": garch_vol,
+        "perpetual_funding_rate": funding,
         "recommended_sl": adaptive_round(close_px - (1.5 * atr_val)),
         "recommended_tp": adaptive_round(close_px + (2.0 * atr_val))
     }
@@ -225,7 +234,8 @@ def scan_market_opportunities() -> str:
         "Analyze the provided candidates using their HMM Regime and GARCH Volatility forecast. "
         "Definitions: Regime 0 = Low-Vol Mean-Reverting. Regime 1 = High-Vol Trending. Regime 2 = Chaotic/Stochastic Chop. "
         "Dynamically adapt your indicator thresholds (e.g. RSI, BB width) based on these specific regimes. "
-        "Also, dynamically scale your position size risk_pct (instead of the hardcoded 1%) based on "
+        "Also, evaluate the 'perpetual_funding_rate'. If funding is heavily positive (> 0.01%), the market is dangerously over-leveraged Long, and breakouts are likely bull-traps. If funding is negative, shorts are trapped and a Long breakout has high probability. "
+        "Dynamically scale your position size risk_pct (instead of the hardcoded 1%) based on "
         "regime stability and GARCH expected volatility. Pass this risk_pct to the place_order tool."
     )
     return json.dumps({"candidates": candidates, "instructions": prompt_injection})
