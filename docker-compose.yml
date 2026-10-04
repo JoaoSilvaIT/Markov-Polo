@@ -13,6 +13,18 @@ services:
       - ./binance_journal.md:/app/binance_journal.md
       - ./binance_journal.jsonl:/app/binance_journal.jsonl
 
+  hmm_bot:
+    build: .
+    container_name: binance_hmm_bot
+    restart: unless-stopped
+    command: ["python", "-u", "binance_hmm_bot.py", "--loop", "5"]
+    env_file:
+      - .env
+    volumes:
+      - ./binance_hmm_state.json:/app/binance_hmm_state.json
+      - ./binance_hmm_journal.md:/app/binance_hmm_journal.md
+      - ./binance_hmm_journal.jsonl:/app/binance_hmm_journal.jsonl
+
   dashboard:
     build: .
     container_name: binance_quant_dashboard
@@ -24,3 +36,6 @@ services:
       - ./binance_state.json:/app/binance_state.json:ro
       - ./binance_journal.md:/app/binance_journal.md:ro
       - ./binance_journal.jsonl:/app/binance_journal.jsonl:ro
+      - ./binance_hmm_state.json:/app/binance_hmm_state.json:ro
+      - ./binance_hmm_journal.md:/app/binance_hmm_journal.md:ro
+      - ./binance_hmm_journal.jsonl:/app/binance_hmm_journal.jsonl:ro
