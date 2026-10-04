@@ -12,6 +12,7 @@ services:
       - ./binance_state.json:/app/binance_state.json
       - ./binance_journal.md:/app/binance_journal.md
       - ./binance_journal.jsonl:/app/binance_journal.jsonl
+      - ./gcp-key.json:/app/gcp-key.json:ro
 
   hmm_bot:
     build: .
@@ -24,6 +25,7 @@ services:
       - ./binance_hmm_state.json:/app/binance_hmm_state.json
       - ./binance_hmm_journal.md:/app/binance_hmm_journal.md
       - ./binance_hmm_journal.jsonl:/app/binance_hmm_journal.jsonl
+      - ./gcp-key.json:/app/gcp-key.json:ro
 
   dashboard:
     build: .
@@ -39,3 +41,4 @@ services:
       - ./binance_hmm_state.json:/app/binance_hmm_state.json:ro
       - ./binance_hmm_journal.md:/app/binance_hmm_journal.md:ro
       - ./binance_hmm_journal.jsonl:/app/binance_hmm_journal.jsonl:ro
+      - ./gcp-key.json:/app/gcp-key.json:ro
