@@ -5,7 +5,7 @@ services:
     build: .
     container_name: binance_quant_bot
     restart: unless-stopped
-    command: ["python", "-u", "binance_bot.py", "--loop", "15"]
+    command: ["python", "-u", "binance_bot.py", "--loop", "5"]
     env_file:
       - .env
     volumes:

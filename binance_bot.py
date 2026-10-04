@@ -310,7 +310,7 @@ def run_agent_cycle():
     audit_and_manage_open_positions()
     
     chat = ai_client.chats.create(
-        model="gemini-2.5-pro",
+        model="gemini-2.5-flash",
         config=types.GenerateContentConfig(tools=tools, temperature=0.1)
     )
 
