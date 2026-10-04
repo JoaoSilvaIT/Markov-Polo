@@ -15,12 +15,14 @@ services:
       - ./gcp-key.json:/app/gcp-key.json:ro
 
   hmm_bot:
-    build: .
+    build: ./rust-bot
     container_name: binance_hmm_bot
     restart: unless-stopped
-    command: ["python", "-u", "binance_hmm_bot.py", "--loop", "5"]
+    command: ["trading-bot", "--run-now"]
     env_file:
       - .env
+    environment:
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-key.json
     volumes:
       - ./binance_hmm_state.json:/app/binance_hmm_state.json
       - ./binance_hmm_journal.md:/app/binance_hmm_journal.md

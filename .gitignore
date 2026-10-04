@@ -7,3 +7,11 @@ binance_journal.*
 crypto_state.json
 trading_journal.*
 scratch/
+
+# Credentials
+gcp-key.json
+*.json
+
+# Rust
+rust-bot/target/
+**/*.rs.bk
