@@ -249,11 +249,15 @@ def place_order(symbol: str, take_profit_price: float, stop_loss_price: float) -
             
         risk_amount_usdc = usdc_total * RISK_PER_TRADE_PCT
         
-        # 2. Check concurrency limits
         all_states = {}
         if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "r") as f:
-                all_states = json.load(f)
+            try:
+                with open(STATE_FILE, "r") as f:
+                    content = f.read()
+                    if content.strip():
+                        all_states = json.loads(content)
+            except Exception:
+                pass
                 
         if len(all_states) >= MAX_CONCURRENT_TRADES:
              return json.dumps({"status": "REJECTED", "reason": f"Max concurrent trades ({MAX_CONCURRENT_TRADES}) reached."})
