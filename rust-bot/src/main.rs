@@ -54,16 +54,20 @@ async fn main() {
                 let sl = pos.stop_loss_price;
                 let amount = pos.amount;
                 
-                if current_price >= tp {
-                    println!("[SENTINEL TRIGGER] {} hit Take Profit (${:.2} >= ${:.2}). Executing Market Sell.", symbol, current_price, tp);
-                    let _ = sentinel_binance.create_market_sell(&symbol, amount).await;
-                    current_state.remove(&symbol);
-                    let _ = save_state(&current_state);
-                } else if current_price <= sl {
-                    println!("[SENTINEL TRIGGER] {} hit Stop Loss (${:.2} <= ${:.2}). Executing Emergency Market Sell.", symbol, current_price, sl);
-                    let _ = sentinel_binance.create_market_sell(&symbol, amount).await;
-                    current_state.remove(&symbol);
-                    let _ = save_state(&current_state);
+                    if current_price >= tp {
+                        println!("[SENTINEL TRIGGER] {} hit Take Profit (${:.2} >= ${:.2}). Executing Market Sell.", symbol, current_price, tp);
+                        let _ = sentinel_binance.create_market_sell(&symbol, amount).await;
+                        current_state.remove(&symbol);
+                        let _ = save_state(&current_state);
+                    } else if current_price <= sl {
+                        println!("[SENTINEL TRIGGER] {} hit Stop Loss (${:.2} <= ${:.2}). Executing Emergency Market Sell.", symbol, current_price, sl);
+                        let _ = sentinel_binance.create_market_sell(&symbol, amount).await;
+                        current_state.remove(&symbol);
+                        let _ = save_state(&current_state);
+                    } else {
+                        // Print a heartbeat so the user knows the Sentinel is actively guarding the trade
+                        println!("[SENTINEL HEARTBEAT] {} - Live Price: ${:.2} (TP: ${:.2} | SL: ${:.2})", symbol, current_price, tp, sl);
+                    }
                 }
             }
             
