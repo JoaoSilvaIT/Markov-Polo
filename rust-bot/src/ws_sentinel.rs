@@ -7,7 +7,7 @@ use serde_json::Value;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use futures_util::StreamExt;
 
-pub async fn run_sentinel(sentinel_binance: BinanceClient, sentinel_state: Arc<Mutex<StateMap>>) {
+pub async fn run_sentinel(sentinel_binance: Arc<BinanceClient>, sentinel_state: Arc<Mutex<StateMap>>) {
     let ws_url = "wss://stream.binance.com:9443/ws/!miniTicker@arr";
 
     loop {
