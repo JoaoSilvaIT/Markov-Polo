@@ -160,18 +160,38 @@ def detect_hmm_regime(df: pd.DataFrame) -> int:
     
     hmm_model = GaussianHMM(n_components=3, covariance_type="diag", n_iter=100, random_state=42)
     hmm_model.fit(X)
-    regimes = hmm_model.predict(X)
     
+    # Deterministic State Sorting to prevent Label Switching
+    variances = np.array([np.diag(hmm_model.covars_[i]) for i in range(hmm_model.n_components)])
+    variances_1d = variances.sum(axis=1)
+    sorted_indices = np.argsort(variances_1d)
+    
+    hmm_model.means_ = hmm_model.means_[sorted_indices]
+    hmm_model.covars_ = hmm_model.covars_[sorted_indices]
+    
+    if hasattr(hmm_model, "startprob_") and hmm_model.startprob_ is not None:
+        hmm_model.startprob_ = hmm_model.startprob_[sorted_indices]
+        
+    if hasattr(hmm_model, "transmat_") and hmm_model.transmat_ is not None:
+        transmat = hmm_model.transmat_[sorted_indices, :]
+        hmm_model.transmat_ = transmat[:, sorted_indices]
+        
+    regimes = hmm_model.predict(X)
     return int(regimes[-1])
 
 def forecast_garch(df: pd.DataFrame) -> float:
-    """Uses GARCH(1,1) to forecast next period's variance."""
+    """Uses GARCH(1,1) with Student's t-distribution to forecast next period's variance."""
     returns = 100 * df['close'].pct_change().dropna() # Scaled for arch_model convergence
-    am = arch_model(returns, vol='Garch', p=1, q=1, rescale=False)
+    am = arch_model(returns, vol='Garch', p=1, q=1, dist='t', rescale=False)
     res = am.fit(disp='off')
     forecasts = res.forecast(horizon=1)
     next_var = forecasts.variance.iloc[-1, 0]
     
+    # Adjust for Fat Tails: scale by nu / (nu - 2) if nu > 2
+    nu = res.params.get('nu', 0)
+    if nu > 2.0:
+        next_var = next_var * (nu / (nu - 2.0))
+        
     return float(np.sqrt(next_var) / 100.0) # Unscaled
 
 def fetch_market_technicals(symbol: str) -> str:
