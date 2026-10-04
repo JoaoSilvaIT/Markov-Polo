@@ -280,13 +280,16 @@ def place_order(symbol: str, take_profit_price: float, stop_loss_price: float) -
         
         # Binance requires minimum notional of typically 5 USDC
         if notional_value < 6.0:
-            return json.dumps({"status": "REJECTED", "reason": f"Order size {notional_value:.2f} USDC is too small for Binance minimums."})
+            res = {"status": "REJECTED", "reason": f"Order size {notional_value:.2f} USDC is too small for Binance minimums."}
+            print(f"[REJECTED] {res['reason']}")
+            return json.dumps(res)
 
         # 4. Execution
         exchange.load_markets()
         market = exchange.market(symbol)
         amount_to_buy = exchange.amount_to_precision(symbol, amount_to_buy)
         
+        print(f"[DEBUG] Attempting to buy {amount_to_buy} {symbol} for notional ${notional_value:.2f} USDC")
         order = exchange.create_order(symbol, 'market', 'buy', float(amount_to_buy))
         fill_price = order.get('average') or order.get('price') or current_price
         
@@ -316,6 +319,7 @@ def place_order(symbol: str, take_profit_price: float, stop_loss_price: float) -
         return json.dumps(res)
         
     except Exception as e:
+        print(f"[API ERROR] {str(e)}")
         return json.dumps({"status": "ERROR", "message": str(e)})
 
 # ---------------------------------------------------------------------
