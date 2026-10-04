@@ -185,7 +185,7 @@ def detect_hmm_regime(df: pd.DataFrame) -> int:
     
     X = np.column_stack([aligned_returns, vol])
     
-    hmm_model = GaussianHMM(n_components=3, covariance_type="full", n_iter=100, random_state=42)
+    hmm_model = GaussianHMM(n_components=3, covariance_type="diag", n_iter=100, random_state=42)
     hmm_model.fit(X)
     regimes = hmm_model.predict(X)
     
@@ -194,7 +194,7 @@ def detect_hmm_regime(df: pd.DataFrame) -> int:
 def forecast_garch(df: pd.DataFrame) -> float:
     """Uses GARCH(1,1) to forecast next period's variance."""
     returns = 100 * df['close'].pct_change().dropna() # Scaled for arch_model convergence
-    am = arch_model(returns, vol='Garch', p=1, q=1)
+    am = arch_model(returns, vol='Garch', p=1, q=1, rescale=False)
     res = am.fit(disp='off')
     forecasts = res.forecast(horizon=1)
     next_var = forecasts.variance.iloc[-1, 0]
