@@ -193,25 +193,27 @@ impl GaussianHMM {
         best_last
     }
 
-    pub fn sort_by_variance(&mut self) {
-        let mut vars = vec![(0, 0.0); self.n_components];
+    pub fn sort_by_sharpe(&mut self) {
+        let mut sharpes = vec![(0, 0.0); self.n_components];
         for c in 0..self.n_components {
-            let total_var: f64 = self.covars.row(c).sum();
-            vars[c] = (c, total_var);
+            let mean = self.means[[c, 0]]; // Feature 0 is return
+            let var = self.covars[[c, 0]].max(1e-8);
+            let sharpe = mean / var.sqrt();
+            sharpes[c] = (c, sharpe);
         }
-        vars.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        sharpes.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
         let mut new_means = self.means.clone();
         let mut new_covars = self.covars.clone();
         let mut new_startprob = self.startprob.clone();
         let mut new_transmat = self.transmat.clone();
 
-        for (i, &(old_idx, _)) in vars.iter().enumerate() {
+        for (i, &(old_idx, _)) in sharpes.iter().enumerate() {
             new_means.row_mut(i).assign(&self.means.row(old_idx));
             new_covars.row_mut(i).assign(&self.covars.row(old_idx));
             new_startprob[i] = self.startprob[old_idx];
             
-            for (j, &(old_col, _)) in vars.iter().enumerate() {
+            for (j, &(old_col, _)) in sharpes.iter().enumerate() {
                 new_transmat[[i, j]] = self.transmat[[old_idx, old_col]];
             }
         }
@@ -253,7 +255,7 @@ pub fn detect_hmm_regime(closes: &[f64]) -> i32 {
     
     let mut hmm = GaussianHMM::new(3, 2);
     hmm.fit(&x, 100);
-    hmm.sort_by_variance(); // Label switching fix
+    hmm.sort_by_sharpe(); // Label switching fix by Sharpe ratio
     
     hmm.predict(&x) as i32
 }

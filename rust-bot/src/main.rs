@@ -44,23 +44,26 @@ async fn main() {
             let keys: Vec<String> = current_state.keys().cloned().collect();
             
             for symbol in keys {
-                if let Ok(current_price) = sentinel_binance.fetch_ticker(&symbol).await {
-                    let pos = current_state.get(&symbol).unwrap();
-                    let tp = pos.take_profit_price;
-                    let sl = pos.stop_loss_price;
-                    let amount = pos.amount;
-                    
-                    if current_price >= tp {
-                        println!("[SENTINEL TRIGGER] {} hit Take Profit (${:.2} >= ${:.2}). Executing Market Sell.", symbol, current_price, tp);
-                        let _ = sentinel_binance.create_market_sell(&symbol, amount).await;
-                        current_state.remove(&symbol);
-                        let _ = save_state(&current_state);
-                    } else if current_price <= sl {
-                        println!("[SENTINEL TRIGGER] {} hit Stop Loss (${:.2} <= ${:.2}). Executing Emergency Market Sell.", symbol, current_price, sl);
-                        let _ = sentinel_binance.create_market_sell(&symbol, amount).await;
-                        current_state.remove(&symbol);
-                        let _ = save_state(&current_state);
-                    }
+                let current_price = match sentinel_binance.fetch_ticker(&symbol).await {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                
+                let pos = current_state.get(&symbol).unwrap();
+                let tp = pos.take_profit_price;
+                let sl = pos.stop_loss_price;
+                let amount = pos.amount;
+                
+                if current_price >= tp {
+                    println!("[SENTINEL TRIGGER] {} hit Take Profit (${:.2} >= ${:.2}). Executing Market Sell.", symbol, current_price, tp);
+                    let _ = sentinel_binance.create_market_sell(&symbol, amount).await;
+                    current_state.remove(&symbol);
+                    let _ = save_state(&current_state);
+                } else if current_price <= sl {
+                    println!("[SENTINEL TRIGGER] {} hit Stop Loss (${:.2} <= ${:.2}). Executing Emergency Market Sell.", symbol, current_price, sl);
+                    let _ = sentinel_binance.create_market_sell(&symbol, amount).await;
+                    current_state.remove(&symbol);
+                    let _ = save_state(&current_state);
                 }
             }
             

@@ -108,8 +108,8 @@ pub async fn place_order(
         oco_list_id: "".to_string(), // OCO deprecated
         entry_price: fill_price,
         amount: amount_f,
-        stop_loss_price: sl_price,
-        take_profit_price: tp_price,
+        stop_loss_price,
+        take_profit_price,
         opened_at: Utc::now().to_rfc3339(),
         risk_amount_usdc,
     };
