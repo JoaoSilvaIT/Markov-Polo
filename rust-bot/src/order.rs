@@ -10,6 +10,7 @@ pub async fn place_order(
     take_profit_price: f64,
     stop_loss_price: f64,
     risk_pct: f64,
+    discord_url: Option<String>,
 ) -> Result<Value, String> {
     
     // 1. Fetch balance
@@ -116,6 +117,10 @@ pub async fn place_order(
 
     state.insert(symbol.to_string(), new_state.clone());
     let _ = save_state(state);
+
+    let msg = format!("🚀 **NEW POSITION:** {} (Risk: {:.2} USDC)\n**Entry:** ${:.2}\n**TP:** ${:.2}\n**SL:** ${:.2}", 
+                      symbol, risk_amount_usdc, fill_price, take_profit_price, stop_loss_price);
+    crate::discord::send_alert(discord_url.as_deref(), &msg).await;
 
     Ok(json!({
         "status": "DISPATCHED",

@@ -7,7 +7,7 @@ use serde_json::Value;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use futures_util::StreamExt;
 
-pub async fn run_sentinel(sentinel_binance: Arc<BinanceClient>, sentinel_state: Arc<Mutex<StateMap>>) {
+pub async fn run_sentinel(sentinel_binance: Arc<BinanceClient>, sentinel_state: Arc<Mutex<StateMap>>, discord_url: Option<String>) {
     let ws_url = "wss://stream.binance.com:9443/ws/!miniTicker@arr";
 
     loop {
@@ -80,11 +80,15 @@ pub async fn run_sentinel(sentinel_binance: Arc<BinanceClient>, sentinel_state: 
                                             let amount = pos.amount;
 
                                             if current_price >= tp {
-                                                println!("[SENTINEL TRIGGER] {} hit Take Profit (${:.2} >= ${:.2}). Executing Market Sell.", state_sym, current_price, tp);
+                                                let msg = format!("✅ **TAKE PROFIT HIT!** {} exited at ${:.2} (Target: ${:.2}). Executed via pure WebSocket zero-latency market sell.", state_sym, current_price, tp);
+                                                println!("[SENTINEL TRIGGER] {}", msg);
+                                                crate::discord::send_alert(discord_url.as_deref(), &msg).await;
                                                 let _ = sentinel_binance.create_market_sell(state_sym, amount).await;
                                                 symbols_to_remove.push(state_sym.clone());
                                             } else if current_price <= sl {
-                                                println!("[SENTINEL TRIGGER] {} hit Stop Loss (${:.2} <= ${:.2}). Executing Emergency Market Sell.", state_sym, current_price, sl);
+                                                let msg = format!("🚨 **STOP LOSS HIT!** {} emergency exited at ${:.2} (Limit: ${:.2}). Executed via pure WebSocket zero-latency market sell.", state_sym, current_price, sl);
+                                                println!("[SENTINEL TRIGGER] {}", msg);
+                                                crate::discord::send_alert(discord_url.as_deref(), &msg).await;
                                                 let _ = sentinel_binance.create_market_sell(state_sym, amount).await;
                                                 symbols_to_remove.push(state_sym.clone());
                                             } else {

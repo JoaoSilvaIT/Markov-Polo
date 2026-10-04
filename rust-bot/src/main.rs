@@ -148,7 +148,7 @@ async fn main() {
                                     let risk = args["risk_pct"].as_f64().unwrap_or(0.02);
                                     
                                     let mut st = state.lock().await;
-                                    let order_res = order::place_order(&binance, &mut st, sym, tp, sl, risk).await;
+                                    let order_res = order::place_order(&binance, &mut st, sym, tp, sl, risk, config.discord_webhook_url.clone()).await;
                                     result_data = match order_res {
                                         Ok(v) => v,
                                         Err(e) => json!({"status": "REJECTED", "error": e})
