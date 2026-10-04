@@ -1,0 +1,7 @@
+ccxt
+pandas
+ta
+python-dotenv
+google-genai
+alpaca-py
+streamlit

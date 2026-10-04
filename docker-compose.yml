@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    container_name: binance_quant_bot
+    restart: unless-stopped
+    command: ["python", "-u", "binance_bot.py", "--loop", "15"]
+    env_file:
+      - .env
+    volumes:
+      - ./binance_state.json:/app/binance_state.json
+      - ./binance_journal.md:/app/binance_journal.md
+      - ./binance_journal.jsonl:/app/binance_journal.jsonl
+
+  dashboard:
+    build: .
+    container_name: binance_quant_dashboard
+    restart: unless-stopped
+    command: ["streamlit", "run", "dashboard.py", "--server.port=8501", "--server.address=0.0.0.0"]
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./binance_state.json:/app/binance_state.json:ro
+      - ./binance_journal.md:/app/binance_journal.md:ro
+      - ./binance_journal.jsonl:/app/binance_journal.jsonl:ro

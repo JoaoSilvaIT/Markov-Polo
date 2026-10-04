@@ -29,7 +29,7 @@ from alpaca.data.requests import (
     CryptoBarsRequest,
     NewsRequest
 )
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 # ---------------------------------------------------------------------
 # 1. INITIALIZE CONFIGURATION & CLIENTS
@@ -413,8 +413,8 @@ def audit_and_manage_open_positions():
             clean_sym = sym.replace("/", "")
             total_range = tp_price - sl_price
             progress_ratio = max(0.0, min(1.0, (current_price - sl_price) / total_range)) if total_range > 0 else 0.5
-            if progress_ratio >= 0.50 and sl_price < avg_entry:
-                print(f"[TRAILING BREAKEVEN] {sym} reached 50%+ to target! Raising Stop-Loss from ${adaptive_round(sl_price)} to Breakeven (${adaptive_round(avg_entry)}). Trade is now ZERO RISK.")
+            if progress_ratio >= 0.35 and sl_price < avg_entry:
+                print(f"[TRAILING BREAKEVEN] {sym} reached 35%+ to target! Raising Stop-Loss from ${adaptive_round(sl_price)} to Breakeven (${adaptive_round(avg_entry)}). Trade is now ZERO RISK.")
                 target_state["stop_loss_price"] = avg_entry
                 sl_price = avg_entry
                 all_states[clean_sym] = target_state
@@ -568,8 +568,8 @@ def scan_market_opportunities(max_budget: float = BUDGET_PER_TRADE) -> str:
             target_universe = get_all_crypto_symbols()
             bars = crypto_data_client.get_crypto_bars(CryptoBarsRequest(
                 symbol_or_symbols=target_universe,
-                timeframe=TimeFrame.Hour,
-                start=datetime.now(timezone.utc) - timedelta(days=7)
+                timeframe=TimeFrame(15, TimeFrameUnit.Minute),
+                start=datetime.now(timezone.utc) - timedelta(days=2)
             ))
             df = bars.df
             for symbol in target_universe:
@@ -579,16 +579,23 @@ def scan_market_opportunities(max_budget: float = BUDGET_PER_TRADE) -> str:
                 if len(sub) < 20:
                     continue
                 close_px = float(sub.iloc[-1]["close"])
+                current_vol = float(sub.iloc[-1]["volume"])
+
                 rsi_series = ta.momentum.RSIIndicator(close=sub["close"], window=14).rsi()
                 rsi_val = round(float(rsi_series.iloc[-1]), 1)
                 
                 sma20_series = ta.trend.SMAIndicator(close=sub["close"], window=min(20, len(sub))).sma_indicator()
                 sma50_series = ta.trend.SMAIndicator(close=sub["close"], window=min(50, len(sub))).sma_indicator()
+                vol_sma20 = ta.trend.SMAIndicator(close=sub["volume"], window=min(20, len(sub))).sma_indicator()
                 sma20_val = float(sma20_series.iloc[-1])
                 sma50_val = float(sma50_series.iloc[-1])
+                vol_sma20_val = float(vol_sma20.iloc[-1])
 
                 macd_obj = ta.trend.MACD(close=sub["close"])
                 macd_diff = float(macd_obj.macd_diff().iloc[-1])
+                
+                bb = ta.volatility.BollingerBands(close=sub["close"], window=20, window_dev=2)
+                bb_width = float(((bb.bollinger_hband() - bb.bollinger_lband()) / bb.bollinger_mavg()).iloc[-1])
 
                 if close_px > sma20_val and sma20_val > sma50_val:
                     trend_state = "strong_bullish"
@@ -605,7 +612,9 @@ def scan_market_opportunities(max_budget: float = BUDGET_PER_TRADE) -> str:
                     "rsi_14": rsi_val,
                     "trend_state": trend_state,
                     "macd_hist_positive": macd_diff > 0,
-                    "timeframe": "1-Hour",
+                    "volume_confirmed": current_vol > vol_sma20_val,
+                    "bb_width": bb_width,
+                    "timeframe": "15-Minute",
                     "affordable": True
                 })
 
@@ -613,10 +622,14 @@ def scan_market_opportunities(max_budget: float = BUDGET_PER_TRADE) -> str:
             # 1. Aligned bullish trend (strong_bullish or bullish)
             # 2. Positive momentum (MACD histogram > 0)
             # 3. Healthy non-overbought RSI sweet spot (40.0 - 58.0)
+            # 4. Volume > 20-period Average
+            # 5. Bollinger Bandwidth in healthy range (0.015 - 0.10)
             high_conviction = [
                 c for c in candidates 
                 if c["trend_state"] in ("strong_bullish", "bullish") 
                 and c["macd_hist_positive"] 
+                and c["volume_confirmed"]
+                and 0.015 <= c["bb_width"] <= 0.10
                 and 40.0 <= c["rsi_14"] <= 58.0
             ]
             high_conviction.sort(key=lambda x: (0 if x["trend_state"] == "strong_bullish" else 1, abs(x["rsi_14"] - 50.0)))
@@ -635,11 +648,11 @@ def scan_market_opportunities(max_budget: float = BUDGET_PER_TRADE) -> str:
             print(f"[TOOL RESULT] Scanned {len(candidates)} crypto pairs: {len(high_conviction)} high-conviction setups found.")
             return json.dumps(result)
         else:
-            # Stocks use daily candles over the past 90 days
+            # Stocks use 1-hour candles over the past 14 days
             bars = stock_data_client.get_stock_bars(StockBarsRequest(
                 symbol_or_symbols=ACTIVE_UNIVERSE,
-                timeframe=TimeFrame.Day,
-                start=datetime.now(timezone.utc) - timedelta(days=90)
+                timeframe=TimeFrame.Hour,
+                start=datetime.now(timezone.utc) - timedelta(days=14)
             ))
             df = bars.df
             for symbol in ACTIVE_UNIVERSE:
@@ -649,6 +662,7 @@ def scan_market_opportunities(max_budget: float = BUDGET_PER_TRADE) -> str:
                 if len(sub) < 20:
                     continue
                 close_px = round(float(sub.iloc[-1]["close"]), 2)
+                current_vol = float(sub.iloc[-1]["volume"])
                 if close_px > max_budget or close_px <= 0:
                     continue
                 rsi_series = ta.momentum.RSIIndicator(close=sub["close"], window=14).rsi()
@@ -656,11 +670,16 @@ def scan_market_opportunities(max_budget: float = BUDGET_PER_TRADE) -> str:
                 
                 sma20_series = ta.trend.SMAIndicator(close=sub["close"], window=min(20, len(sub))).sma_indicator()
                 sma50_series = ta.trend.SMAIndicator(close=sub["close"], window=min(50, len(sub))).sma_indicator()
+                vol_sma20 = ta.trend.SMAIndicator(close=sub["volume"], window=min(20, len(sub))).sma_indicator()
                 sma20_val = round(float(sma20_series.iloc[-1]), 2)
                 sma50_val = round(float(sma50_series.iloc[-1]), 2)
+                vol_sma20_val = float(vol_sma20.iloc[-1])
 
                 macd_obj = ta.trend.MACD(close=sub["close"])
                 macd_diff = float(macd_obj.macd_diff().iloc[-1])
+
+                bb = ta.volatility.BollingerBands(close=sub["close"], window=20, window_dev=2)
+                bb_width = float(((bb.bollinger_hband() - bb.bollinger_lband()) / bb.bollinger_mavg()).iloc[-1])
 
                 if close_px > sma20_val and sma20_val > sma50_val:
                     trend_state = "strong_bullish"
@@ -678,6 +697,9 @@ def scan_market_opportunities(max_budget: float = BUDGET_PER_TRADE) -> str:
                     "rsi_14": rsi_val,
                     "trend_state": trend_state,
                     "macd_hist_positive": macd_diff > 0,
+                    "volume_confirmed": current_vol > vol_sma20_val,
+                    "bb_width": bb_width,
+                    "timeframe": "1-Hour",
                     "affordable_shares": max_whole_shares,
                     "estimated_cost": round(max_whole_shares * close_px, 2)
                 })
@@ -686,6 +708,8 @@ def scan_market_opportunities(max_budget: float = BUDGET_PER_TRADE) -> str:
                 c for c in candidates 
                 if c["trend_state"] in ("strong_bullish", "bullish") 
                 and c["macd_hist_positive"] 
+                and c["volume_confirmed"]
+                and 0.015 <= c["bb_width"] <= 0.10
                 and 40.0 <= c["rsi_14"] <= 58.0
             ]
             high_conviction.sort(key=lambda x: (0 if x["trend_state"] == "strong_bullish" else 1, abs(x["rsi_14"] - 50.0)))
@@ -813,16 +837,16 @@ def fetch_market_technicals(symbol: str) -> str:
     if MODE == "crypto":
         request_params = CryptoBarsRequest(
             symbol_or_symbols=symbol,
-            timeframe=TimeFrame.Hour,
-            start=datetime.now(timezone.utc) - timedelta(days=14)
+            timeframe=TimeFrame(15, TimeFrameUnit.Minute),
+            start=datetime.now(timezone.utc) - timedelta(days=2)
         )
         bars = crypto_data_client.get_crypto_bars(request_params)
         df = bars.df.xs(symbol)
     else:
         request_params = StockBarsRequest(
             symbol_or_symbols=symbol,
-            timeframe=TimeFrame.Day,
-            start=datetime.now(timezone.utc) - timedelta(days=120)
+            timeframe=TimeFrame.Hour,
+            start=datetime.now(timezone.utc) - timedelta(days=14)
         )
         bars = stock_data_client.get_stock_bars(request_params)
         df = bars.df.xs(symbol)
@@ -862,9 +886,9 @@ def fetch_market_technicals(symbol: str) -> str:
     else:
         trend_regime = "neutral_consolidation"
 
-    # ATR Dynamic Sizing: 2.0x ATR Stop Loss, 3.0x ATR Take Profit (1.5:1 ratio)
-    dynamic_stop_loss = adaptive_round(close_px - (2.0 * atr_val))
-    dynamic_take_profit = adaptive_round(close_px + (3.0 * atr_val))
+    # ATR Dynamic Sizing: 1.5x ATR Stop Loss, 2.0x ATR Take Profit (Low Risk/Reward)
+    dynamic_stop_loss = adaptive_round(close_px - (1.5 * atr_val))
+    dynamic_take_profit = adaptive_round(close_px + (2.0 * atr_val))
 
     quant_metrics = {
         "symbol": symbol,
@@ -928,14 +952,14 @@ def place_order(symbol: str, usd_allocation: float, take_profit_price: float, st
     if MODE == "crypto":
         bars = crypto_data_client.get_crypto_bars(CryptoBarsRequest(
             symbol_or_symbols=symbol,
-            timeframe=TimeFrame.Hour,
+            timeframe=TimeFrame(15, TimeFrameUnit.Minute),
             start=datetime.now(timezone.utc) - timedelta(hours=2)
         ))
         current_price = float(bars.df.xs(symbol).iloc[-1]["close"])
     else:
         bars = stock_data_client.get_stock_bars(StockBarsRequest(
             symbol_or_symbols=symbol,
-            timeframe=TimeFrame.Day,
+            timeframe=TimeFrame.Hour,
             start=datetime.now(timezone.utc) - timedelta(days=5)
         ))
         current_price = float(bars.df.xs(symbol).iloc[-1]["close"])
@@ -1106,18 +1130,20 @@ Operational Directives:
      * You are STRICTLY FORBIDDEN from hunting down the list to find another coin to buy!
    - Call 'fetch_market_technicals' to compute exact ATR volatility and dynamic SL/TP brackets.
    - STRICT ENTRY CRITERIA (Every single one must be satisfied):
-     * Trend Regime: 'strong_bullish' (Price > SMA-20 > SMA-50) OR 'bullish'.
-     * RSI-14 Sweet Spot: Between 40.0 and 58.0 (NOT overbought, not in downward momentum).
-     * Reward/Risk Ratio: >= 1.5.
-     * Bollinger Bandwidth: Not in extreme squeeze or excessive blow-off expansion.
+     * Trend Regime: 'strong_bullish' or 'bullish'.
+     * RSI-14 Sweet Spot: Between 40.0 and 58.0.
+     * Bollinger Bandwidth & Volume Confluence must be explicitly confirmed.
    - If ANY quantitative condition is not met, conclude with "Decision: PASS (Quantitative Criteria Not Met)".
 3. EMPIRICAL KNOWLEDGE AUDIT:
    - Call 'query_trade_knowledge_base' with the candidate symbol to review historical win rates, past loss post-mortems, and empirical rules.
    - If historical lessons or rules warn against this setup, conclude with "Decision: PASS (Historical Failure Pattern Detected)".
-4. NEWS & CATALYST AUDIT:
-   - Only if all quantitative and empirical criteria align, call 'fetch_market_news' to confirm broad stability and ensure no negative catalysts exist.
+4. STRICT NEWS & SENTIMENT SCORE:
+   - Call 'fetch_market_news'.
+   - You MUST assign a News Sentiment Score to the headlines.
+   - If the sentiment is Neutral, Bearish, or missing institutional backing, conclude with "Decision: PASS (Weak News Sentiment)".
+   - You may ONLY proceed if the media coverage is distinctly "Bullish" or "Strongly Bullish".
 5. LIVE EXECUTION:
-   - If and ONLY if the setup displays textbook 5-star confluence across Trend, Momentum, RSI, Knowledge Base, and News:
+   - If and ONLY if the setup displays textbook 5-star confluence across Trend, Momentum, Volume, BBs, Knowledge Base, and Strong Bullish News:
      * Call 'place_order' with usd_allocation={BUDGET_PER_TRADE} and the quant SL/TP levels.
    - Otherwise: Conclude with "Decision: PASS".
 6. REPORT: Deliver a structured Quantitative Investment Memo explaining your verdict.

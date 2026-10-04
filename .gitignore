@@ -2,3 +2,8 @@
 __pycache__/
 .env
 *.log
+binance_state.json
+binance_journal.*
+crypto_state.json
+trading_journal.*
+scratch/
