@@ -367,7 +367,7 @@ def run_agent_cycle():
     global CURRENT_CYCLE_DATA
     CURRENT_CYCLE_DATA = {"technicals": {}, "news": {}, "orders": []}
     
-    audit_and_manage_open_positions()
+    # Audit is now handled independently by the Sentinel Daemon
     
     chat = ai_client.chats.create(
         model="gemini-2.5-pro",
@@ -388,7 +388,7 @@ Directives:
 6. If confluence is perfect, call 'place_order' using the recommended_tp and recommended_sl, and the risk_pct you calculated.
 7. Write a brief memo summarizing the decision.
 """
-    print("\nSTARTING BINANCE QUANTITATIVE CYCLE...")
+    print("\n[ALPHA DAEMON] STARTING BINANCE QUANTITATIVE CYCLE...")
     try:
         response = chat.send_message(goal)
         memo = response.text or "Cycle completed."
@@ -400,20 +400,46 @@ Directives:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--once", action="store_true")
+    # --loop is no longer used for AI scan interval, it's hardlocked to 15m marks.
+    # We'll use --loop just as a fallback or ignore it, but keep it for docker-compose compatibility.
     parser.add_argument("--loop", type=int, default=15)
     args = parser.parse_args()
 
     if args.once:
+        audit_and_manage_open_positions()
         run_agent_cycle()
     else:
         last_heartbeat = 0
+        last_ai_scan_minute = -1
+        
+        print("\n🚀 [SYSTEM START] Decoupled Quantitative Architecture Initialized.")
+        print("🛡️ [SENTINEL DAEMON] Risk Management Active (15s Loop)")
+        print("🧠 [ALPHA DAEMON] AI Trade Entry Armed (Locked to :00, :15, :30, :45)")
+        
         while True:
             current_time = time.time()
-            # Send heartbeat ping every 1 hour (3600 seconds)
+            from datetime import datetime
+            current_dt = datetime.fromtimestamp(current_time)
+            
+            # Send heartbeat ping every 1 hour
             if current_time - last_heartbeat >= 3600:
-                send_discord_alert("💓 **SYSTEM HEALTH:** Quant Bot is online, healthy, and actively scanning the markets.")
+                send_discord_alert("💓 **SYSTEM HEALTH:** Decoupled Architecture is online. Sentinel active, Alpha standing by.")
                 last_heartbeat = current_time
                 
-            run_agent_cycle()
-            print(f"\nSleeping for {args.loop} minutes...")
-            time.sleep(args.loop * 60)
+            # ---------------------------------------------------------
+            # 1. THE SENTINEL DAEMON (High-Frequency Risk Management)
+            # ---------------------------------------------------------
+            audit_and_manage_open_positions()
+            
+            # ---------------------------------------------------------
+            # 2. THE ALPHA DAEMON (Strict 15m Candle Close Execution)
+            # ---------------------------------------------------------
+            # Executes ONLY exactly on the 15-minute boundaries.
+            if current_dt.minute % 15 == 0 and current_dt.minute != last_ai_scan_minute:
+                run_agent_cycle()
+                last_ai_scan_minute = current_dt.minute
+                next_scan = (current_dt.minute + 15) % 60
+                print(f"\n[ALPHA DAEMON] Cycle complete. Next AI scan locked for xx:{next_scan:02d}:00.")
+                
+            # Fast sleep for the Sentinel Risk loop
+            time.sleep(15)
