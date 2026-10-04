@@ -122,57 +122,30 @@ def audit_and_manage_open_positions():
         print("[AUDIT] No open positions currently tracked.")
         return
 
+    exchange.load_markets()
     tickers = exchange.fetch_tickers(list(all_states.keys()))
+    action_taken = False
     
     for sym, state in list(all_states.items()):
-        current_price = tickers[sym]['last']
-        entry_price = state['entry_price']
-        sl_price = state['stop_loss_price']
-        tp_price = state['take_profit_price']
-        amount = state['amount']
-
-        pl_usd = (current_price - entry_price) * amount
-        pl_pct = ((current_price - entry_price) / entry_price) * 100
-
-        # Stop Loss
-        if current_price <= sl_price:
-            print(f"[RISK TRIGGER] Stop-Loss hit for {sym}! Liquidating...")
-            try:
-                exchange.create_order(sym, 'market', 'sell', amount)
+        try:
+            open_orders = exchange.fetch_open_orders(sym)
+            if len(open_orders) == 0:
+                print(f"[AUDIT] {sym} Native OCO Order closed (Take-Profit or Stop-Loss hit).")
+                send_discord_alert(f"🏁 **TRADE CLOSED**\n**{sym}** Native OCO triggered. Position flat.")
+                log_to_journal(f"Native OCO triggered for {sym}.", "OCO_CLOSED")
                 del all_states[sym]
-                msg = f"🚨 **STOP-LOSS EXECUTED** for {sym} at ${current_price:.2f}. P&L: {pl_usd:.2f} USDC ({pl_pct:.2f}%)"
-                send_discord_alert(msg)
-                log_to_journal(msg, "STOP_LOSS")
-            except Exception as e:
-                print(f"[ERROR] Failed to close {sym}: {e}")
+                action_taken = True
+            else:
+                current_price = tickers[sym]['last']
+                entry_price = state['entry_price']
+                pl_pct = ((current_price - entry_price) / entry_price) * 100
+                print(f"  * {sym} | Cur: ${current_price:.2f} | Entry: ${entry_price:.2f} | P&L: {pl_pct:+.2f}%\n    [NATIVE OCO ACTIVE] SL: ${state['stop_loss_price']:.2f} -------- TP: ${state['take_profit_price']:.2f}")
+        except Exception as e:
+            print(f"[AUDIT ERROR] Could not check OCO status for {sym}: {e}")
 
-        # Take Profit
-        elif current_price >= tp_price:
-            print(f"[TARGET HIT] Take-Profit hit for {sym}! Liquidating...")
-            try:
-                exchange.create_order(sym, 'market', 'sell', amount)
-                del all_states[sym]
-                msg = f"✅ **TAKE-PROFIT EXECUTED** for {sym} at ${current_price:.2f}. P&L: +{pl_usd:.2f} USDC (+{pl_pct:.2f}%)"
-                send_discord_alert(msg)
-                log_to_journal(msg, "TAKE_PROFIT")
-            except Exception as e:
-                print(f"[ERROR] Failed to close {sym}: {e}")
-
-        # Trailing Breakeven (35% to target)
-        else:
-            total_range = tp_price - sl_price
-            progress = (current_price - sl_price) / total_range if total_range > 0 else 0
-            if progress >= 0.35 and sl_price < entry_price:
-                msg = f"🛡️ **TRAILING BREAKEVEN** for {sym}! Stop-Loss moved to entry (${entry_price:.2f})."
-                print(msg)
-                send_discord_alert(msg)
-                all_states[sym]['stop_loss_price'] = entry_price
-
-            print(f"  * {sym:<8} | Cur: ${current_price:.2f} | Entry: ${entry_price:.2f} | P&L: {pl_pct:+.2f}%")
-            print(f"    Target Track: [SL ${sl_price:.2f}] -------- [TP ${tp_price:.2f}]")
-
-    with open(STATE_FILE, "w") as f:
-        json.dump(all_states, f, indent=2)
+    if action_taken:
+        with open(STATE_FILE, "w") as f:
+            json.dump(all_states, f, indent=2)
 
 # ---------------------------------------------------------------------
 # 3. AGENT TOOLS
@@ -329,9 +302,27 @@ def place_order(symbol: str, take_profit_price: float, stop_loss_price: float, r
         order = exchange.create_order(symbol, 'market', 'buy', float(amount_to_buy))
         fill_price = order.get('average') or order.get('price') or current_price
         
+        # Place Native OCO Order
+        market = exchange.market(symbol)
+        qty_precision = exchange.amount_to_precision(symbol, amount_to_buy)
+        tp_precision = exchange.price_to_precision(symbol, take_profit_price)
+        sl_precision = exchange.price_to_precision(symbol, stop_loss_price)
+        sl_limit_precision = exchange.price_to_precision(symbol, stop_loss_price * 0.995)
+        
+        oco_res = exchange.private_post_order_oco({
+            'symbol': market['id'],
+            'side': 'SELL',
+            'quantity': qty_precision,
+            'price': tp_precision,
+            'stopPrice': sl_precision,
+            'stopLimitPrice': sl_limit_precision,
+            'stopLimitTimeInForce': 'GTC'
+        })
+        
         all_states[symbol] = {
             "symbol": symbol,
             "order_id": order['id'],
+            "oco_list_id": oco_res.get('orderListId', 'UNKNOWN'),
             "entry_price": fill_price,
             "amount": float(amount_to_buy),
             "stop_loss_price": stop_loss_price,
