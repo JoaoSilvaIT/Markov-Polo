@@ -186,6 +186,26 @@ async fn main() {
                                                         }
                                                     }
                                                 }
+                                            } else {
+                                                // TP is already placed. Check if it has been FILLED to close the trade loop.
+                                                let mut tp_filled = false;
+                                                let mut tp_order_to_check = "".to_string();
+                                                if let Some(pos) = state_lock.get("BTC/USDC") {
+                                                    tp_order_to_check = pos.tp_order_id.clone();
+                                                }
+                                                if !tp_order_to_check.is_empty() {
+                                                    if let Ok(order_info) = binance_clone.fetch_order("BTC/USDC", &tp_order_to_check).await {
+                                                        if order_info["status"] == "FILLED" {
+                                                            tp_filled = true;
+                                                        }
+                                                    }
+                                                }
+                                                if tp_filled {
+                                                    state_lock.remove("BTC/USDC");
+                                                    let _ = crate::state::save_state(&state_lock);
+                                                    let msg = "🎉 **TRADE CLOSED IN PROFIT!** Take Profit Limit Sell has successfully filled. Ready for next cycle.".to_string();
+                                                    let _ = crate::discord::send_alert(discord_clone.as_deref(), &msg).await;
+                                                }
                                             }
                                         }
 
