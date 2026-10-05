@@ -10,6 +10,7 @@ pub struct Config {
     pub alpaca_secret_key: Option<String>,
     pub discord_webhook_url: Option<String>,
     pub discord_bot_token: Option<String>,
+    pub hmm_config_path: String,
 }
 
 impl Config {
@@ -24,6 +25,7 @@ impl Config {
             alpaca_secret_key: env::var("ALPACA_SECRET_KEY").ok(),
             discord_webhook_url: env::var("DISCORD_WEBHOOK_URL").ok(),
             discord_bot_token: env::var("DISCORD_BOT_TOKEN").ok(),
+            hmm_config_path: env::var("HMM_CONFIG_PATH").unwrap_or_else(|_| "hmm_weights.json".to_string()),
         }
     }
 }

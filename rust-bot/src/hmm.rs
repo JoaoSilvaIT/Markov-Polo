@@ -259,3 +259,98 @@ pub fn detect_hmm_regime(closes: &[f64]) -> i32 {
     
     hmm.predict(&x) as i32
 }
+
+use serde::{Serialize, Deserialize};
+use std::fs;
+
+#[derive(Serialize, Deserialize)]
+pub struct HmmWeights {
+    pub n_components: usize,
+    pub n_features: usize,
+    pub means: Vec<Vec<f64>>,
+    pub covars: Vec<Vec<f64>>,
+    pub transmat: Vec<Vec<f64>>,
+    pub startprob: Vec<f64>,
+}
+
+impl GaussianHMM {
+    pub fn save_weights(&self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let n_features = self.means.ncols();
+        let mut weights = HmmWeights {
+            n_components: self.n_components,
+            n_features,
+            means: vec![vec![0.0; n_features]; self.n_components],
+            covars: vec![vec![0.0; n_features]; self.n_components],
+            transmat: vec![vec![0.0; self.n_components]; self.n_components],
+            startprob: self.startprob.to_vec(),
+        };
+        
+        for i in 0..self.n_components {
+            for j in 0..n_features {
+                weights.means[i][j] = self.means[[i, j]];
+                weights.covars[i][j] = self.covars[[i, j]];
+            }
+            for j in 0..self.n_components {
+                weights.transmat[i][j] = self.transmat[[i, j]];
+            }
+        }
+        
+        let json = serde_json::to_string_pretty(&weights)?;
+        fs::write(path, json)?;
+        Ok(())
+    }
+
+    pub fn load_weights(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let json = fs::read_to_string(path)?;
+        let weights: HmmWeights = serde_json::from_str(&json)?;
+        
+        let mut hmm = Self::new(weights.n_components, weights.n_features);
+        hmm.startprob = Array1::from_vec(weights.startprob);
+        
+        for i in 0..weights.n_components {
+            for j in 0..weights.n_features {
+                hmm.means[[i, j]] = weights.means[i][j];
+                hmm.covars[[i, j]] = weights.covars[i][j];
+            }
+            for j in 0..weights.n_components {
+                hmm.transmat[[i, j]] = weights.transmat[i][j];
+            }
+        }
+        
+        Ok(hmm)
+    }
+}
+use serde_json;
+
+pub fn train_hmm_offline(closes: &[f64]) -> Option<GaussianHMM> {
+    if closes.len() < 12 { return None; }
+    
+    let mut returns = Vec::with_capacity(closes.len() - 1);
+    for i in 1..closes.len() {
+        returns.push(closes[i] / closes[i-1] - 1.0);
+    }
+    
+    let mut vols = vec![0.0; returns.len()];
+    for i in 10..returns.len() {
+        let slice = &returns[i-10..i];
+        let mean: f64 = slice.iter().sum::<f64>() / 10.0;
+        let var: f64 = slice.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / 10.0;
+        vols[i] = var.sqrt();
+    }
+    
+    let valid_start = 10;
+    if returns.len() - valid_start < 5 { return None; }
+    
+    let n_samples = returns.len() - valid_start;
+    let mut x = Array2::zeros((n_samples, 2));
+    for i in 0..n_samples {
+        x[[i, 0]] = returns[i + valid_start];
+        x[[i, 1]] = vols[i + valid_start];
+    }
+    
+    let mut hmm = GaussianHMM::new(3, 2);
+    hmm.fit(&x, 100);
+    hmm.sort_by_sharpe();
+    
+    Some(hmm)
+}

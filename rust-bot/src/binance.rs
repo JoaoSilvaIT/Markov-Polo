@@ -88,6 +88,20 @@ impl BinanceClient {
         Ok(res)
     }
 
+    pub async fn fetch_order(&self, symbol: &str, order_id: &str) -> Result<Value, Box<dyn std::error::Error>> {
+        let mut params = vec![
+            ("symbol", symbol.replace("/", "")),
+            ("orderId", order_id.to_string()),
+        ];
+        let query = self.sign_request(&mut params);
+        let url = format!("https://api.binance.com/api/v3/order?{}", query);
+        
+        let res: Value = self.client.get(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send().await?.json().await?;
+        Ok(res)
+    }
+
     pub async fn create_market_buy(&self, symbol: &str, quantity: f64) -> Result<Value, Box<dyn std::error::Error>> {
         let mut params = vec![
             ("symbol", symbol.replace("/", "")),
@@ -169,5 +183,32 @@ impl BinanceClient {
             .header("X-MBX-APIKEY", &self.api_key)
             .send().await?.json().await?;
         Ok(res)
+    }
+}
+
+impl BinanceClient {
+    pub async fn create_limit_buy(&self, symbol: &str, quantity: f64, price: f64) -> Result<Value, Box<dyn std::error::Error>> {
+        let mut params = vec![
+            ("symbol", symbol.replace("/", "")),
+            ("side", "BUY".to_string()),
+            ("type", "LIMIT".to_string()),
+            ("timeInForce", "GTC".to_string()),
+            ("quantity", quantity.to_string()),
+            ("price", format!("{:.2}", price)),
+        ];
+        
+        let query = self.sign_request(&mut params);
+        let url = format!("https://api.binance.com/api/v3/order?{}", query);
+        
+        let resp = self.client.post(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await?;
+            
+        let json: Value = resp.json().await?;
+        if json.get("code").is_some() {
+            return Err(format!("Binance API Error: {}", json).into());
+        }
+        Ok(json)
     }
 }
