@@ -63,9 +63,17 @@ pub async fn place_order(
         return Ok(json!({"status": "REJECTED", "reason": format!("Order size {:.2} USDC is too small.", notional_value)}));
     }
 
-    // Format amount (5 decimals generally safe for spot on Binance for small BTC/ETH)
-    let amount_str = format!("{:.5}", amount_to_buy);
-    let amount_f = amount_str.parse::<f64>().unwrap();
+    // Binance LOT_SIZE strict precision rules
+    let precision = match symbol {
+        "BTC/USDC" | "BTCUSDC" => 5,
+        "ETH/USDC" | "ETHUSDC" => 4,
+        "SOL/USDC" | "SOLUSDC" => 2,
+        _ => 3,
+    };
+    
+    // Truncate cleanly instead of rounding up to avoid Insufficient Balance
+    let multiplier = 10_f64.powi(precision);
+    let amount_f = (amount_to_buy * multiplier).floor() / multiplier;
     
     // Execute Market Buy
     let buy_res = client.create_market_buy(symbol, amount_f).await.map_err(|e| e.to_string())?;
