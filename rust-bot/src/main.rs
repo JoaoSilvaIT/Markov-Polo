@@ -154,6 +154,7 @@ async fn main() {
                                         Ok(v) => v,
                                         Err(e) => json!({"status": "REJECTED", "error": e})
                                     };
+                                    println!("[ORDER RESULT] {}", result_data.to_string());
                                 }
 
                                 // Append function response
