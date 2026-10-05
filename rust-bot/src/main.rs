@@ -42,6 +42,16 @@ async fn main() {
         ws_sentinel::run_sentinel(sentinel_binance, sentinel_state, sentinel_discord).await;
     });
 
+    // Discord Bot Listener (Remote Kill Switch)
+    if let Some(token) = config.discord_bot_token.clone() {
+        let discord_binance = binance.clone();
+        let discord_state = state.clone();
+        tokio::spawn(async move {
+            println!("💬 [DISCORD BOT] Listener Active. Waiting for '!stop' command.");
+            discord::run_discord_bot(token, discord_binance, discord_state).await;
+        });
+    }
+
     let mut last_ai_scan_minute = -1;
     let mut run_now = std::env::args().any(|arg| arg == "--run-now");
 
@@ -61,7 +71,11 @@ async fn main() {
             let mut conversation = vec![
                 json!({
                     "role": "user",
-                    "parts": [{"text": "Scan the market. Check news if a setup looks good. If the technicals and news align perfectly with extreme capital preservation, place an order. If anything is uncertain, PASS."}]
+                    "parts": [{"text": r#"Scan the market. Check news if a setup looks good. If the technicals and news align, place an order using these strict architectural rules:
+1. Volatility-Adjusted SL: You must set the Stop Loss at exactly Entry ± (2 * vol) where vol is the EGARCH volatility forecast provided in the data.
+2. Mathematical Expectancy: Your Take Profit MUST yield at least a 2.0 to 2.5 R/R ratio. Reject any setup that cannot mathematically achieve this without hitting major resistance.
+3. Fixed Risk: Position sizing is automatically handled by the engine to risk exactly $0.20 USDC. Just provide the proper SL and TP based on the rules above.
+If anything is uncertain or fails these mathematical checks, PASS."#}]
                 })
             ];
 

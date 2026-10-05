@@ -120,6 +120,38 @@ impl BinanceClient {
         Ok(res)
     }
 
+    pub async fn create_limit_sell(&self, symbol: &str, quantity: f64, price: f64) -> Result<Value, Box<dyn std::error::Error>> {
+        let mut params = vec![
+            ("symbol", symbol.replace("/", "")),
+            ("side", "SELL".to_string()),
+            ("type", "LIMIT".to_string()),
+            ("timeInForce", "GTC".to_string()),
+            ("quantity", quantity.to_string()),
+            ("price", format!("{:.2}", price)), // Make sure precision is handled by caller or string format
+        ];
+        let query = self.sign_request(&mut params);
+        let url = format!("https://api.binance.com/api/v3/order?{}", query);
+        
+        let res: Value = self.client.post(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send().await?.json().await?;
+        Ok(res)
+    }
+
+    pub async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<Value, Box<dyn std::error::Error>> {
+        let mut params = vec![
+            ("symbol", symbol.replace("/", "")),
+            ("orderId", order_id.to_string()),
+        ];
+        let query = self.sign_request(&mut params);
+        let url = format!("https://api.binance.com/api/v3/order?{}", query);
+        
+        let res: Value = self.client.delete(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send().await?.json().await?;
+        Ok(res)
+    }
+
     pub async fn create_oco_sell(&self, symbol: &str, quantity: f64, price: f64, stop_price: f64, stop_limit_price: f64) -> Result<Value, Box<dyn std::error::Error>> {
         let mut params = vec![
             ("symbol", symbol.replace("/", "")),

@@ -80,20 +80,24 @@ pub async fn run_sentinel(sentinel_binance: Arc<BinanceClient>, sentinel_state: 
                                             let amount = pos.amount;
 
                                             if current_price >= tp {
-                                                let msg = format!("✅ **TAKE PROFIT HIT!** {} exited at ${:.2} (Target: ${:.2}). Executed via pure WebSocket zero-latency market sell.", state_sym, current_price, tp);
+                                                let msg = format!("✅ **TAKE PROFIT HIT!** {} exited at ${:.2} (Target: ${:.2}). Executed via Maker Limit Order.", state_sym, current_price, tp);
                                                 println!("[SENTINEL TRIGGER] {}", msg);
                                                 crate::discord::send_alert(discord_url.as_deref(), &msg).await;
-                                                let _ = sentinel_binance.create_market_sell(state_sym, amount).await;
+                                                // Limit order already filled on Binance, so we do NOT market sell. Just remove from state.
                                                 symbols_to_remove.push(state_sym.clone());
                                             } else if current_price <= sl {
                                                 let msg = format!("🚨 **STOP LOSS HIT!** {} emergency exited at ${:.2} (Limit: ${:.2}). Executed via pure WebSocket zero-latency market sell.", state_sym, current_price, sl);
                                                 println!("[SENTINEL TRIGGER] {}", msg);
                                                 crate::discord::send_alert(discord_url.as_deref(), &msg).await;
+                                                // 1. Cancel the resting TP Limit Order to free up the balance
+                                                if !pos.tp_order_id.is_empty() {
+                                                    let _ = sentinel_binance.cancel_order(state_sym, &pos.tp_order_id).await;
+                                                }
+                                                // 2. Execute Market Sell for Stop Loss
                                                 let _ = sentinel_binance.create_market_sell(state_sym, amount).await;
                                                 symbols_to_remove.push(state_sym.clone());
                                             } else {
-                                                // Minimal heartbeat, maybe once every 10 seconds? Websocket is too fast.
-                                                // We'll omit it to prevent WS lag, or just rely on the GUI dashboard.
+                                                // Heartbeat omitted to prevent log spam
                                             }
                                         }
                                     }

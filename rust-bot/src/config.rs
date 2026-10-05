@@ -9,6 +9,7 @@ pub struct Config {
     pub alpaca_api_key: Option<String>,
     pub alpaca_secret_key: Option<String>,
     pub discord_webhook_url: Option<String>,
+    pub discord_bot_token: Option<String>,
 }
 
 impl Config {
@@ -22,6 +23,7 @@ impl Config {
             alpaca_api_key: env::var("ALPACA_API_KEY").ok(),
             alpaca_secret_key: env::var("ALPACA_SECRET_KEY").ok(),
             discord_webhook_url: env::var("DISCORD_WEBHOOK_URL").ok(),
+            discord_bot_token: env::var("DISCORD_BOT_TOKEN").ok(),
         }
     }
 }

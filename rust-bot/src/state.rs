@@ -13,7 +13,7 @@ const JOURNAL_JSONL: &str = "../binance_hmm_journal.jsonl";
 pub struct PositionState {
     pub symbol: String,
     pub order_id: String,
-    pub oco_list_id: String,
+    pub tp_order_id: String,
     pub entry_price: f64,
     pub amount: f64,
     pub stop_loss_price: f64,

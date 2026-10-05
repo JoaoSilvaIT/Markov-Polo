@@ -33,7 +33,8 @@ pub async fn place_order(
         return Ok(json!({"status": "REJECTED", "reason": format!("Insufficient account balance: {} USDC", usdc_total)}));
     }
 
-    let mut risk_amount_usdc = usdc_total * risk_pct;
+    // FIXED FRACTIONAL SIZING: Max risk is strictly $0.20 per trade, adapting to SL distance.
+    let risk_amount_usdc = 0.20;
 
     if state.len() >= 3 {
         return Ok(json!({"status": "REJECTED", "reason": "Max concurrent trades (3) reached."}));
@@ -56,7 +57,6 @@ pub async fn place_order(
     if notional_value > max_notional {
         notional_value = max_notional;
         amount_to_buy = notional_value / current_price;
-        risk_amount_usdc = amount_to_buy * distance_to_sl;
     }
 
     if notional_value < 6.0 {
@@ -104,17 +104,17 @@ pub async fn place_order(
     }
 
     let qty_to_sell = amount_f.min(actual_balance);
-    let qty_to_sell_str = format!("{:.5}", qty_to_sell);
-    // Refactored: We DO NOT place an OCO limit order here. 
-    // The Sentinel loop will actively monitor the price and fire a Market Sell
-    // to guarantee execution during flash crashes and bypass PRER restrictions.
+    
+    // REFACTORED: Place a RESTING LIMIT ORDER for Take Profit (Maker execution)
+    let tp_res = client.create_limit_sell(symbol, qty_to_sell, take_profit_price).await.map_err(|e| e.to_string())?;
+    let tp_order_id = tp_res["orderId"].as_u64().unwrap_or(0).to_string();
 
     let order_id = buy_res["orderId"].as_u64().unwrap_or(0).to_string();
 
     let new_state = PositionState {
         symbol: symbol.to_string(),
         order_id,
-        oco_list_id: "".to_string(), // OCO deprecated
+        tp_order_id,
         entry_price: fill_price,
         amount: amount_f,
         stop_loss_price,
@@ -126,8 +126,8 @@ pub async fn place_order(
     state.insert(symbol.to_string(), new_state.clone());
     let _ = save_state(state);
 
-    let msg = format!("🚀 **NEW POSITION:** {} (Risk: {:.2} USDC)\n**Entry:** ${:.2}\n**TP:** ${:.2}\n**SL:** ${:.2}", 
-                      symbol, risk_amount_usdc, fill_price, take_profit_price, stop_loss_price);
+    let msg = format!("🚀 **NEW POSITION:** {} (Fixed Risk: {:.2} USDC)\n**Entry:** ${:.2}\n**TP Limit:** ${:.2}\n**SL Market:** ${:.2}\n**Size:** {:.5}", 
+                      symbol, risk_amount_usdc, fill_price, take_profit_price, stop_loss_price, amount_f);
     crate::discord::send_alert(discord_url.as_deref(), &msg).await;
 
     Ok(json!({
@@ -136,6 +136,7 @@ pub async fn place_order(
         "notional_usdc": notional_value,
         "amount": amount_f,
         "fill_price": fill_price,
+        "tp_order_id": new_state.tp_order_id,
         "risk_taken_usdc": risk_amount_usdc
     }))
 }
