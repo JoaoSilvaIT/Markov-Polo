@@ -1,46 +1,55 @@
 version: '3.8'
-
 services:
   bot:
     build: .
     container_name: binance_quant_bot
     restart: unless-stopped
-    command: ["python", "-u", "binance_bot.py", "--loop", "5"]
+    command:
+    - python
+    - -u
+    - binance_bot.py
+    - --loop
+    - '5'
     env_file:
-      - .env
+    - .env
     volumes:
-      - ./binance_state.json:/app/binance_state.json
-      - ./binance_journal.md:/app/binance_journal.md
-      - ./binance_journal.jsonl:/app/binance_journal.jsonl
-      - ./gcp-key.json:/app/gcp-key.json:ro
-
+    - ./binance_state.json:/app/binance_state.json
+    - ./binance_journal.md:/app/binance_journal.md
+    - ./binance_journal.jsonl:/app/binance_journal.jsonl
+    - ./gcp-key.json:/app/gcp-key.json:ro
   hmm_bot:
     build: ./rust-bot
     container_name: binance_hmm_bot
     restart: unless-stopped
-    command: ["trading-bot", "--run-now"]
+    command:
+    - trading-bot
     env_file:
-      - .env
+    - .env
     environment:
-      - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-key.json
+    - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-key.json
     volumes:
-      - ./binance_hmm_state.json:/app/binance_hmm_state.json
-      - ./binance_hmm_journal.md:/app/binance_hmm_journal.md
-      - ./binance_hmm_journal.jsonl:/app/binance_hmm_journal.jsonl
-      - ./gcp-key.json:/app/gcp-key.json:ro
-
+    - ./binance_hmm_state.json:/binance_hmm_state.json
+    - ./binance_hmm_journal.md:/binance_hmm_journal.md
+    - ./binance_hmm_journal.jsonl:/binance_hmm_journal.jsonl
+    - ./gcp-key.json:/app/gcp-key.json:ro
+    - ./rust-bot/hmm_weights.json:/app/hmm_weights.json
   dashboard:
     build: .
     container_name: binance_quant_dashboard
     restart: unless-stopped
-    command: ["streamlit", "run", "dashboard.py", "--server.port=8501", "--server.address=0.0.0.0"]
+    command:
+    - streamlit
+    - run
+    - dashboard.py
+    - --server.port=8501
+    - --server.address=0.0.0.0
     ports:
-      - "8501:8501"
+    - 8501:8501
     volumes:
-      - ./binance_state.json:/app/binance_state.json:ro
-      - ./binance_journal.md:/app/binance_journal.md:ro
-      - ./binance_journal.jsonl:/app/binance_journal.jsonl:ro
-      - ./binance_hmm_state.json:/app/binance_hmm_state.json:ro
-      - ./binance_hmm_journal.md:/app/binance_hmm_journal.md:ro
-      - ./binance_hmm_journal.jsonl:/app/binance_hmm_journal.jsonl:ro
-      - ./gcp-key.json:/app/gcp-key.json:ro
+    - ./binance_state.json:/app/binance_state.json:ro
+    - ./binance_journal.md:/app/binance_journal.md:ro
+    - ./binance_journal.jsonl:/app/binance_journal.jsonl:ro
+    - ./binance_hmm_state.json:/app/binance_hmm_state.json:ro
+    - ./binance_hmm_journal.md:/app/binance_hmm_journal.md:ro
+    - ./binance_hmm_journal.jsonl:/app/binance_hmm_journal.jsonl:ro
+    - ./gcp-key.json:/app/gcp-key.json:ro
