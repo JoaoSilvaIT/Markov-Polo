@@ -153,6 +153,10 @@ async fn main() {
 
                                         let is_consolidation = regime == 0 && !is_drifting;
                                         
+                                        let current_price = *closes_clone.last().unwrap_or(&0.0);
+                                        let regime_str = if is_consolidation { "Consolidation" } else if is_drifting { "Trending (Drift)" } else { "Trending (HMM)" };
+                                        println!("💓 [HOT-PATH] BTC Price: ${:.2} | Target Buy: ${:.2} | Regime: {} | Drift: ${:.2}/m", current_price, thresholds.entry_long, regime_str, slope);
+                                        
                                         let mut state_lock = state_clone.lock().await;
                                         let has_position = state_lock.contains_key("BTC/USDC");
 
