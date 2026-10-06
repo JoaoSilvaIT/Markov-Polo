@@ -127,8 +127,11 @@ async fn main() {
                             let state_path_clone = state_file_path.clone();
                             
                             tokio::task::spawn_blocking(move || {
+                                let current_price = *closes_clone.last().unwrap_or(&0.0);
                                 if let Some(ou_params) = estimate_ou_parameters(&closes_clone, 1.0) {
-                                    let thresholds = calculate_optimal_thresholds(&ou_params, 0.0004);
+                                    // Binance Spot taker fee is ~0.10%. We pass the absolute dollar transaction cost.
+                                    let tx_cost = current_price * 0.001;
+                                    let thresholds = calculate_optimal_thresholds(&ou_params, tx_cost);
                                     
                                     // Async context for locking inside spawn_blocking requires block_on or spawn
                                     let rt = tokio::runtime::Handle::current();
@@ -153,14 +156,17 @@ async fn main() {
                                             sum_ii += idx * idx;
                                         }
                                         let slope = (n_drift * sum_ip - sum_i * sum_p) / (n_drift * sum_ii - sum_i * sum_i);
-                                        // If the price is drifting more than $2 per minute on average, it's a trend, not consolidation.
-                                        let is_drifting = slope.abs() > 2.0;
+                                        
+                                        // Calculate total drift over the window as a percentage of current price
+                                        let total_drift_pct = (slope * n_drift) / current_price;
+                                        
+                                        // If the price is drifting more than 1.5% over the window, it's a trend, not consolidation.
+                                        let is_drifting = total_drift_pct.abs() > 0.015;
 
                                         let is_consolidation = regime == 0 && !is_drifting;
                                         
-                                        let current_price = *closes_clone.last().unwrap_or(&0.0);
                                         let regime_str = if is_consolidation { "Consolidation" } else if is_drifting { "Trending (Drift)" } else { "Trending (HMM)" };
-                                        println!("💓 [HOT-PATH] {} Price: ${:.2} | Target Buy: ${:.2} | Regime: {} | Drift: ${:.2}/m", symbol_clone, current_price, thresholds.entry_long, regime_str, slope);
+                                        println!("💓 [HOT-PATH] {} Price: ${:.2} | Target Buy: ${:.2} | Regime: {} | Drift: {:.2}%/window", symbol_clone, current_price, thresholds.entry_long, regime_str, total_drift_pct * 100.0);
                                         
                                         let mut state_lock = state_clone.lock().await;
                                         let has_position = state_lock.contains_key(&symbol_clone);

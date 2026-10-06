@@ -97,10 +97,10 @@ pub fn calculate_optimal_thresholds(params: &OuParameters, transaction_cost: f64
     // If costs are high, the threshold widens to ensure expected profit > costs.
     
     // We base the entry deviation on the equilibrium standard deviation, adjusted for transaction costs.
-    // A standard optimal starting point is ~1.5 standard deviations from the mean.
+    // A standard optimal starting point is ~2.0 standard deviations from the mean (increased from 1.5 for higher win rate).
     // We enforce that the minimum gross profit is at least 2.5x the transaction cost to avoid fee bleed.
     let min_required_profit = transaction_cost * 2.5;
-    let optimal_deviation = (1.5 * sigma_eq).max(min_required_profit);
+    let optimal_deviation = (2.0 * sigma_eq).max(min_required_profit);
     
     // In strict mean-reversion, the optimal exit is exactly at the equilibrium mean (mu).
     OptimalThresholds {
