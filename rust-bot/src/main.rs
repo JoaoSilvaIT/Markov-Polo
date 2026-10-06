@@ -211,6 +211,7 @@ async fn main() {
                                 tokio::task::spawn_blocking(move || {
                                     let hist_last_price = *closes_clone.last().unwrap_or(&0.0);
                                     if let Some(ou_params) = estimate_ou_parameters(&closes_clone, 1.0) {
+                                        let half_life_m = ou_params.half_life_minutes();
                                         // Binance Spot taker fee is ~0.10%. Absolute dollar transaction cost on historical price.
                                         let tx_cost = hist_last_price * 0.001;
                                         let thresholds = calculate_optimal_thresholds(&ou_params, tx_cost);
@@ -232,7 +233,7 @@ async fn main() {
                                         let total_drift_pct = (slope * n_drift) / hist_last_price;
                                         let is_drifting = total_drift_pct.abs() > 0.015;
 
-                                        Some((thresholds, total_drift_pct, is_drifting))
+                                        Some((thresholds, total_drift_pct, is_drifting, half_life_m))
                                     } else {
                                         None
                                     }
@@ -241,19 +242,47 @@ async fn main() {
                                 None
                             };
 
-                            if let Some((thresholds, total_drift_pct, is_drifting)) = calc_res {
+                            if let Some((thresholds, total_drift_pct, is_drifting, half_life_m)) = calc_res {
                                 let regime = 0; // HMM regime
                                 let is_consolidation = regime == 0 && !is_drifting;
                                 
                                 let regime_str = if is_consolidation { "Consolidation" } else if is_drifting { "Trending (Drift)" } else { "Trending (HMM)" };
-                                println!("💓 [HOT-PATH] {} Price: ${:.2} | Target Buy: ${:.2} | Regime: {} | Drift: {:.2}%/window", symbol_clone, close_price, thresholds.entry_long, regime_str, total_drift_pct * 100.0);
+                                println!("💓 [HOT-PATH] {} Price: ${:.2} | Target Buy: ${:.2} | Regime: {} | Drift: {:.2}%/window | t_half: {:.1}m", 
+                                         symbol_clone, close_price, thresholds.entry_long, regime_str, total_drift_pct * 100.0, half_life_m);
                                 
                                 let mut state_lock = state_clone.lock().await;
                                 let has_position = state_lock.contains_key(&symbol_clone);
 
-                                if !is_consolidation && has_position {
-                                    // 🚨 INVALIDATION PROTOCOL: Stationarity broken
-                                    let _ = emergency_flatten(&state_path_clone, &binance_clone, &mut state_lock, &symbol_clone, discord_clone.clone()).await;
+                                if has_position {
+                                    // Check 2 * t_half Time-Stop
+                                    let mut time_stop_triggered = false;
+                                    let mut elapsed_mins = 0.0;
+                                    let mut max_allowed_mins = 120.0;
+                                    if let Some(pos) = state_lock.get(&symbol_clone) {
+                                        if let Ok(opened_dt) = chrono::DateTime::parse_from_rfc3339(&pos.opened_at) {
+                                            elapsed_mins = (chrono::Utc::now() - opened_dt.with_timezone(&chrono::Utc)).num_seconds() as f64 / 60.0;
+                                            max_allowed_mins = if pos.half_life_minutes > 0.0 {
+                                                (2.0 * pos.half_life_minutes).clamp(15.0, 360.0)
+                                            } else {
+                                                120.0
+                                            };
+                                            if elapsed_mins >= max_allowed_mins {
+                                                time_stop_triggered = true;
+                                            }
+                                        }
+                                    }
+
+                                    if !is_consolidation {
+                                        // 🚨 INVALIDATION PROTOCOL: Stationarity broken
+                                        println!("🚨 [INVALIDATION] Regime shift / drift detected for {}. Executing emergency flatten.", symbol_clone);
+                                        let _ = emergency_flatten(&state_path_clone, &binance_clone, &mut state_lock, &symbol_clone, discord_clone.clone()).await;
+                                    } else if time_stop_triggered {
+                                        // ⏱️ TIME-STOP PROTOCOL: 2 * t_half elapsed
+                                        println!("⏱️ [TIME-STOP] {} reached max holding horizon ({:.1}m >= limit {:.1}m). Statistical edge expired. Flattening.", symbol_clone, elapsed_mins, max_allowed_mins);
+                                        let time_msg = format!("⏱️ **HALF-LIFE TIME-STOP EXPIRED:** {} held for {:.1}m (limit: {:.1}m). Statistical mean-reversion thesis expired; liquidating position to release capital.", symbol_clone, elapsed_mins, max_allowed_mins);
+                                        crate::discord::send_alert(discord_clone.as_deref(), &time_msg).await;
+                                        let _ = emergency_flatten(&state_path_clone, &binance_clone, &mut state_lock, &symbol_clone, discord_clone.clone()).await;
+                                    }
                                 } 
                                 else if is_consolidation && !has_position {
                                     // 🟢 O-U ENTRY SIGNAL evaluated strictly out-of-sample on bar t
@@ -265,6 +294,7 @@ async fn main() {
                                             &symbol_clone, 
                                             thresholds.entry_long, 
                                             thresholds.exit_long, 
+                                            half_life_m,
                                             discord_clone
                                         ).await;
                                     }

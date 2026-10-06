@@ -10,6 +10,7 @@ pub async fn place_ou_limit_buy(
     symbol: &str,
     entry_price: f64,
     target_mu: f64,
+    half_life_minutes: f64,
     discord_url: Option<String>,
 ) -> Result<Value, String> {
     
@@ -50,13 +51,15 @@ pub async fn place_ou_limit_buy(
         opened_at: Utc::now().to_rfc3339(),
         risk_amount_usdc: position_size_usdc,
         is_filled: false,
+        half_life_minutes,
     };
 
     state.insert(symbol.to_string(), new_state.clone());
     let _ = save_state(state_file_path, state);
 
-    let msg = format!("🟢 **O-U ENTRY SIGNAL (MAKER):** {}\n**Limit Maker Buy:** ${:.2}\n**Target Mean (μ):** ${:.2}\n**Size:** {:.5} (${:.2})", 
-                      symbol, entry_price, target_mu, amount_f, position_size_usdc);
+    let max_hold = (2.0 * half_life_minutes).clamp(15.0, 360.0);
+    let msg = format!("🟢 **O-U ENTRY SIGNAL (MAKER):** {}\n**Limit Maker Buy:** ${:.2}\n**Target Mean (μ):** ${:.2}\n**Size:** {:.5} (${:.2})\n**Half-Life:** {:.1}m (Max Hold: {:.1}m)", 
+                      symbol, entry_price, target_mu, amount_f, position_size_usdc, half_life_minutes, max_hold);
     crate::discord::send_alert(discord_url.as_deref(), &msg).await;
 
     Ok(json!({"status": "DISPATCHED", "order_id": new_state.order_id}))

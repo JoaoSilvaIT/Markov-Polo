@@ -22,6 +22,8 @@ pub struct PositionState {
     pub risk_amount_usdc: f64,
     #[serde(default)]
     pub is_filled: bool,
+    #[serde(default)]
+    pub half_life_minutes: f64,
 }
 
 pub type StateMap = HashMap<String, PositionState>;

@@ -8,6 +8,16 @@ pub struct OuParameters {
     pub sigma: f64, // Volatility (amplitude of the random Wiener process noise)
 }
 
+impl OuParameters {
+    pub fn half_life_minutes(&self) -> f64 {
+        if self.theta > 1e-6 {
+            (2.0_f64.ln()) / self.theta
+        } else {
+            120.0
+        }
+    }
+}
+
 /// Represents the mathematically optimal entry and exit thresholds.
 #[derive(Debug, Clone)]
 pub struct OptimalThresholds {
@@ -134,5 +144,45 @@ pub fn calculate_optimal_thresholds(params: &OuParameters, transaction_cost: f64
         exit_long: params.mu,
         entry_short: params.mu + optimal_deviation,
         exit_short: params.mu,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_half_life_calculation() {
+        let params = OuParameters {
+            theta: 0.02,
+            mu: 100.0,
+            sigma: 1.0,
+        };
+        // t_half = ln(2) / 0.02 = 0.693147 / 0.02 ≈ 34.657 mins
+        let hl = params.half_life_minutes();
+        assert!((hl - 34.657).abs() < 0.01);
+
+        // Near-zero theta fallback
+        let slow_params = OuParameters {
+            theta: 0.0,
+            mu: 100.0,
+            sigma: 1.0,
+        };
+        assert_eq!(slow_params.half_life_minutes(), 120.0);
+    }
+
+    #[test]
+    fn test_optimal_thresholds_contain_cost_barrier() {
+        let params = OuParameters {
+            theta: 0.05,
+            mu: 2700.0,
+            sigma: 5.0,
+        };
+        let tx_cost = 2.70; // $2.70 fee
+        let thresholds = calculate_optimal_thresholds(&params, tx_cost);
+        
+        assert!(thresholds.entry_long < params.mu);
+        assert_eq!(thresholds.exit_long, params.mu);
+        assert!(params.mu - thresholds.entry_long >= tx_cost * 2.5);
     }
 }

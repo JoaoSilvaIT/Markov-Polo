@@ -193,27 +193,32 @@ impl GaussianHMM {
         best_last
     }
 
-    pub fn sort_by_sharpe(&mut self) {
-        let mut sharpes = vec![(0, 0.0); self.n_components];
+    pub fn sort_by_energy(&mut self) {
+        // Institutional state labeling (Research consensus):
+        // Sort states by emission return-energy: q_k = mu_k^2 + sigma_k^2
+        // - State 0: Lowest return-energy / variance (Calm Consolidation)
+        // - State 1: Moderate energy (Directional / Transition)
+        // - State 2: Highest return-energy / variance (High-volatility cascade / stress shock)
+        let mut energies = vec![(0, 0.0); self.n_components];
         for c in 0..self.n_components {
             let mean = self.means[[c, 0]]; // Feature 0 is return
             let var = self.covars[[c, 0]].max(1e-8);
-            let sharpe = mean / var.sqrt();
-            sharpes[c] = (c, sharpe);
+            let energy = mean.powi(2) + var;
+            energies[c] = (c, energy);
         }
-        sharpes.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        energies.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let mut new_means = self.means.clone();
         let mut new_covars = self.covars.clone();
         let mut new_startprob = self.startprob.clone();
         let mut new_transmat = self.transmat.clone();
 
-        for (i, &(old_idx, _)) in sharpes.iter().enumerate() {
+        for (i, &(old_idx, _)) in energies.iter().enumerate() {
             new_means.row_mut(i).assign(&self.means.row(old_idx));
             new_covars.row_mut(i).assign(&self.covars.row(old_idx));
             new_startprob[i] = self.startprob[old_idx];
             
-            for (j, &(old_col, _)) in sharpes.iter().enumerate() {
+            for (j, &(old_col, _)) in energies.iter().enumerate() {
                 new_transmat[[i, j]] = self.transmat[[old_idx, old_col]];
             }
         }
@@ -222,6 +227,10 @@ impl GaussianHMM {
         self.covars = new_covars;
         self.startprob = new_startprob;
         self.transmat = new_transmat;
+    }
+
+    pub fn sort_by_sharpe(&mut self) {
+        self.sort_by_energy();
     }
 }
 
@@ -255,7 +264,7 @@ pub fn detect_hmm_regime(closes: &[f64]) -> i32 {
     
     let mut hmm = GaussianHMM::new(3, 2);
     hmm.fit(&x, 100);
-    hmm.sort_by_sharpe(); // Label switching fix by Sharpe ratio
+    hmm.sort_by_energy(); // Energy-based state labeling
     
     hmm.predict(&x) as i32
 }
@@ -350,7 +359,7 @@ pub fn train_hmm_offline(closes: &[f64]) -> Option<GaussianHMM> {
     
     let mut hmm = GaussianHMM::new(3, 2);
     hmm.fit(&x, 100);
-    hmm.sort_by_sharpe();
+    hmm.sort_by_energy();
     
     Some(hmm)
 }
