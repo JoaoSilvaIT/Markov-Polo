@@ -1,6 +1,6 @@
 services:
   dashboard:
-    build: .
+    build: ./dashboard
     container_name: binance_quant_dashboard
     restart: unless-stopped
     command:
