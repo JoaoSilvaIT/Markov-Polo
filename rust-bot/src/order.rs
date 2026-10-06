@@ -31,7 +31,7 @@ pub async fn place_ou_limit_buy(
     
     let amount_to_buy = position_size_usdc / entry_price;
     let multiplier = 10_f64.powi(precision);
-    let amount_f = (amount_to_buy * multiplier).floor() / multiplier;
+    let amount_f = ((amount_to_buy * multiplier) + 1e-8).floor() / multiplier;
     
     // We place a Limit Buy to capture the Maker fee.
     // If the price is already below entry_price, this might execute as a Taker.
@@ -105,7 +105,8 @@ pub async fn emergency_flatten(
                 _ => 3,
             };
             let multiplier = 10_f64.powi(precision);
-            let amount_f = (actual_balance * multiplier).floor() / multiplier;
+            // Add a small epsilon to fix floating point truncation issues (e.g., 0.00013 * 100000 = 12.9999999)
+            let amount_f = ((actual_balance * multiplier) + 1e-8).floor() / multiplier;
             
             let _ = client.create_market_sell(symbol, amount_f).await;
         }
