@@ -71,6 +71,7 @@ pub async fn emergency_flatten(
     
     if let Some(pos) = state.get(symbol) {
         let msg = format!("🚨 **HMM REGIME SHIFT DETECTED!** Stationarity broken for {}. Cancelling resting orders and executing emergency Taker Market Sell to flatten risk.", symbol);
+        println!("🚨 [EMERGENCY FLATTEN] Regime shift detected for {}. Executing Market Sell.", symbol);
         crate::discord::send_alert(discord_url.as_deref(), &msg).await;
         
         // 1. Cancel the entry Limit Buy if it hasn't filled, or the exit Limit Sell if it has.
