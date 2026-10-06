@@ -17,24 +17,17 @@ pub struct OptimalThresholds {
     pub exit_short: f64,
 }
 
-/// Estimates the Ornstein-Uhlenbeck parameters using Ordinary Least Squares (OLS)
-/// applied to an exact Autoregressive AR(1) discretization.
-/// 
-/// `data`: The rolling window of price data (e.g., 480 1-minute close prices).
-/// `dt`: The discrete time step (e.g., 1.0 for 1-minute bars).
-pub fn estimate_ou_parameters(data: &[f64], dt: f64) -> Option<OuParameters> {
-    if data.len() < 3 {
+/// Estimates raw AR(1) regression coefficients (a, b, sigma_eps) over a dataset.
+fn estimate_ar1_raw(data: &[f64]) -> Option<(f64, f64, f64)> {
+    if data.len() < 4 {
         return None;
     }
-    
     let n = data.len() - 1;
     let mut sum_x = 0.0;
     let mut sum_y = 0.0;
     let mut sum_xx = 0.0;
     let mut sum_xy = 0.0;
     
-    // We regress X_{t} against X_{t-1}
-    // Y represents X_{t} and X represents X_{t-1}
     for i in 0..n {
         let x = data[i];
         let y = data[i+1];
@@ -52,14 +45,12 @@ pub fn estimate_ou_parameters(data: &[f64], dt: f64) -> Option<OuParameters> {
     let var_x = (sum_xx / nf) - (mean_x * mean_x);
     
     if var_x <= 0.0 {
-        return None; // Cannot regress a perfectly flat line
+        return None;
     }
     
     let b = cov_xy / var_x;
     let a = mean_y - b * mean_x;
     
-    // If b is >= 1.0, the process is a random walk or explosive (not mean-reverting).
-    // If b is <= 0.0, the process is oscillating chaotically.
     if b <= 0.0 || b >= 1.0 {
         return None;
     }
@@ -72,12 +63,47 @@ pub fn estimate_ou_parameters(data: &[f64], dt: f64) -> Option<OuParameters> {
         sum_err_sq += err * err;
     }
     
-    // Calculate variance of the residuals
     let var_err = sum_err_sq / (nf - 2.0).max(1.0);
     let sigma_eps = var_err.sqrt();
     
-    // Extract continuous-time O-U parameters from the discrete AR(1) coefficients
-    let theta = -b.ln() / dt;
+    Some((a, b, sigma_eps))
+}
+
+/// Estimates the Ornstein-Uhlenbeck parameters using Ordinary Least Squares (OLS)
+/// applied to an exact Autoregressive AR(1) discretization with Phillips & Yu (2005)
+/// Jackknife bias reduction to eliminate the Hurwicz upward bias on theta.
+/// 
+/// `data`: The rolling window of price data (e.g., 480 1-minute close prices).
+/// `dt`: The discrete time step (e.g., 1.0 for 1-minute bars).
+pub fn estimate_ou_parameters(data: &[f64], dt: f64) -> Option<OuParameters> {
+    let (a, b, sigma_eps) = estimate_ar1_raw(data)?;
+    
+    let theta_full = -b.ln() / dt;
+    
+    // Apply Phillips & Yu (2005) 2-split Jackknife bias correction:
+    // theta_jack = 2 * theta_full - 0.5 * (theta_1 + theta_2)
+    // This removes the O(1/T) Hurwicz bias that artificially inflates mean-reversion speed.
+    let mid = data.len() / 2;
+    let theta = if mid >= 4 {
+        let part1 = estimate_ar1_raw(&data[..mid]);
+        let part2 = estimate_ar1_raw(&data[mid..]);
+        
+        if let (Some((_, b1, _)), Some((_, b2, _))) = (part1, part2) {
+            let theta1 = -b1.ln() / dt;
+            let theta2 = -b2.ln() / dt;
+            let th_jack = 2.0 * theta_full - 0.5 * (theta1 + theta2);
+            if th_jack > 1e-5 {
+                th_jack
+            } else {
+                theta_full
+            }
+        } else {
+            theta_full
+        }
+    } else {
+        theta_full
+    };
+    
     let mu = a / (1.0 - b);
     let sigma = sigma_eps * ((2.0 * theta) / (1.0 - b * b)).sqrt();
     

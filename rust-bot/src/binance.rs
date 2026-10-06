@@ -6,6 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 type HmacSha256 = Hmac<Sha256>;
 
+pub type BinanceResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
 pub struct BinanceClient {
     pub api_key: String,
     pub secret: String,
@@ -39,20 +41,20 @@ impl BinanceClient {
         format!("{}&signature={}", query, signature)
     }
 
-    pub async fn fetch_ohlcv(&self, symbol: &str, interval: &str, limit: usize) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
+    pub async fn fetch_ohlcv(&self, symbol: &str, interval: &str, limit: usize) -> BinanceResult<Vec<Value>> {
         let url = format!("https://api.binance.com/api/v3/klines?symbol={}&interval={}&limit={}", symbol.replace("/", ""), interval, limit);
         let res: Vec<Value> = self.client.get(&url).send().await?.json().await?;
         Ok(res)
     }
 
-    pub async fn fetch_ticker(&self, symbol: &str) -> Result<f64, Box<dyn std::error::Error>> {
+    pub async fn fetch_ticker(&self, symbol: &str) -> BinanceResult<f64> {
         let url = format!("https://api.binance.com/api/v3/ticker/price?symbol={}", symbol.replace("/", ""));
         let res: Value = self.client.get(&url).send().await?.json().await?;
         let price = res["price"].as_str().unwrap().parse::<f64>()?;
         Ok(price)
     }
 
-    pub async fn fetch_funding_rate(&self, symbol: &str) -> Result<f64, Box<dyn std::error::Error>> {
+    pub async fn fetch_funding_rate(&self, symbol: &str) -> BinanceResult<f64> {
         let perp_symbol = symbol.replace("/", "").replace("USDC", "USDT");
         let url = format!("https://fapi.binance.com/fapi/v1/premiumIndex?symbol={}", perp_symbol);
         let res = self.client.get(&url).send().await?;
@@ -66,7 +68,7 @@ impl BinanceClient {
         Ok(0.0)
     }
 
-    pub async fn fetch_balance(&self) -> Result<Value, Box<dyn std::error::Error>> {
+    pub async fn fetch_balance(&self) -> BinanceResult<Value> {
         let mut params = vec![];
         let query = self.sign_request(&mut params);
         let url = format!("https://api.binance.com/api/v3/account?{}", query);
@@ -77,7 +79,7 @@ impl BinanceClient {
         Ok(res)
     }
 
-    pub async fn fetch_open_orders(&self, symbol: &str) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
+    pub async fn fetch_open_orders(&self, symbol: &str) -> BinanceResult<Vec<Value>> {
         let mut params = vec![("symbol", symbol.replace("/", ""))];
         let query = self.sign_request(&mut params);
         let url = format!("https://api.binance.com/api/v3/openOrders?{}", query);
@@ -88,7 +90,7 @@ impl BinanceClient {
         Ok(res)
     }
 
-    pub async fn fetch_order(&self, symbol: &str, order_id: &str) -> Result<Value, Box<dyn std::error::Error>> {
+    pub async fn fetch_order(&self, symbol: &str, order_id: &str) -> BinanceResult<Value> {
         let mut params = vec![
             ("symbol", symbol.replace("/", "")),
             ("orderId", order_id.to_string()),
@@ -102,7 +104,7 @@ impl BinanceClient {
         Ok(res)
     }
 
-    pub async fn create_market_buy(&self, symbol: &str, quantity: f64) -> Result<Value, Box<dyn std::error::Error>> {
+    pub async fn create_market_buy(&self, symbol: &str, quantity: f64) -> BinanceResult<Value> {
         let mut params = vec![
             ("symbol", symbol.replace("/", "")),
             ("side", "BUY".to_string()),
@@ -118,7 +120,7 @@ impl BinanceClient {
         Ok(res)
     }
 
-    pub async fn create_market_sell(&self, symbol: &str, quantity: f64) -> Result<Value, Box<dyn std::error::Error>> {
+    pub async fn create_market_sell(&self, symbol: &str, quantity: f64) -> BinanceResult<Value> {
         let mut params = vec![
             ("symbol", symbol.replace("/", "")),
             ("side", "SELL".to_string()),
@@ -134,7 +136,7 @@ impl BinanceClient {
         Ok(res)
     }
 
-    pub async fn create_limit_sell(&self, symbol: &str, quantity: f64, price: f64) -> Result<Value, Box<dyn std::error::Error>> {
+    pub async fn create_limit_sell(&self, symbol: &str, quantity: f64, price: f64) -> BinanceResult<Value> {
         let mut params = vec![
             ("symbol", symbol.replace("/", "")),
             ("side", "SELL".to_string()),
@@ -152,7 +154,7 @@ impl BinanceClient {
         Ok(res)
     }
 
-    pub async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<Value, Box<dyn std::error::Error>> {
+    pub async fn cancel_order(&self, symbol: &str, order_id: &str) -> BinanceResult<Value> {
         let mut params = vec![
             ("symbol", symbol.replace("/", "")),
             ("orderId", order_id.to_string()),
@@ -166,7 +168,7 @@ impl BinanceClient {
         Ok(res)
     }
 
-    pub async fn create_oco_sell(&self, symbol: &str, quantity: f64, price: f64, stop_price: f64, stop_limit_price: f64) -> Result<Value, Box<dyn std::error::Error>> {
+    pub async fn create_oco_sell(&self, symbol: &str, quantity: f64, price: f64, stop_price: f64, stop_limit_price: f64) -> BinanceResult<Value> {
         let mut params = vec![
             ("symbol", symbol.replace("/", "")),
             ("side", "SELL".to_string()),
@@ -187,7 +189,7 @@ impl BinanceClient {
 }
 
 impl BinanceClient {
-    pub async fn create_limit_buy(&self, symbol: &str, quantity: f64, price: f64) -> Result<Value, Box<dyn std::error::Error>> {
+    pub async fn create_limit_buy(&self, symbol: &str, quantity: f64, price: f64) -> BinanceResult<Value> {
         let mut params = vec![
             ("symbol", symbol.replace("/", "")),
             ("side", "BUY".to_string()),
