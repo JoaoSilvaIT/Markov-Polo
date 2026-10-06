@@ -49,6 +49,56 @@ pub fn save_state(file_path: &str, state: &StateMap) -> Result<(), Box<dyn std::
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CircuitBreaker {
+    pub consecutive_time_stops: u32,
+    pub paused_until: Option<String>, // RFC3339 timestamp
+}
+
+impl CircuitBreaker {
+    pub fn is_paused(&self) -> bool {
+        if let Some(ref ts) = self.paused_until {
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+                return chrono::Utc::now() < dt.with_timezone(&chrono::Utc);
+            }
+        }
+        false
+    }
+
+    pub fn record_time_stop(&mut self) -> bool {
+        self.consecutive_time_stops += 1;
+        if self.consecutive_time_stops >= 3 {
+            let pause_dt = chrono::Utc::now() + chrono::Duration::hours(24);
+            self.paused_until = Some(pause_dt.to_rfc3339());
+            return true;
+        }
+        false
+    }
+
+    pub fn record_win(&mut self) {
+        self.consecutive_time_stops = 0;
+        self.paused_until = None;
+    }
+}
+
+pub fn load_circuit_breaker(file_path: &str) -> CircuitBreaker {
+    if !std::path::Path::new(file_path).exists() {
+        return CircuitBreaker::default();
+    }
+    fs::read_to_string(file_path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_circuit_breaker(file_path: &str, cb: &CircuitBreaker) {
+    if let Ok(content) = serde_json::to_string_pretty(cb) {
+        let temp_path = format!("{}.tmp", file_path);
+        let _ = fs::write(&temp_path, content);
+        let _ = fs::rename(&temp_path, file_path);
+    }
+}
+
 #[derive(Serialize)]
 struct JournalEntry {
     timestamp: String,
@@ -134,5 +184,24 @@ mod tests {
         let eth = state.get("ETH/USDC").expect("Must contain ETH/USDC");
         assert_eq!(eth.is_filled, true);
         assert_eq!(eth.tp_order_id, "888888");
+    }
+
+    #[test]
+    fn test_circuit_breaker_3_strike_rule() {
+        let mut cb = CircuitBreaker::default();
+        assert_eq!(cb.is_paused(), false);
+        
+        assert_eq!(cb.record_time_stop(), false); // 1 strike
+        assert_eq!(cb.is_paused(), false);
+        
+        assert_eq!(cb.record_time_stop(), false); // 2 strikes
+        assert_eq!(cb.is_paused(), false);
+        
+        assert_eq!(cb.record_time_stop(), true); // 3 strikes -> Tripped!
+        assert_eq!(cb.is_paused(), true);
+        
+        cb.record_win(); // Win resets breaker
+        assert_eq!(cb.is_paused(), false);
+        assert_eq!(cb.consecutive_time_stops, 0);
     }
 }

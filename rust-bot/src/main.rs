@@ -23,7 +23,7 @@ use crate::binance::{BinanceClient, get_symbol_lot_precision, quantize_lot_size}
 use crate::hmm::{GaussianHMM, train_hmm_offline};
 use crate::ou_process::{estimate_ou_parameters, calculate_optimal_thresholds};
 use crate::order::{place_ou_limit_buy, emergency_flatten};
-use crate::state::{StateMap, load_state};
+use crate::state::{StateMap, load_state, load_circuit_breaker, save_circuit_breaker};
 
 #[tokio::main]
 async fn main() {
@@ -36,6 +36,12 @@ async fn main() {
     let state_map: StateMap = load_state(&config.state_file_path).unwrap_or_default();
     let active_state = Arc::new(Mutex::new(state_map));
     let state_file_path = config.state_file_path.clone();
+
+    // Circuit Breaker initialization
+    let cb_path = format!("binance_hmm_cb_{}.json", config.trading_symbol);
+    let cb_state = load_circuit_breaker(&cb_path);
+    let active_cb = Arc::new(Mutex::new(cb_state));
+    let cb_file_path = cb_path.clone();
     
     // Initialize HMM (will load from file or initialize empty)
     let initial_hmm = GaussianHMM::load_weights(&config.hmm_config_path).unwrap_or_else(|_| hmm::GaussianHMM::new(3, 2));
@@ -105,6 +111,8 @@ async fn main() {
     let watcher_symbol = config.trading_symbol.clone();
     let watcher_state_path = config.state_file_path.clone();
     let watcher_discord = config.discord_webhook_url.clone();
+    let watcher_cb = active_cb.clone();
+    let watcher_cb_path = cb_file_path.clone();
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(1500));
@@ -167,6 +175,12 @@ async fn main() {
                             println!("🎉 [FAST-SENTINEL] Take Profit Limit Sell for {} has FILLED!", watcher_symbol);
                             state_lock.remove(&watcher_symbol);
                             let _ = crate::state::save_state(&watcher_state_path, &state_lock);
+                            
+                            // Reset circuit breaker on successful Take Profit win
+                            let mut cb_lock = watcher_cb.lock().await;
+                            cb_lock.record_win();
+                            save_circuit_breaker(&watcher_cb_path, &cb_lock);
+
                             let msg = format!("🎉 **TRADE CLOSED IN PROFIT!** {} Take Profit Limit Sell has successfully filled. Ready for next cycle.", watcher_symbol);
                             let _ = crate::discord::send_alert(watcher_discord.as_deref(), &msg).await;
                         }
@@ -205,6 +219,8 @@ async fn main() {
                             let discord_clone = discord_url.clone();
                             let symbol_clone = trading_symbol.clone();
                             let state_path_clone = state_file_path.clone();
+                            let cb_clone = active_cb.clone();
+                            let cb_path_clone = cb_file_path.clone();
                             
                             // Pure CPU computation in blocking thread, evaluating historical closes up to t-1
                             let calc_res = if closes_clone.len() >= 100 {
@@ -245,8 +261,28 @@ async fn main() {
                             if let Some((thresholds, total_drift_pct, is_drifting, half_life_m)) = calc_res {
                                 let regime = 0; // HMM regime
                                 let is_consolidation = regime == 0 && !is_drifting;
+
+                                // Half-Life Eligibility Gate: 15m <= t_half <= 120m
+                                let is_valid_half_life = half_life_m >= 15.0 && half_life_m <= 120.0;
                                 
-                                let regime_str = if is_consolidation { "Consolidation" } else if is_drifting { "Trending (Drift)" } else { "Trending (HMM)" };
+                                let cb_lock = cb_clone.lock().await;
+                                let is_cb_paused = cb_lock.is_paused();
+                                drop(cb_lock);
+
+                                let regime_str = if !is_consolidation {
+                                    if is_drifting { "Trending (Drift)" } else { "Trending (HMM)" }
+                                } else if is_cb_paused {
+                                    "Consolidation (Vetoed: Circuit Breaker 24h Pause)"
+                                } else if !is_valid_half_life {
+                                    if half_life_m < 15.0 {
+                                        "Consolidation (Vetoed: t_half < 15m noise)"
+                                    } else {
+                                        "Consolidation (Vetoed: t_half > 120m slow)"
+                                    }
+                                } else {
+                                    "Consolidation (Tradable)"
+                                };
+
                                 println!("💓 [HOT-PATH] {} Price: ${:.2} | Target Buy: ${:.2} | Regime: {} | Drift: {:.2}%/window | t_half: {:.1}m", 
                                          symbol_clone, close_price, thresholds.entry_long, regime_str, total_drift_pct * 100.0, half_life_m);
                                 
@@ -279,12 +315,22 @@ async fn main() {
                                     } else if time_stop_triggered {
                                         // ⏱️ TIME-STOP PROTOCOL: 2 * t_half elapsed
                                         println!("⏱️ [TIME-STOP] {} reached max holding horizon ({:.1}m >= limit {:.1}m). Statistical edge expired. Flattening.", symbol_clone, elapsed_mins, max_allowed_mins);
-                                        let time_msg = format!("⏱️ **HALF-LIFE TIME-STOP EXPIRED:** {} held for {:.1}m (limit: {:.1}m). Statistical mean-reversion thesis expired; liquidating position to release capital.", symbol_clone, elapsed_mins, max_allowed_mins);
+                                        
+                                        // Record strike on Circuit Breaker
+                                        let mut cb_lock = cb_clone.lock().await;
+                                        let tripped = cb_lock.record_time_stop();
+                                        save_circuit_breaker(&cb_path_clone, &cb_lock);
+
+                                        let mut time_msg = format!("⏱️ **HALF-LIFE TIME-STOP EXPIRED:** {} held for {:.1}m (limit: {:.1}m). Statistical mean-reversion thesis expired; liquidating position to release capital.", symbol_clone, elapsed_mins, max_allowed_mins);
+                                        if tripped {
+                                            time_msg.push_str("\n🚨 **CIRCUIT BREAKER TRIGGERED:** 3 consecutive time-stop exits! Trading paused on this symbol for 24 hours.");
+                                            eprintln!("🚨 [CIRCUIT BREAKER] 3 consecutive time-stops on {}! Halting symbol for 24 hours.", symbol_clone);
+                                        }
                                         crate::discord::send_alert(discord_clone.as_deref(), &time_msg).await;
                                         let _ = emergency_flatten(&state_path_clone, &binance_clone, &mut state_lock, &symbol_clone, discord_clone.clone()).await;
                                     }
                                 } 
-                                else if is_consolidation && !has_position {
+                                else if is_consolidation && !has_position && is_valid_half_life && !is_cb_paused {
                                     // 🟢 O-U ENTRY SIGNAL evaluated strictly out-of-sample on bar t
                                     if close_price <= thresholds.entry_long {
                                         let _ = place_ou_limit_buy(
