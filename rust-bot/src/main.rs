@@ -333,16 +333,20 @@ async fn main() {
                                 else if is_consolidation && !has_position && is_valid_half_life && !is_cb_paused {
                                     // 🟢 O-U ENTRY SIGNAL evaluated strictly out-of-sample on bar t
                                     if close_price <= thresholds.entry_long {
-                                        let _ = place_ou_limit_buy(
+                                        // Ensure post-only maker bid never crosses the book above current market price
+                                        let entry_limit_price = f64::min(close_price, thresholds.entry_long);
+                                        if let Err(e) = place_ou_limit_buy(
                                             &state_path_clone,
                                             &binance_clone, 
                                             &mut state_lock, 
                                             &symbol_clone, 
-                                            thresholds.entry_long, 
+                                            entry_limit_price, 
                                             thresholds.exit_long, 
                                             half_life_m,
                                             discord_clone
-                                        ).await;
+                                        ).await {
+                                            eprintln!("❌ [ORDER ERROR] Failed to dispatch limit maker buy for {}: {}", symbol_clone, e);
+                                        }
                                     }
                                 }
                             }
