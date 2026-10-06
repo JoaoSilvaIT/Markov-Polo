@@ -19,7 +19,7 @@ mod ws_sentinel;
 mod ou_process;
 
 use crate::config::Config;
-use crate::binance::BinanceClient;
+use crate::binance::{BinanceClient, get_symbol_lot_precision, quantize_lot_size};
 use crate::hmm::{GaussianHMM, train_hmm_offline};
 use crate::ou_process::{estimate_ou_parameters, calculate_optimal_thresholds};
 use crate::order::{place_ou_limit_buy, emergency_flatten};
@@ -117,13 +117,44 @@ async fn main() {
                 if pos.tp_order_id.is_empty() && !pos.order_id.is_empty() {
                     if let Ok(order_info) = watcher_binance.fetch_order(&watcher_symbol, &pos.order_id).await {
                         if order_info["status"] == "FILLED" {
-                            println!("🟢 [FAST-SENTINEL] Entry Filled for {}! Instantly placing resting Take Profit at ${:.2}", watcher_symbol, pos.take_profit_price);
-                            if let Ok(sell_res) = watcher_binance.create_limit_sell(&watcher_symbol, pos.amount, pos.take_profit_price).await {
-                                if let Some(p) = state_lock.get_mut(&watcher_symbol) {
-                                    p.tp_order_id = sell_res["orderId"].as_u64().unwrap_or(0).to_string();
-                                    let _ = crate::state::save_state(&watcher_state_path, &state_lock);
-                                    let msg = format!("🟢 **TAKE PROFIT PLACED:** {}\n**Target:** ${:.2}\n**Size:** {:.5}", watcher_symbol, pos.take_profit_price, pos.amount);
-                                    let _ = crate::discord::send_alert(watcher_discord.as_deref(), &msg).await;
+                            println!("🟢 [FAST-SENTINEL] Entry Filled for {}! Calculating net sellable quantity and placing resting Take Profit at ${:.2}", watcher_symbol, pos.take_profit_price);
+                            
+                            // Reconcile actual executed quantity against base asset free balance to defeat the gross-vs-net fee trap
+                            let executed_qty = order_info.get("executedQty")
+                                .and_then(|q| q.as_str())
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(pos.amount);
+                            
+                            let base_asset = watcher_symbol.replace("USDC", "").replace("/", "");
+                            let free_balance = watcher_binance.fetch_free_balance(&base_asset).await.unwrap_or(executed_qty);
+                            
+                            let precision = get_symbol_lot_precision(&watcher_symbol);
+                            let sell_target = f64::min(executed_qty, free_balance);
+                            let net_sell_amount = quantize_lot_size(sell_target, precision);
+
+                            if net_sell_amount > 0.0 {
+                                match watcher_binance.create_limit_sell(&watcher_symbol, net_sell_amount, pos.take_profit_price).await {
+                                    Ok(sell_res) => {
+                                        if let Some(p) = state_lock.get_mut(&watcher_symbol) {
+                                            let tp_id = sell_res.get("orderId").and_then(|id| {
+                                                if id.is_u64() { Some(id.as_u64().unwrap().to_string()) }
+                                                else if id.is_string() { Some(id.as_str().unwrap().to_string()) }
+                                                else { None }
+                                            }).unwrap_or_default();
+
+                                            if !tp_id.is_empty() {
+                                                p.tp_order_id = tp_id;
+                                                p.amount = net_sell_amount;
+                                                p.is_filled = true;
+                                                let _ = crate::state::save_state(&watcher_state_path, &state_lock);
+                                                let msg = format!("🟢 **TAKE PROFIT PLACED:** {}\n**Target:** ${:.2}\n**Net Sellable Size:** {:.5}", watcher_symbol, pos.take_profit_price, net_sell_amount);
+                                                let _ = crate::discord::send_alert(watcher_discord.as_deref(), &msg).await;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("❌ [FAST-SENTINEL] Failed to place TP limit sell for {}: {}", watcher_symbol, e);
+                                    }
                                 }
                             }
                         }
@@ -164,9 +195,10 @@ async fn main() {
                         let close_price = kline.get("c").and_then(|c| c.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
                         
                         if is_closed {
-                            if rolling_closes.len() >= 480 { rolling_closes.remove(0); }
-                            rolling_closes.push(close_price);
-                            
+                            // ------------------------------------------------------------------
+                            // In-Sample Signal Leakage Prevention:
+                            // Estimate parameters strictly on historical bars through t-1.
+                            // ------------------------------------------------------------------
                             let closes_clone = rolling_closes.clone();
                             let binance_clone = binance.clone();
                             let state_clone = active_state.clone();
@@ -174,43 +206,47 @@ async fn main() {
                             let symbol_clone = trading_symbol.clone();
                             let state_path_clone = state_file_path.clone();
                             
-                            // Pure CPU computation in blocking thread, yielding results back without blocking the runtime
-                            let calc_res = tokio::task::spawn_blocking(move || {
-                                let current_price = *closes_clone.last().unwrap_or(&0.0);
-                                if let Some(ou_params) = estimate_ou_parameters(&closes_clone, 1.0) {
-                                    // Binance Spot taker fee is ~0.10%. We pass the absolute dollar transaction cost.
-                                    let tx_cost = current_price * 0.001;
-                                    let thresholds = calculate_optimal_thresholds(&ou_params, tx_cost);
-                                    
-                                    // OLS Slope drift calculation
-                                    let n_drift = closes_clone.len() as f64;
-                                    let mut sum_i = 0.0;
-                                    let mut sum_p = 0.0;
-                                    let mut sum_ip = 0.0;
-                                    let mut sum_ii = 0.0;
-                                    for (i, &p) in closes_clone.iter().enumerate() {
-                                        let idx = i as f64;
-                                        sum_i += idx;
-                                        sum_p += p;
-                                        sum_ip += idx * p;
-                                        sum_ii += idx * idx;
+                            // Pure CPU computation in blocking thread, evaluating historical closes up to t-1
+                            let calc_res = if closes_clone.len() >= 100 {
+                                tokio::task::spawn_blocking(move || {
+                                    let hist_last_price = *closes_clone.last().unwrap_or(&0.0);
+                                    if let Some(ou_params) = estimate_ou_parameters(&closes_clone, 1.0) {
+                                        // Binance Spot taker fee is ~0.10%. Absolute dollar transaction cost on historical price.
+                                        let tx_cost = hist_last_price * 0.001;
+                                        let thresholds = calculate_optimal_thresholds(&ou_params, tx_cost);
+                                        
+                                        // OLS Slope drift calculation on historical window
+                                        let n_drift = closes_clone.len() as f64;
+                                        let mut sum_i = 0.0;
+                                        let mut sum_p = 0.0;
+                                        let mut sum_ip = 0.0;
+                                        let mut sum_ii = 0.0;
+                                        for (i, &p) in closes_clone.iter().enumerate() {
+                                            let idx = i as f64;
+                                            sum_i += idx;
+                                            sum_p += p;
+                                            sum_ip += idx * p;
+                                            sum_ii += idx * idx;
+                                        }
+                                        let slope = (n_drift * sum_ip - sum_i * sum_p) / (n_drift * sum_ii - sum_i * sum_i);
+                                        let total_drift_pct = (slope * n_drift) / hist_last_price;
+                                        let is_drifting = total_drift_pct.abs() > 0.015;
+
+                                        Some((thresholds, total_drift_pct, is_drifting))
+                                    } else {
+                                        None
                                     }
-                                    let slope = (n_drift * sum_ip - sum_i * sum_p) / (n_drift * sum_ii - sum_i * sum_i);
-                                    let total_drift_pct = (slope * n_drift) / current_price;
-                                    let is_drifting = total_drift_pct.abs() > 0.015;
+                                }).await.unwrap_or(None)
+                            } else {
+                                None
+                            };
 
-                                    Some((current_price, thresholds, total_drift_pct, is_drifting))
-                                } else {
-                                    None
-                                }
-                            }).await.unwrap_or(None);
-
-                            if let Some((current_price, thresholds, total_drift_pct, is_drifting)) = calc_res {
+                            if let Some((thresholds, total_drift_pct, is_drifting)) = calc_res {
                                 let regime = 0; // HMM regime
                                 let is_consolidation = regime == 0 && !is_drifting;
                                 
                                 let regime_str = if is_consolidation { "Consolidation" } else if is_drifting { "Trending (Drift)" } else { "Trending (HMM)" };
-                                println!("💓 [HOT-PATH] {} Price: ${:.2} | Target Buy: ${:.2} | Regime: {} | Drift: {:.2}%/window", symbol_clone, current_price, thresholds.entry_long, regime_str, total_drift_pct * 100.0);
+                                println!("💓 [HOT-PATH] {} Price: ${:.2} | Target Buy: ${:.2} | Regime: {} | Drift: {:.2}%/window", symbol_clone, close_price, thresholds.entry_long, regime_str, total_drift_pct * 100.0);
                                 
                                 let mut state_lock = state_clone.lock().await;
                                 let has_position = state_lock.contains_key(&symbol_clone);
@@ -220,7 +256,7 @@ async fn main() {
                                     let _ = emergency_flatten(&state_path_clone, &binance_clone, &mut state_lock, &symbol_clone, discord_clone.clone()).await;
                                 } 
                                 else if is_consolidation && !has_position {
-                                    // 🟢 O-U ENTRY SIGNAL
+                                    // 🟢 O-U ENTRY SIGNAL evaluated strictly out-of-sample on bar t
                                     if close_price <= thresholds.entry_long {
                                         let _ = place_ou_limit_buy(
                                             &state_path_clone,
@@ -234,6 +270,10 @@ async fn main() {
                                     }
                                 }
                             }
+
+                            // Advance rolling window: append completed bar t for future bar calibrations
+                            if rolling_closes.len() >= 480 { rolling_closes.remove(0); }
+                            rolling_closes.push(close_price);
                         }
                     }
                 },

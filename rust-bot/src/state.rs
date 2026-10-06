@@ -20,6 +20,8 @@ pub struct PositionState {
     pub take_profit_price: f64,
     pub opened_at: String,
     pub risk_amount_usdc: f64,
+    #[serde(default)]
+    pub is_filled: bool,
 }
 
 pub type StateMap = HashMap<String, PositionState>;
@@ -79,5 +81,56 @@ pub fn log_to_journal(memo: &str, event_type: &str, details: Value) {
         let _ = writeln!(file, "## [{}] {}\n", now.format("%Y-%m-%d %H:%M:%S UTC"), event_type);
         let memo_text = if memo.trim().is_empty() { "No text memo generated." } else { memo.trim() };
         let _ = writeln!(file, "{}\n\n---", memo_text);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_position_state_backward_compatibility() {
+        let old_json = r#"{
+            "BTC/USDC": {
+                "symbol": "BTC/USDC",
+                "order_id": "123456",
+                "tp_order_id": "",
+                "entry_price": 85000.0,
+                "amount": 0.00014,
+                "stop_loss_price": 0.0,
+                "take_profit_price": 85500.0,
+                "opened_at": "2026-10-06T12:00:00Z",
+                "risk_amount_usdc": 12.0
+            }
+        }"#;
+
+        let state: StateMap = serde_json::from_str(old_json).expect("Deserialization must succeed");
+        let btc = state.get("BTC/USDC").expect("Must contain BTC/USDC");
+        assert_eq!(btc.is_filled, false);
+        assert_eq!(btc.order_id, "123456");
+        assert_eq!(btc.amount, 0.00014);
+    }
+
+    #[test]
+    fn test_position_state_with_is_filled() {
+        let new_json = r#"{
+            "ETH/USDC": {
+                "symbol": "ETH/USDC",
+                "order_id": "999999",
+                "tp_order_id": "888888",
+                "entry_price": 2680.0,
+                "amount": 0.0044,
+                "stop_loss_price": 0.0,
+                "take_profit_price": 2700.0,
+                "opened_at": "2026-10-06T12:00:00Z",
+                "risk_amount_usdc": 12.0,
+                "is_filled": true
+            }
+        }"#;
+
+        let state: StateMap = serde_json::from_str(new_json).expect("Deserialization must succeed");
+        let eth = state.get("ETH/USDC").expect("Must contain ETH/USDC");
+        assert_eq!(eth.is_filled, true);
+        assert_eq!(eth.tp_order_id, "888888");
     }
 }
