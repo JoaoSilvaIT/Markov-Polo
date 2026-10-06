@@ -109,7 +109,7 @@ pub async fn run_sentinel(sentinel_binance: Arc<BinanceClient>, sentinel_state: 
                             for sym in symbols_to_remove {
                                 current_state.remove(&sym);
                             }
-                            let _ = save_state(&current_state);
+                            let _ = save_state("", &current_state);
                         }
                     }
                 }

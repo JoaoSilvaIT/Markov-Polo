@@ -4,6 +4,7 @@ use chrono::Utc;
 use serde_json::{json, Value};
 
 pub async fn place_ou_limit_buy(
+    state_file_path: &str,
     client: &BinanceClient,
     state: &mut StateMap,
     symbol: &str,
@@ -51,7 +52,7 @@ pub async fn place_ou_limit_buy(
     };
 
     state.insert(symbol.to_string(), new_state.clone());
-    let _ = save_state(state);
+    let _ = save_state(state_file_path, state);
 
     let msg = format!("🟢 **O-U ENTRY SIGNAL:** {}\n**Maker Limit Buy:** ${:.2}\n**Target Mean (μ):** ${:.2}\n**Size:** {:.5} (${:.2})", 
                       symbol, entry_price, target_mu, amount_f, position_size_usdc);
@@ -61,6 +62,7 @@ pub async fn place_ou_limit_buy(
 }
 
 pub async fn emergency_flatten(
+    state_file_path: &str,
     client: &BinanceClient,
     state: &mut StateMap,
     symbol: &str,
@@ -109,7 +111,7 @@ pub async fn emergency_flatten(
         }
         
         state.remove(symbol);
-        let _ = save_state(state);
+        let _ = save_state(state_file_path, state);
     }
     
     Ok(())

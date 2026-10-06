@@ -33,8 +33,9 @@ async fn main() {
     let binance = Arc::new(BinanceClient::new(config.binance_api_key.clone(), config.binance_secret_key.clone()));
     
     // Load current position state
-    let state_map: StateMap = load_state().unwrap_or_default();
+    let state_map: StateMap = load_state(&config.state_file_path).unwrap_or_default();
     let active_state = Arc::new(Mutex::new(state_map));
+    let state_file_path = config.state_file_path.clone();
     
     // Initialize HMM (will load from file or initialize empty)
     let initial_hmm = GaussianHMM::load_weights(&config.hmm_config_path).unwrap_or_else(|_| hmm::GaussianHMM::new(3, 2));
@@ -48,11 +49,12 @@ async fn main() {
     let hmm_trainer_clone = hmm_model.clone();
     let binance_trainer_clone = binance.clone();
     let config_trainer_path = config.hmm_config_path.clone();
+    let config_trainer_symbol = config.trading_symbol.clone();
     
     tokio::spawn(async move {
         loop {
             println!("⚙️ [COLD-PATH] Initiating 24-hour HMM recalibration...");
-            let klines_res = binance_trainer_clone.fetch_ohlcv("BTCUSDC", "15m", 1000).await.ok();
+            let klines_res = binance_trainer_clone.fetch_ohlcv(&config_trainer_symbol, "15m", 1000).await.ok();
             if let Some(klines) = klines_res {
                 let mut closes = Vec::new();
                 for k in klines {
@@ -83,7 +85,8 @@ async fn main() {
     let mut rolling_closes: Vec<f64> = Vec::with_capacity(480);
     
     println!("⏳ [INGESTION] Pre-filling 480-minute rolling window via REST API...");
-    if let Ok(klines) = binance.fetch_ohlcv("BTCUSDC", "1m", 480).await {
+    let trading_symbol = config.trading_symbol.clone();
+    if let Ok(klines) = binance.fetch_ohlcv(&trading_symbol, "1m", 480).await {
         for k in klines {
             if let Some(c) = k[4].as_str().and_then(|s| s.parse::<f64>().ok()) {
                 rolling_closes.push(c);
@@ -93,10 +96,10 @@ async fn main() {
     
     crate::discord::send_alert(discord_url.as_deref(), "🚀 **O-U Architecture Online**\nFully automated HMM recalibration and deterministic websocket ingestion active.").await;
 
-    let ws_url = "wss://stream.binance.com:9443/ws/btcusdc@kline_1m";
+    let ws_url = format!("wss://stream.binance.com:9443/ws/{}@kline_1m", trading_symbol.to_lowercase());
 
     loop {
-        let ws_stream = match connect_async(ws_url).await {
+        let ws_stream = match connect_async(&ws_url).await {
             Ok((stream, _)) => stream,
             Err(e) => { tokio::time::sleep(Duration::from_secs(5)).await; continue; }
         };
@@ -120,6 +123,8 @@ async fn main() {
                             let binance_clone = binance.clone();
                             let state_clone = active_state.clone();
                             let discord_clone = discord_url.clone();
+                            let symbol_clone = trading_symbol.clone();
+                            let state_path_clone = state_file_path.clone();
                             
                             tokio::task::spawn_blocking(move || {
                                 if let Some(ou_params) = estimate_ou_parameters(&closes_clone, 1.0) {
@@ -155,10 +160,10 @@ async fn main() {
                                         
                                         let current_price = *closes_clone.last().unwrap_or(&0.0);
                                         let regime_str = if is_consolidation { "Consolidation" } else if is_drifting { "Trending (Drift)" } else { "Trending (HMM)" };
-                                        println!("💓 [HOT-PATH] BTC Price: ${:.2} | Target Buy: ${:.2} | Regime: {} | Drift: ${:.2}/m", current_price, thresholds.entry_long, regime_str, slope);
+                                        println!("💓 [HOT-PATH] {} Price: ${:.2} | Target Buy: ${:.2} | Regime: {} | Drift: ${:.2}/m", symbol_clone, current_price, thresholds.entry_long, regime_str, slope);
                                         
                                         let mut state_lock = state_clone.lock().await;
-                                        let has_position = state_lock.contains_key("BTC/USDC");
+                                        let has_position = state_lock.contains_key(&symbol_clone);
 
                                         // Check and place Take Profit if needed
                                         if has_position {
@@ -167,7 +172,7 @@ async fn main() {
                                             let mut tp_price = 0.0;
                                             let mut amount = 0.0;
                                             
-                                            if let Some(pos) = state_lock.get("BTC/USDC") {
+                                            if let Some(pos) = state_lock.get(&symbol_clone) {
                                                 if pos.tp_order_id.is_empty() {
                                                     needs_tp = true;
                                                     order_id = pos.order_id.clone();
@@ -177,13 +182,13 @@ async fn main() {
                                             }
                                             
                                             if needs_tp {
-                                                if let Ok(order_info) = binance_clone.fetch_order("BTC/USDC", &order_id).await {
+                                                if let Ok(order_info) = binance_clone.fetch_order(&symbol_clone, &order_id).await {
                                                     if order_info["status"] == "FILLED" {
                                                         println!("🟢 [EXECUTION] Entry Filled! Placing resting Take Profit at ${:.2}", tp_price);
-                                                        if let Ok(sell_res) = binance_clone.create_limit_sell("BTC/USDC", amount, tp_price).await {
-                                                            if let Some(pos) = state_lock.get_mut("BTC/USDC") {
+                                                        if let Ok(sell_res) = binance_clone.create_limit_sell(&symbol_clone, amount, tp_price).await {
+                                                            if let Some(pos) = state_lock.get_mut(&symbol_clone) {
                                                                 pos.tp_order_id = sell_res["orderId"].as_u64().unwrap_or(0).to_string();
-                                                                let _ = crate::state::save_state(&state_lock);
+                                                                let _ = crate::state::save_state(&state_path_clone, &state_lock);
                                                                 let msg = format!("🟢 **TAKE PROFIT PLACED:** BTC/USDC\n**Target:** ${:.2}\n**Size:** {:.5}", tp_price, amount);
                                                                 let _ = crate::discord::send_alert(discord_clone.as_deref(), &msg).await;
                                                             }
@@ -194,19 +199,19 @@ async fn main() {
                                                 // TP is already placed. Check if it has been FILLED to close the trade loop.
                                                 let mut tp_filled = false;
                                                 let mut tp_order_to_check = "".to_string();
-                                                if let Some(pos) = state_lock.get("BTC/USDC") {
+                                                if let Some(pos) = state_lock.get(&symbol_clone) {
                                                     tp_order_to_check = pos.tp_order_id.clone();
                                                 }
                                                 if !tp_order_to_check.is_empty() {
-                                                    if let Ok(order_info) = binance_clone.fetch_order("BTC/USDC", &tp_order_to_check).await {
+                                                    if let Ok(order_info) = binance_clone.fetch_order(&symbol_clone, &tp_order_to_check).await {
                                                         if order_info["status"] == "FILLED" {
                                                             tp_filled = true;
                                                         }
                                                     }
                                                 }
                                                 if tp_filled {
-                                                    state_lock.remove("BTC/USDC");
-                                                    let _ = crate::state::save_state(&state_lock);
+                                                    state_lock.remove(&symbol_clone);
+                                                    let _ = crate::state::save_state(&state_path_clone, &state_lock);
                                                     let msg = "🎉 **TRADE CLOSED IN PROFIT!** Take Profit Limit Sell has successfully filled. Ready for next cycle.".to_string();
                                                     let _ = crate::discord::send_alert(discord_clone.as_deref(), &msg).await;
                                                 }
@@ -215,15 +220,16 @@ async fn main() {
 
                                         if !is_consolidation && has_position {
                                             // 🚨 INVALIDATION PROTOCOL: Stationarity broken
-                                            let _ = emergency_flatten(&binance_clone, &mut state_lock, "BTC/USDC", discord_clone.clone()).await;
+                                            let _ = emergency_flatten(&state_path_clone, &binance_clone, &mut state_lock, &symbol_clone, discord_clone.clone()).await;
                                         } 
                                         else if is_consolidation && !has_position {
                                             // 🟢 O-U ENTRY SIGNAL
                                             if close_price <= thresholds.entry_long {
                                                 let _ = place_ou_limit_buy(
+                                                    &state_path_clone,
                                                     &binance_clone, 
                                                     &mut state_lock, 
-                                                    "BTC/USDC", 
+                                                    &symbol_clone, 
                                                     thresholds.entry_long, 
                                                     thresholds.exit_long, 
                                                     discord_clone

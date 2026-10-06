@@ -40,7 +40,7 @@ impl EventHandler for Handler {
             }
             
             st.clear();
-            let _ = crate::state::save_state(&st);
+            let _ = crate::state::save_state("", &st);
             
             let _ = msg.channel_id.say(&ctx.http, "✅ **All positions liquidated.** Bot process terminated.").await;
             

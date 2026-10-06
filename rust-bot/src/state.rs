@@ -24,11 +24,11 @@ pub struct PositionState {
 
 pub type StateMap = HashMap<String, PositionState>;
 
-pub fn load_state() -> Result<StateMap, Box<dyn std::error::Error>> {
-    if !std::path::Path::new(STATE_FILE).exists() {
+pub fn load_state(file_path: &str) -> Result<StateMap, Box<dyn std::error::Error>> {
+    if !std::path::Path::new(file_path).exists() {
         return Ok(HashMap::new());
     }
-    let content = fs::read_to_string(STATE_FILE)?;
+    let content = fs::read_to_string(file_path)?;
     if content.trim().is_empty() {
         return Ok(HashMap::new());
     }
@@ -36,12 +36,12 @@ pub fn load_state() -> Result<StateMap, Box<dyn std::error::Error>> {
     Ok(state)
 }
 
-pub fn save_state(state: &StateMap) -> Result<(), Box<dyn std::error::Error>> {
+pub fn save_state(file_path: &str, state: &StateMap) -> Result<(), Box<dyn std::error::Error>> {
     let content = serde_json::to_string_pretty(state)?;
     // Atomic file save to prevent corruption on panic/power loss
-    let temp_path = format!("{}.tmp", STATE_FILE);
+    let temp_path = format!("{}.tmp", file_path);
     fs::write(&temp_path, content)?;
-    fs::rename(&temp_path, STATE_FILE)?;
+    fs::rename(&temp_path, file_path)?;
     Ok(())
 }
 
