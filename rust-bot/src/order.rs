@@ -77,6 +77,10 @@ pub async fn place_ou_limit_buy(
         format!("Exchange response missing orderId: {:?}", buy_res)
     })?;
 
+    // Epsilon Shave: front-run the mean by 5 bps (min $0.02) to avoid Schelling point liquidity walls
+    let epsilon_shave = (target_mu * 0.0005).max(0.02);
+    let target_tp = target_mu - epsilon_shave;
+
     let new_state = PositionState {
         symbol: symbol.to_string(),
         order_id,
@@ -84,12 +88,18 @@ pub async fn place_ou_limit_buy(
         entry_price: post_only_price,
         amount: amount_f,
         stop_loss_price: 0.0, // No structural stop loss in O-U
-        take_profit_price: target_mu,
+        take_profit_price: target_tp,
         opened_at: Utc::now().to_rfc3339(),
         risk_amount_usdc: position_size_usdc,
         is_filled: false,
         half_life_minutes,
         client_order_id,
+        max_progress: 0.0,
+        max_favorable_price: post_only_price,
+        effective_tp: target_tp,
+        last_reprice_time: Utc::now().timestamp_millis(),
+        reprice_count: 0,
+        candidate_lower_count: 0,
     };
 
     state.insert(symbol.to_string(), new_state.clone());

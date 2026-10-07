@@ -95,11 +95,17 @@ async fn main() {
     
     println!("⏳ [INGESTION] Pre-filling 480-minute rolling window via REST API...");
     let trading_symbol = config.trading_symbol.clone();
-    if let Ok(klines) = binance.fetch_ohlcv(&trading_symbol, "1m", 480).await {
-        for k in klines {
-            if let Some(c) = k[4].as_str().and_then(|s| s.parse::<f64>().ok()) {
-                rolling_closes.push(c);
+    match binance.fetch_ohlcv(&trading_symbol, "1m", 480).await {
+        Ok(klines) => {
+            for k in klines {
+                if let Some(c) = k[4].as_str().and_then(|s| s.parse::<f64>().ok()) {
+                    rolling_closes.push(c);
+                }
             }
+            println!("✅ [INGESTION] Successfully loaded {} historical 1m bars for {}.", rolling_closes.len(), trading_symbol);
+        }
+        Err(e) => {
+            eprintln!("❌ [INGESTION ERROR] Failed to fetch historical 1m bars for {}: {}", trading_symbol, e);
         }
     }
     
@@ -277,62 +283,64 @@ async fn main() {
                             let calc_res = if closes_clone.len() >= 100 {
                                 tokio::task::spawn_blocking(move || {
                                     let hist_last_price = *closes_clone.last().unwrap_or(&0.0);
-                                    if let Some(ou_params) = estimate_ou_parameters(&closes_clone, 1.0) {
-                                        let half_life_m = ou_params.half_life_minutes();
-                                        // Binance Spot taker fee is ~0.10%. Absolute dollar transaction cost on historical price.
+                                    // Ornstein-Uhlenbeck Process Estimation
+                                    let (thresholds_opt, half_life_m) = if let Some(ou_params) = estimate_ou_parameters(&closes_clone, 1.0) {
+                                        let hl = ou_params.half_life_minutes();
                                         let tx_cost = hist_last_price * 0.001;
-                                        let thresholds = calculate_optimal_thresholds(&ou_params, tx_cost);
-                                        
-                                        // OLS Slope drift calculation on historical window
-                                        let n_drift = closes_clone.len() as f64;
-                                        let mut sum_i = 0.0;
-                                        let mut sum_p = 0.0;
-                                        let mut sum_ip = 0.0;
-                                        let mut sum_ii = 0.0;
-                                        for (i, &p) in closes_clone.iter().enumerate() {
-                                            let idx = i as f64;
-                                            sum_i += idx;
-                                            sum_p += p;
-                                            sum_ip += idx * p;
-                                            sum_ii += idx * idx;
-                                        }
-                                        let slope = (n_drift * sum_ip - sum_i * sum_p) / (n_drift * sum_ii - sum_i * sum_i);
-                                        let total_drift_pct = (slope * n_drift) / hist_last_price;
-                                        let is_drifting = total_drift_pct.abs() > 0.015;
-
-                                        // Standardized Short-Horizon Downside Shock Calculation (Z15 & Z60 with robust MAD)
-                                        let n = closes_clone.len();
-                                        let mut z_15 = 0.0;
-                                        let mut z_60 = 0.0;
-                                        if n >= 65 && current_close > 0.0 {
-                                            let mut returns_1m = Vec::with_capacity(n - 1);
-                                            for i in 1..n {
-                                                returns_1m.push((closes_clone[i] / closes_clone[i-1]).ln());
-                                            }
-                                            // Robust Median Absolute Deviation (MAD) scaled by 1.4826 for normal consistency
-                                            let sigma_mad = calculate_mad_sigma(&returns_1m);
-
-                                            // Live return evaluated with current completed bar close_price vs historical closes
-                                            let ret_15 = (current_close / closes_clone[n - 15]).ln();
-                                            z_15 = ret_15 / (sigma_mad * (15.0_f64).sqrt());
-
-                                            let ret_60 = (current_close / closes_clone[n - 60]).ln();
-                                            z_60 = ret_60 / (sigma_mad * (60.0_f64).sqrt());
-                                        }
-                                        let is_shock = z_15 < -3.0 || z_60 < -3.0;
-
-                                        Some((thresholds, total_drift_pct, is_drifting, half_life_m, z_15, z_60, is_shock, hist_last_price))
+                                        let th = calculate_optimal_thresholds(&ou_params, tx_cost);
+                                        (Some(th), hl)
                                     } else {
-                                        None
+                                        (None, 999.0)
+                                    };
+
+                                    // OLS Slope drift calculation on historical window
+                                    let n_drift = closes_clone.len() as f64;
+                                    let mut sum_i = 0.0;
+                                    let mut sum_p = 0.0;
+                                    let mut sum_ip = 0.0;
+                                    let mut sum_ii = 0.0;
+                                    for (i, &p) in closes_clone.iter().enumerate() {
+                                        let idx = i as f64;
+                                        sum_i += idx;
+                                        sum_p += p;
+                                        sum_ip += idx * p;
+                                        sum_ii += idx * idx;
                                     }
+                                    let slope = (n_drift * sum_ip - sum_i * sum_p) / (n_drift * sum_ii - sum_i * sum_i);
+                                    let total_drift_pct = (slope * n_drift) / hist_last_price;
+                                    let is_drifting = total_drift_pct.abs() > 0.015;
+
+                                    // Standardized Short-Horizon Downside Shock Calculation (Z15 & Z60 with robust MAD)
+                                    let n = closes_clone.len();
+                                    let mut z_15 = 0.0;
+                                    let mut z_60 = 0.0;
+                                    if n >= 65 && current_close > 0.0 {
+                                        let mut returns_1m = Vec::with_capacity(n - 1);
+                                        for i in 1..n {
+                                            returns_1m.push((closes_clone[i] / closes_clone[i-1]).ln());
+                                        }
+                                        // Robust Median Absolute Deviation (MAD) scaled by 1.4826 for normal consistency
+                                        let sigma_mad = calculate_mad_sigma(&returns_1m);
+
+                                        // Live return evaluated with current completed bar close_price vs historical closes
+                                        let ret_15 = (current_close / closes_clone[n - 15]).ln();
+                                        z_15 = ret_15 / (sigma_mad * (15.0_f64).sqrt());
+
+                                        let ret_60 = (current_close / closes_clone[n - 60]).ln();
+                                        z_60 = ret_60 / (sigma_mad * (60.0_f64).sqrt());
+                                    }
+                                    let is_shock = z_15 < -3.0 || z_60 < -3.0;
+
+                                    Some((thresholds_opt, total_drift_pct, is_drifting, half_life_m, z_15, z_60, is_shock, hist_last_price))
                                 }).await.unwrap_or(None)
                             } else {
                                 None
                             };
 
-                            if let Some((thresholds, total_drift_pct, is_drifting, half_life_m, z_15, z_60, is_shock, hist_last_price)) = calc_res {
+                            if let Some((thresholds_opt, total_drift_pct, is_drifting, half_life_m, z_15, z_60, is_shock, hist_last_price)) = calc_res {
                                 let regime = 0; // HMM regime
-                                let is_consolidation = regime == 0 && !is_drifting;
+                                let is_stationary = thresholds_opt.is_some();
+                                let is_consolidation = regime == 0 && !is_drifting && is_stationary;
 
                                 // Half-Life Eligibility Gate: 15m <= t_half <= 120m
                                 let is_valid_half_life = half_life_m >= 15.0 && half_life_m <= 120.0;
@@ -345,7 +353,9 @@ async fn main() {
                                 let cluster_active = has_active_cluster_position(&symbol_clone);
                                 let is_cluster_blocked = cluster_active.is_some();
 
-                                let regime_str = if !is_consolidation {
+                                let regime_str = if !is_stationary {
+                                    "Trending (Non-Stationary: AR(1) b >= 1.0)"
+                                } else if !is_consolidation {
                                     if is_drifting { "Trending (Drift)" } else { "Trending (HMM)" }
                                 } else if is_cb_paused {
                                     "Consolidation (Vetoed: Circuit Breaker 24h Pause)"
@@ -363,8 +373,13 @@ async fn main() {
                                     "Consolidation (Tradable)"
                                 };
 
-                                println!("💓 [HOT-PATH] {} Price: ${:.2} | Target Buy: ${:.2} | Regime: {} | Drift: {:.2}%/window | t_half: {:.1}m | Z15: {:.2} | Z60: {:.2}", 
-                                         symbol_clone, close_price, thresholds.entry_long, regime_str, total_drift_pct * 100.0, half_life_m, z_15, z_60);
+                                let target_buy_str = match thresholds_opt {
+                                    Some(ref th) => format!("${:.2}", th.entry_long),
+                                    None => "N/A (b >= 1.0)".to_string(),
+                                };
+
+                                println!("💓 [HOT-PATH] {} Price: ${:.2} | Target Buy: {} | Regime: {} | Drift: {:.2}%/window | t_half: {:.1}m | Z15: {:.2} | Z60: {:.2}", 
+                                         symbol_clone, close_price, target_buy_str, regime_str, total_drift_pct * 100.0, half_life_m, z_15, z_60);
                                 
                                 let mut state_lock = state_clone.lock().await;
                                 let has_position = state_lock.contains_key(&symbol_clone);
@@ -385,9 +400,16 @@ async fn main() {
                                     // Check resting entry TTL (5m) and filled position 2 * t_half Time-Stop
                                     let mut entry_ttl_expired = false;
                                     let mut time_stop_triggered = false;
+                                    let mut giveback_triggered = false;
                                     let mut elapsed_mins = 0.0;
                                     let mut max_allowed_mins = 120.0;
-                                    if let Some(pos) = state_lock.get(&symbol_clone) {
+
+                                    let mut should_reprice = false;
+                                    let mut new_reprice_target = 0.0;
+                                    let mut reprice_qty = 0.0;
+                                    let mut old_tp_order_id = String::new();
+
+                                    if let Some(pos) = state_lock.get_mut(&symbol_clone) {
                                         if let Ok(opened_dt) = chrono::DateTime::parse_from_rfc3339(&pos.opened_at) {
                                             elapsed_mins = (chrono::Utc::now() - opened_dt.with_timezone(&chrono::Utc)).num_seconds() as f64 / 60.0;
                                             if !pos.is_filled {
@@ -405,6 +427,87 @@ async fn main() {
                                                 if elapsed_mins >= max_allowed_mins {
                                                     time_stop_triggered = true;
                                                 }
+
+                                                // -------------------------------------------------------------
+                                                // Normalized Progress & 20% Giveback Ratchet (Researcher 2)
+                                                // -------------------------------------------------------------
+                                                let d_0 = pos.take_profit_price - pos.entry_price;
+                                                if d_0 > 0.0 {
+                                                    let q_t = (close_price - pos.entry_price) / d_0;
+                                                    if q_t > pos.max_progress {
+                                                        pos.max_progress = q_t;
+                                                        pos.max_favorable_price = close_price;
+                                                    }
+
+                                                    // Arm Profit Protection once trade covers >= 75% of target
+                                                    // Trigger profit-locked exit if price retraces by 20% giveback
+                                                    let q_be = 0.15; // covers ~15-20 bps roundtrip fees + slippage
+                                                    if pos.max_progress >= 0.75 && q_t <= f64::max(q_be, pos.max_progress - 0.20) {
+                                                        giveback_triggered = true;
+                                                    }
+
+                                                    // -------------------------------------------------------------
+                                                    // One-Way Adaptive Downward Ratchet (Causal Live Mean Tracking)
+                                                    // -------------------------------------------------------------
+                                                    if let Some(ref th) = thresholds_opt {
+                                                        let live_mu = th.exit_long;
+                                                        let eps_shave = (live_mu * 0.0005).max(0.02);
+                                                        let b_cand = live_mu - eps_shave;
+                                                        let p_min = pos.entry_price * 1.0020; // Economic floor: >= 20 bps gross profit
+                                                        let delta_reprice = (pos.entry_price * 0.0005).max(0.10 * d_0).max(0.03);
+
+                                                        if b_cand <= pos.effective_tp - delta_reprice && b_cand >= p_min {
+                                                            pos.candidate_lower_count += 1;
+                                                            let now_ms = chrono::Utc::now().timestamp_millis();
+                                                            let cooldown_ok = (now_ms - pos.last_reprice_time) >= 180_000; // 3 min
+                                                            if pos.candidate_lower_count >= 3 && cooldown_ok && pos.reprice_count < 3 {
+                                                                should_reprice = true;
+                                                                new_reprice_target = b_cand;
+                                                                reprice_qty = pos.amount;
+                                                                old_tp_order_id = pos.tp_order_id.clone();
+                                                                pos.effective_tp = b_cand;
+                                                                pos.last_reprice_time = now_ms;
+                                                                pos.reprice_count += 1;
+                                                                pos.candidate_lower_count = 0;
+                                                            }
+                                                        } else if b_cand > pos.effective_tp {
+                                                            // Never ratchet upward! Reset persistence count
+                                                            pos.candidate_lower_count = 0;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    let _ = crate::state::save_state(&state_path_clone, &state_lock);
+
+                                    // Handle Adaptive One-Way Reprice Execution
+                                    if should_reprice && new_reprice_target > 0.0 && reprice_qty > 0.0 {
+                                        let rounded_target = (new_reprice_target * 100.0).round() / 100.0;
+                                        println!("🔄 [ONE-WAY RATCHET REPRICE] {} live mean dropped. Repricing TP order to ${:.2} (Attempt)...", 
+                                                 symbol_clone, rounded_target);
+                                        if !old_tp_order_id.is_empty() {
+                                            let _ = binance_clone.cancel_order(&symbol_clone, &old_tp_order_id).await;
+                                        }
+                                        match binance_clone.create_limit_sell(&symbol_clone, reprice_qty, rounded_target).await {
+                                            Ok(sell_res) => {
+                                                let new_tp_id = sell_res.get("orderId").and_then(|id| {
+                                                    if id.is_u64() { Some(id.as_u64().unwrap().to_string()) }
+                                                    else if id.is_string() { Some(id.as_str().unwrap().to_string()) }
+                                                    else { None }
+                                                }).unwrap_or_default();
+                                                if !new_tp_id.is_empty() {
+                                                    if let Some(p) = state_lock.get_mut(&symbol_clone) {
+                                                        p.tp_order_id = new_tp_id;
+                                                        p.take_profit_price = rounded_target;
+                                                        let _ = crate::state::save_state(&state_path_clone, &state_lock);
+                                                    }
+                                                    let reprice_msg = format!("🔄 **TP ADAPTIVELY REPRICED:** {}\n**New Target:** ${:.2}\n**Live Mean Ratchet Active**", symbol_clone, rounded_target);
+                                                    crate::discord::send_alert(discord_clone.as_deref(), &reprice_msg).await;
+                                                }
+                                            }
+                                            Err(e) => {
+                                                eprintln!("❌ [REPRICE FAILED] Could not replace TP order for {}: {}", symbol_clone, e);
                                             }
                                         }
                                     }
@@ -412,6 +515,16 @@ async fn main() {
                                     if entry_ttl_expired {
                                         // ⏱️ ENTRY TTL EXPIRED: Unfilled resting maker order cancelled after 5 minutes
                                         println!("⏱️ [ENTRY TTL EXPIRED] Resting limit buy for {} unfilled after {:.1}m. Cancelling order to release cluster.", symbol_clone, elapsed_mins);
+                                        let _ = emergency_flatten(&state_path_clone, &binance_clone, &mut state_lock, &symbol_clone, discord_clone.clone()).await;
+                                    } else if giveback_triggered {
+                                        // 🏆 PROFIT RATCHET EXECUTED: 20% Giveback from peak progress triggered
+                                        let peak_prog = state_lock.get(&symbol_clone).map(|p| p.max_progress * 100.0).unwrap_or(0.0);
+                                        let ent_px = state_lock.get(&symbol_clone).map(|p| p.entry_price).unwrap_or(0.0);
+                                        println!("🏆 [PROFIT RATCHET EXECUTED] {} peak progress was {:.1}%. Retracement triggered 20% giveback exit at ${:.2}. Banking profit!", 
+                                                 symbol_clone, peak_prog, close_price);
+                                        let ratchet_msg = format!("🏆 **PROFIT RATCHET EXECUTED:** {} reached {:.1}% peak progress. Retracement triggered profit lock at ${:.2} (Entry: ${:.2}). Neutralizing risk.", 
+                                                                 symbol_clone, peak_prog, close_price, ent_px);
+                                        crate::discord::send_alert(discord_clone.as_deref(), &ratchet_msg).await;
                                         let _ = emergency_flatten(&state_path_clone, &binance_clone, &mut state_lock, &symbol_clone, discord_clone.clone()).await;
                                     } else if is_shock {
                                         // 🚨 SHOCK CASCADE ON ACTIVE POSITION
@@ -528,24 +641,26 @@ async fn main() {
                                         }
                                     } 
                                     else if is_eligible {
-                                        // Stage 1: Arm signal when price touches or dips below threshold
-                                        if close_price <= thresholds.entry_long {
-                                            let baseline_arm = rolling_closes.iter().sum::<f64>() / rolling_closes.len() as f64;
-                                            let unitless_entry_dev = (thresholds.entry_long / baseline_arm).ln();
-                                            let unitless_exit_dev = (thresholds.exit_long / baseline_arm).ln();
+                                        if let Some(ref thresholds) = thresholds_opt {
+                                            // Stage 1: Arm signal when price touches or dips below threshold
+                                            if close_price <= thresholds.entry_long {
+                                                let baseline_arm = rolling_closes.iter().sum::<f64>() / rolling_closes.len() as f64;
+                                                let unitless_entry_dev = (thresholds.entry_long / baseline_arm).ln();
+                                                let unitless_exit_dev = (thresholds.exit_long / baseline_arm).ln();
 
-                                            armed_state.is_armed = true;
-                                            armed_state.armed_at = Some(chrono::Utc::now().to_rfc3339());
-                                            armed_state.entry_threshold = thresholds.entry_long;
-                                            armed_state.exit_threshold = thresholds.exit_long;
-                                            armed_state.unitless_entry_dev = unitless_entry_dev;
-                                            armed_state.unitless_exit_dev = unitless_exit_dev;
-                                            armed_state.half_life_m = half_life_m;
-                                            armed_state.lowest_price = close_price;
-                                            save_armed_signal(&arm_path_clone, &armed_state);
+                                                armed_state.is_armed = true;
+                                                armed_state.armed_at = Some(chrono::Utc::now().to_rfc3339());
+                                                armed_state.entry_threshold = thresholds.entry_long;
+                                                armed_state.exit_threshold = thresholds.exit_long;
+                                                armed_state.unitless_entry_dev = unitless_entry_dev;
+                                                armed_state.unitless_exit_dev = unitless_exit_dev;
+                                                armed_state.half_life_m = half_life_m;
+                                                armed_state.lowest_price = close_price;
+                                                save_armed_signal(&arm_path_clone, &armed_state);
 
-                                            println!("🟡 [SIGNAL ARMED] {} touched entry threshold (${:.2} <= ${:.2}). Signal armed (Unitless Exit dev: {:.4}, t_half: {:.1}m). Waiting for green reversal bounce confirmation before buying.", 
-                                                     symbol_clone, close_price, thresholds.entry_long, unitless_exit_dev, half_life_m);
+                                                println!("🟡 [SIGNAL ARMED] {} touched entry threshold (${:.2} <= ${:.2}). Signal armed (Unitless Exit dev: {:.4}, t_half: {:.1}m). Waiting for green reversal bounce confirmation before buying.", 
+                                                         symbol_clone, close_price, thresholds.entry_long, unitless_exit_dev, half_life_m);
+                                            }
                                         }
                                     }
                                 }

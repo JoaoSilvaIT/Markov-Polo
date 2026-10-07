@@ -1,0 +1,7 @@
+target/
+.env
+*.json
+*.lock
+!Cargo.lock
+!hl_portfolio_cluster.lock
+*.log

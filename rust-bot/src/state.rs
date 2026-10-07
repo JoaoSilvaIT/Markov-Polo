@@ -26,6 +26,18 @@ pub struct PositionState {
     pub half_life_minutes: f64,
     #[serde(default)]
     pub client_order_id: String,
+    #[serde(default)]
+    pub max_progress: f64,
+    #[serde(default)]
+    pub max_favorable_price: f64,
+    #[serde(default)]
+    pub effective_tp: f64,
+    #[serde(default)]
+    pub last_reprice_time: i64,
+    #[serde(default)]
+    pub reprice_count: u32,
+    #[serde(default)]
+    pub candidate_lower_count: u32,
 }
 
 pub type StateMap = HashMap<String, PositionState>;
