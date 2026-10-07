@@ -147,6 +147,30 @@ pub fn calculate_optimal_thresholds(params: &OuParameters, transaction_cost: f64
     }
 }
 
+/// Computes the robust Median Absolute Deviation (MAD) of a return series,
+/// scaled by 1.4826 for normal consistency and floored at 1e-5.
+pub fn calculate_mad_sigma(returns: &[f64]) -> f64 {
+    if returns.is_empty() {
+        return 1e-5;
+    }
+    let mut sorted_r = returns.to_vec();
+    sorted_r.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = sorted_r.len() / 2;
+    let med_r = if sorted_r.len() % 2 == 0 {
+        (sorted_r[mid - 1] + sorted_r[mid]) / 2.0
+    } else {
+        sorted_r[mid]
+    };
+    let mut abs_devs: Vec<f64> = sorted_r.iter().map(|&r| (r - med_r).abs()).collect();
+    abs_devs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let med_dev = if abs_devs.len() % 2 == 0 {
+        (abs_devs[mid - 1] + abs_devs[mid]) / 2.0
+    } else {
+        abs_devs[mid]
+    };
+    (1.4826 * med_dev).max(1e-5)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +208,19 @@ mod tests {
         assert!(thresholds.entry_long < params.mu);
         assert_eq!(thresholds.exit_long, params.mu);
         assert!(params.mu - thresholds.entry_long >= tx_cost * 2.5);
+    }
+
+    #[test]
+    fn test_mad_sigma_robust_against_outliers() {
+        // Normal returns with low variance
+        let mut returns = vec![0.001, -0.001, 0.0012, -0.0009, 0.0008, -0.0011, 0.0002];
+        let sigma_base = calculate_mad_sigma(&returns);
+        
+        // Add an extreme outlier flash-crash return (-5%)
+        returns.push(-0.05);
+        let sigma_with_outlier = calculate_mad_sigma(&returns);
+        
+        // MAD should be virtually unaffected by a single outlier, preventing denominator inflation
+        assert!((sigma_with_outlier - sigma_base).abs() < 0.0005);
     }
 }

@@ -104,6 +104,10 @@ pub struct ArmedSignal {
     pub is_armed: bool,
     pub armed_at: Option<String>,
     pub entry_threshold: f64,
+    #[serde(default)]
+    pub exit_threshold: f64,
+    #[serde(default)]
+    pub half_life_m: f64,
     pub lowest_price: f64,
 }
 
@@ -125,8 +129,96 @@ pub fn save_armed_signal(file_path: &str, armed: &ArmedSignal) {
     }
 }
 
-/// Checks if any other symbol in the portfolio cluster currently has an active open position
+pub const CLUSTER_LOCK_FILE: &str = "binance_portfolio_cluster.lock";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterLease {
+    pub owner: String,
+    pub acquired_at: String,
+    pub expires_at: String,
+}
+
+/// Atomically attempts to acquire the portfolio cluster lease via POSIX O_CREAT|O_EXCL
+pub fn try_acquire_cluster_lease(symbol: &str, duration_secs: i64) -> bool {
+    let now = chrono::Utc::now();
+    let expires = now + chrono::Duration::seconds(duration_secs);
+
+    if std::path::Path::new(CLUSTER_LOCK_FILE).exists() {
+        if let Ok(content) = fs::read_to_string(CLUSTER_LOCK_FILE) {
+            if let Ok(lease) = serde_json::from_str::<ClusterLease>(&content) {
+                if lease.owner == symbol {
+                    // Already owned by this symbol, refresh expiration
+                    let new_lease = ClusterLease {
+                        owner: symbol.to_string(),
+                        acquired_at: lease.acquired_at,
+                        expires_at: expires.to_rfc3339(),
+                    };
+                    let _ = fs::write(CLUSTER_LOCK_FILE, serde_json::to_string_pretty(&new_lease).unwrap_or_default());
+                    return true;
+                }
+                if let Ok(exp_dt) = chrono::DateTime::parse_from_rfc3339(&lease.expires_at) {
+                    if now < exp_dt.with_timezone(&chrono::Utc) {
+                        // Active lease held by another symbol
+                        return false;
+                    }
+                }
+            }
+        }
+        // Stale or expired lock file; clean it up
+        let _ = fs::remove_file(CLUSTER_LOCK_FILE);
+    }
+
+    let lease = ClusterLease {
+        owner: symbol.to_string(),
+        acquired_at: now.to_rfc3339(),
+        expires_at: expires.to_rfc3339(),
+    };
+    let content = match serde_json::to_string_pretty(&lease) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    match OpenOptions::new().write(true).create_new(true).open(CLUSTER_LOCK_FILE) {
+        Ok(mut f) => {
+            let _ = f.write_all(content.as_bytes());
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Releases the portfolio cluster lease if held by symbol
+pub fn release_cluster_lease(symbol: &str) {
+    if std::path::Path::new(CLUSTER_LOCK_FILE).exists() {
+        if let Ok(content) = fs::read_to_string(CLUSTER_LOCK_FILE) {
+            if let Ok(lease) = serde_json::from_str::<ClusterLease>(&content) {
+                if lease.owner == symbol {
+                    let _ = fs::remove_file(CLUSTER_LOCK_FILE);
+                }
+            }
+        }
+    }
+}
+
+/// Checks if any other symbol in the portfolio cluster currently has an active open position or active atomic lease
 pub fn has_active_cluster_position(current_symbol: &str) -> Option<String> {
+    let now = chrono::Utc::now();
+    // 1. Check atomic lease lock
+    if std::path::Path::new(CLUSTER_LOCK_FILE).exists() {
+        if let Ok(content) = fs::read_to_string(CLUSTER_LOCK_FILE) {
+            if let Ok(lease) = serde_json::from_str::<ClusterLease>(&content) {
+                if lease.owner != current_symbol {
+                    if let Ok(exp_dt) = chrono::DateTime::parse_from_rfc3339(&lease.expires_at) {
+                        if now < exp_dt.with_timezone(&chrono::Utc) {
+                            return Some(lease.owner);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Check position state files across all symbols
     let all_symbols = ["BTCUSDC", "ETHUSDC", "SOLUSDC"];
     for sym in &all_symbols {
         if *sym == current_symbol {
@@ -258,8 +350,11 @@ mod tests {
         arm.is_armed = true;
         arm.armed_at = Some(chrono::Utc::now().to_rfc3339());
         arm.entry_threshold = 120.26;
+        arm.exit_threshold = 122.50;
+        arm.half_life_m = 35.0;
         arm.lowest_price = 120.14;
         assert_eq!(arm.is_armed, true);
+        assert_eq!(arm.exit_threshold, 122.50);
 
         // Stage 2: Deeper dip updates lowest price
         if 119.80 < arm.lowest_price {
@@ -270,5 +365,22 @@ mod tests {
         // Stage 3: Disarm on submit
         arm.is_armed = false;
         assert_eq!(arm.is_armed, false);
+    }
+
+    #[test]
+    fn test_atomic_cluster_lease() {
+        let _ = fs::remove_file(CLUSTER_LOCK_FILE);
+        // Symbol A acquires lease
+        assert!(try_acquire_cluster_lease("BTCUSDC", 60));
+        // Symbol B fails to acquire lease
+        assert!(!try_acquire_cluster_lease("ETHUSDC", 60));
+        // Symbol A has active cluster position from ETH's perspective
+        assert_eq!(has_active_cluster_position("ETHUSDC"), Some("BTCUSDC".to_string()));
+        // Symbol A releases lease
+        release_cluster_lease("BTCUSDC");
+        // Symbol B can now acquire lease
+        assert!(try_acquire_cluster_lease("ETHUSDC", 60));
+        release_cluster_lease("ETHUSDC");
+        let _ = fs::remove_file(CLUSTER_LOCK_FILE);
     }
 }

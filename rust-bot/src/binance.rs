@@ -54,6 +54,14 @@ impl BinanceClient {
         Ok(price)
     }
 
+    pub async fn fetch_book_ticker(&self, symbol: &str) -> BinanceResult<(f64, f64)> {
+        let url = format!("https://api.binance.com/api/v3/ticker/bookTicker?symbol={}", symbol.replace("/", ""));
+        let res: Value = self.client.get(&url).send().await?.json().await?;
+        let bid = res["bidPrice"].as_str().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        let ask = res["askPrice"].as_str().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        Ok((bid, ask))
+    }
+
     pub async fn fetch_funding_rate(&self, symbol: &str) -> BinanceResult<f64> {
         let perp_symbol = symbol.replace("/", "").replace("USDC", "USDT");
         let url = format!("https://fapi.binance.com/fapi/v1/premiumIndex?symbol={}", perp_symbol);
