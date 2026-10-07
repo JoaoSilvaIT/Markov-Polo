@@ -52,8 +52,10 @@ pub async fn place_ou_limit_buy(
     let amount_to_buy = position_size_usdc / post_only_price;
     let amount_f = quantize_lot_size(amount_to_buy, precision);
     
+    let client_order_id = format!("{}_{}", symbol.replace("/", ""), Utc::now().timestamp_millis());
+
     // We place a LIMIT_MAKER order to strictly capture the Maker rebate and avoid taker fees.
-    let buy_res = match client.create_limit_buy(symbol, amount_f, post_only_price).await {
+    let buy_res = match client.create_limit_buy(symbol, amount_f, post_only_price, Some(&client_order_id)).await {
         Ok(res) => res,
         Err(e) => {
             // Release the cluster lease on rejection to avoid deadlock
@@ -87,6 +89,7 @@ pub async fn place_ou_limit_buy(
         risk_amount_usdc: position_size_usdc,
         is_filled: false,
         half_life_minutes,
+        client_order_id,
     };
 
     state.insert(symbol.to_string(), new_state.clone());
@@ -116,6 +119,7 @@ pub async fn emergency_flatten(
 
     // Case 1: Check if the entry order was resting and never filled
     let is_position_filled = pos.is_filled || !pos.tp_order_id.is_empty();
+    let mut fill_qty = pos.amount;
 
     if !is_position_filled {
         // Double check exchange status of the entry limit buy order
@@ -136,6 +140,10 @@ pub async fn emergency_flatten(
             crate::discord::send_alert(discord_url.as_deref(), &msg).await;
             return Ok(());
         }
+
+        if executed_qty > 0.0 {
+            fill_qty = executed_qty;
+        }
     }
 
     // Case 2: The position was filled (or partially executed). We must flatten risk.
@@ -151,13 +159,21 @@ pub async fn emergency_flatten(
         let _ = client.cancel_order(symbol, &pos.tp_order_id).await;
     }
 
-    // 2. Fetch actual free base asset balance in the account
+    // 2. Fetch actual free base asset balance in the account (fail-closed: never treat API failure as zero inventory)
     let base_asset = symbol.replace("USDC", "").replace("/", "");
-    let actual_balance = client.fetch_free_balance(&base_asset).await.unwrap_or(0.0);
+    let actual_balance = match client.fetch_free_balance(&base_asset).await {
+        Ok(bal) => bal,
+        Err(e) => {
+            eprintln!("❌ [EMERGENCY FLATTEN] Failed to fetch free balance for {}: {}. Preserving state and lease to prevent orphan inventory.", base_asset, e);
+            let err_msg = format!("❌ **BALANCE FETCH FAILED DURING FLATTEN:** Failed to fetch free balance for {}: {}. State preserved.", base_asset, e);
+            crate::discord::send_alert(discord_url.as_deref(), &err_msg).await;
+            return Err(e.to_string());
+        }
+    };
 
-    // 3. Determine sellable quantity (capped at position amount to never dump outside inventory)
+    // 3. Determine sellable quantity (capped at strategy fill amount to never dump outside inventory)
     let precision = get_symbol_lot_precision(symbol);
-    let sell_target = f64::min(pos.amount, actual_balance);
+    let sell_target = f64::min(fill_qty, actual_balance);
     let amount_f = quantize_lot_size(sell_target, precision);
 
     if amount_f > 0.0 {

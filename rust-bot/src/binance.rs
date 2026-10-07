@@ -131,6 +131,23 @@ impl BinanceClient {
         Ok(res)
     }
 
+    pub async fn fetch_order_by_client_id(&self, symbol: &str, client_order_id: &str) -> BinanceResult<Value> {
+        let mut params = vec![
+            ("symbol", symbol.replace("/", "")),
+            ("origClientOrderId", client_order_id.to_string()),
+        ];
+        let query = self.sign_request(&mut params);
+        let url = format!("https://api.binance.com/api/v3/order?{}", query);
+        
+        let res: Value = self.client.get(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send().await?.json().await?;
+        if res.get("code").is_some() {
+            return Err(format!("Binance API Error: {}", res).into());
+        }
+        Ok(res)
+    }
+
     pub async fn create_market_buy(&self, symbol: &str, quantity: f64) -> BinanceResult<Value> {
         let mut params = vec![
             ("symbol", symbol.replace("/", "")),
@@ -229,7 +246,7 @@ impl BinanceClient {
         Ok(res)
     }
 
-    pub async fn create_limit_buy(&self, symbol: &str, quantity: f64, price: f64) -> BinanceResult<Value> {
+    pub async fn create_limit_buy(&self, symbol: &str, quantity: f64, price: f64, client_order_id: Option<&str>) -> BinanceResult<Value> {
         // Enforce LIMIT_MAKER (Post-Only) to strictly capture maker rebates and prevent taker fees.
         // LIMIT_MAKER rejects timeInForce parameter on Binance Spot.
         let mut params = vec![
@@ -239,6 +256,9 @@ impl BinanceClient {
             ("quantity", quantity.to_string()),
             ("price", format!("{:.2}", price)),
         ];
+        if let Some(cid) = client_order_id {
+            params.push(("newClientOrderId", cid.to_string()));
+        }
         
         let query = self.sign_request(&mut params);
         let url = format!("https://api.binance.com/api/v3/order?{}", query);

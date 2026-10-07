@@ -24,6 +24,8 @@ pub struct PositionState {
     pub is_filled: bool,
     #[serde(default)]
     pub half_life_minutes: f64,
+    #[serde(default)]
+    pub client_order_id: String,
 }
 
 pub type StateMap = HashMap<String, PositionState>;
@@ -213,8 +215,12 @@ pub fn refresh_cluster_lease(symbol: &str, duration_secs: i64) -> bool {
             if let Ok(mut lease) = serde_json::from_str::<ClusterLease>(&content) {
                 if lease.owner == symbol {
                     lease.expires_at = expires.to_rfc3339();
-                    let _ = fs::write(CLUSTER_LOCK_FILE, serde_json::to_string_pretty(&lease).unwrap_or_default());
-                    return true;
+                    if let Ok(pretty) = serde_json::to_string_pretty(&lease) {
+                        let tmp = format!("{}.tmp_{}", CLUSTER_LOCK_FILE, symbol);
+                        let _ = fs::write(&tmp, pretty);
+                        let _ = fs::rename(&tmp, CLUSTER_LOCK_FILE);
+                        return true;
+                    }
                 }
             }
         }

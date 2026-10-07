@@ -171,6 +171,16 @@ pub fn calculate_mad_sigma(returns: &[f64]) -> f64 {
     (1.4826 * med_dev).max(1e-5)
 }
 
+/// Computes the net expected edge in basis points between entry and exit price:
+/// edge_bps = ln(exit_target / entry_price) * 10,000
+pub fn calculate_net_edge_bps(entry_price: f64, exit_target: f64) -> f64 {
+    if entry_price > 0.0 && exit_target > entry_price {
+        (exit_target / entry_price).ln() * 10_000.0
+    } else {
+        0.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,5 +232,21 @@ mod tests {
         
         // MAD should be virtually unaffected by a single outlier, preventing denominator inflation
         assert!((sigma_with_outlier - sigma_base).abs() < 0.0005);
+    }
+
+    #[test]
+    fn test_calculate_net_edge_bps() {
+        // Less than 25 bps hurdle: 20 bps
+        let low_edge = calculate_net_edge_bps(100.0, 100.20);
+        assert!(low_edge < 25.0);
+        assert!((low_edge - 19.98).abs() < 0.1);
+
+        // Above 25 bps hurdle: 35 bps
+        let good_edge = calculate_net_edge_bps(100.0, 100.35);
+        assert!(good_edge >= 25.0);
+
+        // Inverted or flat price: 0 bps
+        assert_eq!(calculate_net_edge_bps(100.0, 99.0), 0.0);
+        assert_eq!(calculate_net_edge_bps(100.0, 100.0), 0.0);
     }
 }

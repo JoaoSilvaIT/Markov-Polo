@@ -21,7 +21,7 @@ mod ou_process;
 use crate::config::Config;
 use crate::binance::{BinanceClient, get_symbol_lot_precision, quantize_lot_size};
 use crate::hmm::{GaussianHMM, train_hmm_offline};
-use crate::ou_process::{estimate_ou_parameters, calculate_optimal_thresholds, calculate_mad_sigma};
+use crate::ou_process::{estimate_ou_parameters, calculate_optimal_thresholds, calculate_mad_sigma, calculate_net_edge_bps};
 use crate::order::{place_ou_limit_buy, emergency_flatten};
 use crate::state::{StateMap, load_state, load_circuit_breaker, save_circuit_breaker, load_armed_signal, save_armed_signal, has_active_cluster_position};
 
@@ -127,20 +127,59 @@ async fn main() {
                 // Scenario 1: Entry order is pending fill, TP not placed yet
                 if pos.tp_order_id.is_empty() && !pos.order_id.is_empty() {
                     if let Ok(order_info) = watcher_binance.fetch_order(&watcher_symbol, &pos.order_id).await {
-                        if order_info["status"] == "FILLED" {
-                            println!("🟢 [FAST-SENTINEL] Entry Filled for {}! Calculating net sellable quantity and placing resting Take Profit at ${:.2}", watcher_symbol, pos.take_profit_price);
-                            
+                        let status = order_info.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                        let executed_qty = order_info.get("executedQty")
+                            .and_then(|q| q.as_str())
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+
+                        let mut should_place_tp = false;
+                        let mut final_fill_qty = executed_qty;
+
+                        if status == "FILLED" {
+                            println!("🟢 [FAST-SENTINEL] Entry Filled for {}! (Qty: {:.5}) Placing resting Take Profit at ${:.2}", watcher_symbol, executed_qty, pos.take_profit_price);
+                            should_place_tp = true;
+                            final_fill_qty = if executed_qty > 0.0 { executed_qty } else { pos.amount };
+                        } else if status == "PARTIALLY_FILLED" {
+                            let elapsed_secs = chrono::DateTime::parse_from_rfc3339(&pos.opened_at)
+                                .map(|dt| (chrono::Utc::now() - dt.with_timezone(&chrono::Utc)).num_seconds())
+                                .unwrap_or(0);
+
+                            if elapsed_secs >= 60 {
+                                println!("⏱️ [FAST-SENTINEL] Entry for {} partially filled ({:.5} / {:.5}) after {}s (>= 60s). Cancelling unfilled remainder and placing TP.",
+                                         watcher_symbol, executed_qty, pos.amount, elapsed_secs);
+                                let _ = watcher_binance.cancel_order(&watcher_symbol, &pos.order_id).await;
+                                if let Ok(cancel_info) = watcher_binance.fetch_order(&watcher_symbol, &pos.order_id).await {
+                                    if let Some(post_cancel_qty) = cancel_info.get("executedQty").and_then(|q| q.as_str()).and_then(|s| s.parse::<f64>().ok()) {
+                                        final_fill_qty = post_cancel_qty;
+                                    }
+                                }
+                                should_place_tp = true;
+                            }
+                        } else if status == "CANCELED" || status == "EXPIRED" {
+                            if executed_qty > 0.0 {
+                                println!("⚠️ [FAST-SENTINEL] Entry for {} was {} with partial fills ({:.5}). Placing TP.", watcher_symbol, status, executed_qty);
+                                should_place_tp = true;
+                            } else {
+                                println!("⚪ [FAST-SENTINEL] Entry for {} was {} with 0 fills. Cleaning up state.", watcher_symbol, status);
+                                state_lock.remove(&watcher_symbol);
+                                let _ = crate::state::save_state(&watcher_state_path, &state_lock);
+                                crate::state::release_cluster_lease(&watcher_symbol);
+                            }
+                        } else if status == "REJECTED" {
+                            println!("❌ [FAST-SENTINEL] Entry for {} was REJECTED. Cleaning up state.", watcher_symbol);
+                            state_lock.remove(&watcher_symbol);
+                            let _ = crate::state::save_state(&watcher_state_path, &state_lock);
+                            crate::state::release_cluster_lease(&watcher_symbol);
+                        }
+
+                        if should_place_tp && final_fill_qty > 0.0 {
                             // Reconcile actual executed quantity against base asset free balance to defeat the gross-vs-net fee trap
-                            let executed_qty = order_info.get("executedQty")
-                                .and_then(|q| q.as_str())
-                                .and_then(|s| s.parse::<f64>().ok())
-                                .unwrap_or(pos.amount);
-                            
                             let base_asset = watcher_symbol.replace("USDC", "").replace("/", "");
-                            let free_balance = watcher_binance.fetch_free_balance(&base_asset).await.unwrap_or(executed_qty);
+                            let free_balance = watcher_binance.fetch_free_balance(&base_asset).await.unwrap_or(final_fill_qty);
                             
                             let precision = get_symbol_lot_precision(&watcher_symbol);
-                            let sell_target = f64::min(executed_qty, free_balance);
+                            let sell_target = f64::min(final_fill_qty, free_balance);
                             let net_sell_amount = quantize_lot_size(sell_target, precision);
 
                             if net_sell_amount > 0.0 {
@@ -153,7 +192,7 @@ async fn main() {
                                                 else { None }
                                             }).unwrap_or_default();
 
-                                             if !tp_id.is_empty() {
+                                            if !tp_id.is_empty() {
                                                 p.tp_order_id = tp_id;
                                                 p.amount = net_sell_amount;
                                                 p.is_filled = true;
@@ -168,6 +207,11 @@ async fn main() {
                                         eprintln!("❌ [FAST-SENTINEL] Failed to place TP limit sell for {}: {}", watcher_symbol, e);
                                     }
                                 }
+                            } else {
+                                println!("⚠️ [FAST-SENTINEL] Fill quantity {:.5} on {} is below min lot size. Releasing state.", final_fill_qty, watcher_symbol);
+                                state_lock.remove(&watcher_symbol);
+                                let _ = crate::state::save_state(&watcher_state_path, &state_lock);
+                                crate::state::release_cluster_lease(&watcher_symbol);
                             }
                         }
                     }
@@ -334,7 +378,9 @@ async fn main() {
                                     }
 
                                     // Continuously refresh cluster lease while position is active
-                                    let _ = crate::state::refresh_cluster_lease(&symbol_clone, 3600);
+                                    if !crate::state::refresh_cluster_lease(&symbol_clone, 3600) {
+                                        eprintln!("⚠️ [LEASE REFRESH] Could not refresh cluster lease for {}. Re-evaluating lease lock.", symbol_clone);
+                                    }
 
                                     // Check resting entry TTL (5m) and filled position 2 * t_half Time-Stop
                                     let mut entry_ttl_expired = false;
@@ -448,25 +494,35 @@ async fn main() {
                                             let still_below_exit = close_price < dynamic_exit_target;
 
                                             if is_green_bounce && bounced_off_low && still_below_exit {
-                                                println!("🟢 [REVERSAL CONFIRMED] {} reversed from dip low ${:.2} up to ${:.2} (prev: ${:.2})! Submitting maker buy (Live SMA: ${:.2}, Dynamic TP μ: ${:.2}).", 
-                                                         symbol_clone, armed_state.lowest_price, close_price, hist_last_price, live_sma, dynamic_exit_target);
-                                                
-                                                let frozen_hl = armed_state.half_life_m;
-                                                armed_state.is_armed = false;
-                                                save_armed_signal(&arm_path_clone, &armed_state);
-
                                                 let entry_limit_price = f64::min(close_price, dynamic_entry_cap);
-                                                if let Err(e) = place_ou_limit_buy(
-                                                    &state_path_clone,
-                                                    &binance_clone, 
-                                                    &mut state_lock, 
-                                                    &symbol_clone, 
-                                                    entry_limit_price, 
-                                                    dynamic_exit_target, 
-                                                    frozen_hl, 
-                                                    discord_clone
-                                                ).await {
-                                                    eprintln!("❌ [ORDER ERROR] Failed to dispatch limit maker buy for {}: {}", symbol_clone, e);
+                                                let net_edge_bps = calculate_net_edge_bps(entry_limit_price, dynamic_exit_target);
+
+                                                // Economic edge hurdle: ensure net expected return >= 25 bps (c_roundtrip ~ 15-20 bps + safety margin)
+                                                if net_edge_bps < 25.0 {
+                                                    println!("⚠️ [ECONOMIC HURDLE VETO] Net edge too narrow for {}: {:.1} bps (< 25.0 bps hurdle). Dynamic exit: ${:.2}, Entry limit: ${:.2}. Disarming signal.", 
+                                                             symbol_clone, net_edge_bps, dynamic_exit_target, entry_limit_price);
+                                                    armed_state.is_armed = false;
+                                                    save_armed_signal(&arm_path_clone, &armed_state);
+                                                } else {
+                                                    println!("🟢 [REVERSAL CONFIRMED] {} reversed from dip low ${:.2} up to ${:.2} (prev: ${:.2})! Edge: {:.1} bps. Submitting maker buy (Live SMA: ${:.2}, Dynamic TP μ: ${:.2}).", 
+                                                             symbol_clone, armed_state.lowest_price, close_price, hist_last_price, net_edge_bps, live_sma, dynamic_exit_target);
+                                                    
+                                                    let frozen_hl = armed_state.half_life_m;
+                                                    armed_state.is_armed = false;
+                                                    save_armed_signal(&arm_path_clone, &armed_state);
+
+                                                    if let Err(e) = place_ou_limit_buy(
+                                                        &state_path_clone,
+                                                        &binance_clone, 
+                                                        &mut state_lock, 
+                                                        &symbol_clone, 
+                                                        entry_limit_price, 
+                                                        dynamic_exit_target, 
+                                                        frozen_hl, 
+                                                        discord_clone
+                                                    ).await {
+                                                        eprintln!("❌ [ORDER ERROR] Failed to dispatch limit maker buy for {}: {}", symbol_clone, e);
+                                                    }
                                                 }
                                             }
                                         }
