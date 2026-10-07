@@ -129,6 +129,9 @@ pub async fn place_ou_maker_entry(
         last_reprice_time: Utc::now().timestamp_millis(),
         reprice_count: 0,
         candidate_lower_count: 0,
+        engine_type: "EngineA".to_string(),
+        chandelier_stop: 0.0,
+        current_atr: 0.0,
     };
 
     state.insert(symbol.to_string(), new_state.clone());

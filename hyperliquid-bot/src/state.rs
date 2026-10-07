@@ -59,6 +59,16 @@ pub struct PositionState {
     pub reprice_count: u32,
     #[serde(default)]
     pub candidate_lower_count: u32,
+    #[serde(default = "default_engine_owner")]
+    pub engine_type: String,
+    #[serde(default)]
+    pub chandelier_stop: f64,
+    #[serde(default)]
+    pub current_atr: f64,
+}
+
+pub fn default_engine_owner() -> String {
+    "EngineA".to_string()
 }
 
 fn default_side() -> String {
@@ -176,12 +186,18 @@ pub fn save_armed_signal(file_path: &str, armed: &ArmedSignal) {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterLease {
     pub owner: String,
+    #[serde(default = "default_engine_owner")]
+    pub engine_owner: String,
     pub acquired_at: String,
     pub expires_at: String,
 }
 
 /// Atomically attempts to acquire the portfolio cluster lease via POSIX O_CREAT|O_EXCL
 pub fn try_acquire_cluster_lease(symbol: &str, duration_secs: i64) -> bool {
+    try_acquire_cluster_lease_for_engine(symbol, "EngineA", duration_secs)
+}
+
+pub fn try_acquire_cluster_lease_for_engine(symbol: &str, engine_owner: &str, duration_secs: i64) -> bool {
     let now = chrono::Utc::now();
     let expires = now + chrono::Duration::seconds(duration_secs);
 
@@ -191,6 +207,7 @@ pub fn try_acquire_cluster_lease(symbol: &str, duration_secs: i64) -> bool {
                 if lease.owner == symbol {
                     let new_lease = ClusterLease {
                         owner: symbol.to_string(),
+                        engine_owner: engine_owner.to_string(),
                         acquired_at: lease.acquired_at,
                         expires_at: expires.to_rfc3339(),
                     };
@@ -224,6 +241,7 @@ pub fn try_acquire_cluster_lease(symbol: &str, duration_secs: i64) -> bool {
 
     let lease = ClusterLease {
         owner: symbol.to_string(),
+        engine_owner: engine_owner.to_string(),
         acquired_at: now.to_rfc3339(),
         expires_at: expires.to_rfc3339(),
     };

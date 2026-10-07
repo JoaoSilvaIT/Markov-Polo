@@ -7,15 +7,20 @@ use std::time::Duration;
 use tokio::sync::{mpsc::unbounded_channel, Mutex, RwLock};
 
 mod config;
+mod controller;
 mod discord;
 mod hmm;
 mod hyperliquid;
 mod order;
 mod ou_process;
 mod state;
+mod trend;
 
 use crate::config::Config;
-use crate::hmm::{train_hmm_offline, GaussianHMM};
+use crate::controller::{
+    load_controller_state, save_controller_state, ControllerMode,
+};
+use crate::hmm::{compute_hmm_posteriors, train_hmm_offline, GaussianHMM};
 use crate::hyperliquid::{
     cancel_order, fetch_sz_decimals_map, get_user_position, place_post_only_order, quantize_price,
 };
@@ -27,6 +32,11 @@ use crate::ou_process::{
 use crate::state::{
     has_active_cluster_position, load_armed_signal, load_circuit_breaker, load_state,
     release_cluster_lease, save_armed_signal, save_circuit_breaker, save_state, Side, StateMap,
+};
+use crate::trend::{
+    calculate_atr, calculate_donchian, calculate_obi_score, check_trend_alignment,
+    load_shadow_trade, record_shadow_entry, record_shadow_exit, save_shadow_trade, CandleBar,
+    ChandelierExitState, TrendAlignment,
 };
 
 #[tokio::main]
@@ -205,6 +215,55 @@ async fn main() {
         }
     }
 
+    // Pre-fill 15m historical candles for Trend Following & Donchian Breakouts
+    let mut rolling_15m_bars: Vec<CandleBar> = Vec::with_capacity(100);
+    println!(
+        "⏳ [INGESTION] Pre-filling 15m historical candles for {} via Hyperliquid REST...",
+        trading_symbol
+    );
+    let window_15m_start_ms = now_ms.saturating_sub(100 * 15 * 60 * 1000);
+    match info_client
+        .candles_snapshot(
+            trading_symbol.clone(),
+            "15m".to_string(),
+            window_15m_start_ms,
+            now_ms,
+        )
+        .await
+    {
+        Ok(candles) => {
+            for c in candles {
+                if let (Ok(open_f), Ok(high_f), Ok(low_f), Ok(close_f)) = (
+                    c.open.parse::<f64>(),
+                    c.high.parse::<f64>(),
+                    c.low.parse::<f64>(),
+                    c.close.parse::<f64>(),
+                ) {
+                    let vol_f = c.vlm.parse::<f64>().unwrap_or(0.0);
+                    rolling_15m_bars.push(CandleBar {
+                        time_open: c.time_open,
+                        open: open_f,
+                        high: high_f,
+                        low: low_f,
+                        close: close_f,
+                        volume: vol_f,
+                    });
+                }
+            }
+            println!(
+                "✅ [INGESTION] Successfully loaded {} historical 15m bars for {}.",
+                rolling_15m_bars.len(),
+                trading_symbol
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "❌ [INGESTION ERROR] Failed to fetch 15m candles for {}: {}",
+                trading_symbol, e
+            );
+        }
+    }
+
     crate::discord::send_alert(
         discord_url.as_deref(),
         &format!(
@@ -361,6 +420,12 @@ async fn main() {
     // HOT-PATH: WebSocket 1m Candle Ingestion & Bi-Directional O-U Execution
     // ------------------------------------------------------------------------
     let position_size_usdc = config.position_size_usdc;
+    let trend_engine_mode = config.trend_engine_mode.clone();
+    let trend_risk_fraction = config.trend_risk_fraction;
+    let donchian_period = config.donchian_period;
+    let chandelier_atr_mult = config.chandelier_atr_mult;
+    let mut controller = load_controller_state(&trading_symbol);
+    let mut current_15m_bar: Option<CandleBar> = None;
     let mut last_processed_open_ms = 0u64;
 
     loop {
@@ -396,9 +461,48 @@ async fn main() {
                 let candle = candle_msg.data;
                 let open_ms = candle.time_open;
                 let close_price = candle.close.parse::<f64>().unwrap_or(0.0);
+                let high_price = candle.high.parse::<f64>().unwrap_or(close_price);
+                let low_price = candle.low.parse::<f64>().unwrap_or(close_price);
+                let open_price = candle.open.parse::<f64>().unwrap_or(close_price);
+                let vol_val = candle.volume.parse::<f64>().unwrap_or(0.0);
 
                 // Detect completed 1-minute candle transitions
                 if last_processed_open_ms > 0 && open_ms > last_processed_open_ms && close_price > 0.0 {
+                    let candle_bucket_15m = (open_ms / (15 * 60 * 1000)) * (15 * 60 * 1000);
+                    let mut is_new_15m_bar = false;
+
+                    if let Some(ref mut cur_15m) = current_15m_bar {
+                        if cur_15m.time_open == candle_bucket_15m {
+                            cur_15m.high = cur_15m.high.max(high_price);
+                            cur_15m.low = cur_15m.low.min(low_price);
+                            cur_15m.close = close_price;
+                            cur_15m.volume += vol_val;
+                        } else {
+                            rolling_15m_bars.push(cur_15m.clone());
+                            if rolling_15m_bars.len() > 100 {
+                                rolling_15m_bars.remove(0);
+                            }
+                            *cur_15m = CandleBar {
+                                time_open: candle_bucket_15m,
+                                open: open_price,
+                                high: high_price,
+                                low: low_price,
+                                close: close_price,
+                                volume: vol_val,
+                            };
+                            is_new_15m_bar = true;
+                        }
+                    } else {
+                        current_15m_bar = Some(CandleBar {
+                            time_open: candle_bucket_15m,
+                            open: open_price,
+                            high: high_price,
+                            low: low_price,
+                            close: close_price,
+                            volume: vol_val,
+                        });
+                    }
+
                     let closes_clone = rolling_closes.clone();
                     let exchange_clone = exchange.clone();
                     let info_clone = info_client.clone();
@@ -507,21 +611,44 @@ async fn main() {
                         let cluster_active = has_active_cluster_position(&symbol_clone);
                         let is_cluster_blocked = cluster_active.is_some();
 
-                        let regime_str = if !is_stationary {
-                            "Trending (Non-Stationary)"
-                        } else if !is_consolidation {
-                            "Trending (Drift)"
-                        } else if is_cb_paused {
-                            "Consolidation (Vetoed: Circuit Breaker Pause)"
-                        } else if is_downside_shock || is_upside_shock {
-                            "Consolidation (Vetoed: Volatility Shock)"
-                        } else if is_cluster_blocked {
-                            "Consolidation (Vetoed: Cluster Active)"
-                        } else if !is_valid_half_life {
-                            "Consolidation (Vetoed: Half-Life Out of Bounds)"
+                        // ------------------------------------------------------------------
+                        // 3-MODE CONTROLLER REGIME INFERENCE (HMM Causal Filter + Hysteresis)
+                        // ------------------------------------------------------------------
+                        let closes_15m: Vec<f64> = rolling_15m_bars.iter().map(|b| b.close).collect();
+                        let (p_c, p_t, p_s) = if closes_15m.len() >= 15 {
+                            let hmm_lock = hmm_model.read().await;
+                            let res = compute_hmm_posteriors(&*hmm_lock, &closes_15m);
+                            drop(hmm_lock);
+                            res.unwrap_or((0.60, 0.25, 0.15))
                         } else {
-                            "Consolidation (Tradable Bi-Directional)"
+                            (0.60, 0.25, 0.15)
                         };
+
+                        let donchian_opt = calculate_donchian(&rolling_15m_bars, donchian_period);
+                        let has_donchian_breakout = if let Some(ref d) = donchian_opt {
+                            close_price > d.upper || close_price < d.lower
+                        } else {
+                            false
+                        };
+
+                        let prev_mode = controller.current_mode;
+                        controller.evaluate_15m_bar(
+                            p_c,
+                            p_t,
+                            z_15,
+                            z_60,
+                            has_donchian_breakout,
+                            is_stationary,
+                            is_valid_half_life,
+                        );
+                        save_controller_state(&symbol_clone, &controller);
+
+                        if prev_mode != controller.current_mode || is_new_15m_bar {
+                            println!(
+                                "🧭 [3-MODE CONTROLLER] Mode: {} (was {}) | P_C: {:.1}% | P_T: {:.1}% | P_Shock: {:.1}% | Reason: {}",
+                                controller.current_mode, prev_mode, p_c * 100.0, p_t * 100.0, p_s * 100.0, controller.last_reason
+                            );
+                        }
 
                         let (target_buy_str, target_short_str) = match thresholds_opt {
                             Some(ref th) => (
@@ -532,9 +659,118 @@ async fn main() {
                         };
 
                         println!(
-                            "💓 [HOT-PATH] {} Price: ${:.2} | Long Buy: {} | Short Sell: {} | Regime: {} | Drift: {:.2}% | t_half: {:.1}m | Z15: {:.2} | Z60: {:.2}",
-                            symbol_clone, close_price, target_buy_str, target_short_str, regime_str, total_drift_pct * 100.0, half_life_m, z_15, z_60
+                            "💓 [HOT-PATH] {} Price: ${:.2} | Long Buy: {} | Short Sell: {} | Mode: {} | P_C: {:.0}% | P_T: {:.0}% | Drift: {:.2}% | t_half: {:.1}m | Z15: {:.2} | Z60: {:.2}",
+                            symbol_clone, close_price, target_buy_str, target_short_str, controller.current_mode, p_c * 100.0, p_t * 100.0, total_drift_pct * 100.0, half_life_m, z_15, z_60
                         );
+
+                        // ------------------------------------------------------------------
+                        // ENGINE B SUPERVISOR: Active Shadow Trend Trailing Stop & Exits
+                        // ------------------------------------------------------------------
+                        if let Some(mut shadow_trade) = load_shadow_trade(&symbol_clone) {
+                            if shadow_trade.is_active {
+                                let current_atr = calculate_atr(&rolling_15m_bars, 20).unwrap_or(shadow_trade.atr_at_entry);
+                                let mut chandelier = ChandelierExitState {
+                                    side: shadow_trade.side.clone(),
+                                    entry_price: shadow_trade.entry_price,
+                                    extreme_favorable_price: shadow_trade.extreme_favorable_price,
+                                    current_stop: shadow_trade.current_stop,
+                                    initial_stop: shadow_trade.initial_stop,
+                                    base_multiplier: chandelier_atr_mult,
+                                    active_multiplier: chandelier_atr_mult,
+                                };
+
+                                let new_stop = chandelier.update(high_price, low_price, current_atr, p_t);
+                                shadow_trade.current_stop = new_stop;
+                                shadow_trade.extreme_favorable_price = chandelier.extreme_favorable_price;
+                                save_shadow_trade(&symbol_clone, Some(&shadow_trade));
+
+                                println!(
+                                    "🟣 [SHADOW-TREND MONITOR] {} {} | Price: ${:.2} | Ratchet Stop: ${:.2} | Extreme: ${:.2}",
+                                    symbol_clone, shadow_trade.side, close_price, new_stop, shadow_trade.extreme_favorable_price
+                                );
+
+                                if chandelier.is_stopped_out(close_price) {
+                                    let net_pnl = record_shadow_exit(&mut shadow_trade, close_price, "3-ATR Chandelier Trailing Stop");
+                                    controller.notify_trend_stopped_out();
+                                    save_controller_state(&symbol_clone, &controller);
+                                    let ret_bps = shadow_trade.return_bps.unwrap_or(0.0);
+                                    println!(
+                                        "🛑 [SHADOW-TREND EXIT] {} stopped out at ${:.2}! Net PnL: ${:.2} ({:.1} bps).",
+                                        symbol_clone, close_price, net_pnl, ret_bps
+                                    );
+                                    crate::discord::send_alert(
+                                        discord_clone.as_deref(),
+                                        &format!(
+                                            "🛑 **[PHASE 0 SHADOW-TREND EXIT]** {} {}\n**Exit Price:** ${:.2} (Stop: ${:.2})\n**Net PnL:** ${:.2} ({:.1} bps)\n**Reason:** 3-ATR Chandelier Trailing Stop",
+                                            symbol_clone, shadow_trade.side, close_price, new_stop, net_pnl, ret_bps
+                                        ),
+                                    ).await;
+                                }
+                            }
+                        }
+
+                        // ------------------------------------------------------------------
+                        // ENGINE B ENTRY: Donchian Breakout + OBI Queue Dancing (Shadow Mode)
+                        // ------------------------------------------------------------------
+                        if controller.current_mode == ControllerMode::Trend {
+                            let active_shadow = load_shadow_trade(&symbol_clone);
+                            if active_shadow.is_none() {
+                                if let Some(ref donchian) = donchian_opt {
+                                    let alignment = check_trend_alignment(&closes_15m);
+                                    let is_long_breakout = close_price > donchian.upper && alignment == TrendAlignment::Bullish;
+                                    let is_short_breakout = close_price < donchian.lower && alignment == TrendAlignment::Bearish;
+
+                                    if is_long_breakout || is_short_breakout {
+                                        let side = if is_long_breakout { Side::Long } else { Side::Short };
+                                        let current_atr = calculate_atr(&rolling_15m_bars, 20).unwrap_or(close_price * 0.01);
+
+                                        let mut obi_score = 0.0;
+                                        if let Ok(l2_book) = info_clone.l2_snapshot(symbol_clone.clone()).await {
+                                            if l2_book.levels.len() >= 2 {
+                                                let bids: Vec<(f64, f64)> = l2_book.levels[0]
+                                                    .iter()
+                                                    .filter_map(|l| Some((l.px.parse().ok()?, l.sz.parse().ok()?)))
+                                                    .collect();
+                                                let asks: Vec<(f64, f64)> = l2_book.levels[1]
+                                                    .iter()
+                                                    .filter_map(|l| Some((l.px.parse().ok()?, l.sz.parse().ok()?)))
+                                                    .collect();
+                                                obi_score = calculate_obi_score(&bids, &asks, 5);
+                                            }
+                                        }
+
+                                        let obi_favorable = if side == Side::Long { obi_score >= -0.15 } else { obi_score <= 0.15 };
+                                        if obi_favorable {
+                                            let trend_notional = position_size_usdc * trend_risk_fraction;
+                                            let shadow_size = trend_notional / close_price;
+
+                                            if trend_engine_mode == "shadow" {
+                                                let shadow_trade = record_shadow_entry(
+                                                    &symbol_clone,
+                                                    side.clone(),
+                                                    close_price,
+                                                    shadow_size,
+                                                    current_atr,
+                                                    chandelier_atr_mult,
+                                                );
+                                                let side_str = if side == Side::Long { "LONG" } else { "SHORT" };
+                                                println!(
+                                                    "🟣 [SHADOW-TREND ENTRY] {} {} breakout entered at ${:.2} | Size: {:.4} (${:.2}) | Initial Stop: ${:.2} | OBI: {:.2}",
+                                                    symbol_clone, side_str, close_price, shadow_size, trend_notional, shadow_trade.initial_stop, obi_score
+                                                );
+                                                crate::discord::send_alert(
+                                                    discord_clone.as_deref(),
+                                                    &format!(
+                                                        "🟣 **[PHASE 0 SHADOW-TREND ENTRY]** {} {}\n**Simulated Entry:** ${:.2}\n**Initial 3-ATR Stop:** ${:.2}\n**Size:** {:.4} (${:.2})\n**OBI:** {:.2} | **ATR:** ${:.2}",
+                                                        symbol_clone, side_str, close_price, shadow_trade.initial_stop, shadow_size, trend_notional, obi_score, current_atr
+                                                    ),
+                                                ).await;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
 
                         let mut state_lock = state_clone.lock().await;
                         let has_position = state_lock.contains_key(&symbol_clone);
@@ -838,7 +1074,17 @@ async fn main() {
                             let is_eligible = is_consolidation
                                 && is_valid_half_life
                                 && !is_cb_paused
-                                && !is_cluster_blocked;
+                                && !is_cluster_blocked
+                                && controller.current_mode == ControllerMode::MeanReversion;
+
+                            if armed_state.is_armed && controller.current_mode != ControllerMode::MeanReversion {
+                                println!(
+                                    "⏸️ [MEAN REVERSION VETO] Controller mode is {} (not MeanReversion). Clearing armed state for {}.",
+                                    controller.current_mode, symbol_clone
+                                );
+                                armed_state.is_armed = false;
+                                save_armed_signal(&arm_path_clone, &armed_state);
+                            }
 
                             if armed_state.is_armed {
                                 let arm_side = armed_state.side.clone();

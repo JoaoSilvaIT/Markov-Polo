@@ -194,6 +194,40 @@ impl GaussianHMM {
         best_last
     }
 
+    pub fn filtered_posteriors(&self, x: &Array2<f64>) -> Array1<f64> {
+        let n_samples = x.nrows();
+        if n_samples == 0 {
+            return Array1::from_elem(self.n_components, 1.0 / self.n_components as f64);
+        }
+
+        let log_emiss = self.log_gaussian_prob(x);
+        let log_transmat = self.transmat.mapv(|v| v.max(1e-15).ln());
+        let log_startprob = self.startprob.mapv(|v| v.max(1e-15).ln());
+
+        let mut log_alpha = Array2::zeros((n_samples, self.n_components));
+        for c in 0..self.n_components {
+            log_alpha[[0, c]] = log_startprob[c] + log_emiss[[0, c]];
+        }
+
+        for t in 1..n_samples {
+            for c in 0..self.n_components {
+                let mut prev = Array1::zeros(self.n_components);
+                for i in 0..self.n_components {
+                    prev[i] = log_alpha[[t - 1, i]] + log_transmat[[i, c]];
+                }
+                log_alpha[[t, c]] = logsumexp(&prev) + log_emiss[[t, c]];
+            }
+        }
+
+        let last_row = log_alpha.row(n_samples - 1).to_owned();
+        let denom = logsumexp(&last_row);
+        let mut post = Array1::zeros(self.n_components);
+        for c in 0..self.n_components {
+            post[c] = (last_row[c] - denom).exp();
+        }
+        post
+    }
+
     pub fn sort_by_energy(&mut self) {
         // Institutional state labeling (Research consensus):
         // Sort states by emission return-energy: q_k = mu_k^2 + sigma_k^2
@@ -365,4 +399,67 @@ pub fn train_hmm_offline(closes: &[f64]) -> Option<GaussianHMM> {
     hmm.sort_by_energy();
     
     Some(hmm)
+}
+
+pub fn compute_hmm_posteriors(hmm: &GaussianHMM, closes: &[f64]) -> Option<(f64, f64, f64)> {
+    if closes.len() < 15 {
+        return None;
+    }
+
+    let mut returns = Vec::with_capacity(closes.len() - 1);
+    for i in 1..closes.len() {
+        returns.push(closes[i] / closes[i - 1] - 1.0);
+    }
+
+    let mut vols = vec![0.0; returns.len()];
+    for i in 10..returns.len() {
+        let slice = &returns[i - 10..i];
+        let mean: f64 = slice.iter().sum::<f64>() / 10.0;
+        let var: f64 = slice.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / 10.0;
+        vols[i] = var.sqrt();
+    }
+
+    let valid_start = 10;
+    if returns.len() - valid_start < 5 {
+        return None;
+    }
+
+    let n_samples = returns.len() - valid_start;
+    let mut x = Array2::zeros((n_samples, 2));
+    for i in 0..n_samples {
+        x[[i, 0]] = returns[i + valid_start];
+        x[[i, 1]] = vols[i + valid_start];
+    }
+
+    let post = hmm.filtered_posteriors(&x);
+    if post.len() >= 3 {
+        Some((post[0], post[1], post[2]))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hmm_filtered_posteriors_sum_to_one() {
+        let mut closes = Vec::new();
+        let mut p = 100.0;
+        for i in 0..100 {
+            p += (i as f64 * 0.1).sin();
+            closes.push(p);
+        }
+
+        let hmm = train_hmm_offline(&closes).expect("Trained HMM");
+        let posteriors = compute_hmm_posteriors(&hmm, &closes);
+        assert!(posteriors.is_some());
+        let (p_c, p_t, p_s) = posteriors.unwrap();
+        let sum = p_c + p_t + p_s;
+        assert!((sum - 1.0).abs() < 1e-4, "Posteriors should sum to 1.0: {}", sum);
+        assert!(p_c >= 0.0 && p_c <= 1.0);
+        assert!(p_t >= 0.0 && p_t <= 1.0);
+        assert!(p_s >= 0.0 && p_s <= 1.0);
+    }
 }

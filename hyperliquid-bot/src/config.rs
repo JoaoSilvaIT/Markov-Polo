@@ -13,6 +13,10 @@ pub struct Config {
     pub discord_webhook_url: Option<String>,
     pub hmm_config_path: String,
     pub state_file_path: String,
+    pub trend_engine_mode: String,
+    pub trend_risk_fraction: f64,
+    pub donchian_period: usize,
+    pub chandelier_atr_mult: f64,
 }
 
 impl Config {
@@ -50,6 +54,22 @@ impl Config {
             .unwrap_or_else(|_| format!("hl_hmm_weights_{}.json", symbol));
         let state_path = format!("hl_hmm_state_{}.json", symbol);
 
+        let trend_mode = env::var("HL_TREND_ENGINE_MODE")
+            .unwrap_or_else(|_| "shadow".to_string())
+            .to_lowercase();
+        let trend_risk = env::var("HL_TREND_RISK_FRACTION")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.25);
+        let donchian_period = env::var("HL_DONCHIAN_PERIOD")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(20);
+        let chandelier_mult = env::var("HL_CHANDELIER_ATR_MULT")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(3.0);
+
         Config {
             hl_private_key: env::var("HL_PRIVATE_KEY").unwrap_or_else(|_| {
                 // Fallback dummy key for testing without panicking during offline tests
@@ -64,6 +84,10 @@ impl Config {
             discord_webhook_url: env::var("DISCORD_WEBHOOK_URL").ok(),
             hmm_config_path: hmm_path,
             state_file_path: state_path,
+            trend_engine_mode: trend_mode,
+            trend_risk_fraction: trend_risk,
+            donchian_period,
+            chandelier_atr_mult: chandelier_mult,
         }
     }
 }
