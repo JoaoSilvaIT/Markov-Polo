@@ -5,15 +5,14 @@ services:
       dockerfile: Dockerfile
     container_name: hl_bot_btc
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
-      - HL_PRIVATE_KEY=${HL_PRIVATE_KEY}
-      - HL_WALLET_ADDRESS=${HL_WALLET_ADDRESS}
-      - HL_IS_MAINNET=${HL_IS_MAINNET:-true}
       - HL_TRADING_SYMBOL=BTC
-      - POSITION_SIZE_USDC=${POSITION_SIZE_USDC:-25.0}
-      - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}
+      - HL_LEVERAGE=${HL_LEVERAGE:-3}
+      - HL_IS_CROSS=${HL_IS_CROSS:-true}
     volumes:
-      - ./data:/app/data
+      - ./hl_bot_data:/app
 
   hl_bot_eth:
     build:
@@ -21,15 +20,14 @@ services:
       dockerfile: Dockerfile
     container_name: hl_bot_eth
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
-      - HL_PRIVATE_KEY=${HL_PRIVATE_KEY}
-      - HL_WALLET_ADDRESS=${HL_WALLET_ADDRESS}
-      - HL_IS_MAINNET=${HL_IS_MAINNET:-true}
       - HL_TRADING_SYMBOL=ETH
-      - POSITION_SIZE_USDC=${POSITION_SIZE_USDC:-25.0}
-      - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}
+      - HL_LEVERAGE=${HL_LEVERAGE:-3}
+      - HL_IS_CROSS=${HL_IS_CROSS:-true}
     volumes:
-      - ./data:/app/data
+      - ./hl_bot_data:/app
 
   hl_bot_sol:
     build:
@@ -37,12 +35,11 @@ services:
       dockerfile: Dockerfile
     container_name: hl_bot_sol
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
-      - HL_PRIVATE_KEY=${HL_PRIVATE_KEY}
-      - HL_WALLET_ADDRESS=${HL_WALLET_ADDRESS}
-      - HL_IS_MAINNET=${HL_IS_MAINNET:-true}
       - HL_TRADING_SYMBOL=SOL
-      - POSITION_SIZE_USDC=${POSITION_SIZE_USDC:-25.0}
-      - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}
+      - HL_LEVERAGE=${HL_LEVERAGE:-3}
+      - HL_IS_CROSS=${HL_IS_CROSS:-true}
     volumes:
-      - ./data:/app/data
+      - ./hl_bot_data:/app
