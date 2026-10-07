@@ -17,7 +17,7 @@ mod state;
 use crate::config::Config;
 use crate::hmm::{train_hmm_offline, GaussianHMM};
 use crate::hyperliquid::{
-    cancel_order, fetch_sz_decimals_map, place_post_only_order, quantize_price,
+    cancel_order, fetch_sz_decimals_map, get_user_position, place_post_only_order, quantize_price,
 };
 use crate::order::{emergency_flatten, place_ou_maker_entry};
 use crate::ou_process::{
@@ -237,10 +237,24 @@ async fn main() {
                 // Scenario 1: Entry order is pending, TP not yet placed
                 if pos.tp_order_id.is_empty() && !pos.order_id.is_empty() {
                     if let Ok(oid) = pos.order_id.parse::<u64>() {
+                        // Cross-reference user position to see if order filled
+                        let (current_szi, _) = get_user_position(&watcher_info, user_address, &watcher_symbol)
+                            .await
+                            .unwrap_or((0.0, None));
+                        let pos_exists = if pos.side == "LONG" {
+                            current_szi > 0.0
+                        } else {
+                            current_szi < 0.0
+                        };
+
                         if let Ok(order_status) = watcher_info.query_order_by_oid(user_address, oid).await {
-                            let status = order_status.status.to_uppercase();
-                            let is_filled = status == "FILLED";
-                            let is_open = status == "OPEN" || status == "RESTING";
+                            let inner_status = if let Some(ref o) = order_status.order {
+                                o.status.to_uppercase()
+                            } else {
+                                order_status.status.to_uppercase()
+                            };
+                            let is_filled = inner_status == "FILLED" || pos_exists;
+                            let _is_open = inner_status == "OPEN" || inner_status == "RESTING";
 
                             if is_filled {
                                 println!(
@@ -283,24 +297,40 @@ async fn main() {
                                         );
                                     }
                                 }
-                            } else if !is_open {
-                                // Cancelled or rejected with 0 fills
+                            } else if inner_status == "CANCELED"
+                                || inner_status == "REJECTED"
+                                || inner_status == "MARGINCANCELED"
+                                || inner_status == "UNKNOWNOID"
+                            {
+                                // Truly cancelled or rejected with 0 fills
                                 println!(
                                     "⚪ [FAST-SENTINEL] Entry for {} status: {}. Cleaning up state.",
-                                    watcher_symbol, status
+                                    watcher_symbol, inner_status
                                 );
                                 state_lock.remove(&watcher_symbol);
                                 let _ = save_state(&watcher_state_path, &state_lock);
                                 release_cluster_lease(&watcher_symbol);
                             }
+                            // If is_open, order is resting peacefully on the order book. Do not clean up!
                         }
                     }
                 }
                 // Scenario 2: TP order is resting on book. Check if filled
                 else if !pos.tp_order_id.is_empty() {
                     if let Ok(tp_oid) = pos.tp_order_id.parse::<u64>() {
+                        let (current_szi, _) = get_user_position(&watcher_info, user_address, &watcher_symbol)
+                            .await
+                            .unwrap_or((0.0, None));
+                        let is_flat = current_szi.abs() == 0.0;
+
                         if let Ok(order_status) = watcher_info.query_order_by_oid(user_address, tp_oid).await {
-                            if order_status.status.to_uppercase() == "FILLED" {
+                            let inner_status = if let Some(ref o) = order_status.order {
+                                o.status.to_uppercase()
+                            } else {
+                                order_status.status.to_uppercase()
+                            };
+
+                            if inner_status == "FILLED" || is_flat {
                                 println!(
                                     "🎉 [FAST-SENTINEL] Take Profit for {} (Side: {}) has FILLED!",
                                     watcher_symbol, pos.side
