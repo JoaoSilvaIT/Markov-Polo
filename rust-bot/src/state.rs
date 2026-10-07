@@ -99,6 +99,50 @@ pub fn save_circuit_breaker(file_path: &str, cb: &CircuitBreaker) {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ArmedSignal {
+    pub is_armed: bool,
+    pub armed_at: Option<String>,
+    pub entry_threshold: f64,
+    pub lowest_price: f64,
+}
+
+pub fn load_armed_signal(file_path: &str) -> ArmedSignal {
+    if !std::path::Path::new(file_path).exists() {
+        return ArmedSignal::default();
+    }
+    fs::read_to_string(file_path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_armed_signal(file_path: &str, armed: &ArmedSignal) {
+    if let Ok(content) = serde_json::to_string_pretty(armed) {
+        let temp_path = format!("{}.tmp", file_path);
+        let _ = fs::write(&temp_path, content);
+        let _ = fs::rename(&temp_path, file_path);
+    }
+}
+
+/// Checks if any other symbol in the portfolio cluster currently has an active open position
+pub fn has_active_cluster_position(current_symbol: &str) -> Option<String> {
+    let all_symbols = ["BTCUSDC", "ETHUSDC", "SOLUSDC"];
+    for sym in &all_symbols {
+        if *sym == current_symbol {
+            continue;
+        }
+        let state_file = format!("binance_hmm_state_{}.json", sym);
+        if let Ok(state) = load_state(&state_file) {
+            if let Some(pos) = state.get(*sym) {
+                if !pos.order_id.is_empty() {
+                    return Some(sym.to_string());
+                }
+            }
+        }
+    }
+    None
+}
 #[derive(Serialize)]
 struct JournalEntry {
     timestamp: String,
@@ -203,5 +247,28 @@ mod tests {
         cb.record_win(); // Win resets breaker
         assert_eq!(cb.is_paused(), false);
         assert_eq!(cb.consecutive_time_stops, 0);
+    }
+
+    #[test]
+    fn test_armed_signal_state_lifecycle() {
+        let mut arm = ArmedSignal::default();
+        assert_eq!(arm.is_armed, false);
+
+        // Stage 1: Arm on dip
+        arm.is_armed = true;
+        arm.armed_at = Some(chrono::Utc::now().to_rfc3339());
+        arm.entry_threshold = 120.26;
+        arm.lowest_price = 120.14;
+        assert_eq!(arm.is_armed, true);
+
+        // Stage 2: Deeper dip updates lowest price
+        if 119.80 < arm.lowest_price {
+            arm.lowest_price = 119.80;
+        }
+        assert_eq!(arm.lowest_price, 119.80);
+
+        // Stage 3: Disarm on submit
+        arm.is_armed = false;
+        assert_eq!(arm.is_armed, false);
     }
 }

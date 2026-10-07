@@ -23,7 +23,7 @@ use crate::binance::{BinanceClient, get_symbol_lot_precision, quantize_lot_size}
 use crate::hmm::{GaussianHMM, train_hmm_offline};
 use crate::ou_process::{estimate_ou_parameters, calculate_optimal_thresholds};
 use crate::order::{place_ou_limit_buy, emergency_flatten};
-use crate::state::{StateMap, load_state, load_circuit_breaker, save_circuit_breaker};
+use crate::state::{StateMap, load_state, load_circuit_breaker, save_circuit_breaker, load_armed_signal, save_armed_signal, has_active_cluster_position};
 
 #[tokio::main]
 async fn main() {
@@ -42,6 +42,9 @@ async fn main() {
     let cb_state = load_circuit_breaker(&cb_path);
     let active_cb = Arc::new(Mutex::new(cb_state));
     let cb_file_path = cb_path.clone();
+
+    // Reversal-Confirmed Entry Armed state path
+    let arm_file_path = format!("binance_hmm_arm_{}.json", config.trading_symbol);
     
     // Initialize HMM (will load from file or initialize empty)
     let initial_hmm = GaussianHMM::load_weights(&config.hmm_config_path).unwrap_or_else(|_| hmm::GaussianHMM::new(3, 2));
@@ -221,6 +224,7 @@ async fn main() {
                             let state_path_clone = state_file_path.clone();
                             let cb_clone = active_cb.clone();
                             let cb_path_clone = cb_file_path.clone();
+                            let arm_path_clone = arm_file_path.clone();
                             
                             // Pure CPU computation in blocking thread, evaluating historical closes up to t-1
                             let calc_res = if closes_clone.len() >= 100 {
@@ -249,7 +253,28 @@ async fn main() {
                                         let total_drift_pct = (slope * n_drift) / hist_last_price;
                                         let is_drifting = total_drift_pct.abs() > 0.015;
 
-                                        Some((thresholds, total_drift_pct, is_drifting, half_life_m))
+                                        // Standardized Short-Horizon Downside Shock Calculation (Z15 & Z60)
+                                        let n = closes_clone.len();
+                                        let mut z_15 = 0.0;
+                                        let mut z_60 = 0.0;
+                                        if n >= 65 {
+                                            let mut returns_1m = Vec::with_capacity(n - 1);
+                                            for i in 1..n {
+                                                returns_1m.push((closes_clone[i] / closes_clone[i-1]).ln());
+                                            }
+                                            let r_mean = returns_1m.iter().sum::<f64>() / returns_1m.len() as f64;
+                                            let r_var = returns_1m.iter().map(|r| (r - r_mean).powi(2)).sum::<f64>() / (returns_1m.len() - 1) as f64;
+                                            let sigma_1m = r_var.sqrt().max(1e-6);
+
+                                            let ret_15 = (hist_last_price / closes_clone[n - 16]).ln();
+                                            z_15 = ret_15 / (sigma_1m * (15.0_f64).sqrt());
+
+                                            let ret_60 = (hist_last_price / closes_clone[n - 61]).ln();
+                                            z_60 = ret_60 / (sigma_1m * (60.0_f64).sqrt());
+                                        }
+                                        let is_shock = z_15 < -2.5 || z_60 < -2.5;
+
+                                        Some((thresholds, total_drift_pct, is_drifting, half_life_m, z_15, z_60, is_shock, hist_last_price))
                                     } else {
                                         None
                                     }
@@ -258,7 +283,7 @@ async fn main() {
                                 None
                             };
 
-                            if let Some((thresholds, total_drift_pct, is_drifting, half_life_m)) = calc_res {
+                            if let Some((thresholds, total_drift_pct, is_drifting, half_life_m, z_15, z_60, is_shock, hist_last_price)) = calc_res {
                                 let regime = 0; // HMM regime
                                 let is_consolidation = regime == 0 && !is_drifting;
 
@@ -269,10 +294,18 @@ async fn main() {
                                 let is_cb_paused = cb_lock.is_paused();
                                 drop(cb_lock);
 
+                                // Portfolio Cluster Check (only 1 active position allowed across BTC, ETH, SOL)
+                                let cluster_active = has_active_cluster_position(&symbol_clone);
+                                let is_cluster_blocked = cluster_active.is_some();
+
                                 let regime_str = if !is_consolidation {
                                     if is_drifting { "Trending (Drift)" } else { "Trending (HMM)" }
                                 } else if is_cb_paused {
                                     "Consolidation (Vetoed: Circuit Breaker 24h Pause)"
+                                } else if is_shock {
+                                    "Consolidation (Vetoed: Shock Cascade)"
+                                } else if is_cluster_blocked {
+                                    "Consolidation (Vetoed: Cluster Active)"
                                 } else if !is_valid_half_life {
                                     if half_life_m < 15.0 {
                                         "Consolidation (Vetoed: t_half < 15m noise)"
@@ -283,13 +316,20 @@ async fn main() {
                                     "Consolidation (Tradable)"
                                 };
 
-                                println!("💓 [HOT-PATH] {} Price: ${:.2} | Target Buy: ${:.2} | Regime: {} | Drift: {:.2}%/window | t_half: {:.1}m", 
-                                         symbol_clone, close_price, thresholds.entry_long, regime_str, total_drift_pct * 100.0, half_life_m);
+                                println!("💓 [HOT-PATH] {} Price: ${:.2} | Target Buy: ${:.2} | Regime: {} | Drift: {:.2}%/window | t_half: {:.1}m | Z15: {:.2} | Z60: {:.2}", 
+                                         symbol_clone, close_price, thresholds.entry_long, regime_str, total_drift_pct * 100.0, half_life_m, z_15, z_60);
                                 
                                 let mut state_lock = state_clone.lock().await;
                                 let has_position = state_lock.contains_key(&symbol_clone);
 
                                 if has_position {
+                                    // Make sure armed state is cleared if holding a position
+                                    let mut armed_state = load_armed_signal(&arm_path_clone);
+                                    if armed_state.is_armed {
+                                        armed_state.is_armed = false;
+                                        save_armed_signal(&arm_path_clone, &armed_state);
+                                    }
+
                                     // Check 2 * t_half Time-Stop
                                     let mut time_stop_triggered = false;
                                     let mut elapsed_mins = 0.0;
@@ -330,22 +370,81 @@ async fn main() {
                                         let _ = emergency_flatten(&state_path_clone, &binance_clone, &mut state_lock, &symbol_clone, discord_clone.clone()).await;
                                     }
                                 } 
-                                else if is_consolidation && !has_position && is_valid_half_life && !is_cb_paused {
-                                    // 🟢 O-U ENTRY SIGNAL evaluated strictly out-of-sample on bar t
-                                    if close_price <= thresholds.entry_long {
-                                        // Ensure post-only maker bid never crosses the book above current market price
-                                        let entry_limit_price = f64::min(close_price, thresholds.entry_long);
-                                        if let Err(e) = place_ou_limit_buy(
-                                            &state_path_clone,
-                                            &binance_clone, 
-                                            &mut state_lock, 
-                                            &symbol_clone, 
-                                            entry_limit_price, 
-                                            thresholds.exit_long, 
-                                            half_life_m,
-                                            discord_clone
-                                        ).await {
-                                            eprintln!("❌ [ORDER ERROR] Failed to dispatch limit maker buy for {}: {}", symbol_clone, e);
+                                else if !has_position {
+                                    // ------------------------------------------------------------------
+                                    // REVERSAL-CONFIRMED ENTRY PROTOCOL (Arm -> Bounce -> Buy)
+                                    // ------------------------------------------------------------------
+                                    let mut armed_state = load_armed_signal(&arm_path_clone);
+                                    let is_eligible = is_consolidation && is_valid_half_life && !is_cb_paused && !is_shock && !is_cluster_blocked;
+
+                                    if armed_state.is_armed {
+                                        // Update lowest dip price recorded during this downward stretch
+                                        if close_price < armed_state.lowest_price {
+                                            armed_state.lowest_price = close_price;
+                                            save_armed_signal(&arm_path_clone, &armed_state);
+                                        }
+
+                                        // Check expiration (timeout after 45 minutes)
+                                        let mut expired = false;
+                                        if let Some(ref at_ts) = armed_state.armed_at {
+                                            if let Ok(at_dt) = chrono::DateTime::parse_from_rfc3339(at_ts) {
+                                                let elapsed = (chrono::Utc::now() - at_dt.with_timezone(&chrono::Utc)).num_seconds() as f64 / 60.0;
+                                                if elapsed >= 45.0 {
+                                                    expired = true;
+                                                }
+                                            }
+                                        }
+
+                                        // Disarm if shock occurred, circuit breaker paused, regime broke, cluster became active, or timed out
+                                        if !is_eligible || expired {
+                                            println!("⚪ [DISARMED] {} signal disarmed (Shock: {}, Regime broke: {}, Cluster: {}, Expired: {})", 
+                                                     symbol_clone, is_shock, !is_consolidation, is_cluster_blocked, expired);
+                                            armed_state.is_armed = false;
+                                            save_armed_signal(&arm_path_clone, &armed_state);
+                                        } 
+                                        else {
+                                            // 🟢 REVERSAL CONFIRMATION:
+                                            // 1. Current 1m bar closed green (reversal onset): close_price > hist_last_price
+                                            // 2. Price bounced off the dip low: close_price >= armed_state.lowest_price * 1.0005 || close_price >= armed_state.entry_threshold
+                                            // 3. Price is still attractive below mean exit target: close_price < thresholds.exit_long
+                                            let is_green_bounce = close_price > hist_last_price;
+                                            let bounced_off_low = close_price >= armed_state.lowest_price * 1.0005 || close_price >= armed_state.entry_threshold;
+                                            let still_below_exit = close_price < thresholds.exit_long;
+
+                                            if is_green_bounce && bounced_off_low && still_below_exit {
+                                                println!("🟢 [REVERSAL CONFIRMED] {} reversed from dip low ${:.2} up to ${:.2} (prev: ${:.2})! Submitting maker buy.", 
+                                                         symbol_clone, armed_state.lowest_price, close_price, hist_last_price);
+                                                
+                                                armed_state.is_armed = false;
+                                                save_armed_signal(&arm_path_clone, &armed_state);
+
+                                                let entry_limit_price = f64::min(close_price, thresholds.entry_long);
+                                                if let Err(e) = place_ou_limit_buy(
+                                                    &state_path_clone,
+                                                    &binance_clone, 
+                                                    &mut state_lock, 
+                                                    &symbol_clone, 
+                                                    entry_limit_price, 
+                                                    thresholds.exit_long, 
+                                                    half_life_m,
+                                                    discord_clone
+                                                ).await {
+                                                    eprintln!("❌ [ORDER ERROR] Failed to dispatch limit maker buy for {}: {}", symbol_clone, e);
+                                                }
+                                            }
+                                        }
+                                    } 
+                                    else if is_eligible {
+                                        // Stage 1: Arm signal when price touches or dips below threshold
+                                        if close_price <= thresholds.entry_long {
+                                            armed_state.is_armed = true;
+                                            armed_state.armed_at = Some(chrono::Utc::now().to_rfc3339());
+                                            armed_state.entry_threshold = thresholds.entry_long;
+                                            armed_state.lowest_price = close_price;
+                                            save_armed_signal(&arm_path_clone, &armed_state);
+
+                                            println!("🟡 [SIGNAL ARMED] {} touched entry threshold (${:.2} <= ${:.2}). Signal armed. Waiting for green reversal bounce confirmation before buying.", 
+                                                     symbol_clone, close_price, thresholds.entry_long);
                                         }
                                     }
                                 }

@@ -14,7 +14,11 @@ pub async fn place_ou_limit_buy(
     discord_url: Option<String>,
 ) -> Result<Value, String> {
     
-    let position_size_usdc = 12.0; // Fixed $12 position size to safely clear Binance $5 MIN_NOTIONAL
+    // Default $25.0 position size under Portfolio Cluster rule (single active position across portfolio)
+    let position_size_usdc = std::env::var("POSITION_SIZE_USDC")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(25.0);
 
     if state.len() >= 3 {
         return Ok(json!({"status": "REJECTED", "reason": "Max concurrent trades reached."}));
