@@ -107,6 +107,10 @@ pub struct ArmedSignal {
     #[serde(default)]
     pub exit_threshold: f64,
     #[serde(default)]
+    pub unitless_exit_dev: f64,
+    #[serde(default)]
+    pub unitless_entry_dev: f64,
+    #[serde(default)]
     pub half_life_m: f64,
     pub lowest_price: f64,
 }
@@ -156,6 +160,19 @@ pub fn try_acquire_cluster_lease(symbol: &str, duration_secs: i64) -> bool {
                     let _ = fs::write(CLUSTER_LOCK_FILE, serde_json::to_string_pretty(&new_lease).unwrap_or_default());
                     return true;
                 }
+                
+                // Check if current lease owner has an active open position in state file
+                let owner_state_file = format!("binance_hmm_state_{}.json", lease.owner);
+                let owner_has_pos = load_state(&owner_state_file)
+                    .ok()
+                    .and_then(|s| s.get(&lease.owner).cloned())
+                    .map(|p| !p.order_id.is_empty())
+                    .unwrap_or(false);
+
+                if owner_has_pos {
+                    return false; // Actively held by open position
+                }
+
                 if let Ok(exp_dt) = chrono::DateTime::parse_from_rfc3339(&lease.expires_at) {
                     if now < exp_dt.with_timezone(&chrono::Utc) {
                         // Active lease held by another symbol
@@ -187,6 +204,24 @@ pub fn try_acquire_cluster_lease(symbol: &str, duration_secs: i64) -> bool {
     }
 }
 
+/// Refreshes/renews the active cluster lease while position or entry order is open
+pub fn refresh_cluster_lease(symbol: &str, duration_secs: i64) -> bool {
+    let now = chrono::Utc::now();
+    let expires = now + chrono::Duration::seconds(duration_secs);
+    if std::path::Path::new(CLUSTER_LOCK_FILE).exists() {
+        if let Ok(content) = fs::read_to_string(CLUSTER_LOCK_FILE) {
+            if let Ok(mut lease) = serde_json::from_str::<ClusterLease>(&content) {
+                if lease.owner == symbol {
+                    lease.expires_at = expires.to_rfc3339();
+                    let _ = fs::write(CLUSTER_LOCK_FILE, serde_json::to_string_pretty(&lease).unwrap_or_default());
+                    return true;
+                }
+            }
+        }
+    }
+    try_acquire_cluster_lease(symbol, duration_secs)
+}
+
 /// Releases the portfolio cluster lease if held by symbol
 pub fn release_cluster_lease(symbol: &str) {
     if std::path::Path::new(CLUSTER_LOCK_FILE).exists() {
@@ -208,6 +243,18 @@ pub fn has_active_cluster_position(current_symbol: &str) -> Option<String> {
         if let Ok(content) = fs::read_to_string(CLUSTER_LOCK_FILE) {
             if let Ok(lease) = serde_json::from_str::<ClusterLease>(&content) {
                 if lease.owner != current_symbol {
+                    // Check if lease owner has an active position in state
+                    let owner_state_file = format!("binance_hmm_state_{}.json", lease.owner);
+                    let owner_has_pos = load_state(&owner_state_file)
+                        .ok()
+                        .and_then(|s| s.get(&lease.owner).cloned())
+                        .map(|p| !p.order_id.is_empty())
+                        .unwrap_or(false);
+
+                    if owner_has_pos {
+                        return Some(lease.owner);
+                    }
+
                     if let Ok(exp_dt) = chrono::DateTime::parse_from_rfc3339(&lease.expires_at) {
                         if now < exp_dt.with_timezone(&chrono::Utc) {
                             return Some(lease.owner);
@@ -346,11 +393,14 @@ mod tests {
         let mut arm = ArmedSignal::default();
         assert_eq!(arm.is_armed, false);
 
-        // Stage 1: Arm on dip
+        // Stage 1: Arm on dip with unitless deviations relative to SMA
+        let sma_arm = 121.0_f64;
         arm.is_armed = true;
         arm.armed_at = Some(chrono::Utc::now().to_rfc3339());
         arm.entry_threshold = 120.26;
         arm.exit_threshold = 122.50;
+        arm.unitless_entry_dev = (120.26_f64 / sma_arm).ln();
+        arm.unitless_exit_dev = (122.50_f64 / sma_arm).ln();
         arm.half_life_m = 35.0;
         arm.lowest_price = 120.14;
         assert_eq!(arm.is_armed, true);
@@ -361,6 +411,13 @@ mod tests {
             arm.lowest_price = 119.80;
         }
         assert_eq!(arm.lowest_price, 119.80);
+
+        // Stage 2 execution: baseline dragged to 120.0
+        let sma_bounce = 120.0;
+        let dynamic_tp = sma_bounce * arm.unitless_exit_dev.exp();
+        // Dynamic TP should be lower than original 122.50 because baseline dragged down
+        assert!(dynamic_tp < 122.50);
+        assert!((dynamic_tp - (120.0 * (122.50 / 121.0))).abs() < 1e-4);
 
         // Stage 3: Disarm on submit
         arm.is_armed = false;

@@ -333,6 +333,9 @@ async fn main() {
                                         save_armed_signal(&arm_path_clone, &armed_state);
                                     }
 
+                                    // Continuously refresh cluster lease while position is active
+                                    let _ = crate::state::refresh_cluster_lease(&symbol_clone, 3600);
+
                                     // Check resting entry TTL (5m) and filled position 2 * t_half Time-Stop
                                     let mut entry_ttl_expired = false;
                                     let mut time_stop_triggered = false;
@@ -427,30 +430,39 @@ async fn main() {
                                             // 🟢 REVERSAL CONFIRMATION:
                                             // 1. Current 1m bar closed green (reversal onset): close_price > hist_last_price
                                             // 2. Price bounced off the dip low: close_price >= armed_state.lowest_price * 1.0005 || close_price >= armed_state.entry_threshold
-                                            // 3. Price is still attractive below frozen mean exit target: close_price < armed_state.exit_threshold
+                                            // 3. Price is still attractive below dynamically translated mean exit target
+                                            let live_sma = rolling_closes.iter().sum::<f64>() / rolling_closes.len() as f64;
+                                            let dynamic_exit_target = if armed_state.unitless_exit_dev != 0.0 {
+                                                live_sma * armed_state.unitless_exit_dev.exp()
+                                            } else {
+                                                armed_state.exit_threshold
+                                            };
+                                            let dynamic_entry_cap = if armed_state.unitless_entry_dev != 0.0 {
+                                                live_sma * armed_state.unitless_entry_dev.exp()
+                                            } else {
+                                                armed_state.entry_threshold
+                                            };
+
                                             let is_green_bounce = close_price > hist_last_price;
-                                            let bounced_off_low = close_price >= armed_state.lowest_price * 1.0005 || close_price >= armed_state.entry_threshold;
-                                            let still_below_exit = close_price < armed_state.exit_threshold;
+                                            let bounced_off_low = close_price >= armed_state.lowest_price * 1.0005 || close_price >= dynamic_entry_cap;
+                                            let still_below_exit = close_price < dynamic_exit_target;
 
                                             if is_green_bounce && bounced_off_low && still_below_exit {
-                                                println!("🟢 [REVERSAL CONFIRMED] {} reversed from dip low ${:.2} up to ${:.2} (prev: ${:.2})! Submitting maker buy.", 
-                                                         symbol_clone, armed_state.lowest_price, close_price, hist_last_price);
+                                                println!("🟢 [REVERSAL CONFIRMED] {} reversed from dip low ${:.2} up to ${:.2} (prev: ${:.2})! Submitting maker buy (Live SMA: ${:.2}, Dynamic TP μ: ${:.2}).", 
+                                                         symbol_clone, armed_state.lowest_price, close_price, hist_last_price, live_sma, dynamic_exit_target);
                                                 
-                                                let frozen_entry = armed_state.entry_threshold;
-                                                let frozen_exit = armed_state.exit_threshold;
                                                 let frozen_hl = armed_state.half_life_m;
-
                                                 armed_state.is_armed = false;
                                                 save_armed_signal(&arm_path_clone, &armed_state);
 
-                                                let entry_limit_price = f64::min(close_price, frozen_entry);
+                                                let entry_limit_price = f64::min(close_price, dynamic_entry_cap);
                                                 if let Err(e) = place_ou_limit_buy(
                                                     &state_path_clone,
                                                     &binance_clone, 
                                                     &mut state_lock, 
                                                     &symbol_clone, 
                                                     entry_limit_price, 
-                                                    frozen_exit, 
+                                                    dynamic_exit_target, 
                                                     frozen_hl, 
                                                     discord_clone
                                                 ).await {
@@ -462,16 +474,22 @@ async fn main() {
                                     else if is_eligible {
                                         // Stage 1: Arm signal when price touches or dips below threshold
                                         if close_price <= thresholds.entry_long {
+                                            let baseline_arm = rolling_closes.iter().sum::<f64>() / rolling_closes.len() as f64;
+                                            let unitless_entry_dev = (thresholds.entry_long / baseline_arm).ln();
+                                            let unitless_exit_dev = (thresholds.exit_long / baseline_arm).ln();
+
                                             armed_state.is_armed = true;
                                             armed_state.armed_at = Some(chrono::Utc::now().to_rfc3339());
                                             armed_state.entry_threshold = thresholds.entry_long;
                                             armed_state.exit_threshold = thresholds.exit_long;
+                                            armed_state.unitless_entry_dev = unitless_entry_dev;
+                                            armed_state.unitless_exit_dev = unitless_exit_dev;
                                             armed_state.half_life_m = half_life_m;
                                             armed_state.lowest_price = close_price;
                                             save_armed_signal(&arm_path_clone, &armed_state);
 
-                                            println!("🟡 [SIGNAL ARMED] {} touched entry threshold (${:.2} <= ${:.2}). Signal armed (Exit μ: ${:.2}, t_half: {:.1}m). Waiting for green reversal bounce confirmation before buying.", 
-                                                     symbol_clone, close_price, thresholds.entry_long, thresholds.exit_long, half_life_m);
+                                            println!("🟡 [SIGNAL ARMED] {} touched entry threshold (${:.2} <= ${:.2}). Signal armed (Unitless Exit dev: {:.4}, t_half: {:.1}m). Waiting for green reversal bounce confirmation before buying.", 
+                                                     symbol_clone, close_price, thresholds.entry_long, unitless_exit_dev, half_life_m);
                                         }
                                     }
                                 }

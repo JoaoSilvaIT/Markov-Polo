@@ -27,24 +27,26 @@ pub async fn place_ou_limit_buy(
         return Ok(json!({"status": "REJECTED", "reason": format!("Already hold or have open order for {}.", symbol)}));
     }
 
-    // Atomically acquire the portfolio cluster lease (5 minutes lease while waiting for fill)
-    if !try_acquire_cluster_lease(symbol, 300) {
+    // Atomically acquire the portfolio cluster lease (1 hour lease renewed continuously while holding)
+    if !try_acquire_cluster_lease(symbol, 3600) {
         return Ok(json!({"status": "REJECTED", "reason": "Cluster lock currently acquired by another portfolio symbol."}));
     }
 
-    // Query live order book ticker to join the best bid without crossing the ask
-    let (top_bid, top_ask) = client.fetch_book_ticker(symbol).await.unwrap_or((0.0, 0.0));
-    let post_only_price = if top_bid > 0.0 && top_ask > 0.0 {
-        // Join top bid, never cross the ask, and respect entry_price ceiling
-        let safe_price = f64::min(top_bid, entry_price);
-        if safe_price >= top_ask {
-            (top_ask - 0.01).max(0.0)
-        } else {
-            safe_price
+    // Fail-Closed: Query live order book ticker to join the best bid without crossing the ask
+    let (top_bid, top_ask) = match client.fetch_book_ticker(symbol).await {
+        Ok(quotes) => quotes,
+        Err(e) => {
+            release_cluster_lease(symbol);
+            return Err(format!("Failed to query live book ticker: {}", e));
         }
-    } else {
-        entry_price
     };
+
+    if top_bid <= 0.0 || top_ask <= 0.0 || top_bid >= top_ask {
+        release_cluster_lease(symbol);
+        return Err(format!("Invalid or crossed book ticker quotes: bid={}, ask={}", top_bid, top_ask));
+    }
+
+    let post_only_price = f64::min(top_bid, entry_price);
 
     let precision = get_symbol_lot_precision(symbol);
     let amount_to_buy = position_size_usdc / post_only_price;
