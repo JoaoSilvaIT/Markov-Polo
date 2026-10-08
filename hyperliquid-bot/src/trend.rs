@@ -321,7 +321,7 @@ impl L2ObiTracker {
                         self.stable_start_ms = local_recv_ms;
                     }
                     let stable_duration = local_recv_ms.saturating_sub(self.stable_start_ms);
-                    if self.low_latency_streak >= 2 && (stable_duration >= 30_000 || self.low_latency_streak >= 3) {
+                    if self.low_latency_streak >= 2 && stable_duration >= 30_000 {
                         self.tau_1_ms = 250.0;
                         self.tau_2_ms = 1000.0;
                         self.current_regime_label = "LowLatency".to_string();
@@ -329,7 +329,7 @@ impl L2ObiTracker {
                         self.stable_start_ms = 0;
                     }
                 } else {
-                    self.low_latency_streak = self.low_latency_streak.saturating_add(1);
+                    self.low_latency_streak = 0;
                 }
             }
         }
@@ -450,6 +450,12 @@ impl L2ObiTracker {
         self.last_instant = None;
         self.low_latency_streak = 0;
         self.stable_start_ms = 0;
+        self.last_local_recv_ms = 0;
+        self.last_exchange_time_ms = 0;
+        self.last_update_ms = 0;
+        self.best_bid = 0.0;
+        self.best_ask = 0.0;
+        self.gaps_over_3s = 0;
     }
 }
 
@@ -709,19 +715,57 @@ pub const SHADOW_CLUSTER_LOCK: &str = "hl_shadow_cluster.lock";
 pub const SHADOW_CLUSTER_LOCK_GUARD: &str = "hl_shadow_cluster.lock.guard";
 pub const SHADOW_CLUSTER_COUNTER: &str = "hl_shadow_cluster.counter";
 
-pub fn get_and_inc_shadow_counter() -> u64 {
-    let current: u64 = fs::read_to_string(SHADOW_CLUSTER_COUNTER)
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(0);
-    let next = current + 1;
-    let _ = fs::write(SHADOW_CLUSTER_COUNTER, next.to_string());
-    next
+/// Atomically reads and increments the monotonic shadow counter.
+/// Fails closed if the counter file exists but is corrupted.
+pub fn get_and_inc_shadow_counter() -> Result<u64, String> {
+    let counter_path = std::path::Path::new(SHADOW_CLUSTER_COUNTER);
+    let current = if counter_path.exists() {
+        let content = fs::read_to_string(counter_path)
+            .map_err(|e| format!("Failed to read shadow counter file: {}", e))?;
+        content
+            .trim()
+            .parse::<u64>()
+            .map_err(|e| format!("Corrupted shadow counter '{}': {}", content.trim(), e))?
+    } else {
+        0u64
+    };
+
+    let next = current
+        .checked_add(1)
+        .ok_or_else(|| "Shadow counter overflow".to_string())?;
+
+    let tmp_path = format!("{}.tmp.{}", SHADOW_CLUSTER_COUNTER, std::process::id());
+    {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(|e| format!("Failed to open temp shadow counter: {}", e))?;
+        file.write_all(next.to_string().as_bytes())
+            .map_err(|e| format!("Failed to write temp shadow counter: {}", e))?;
+        file.sync_all()
+            .map_err(|e| format!("Failed to sync temp shadow counter: {}", e))?;
+    }
+
+    fs::rename(&tmp_path, counter_path)
+        .map_err(|e| format!("Failed to atomically rename shadow counter: {}", e))?;
+
+    if let Some(parent) = counter_path.parent() {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+
+    Ok(next)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShadowClusterLease {
     pub symbol: String,
+    #[serde(default)]
+    pub owner_uuid: String,
     pub lease_token: String,
     pub acquired_at: i64,
     pub expires_at: i64,
@@ -729,12 +773,49 @@ pub struct ShadowClusterLease {
     pub fencing_token: u64,
 }
 
+fn write_shadow_lease_atomic(lease: &ShadowClusterLease) -> Result<(), String> {
+    let content = serde_json::to_string_pretty(lease)
+        .map_err(|e| format!("Failed to serialize shadow lease: {}", e))?;
+    let lock_path = std::path::Path::new(SHADOW_CLUSTER_LOCK);
+    let tmp_path = format!("{}.tmp.{}", SHADOW_CLUSTER_LOCK, std::process::id());
+    {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(|e| format!("Failed to open temp shadow lease: {}", e))?;
+        file.write_all(content.as_bytes())
+            .map_err(|e| format!("Failed to write temp shadow lease: {}", e))?;
+        file.sync_all()
+            .map_err(|e| format!("Failed to sync temp shadow lease: {}", e))?;
+    }
+    fs::rename(&tmp_path, lock_path)
+        .map_err(|e| format!("Failed to rename shadow lease file: {}", e))?;
+    if let Some(parent) = lock_path.parent() {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
 /// Atomically acquires the virtual shadow cluster lease using flock mutual exclusion.
 /// Returns (is_acquired, lease_token)
 pub fn try_acquire_shadow_cluster_lease(symbol: &str) -> (bool, Option<String>) {
+    let owner_uuid = format!("{}_{}", symbol, Utc::now().timestamp_micros());
+    let (acq, tok, _) = try_acquire_shadow_cluster_lease_with_uuid(symbol, &owner_uuid);
+    (acq, tok)
+}
+
+pub fn try_acquire_shadow_cluster_lease_with_uuid(
+    symbol: &str,
+    owner_uuid: &str,
+) -> (bool, Option<String>, u64) {
     let _guard = match FlockGuard::acquire(SHADOW_CLUSTER_LOCK_GUARD) {
         Ok(g) => g,
-        Err(_) => return (false, None),
+        Err(_) => return (false, None, 0),
     };
     let now = Utc::now().timestamp();
 
@@ -742,15 +823,20 @@ pub fn try_acquire_shadow_cluster_lease(symbol: &str) -> (bool, Option<String>) 
     if std::path::Path::new(SHADOW_CLUSTER_LOCK).exists() {
         if let Ok(c) = fs::read_to_string(SHADOW_CLUSTER_LOCK) {
             if let Ok(mut lease) = serde_json::from_str::<ShadowClusterLease>(&c) {
-                // If this symbol already holds the lease, refresh it
+                // If this symbol already holds the lease
                 if lease.symbol == symbol {
-                    let new_token = get_and_inc_shadow_counter();
-                    lease.expires_at = now + 3600;
-                    lease.fencing_token = new_token;
-                    if let Ok(pretty) = serde_json::to_string_pretty(&lease) {
-                        let _ = fs::write(SHADOW_CLUSTER_LOCK, pretty);
+                    if !lease.owner_uuid.is_empty() && lease.owner_uuid != owner_uuid {
+                        eprintln!(
+                            "⚠️ [SHADOW LEASE REJECTED] Active lease for {} held by another UUID ('{}' != '{}'). Rejecting duplicate takeover.",
+                            symbol, lease.owner_uuid, owner_uuid
+                        );
+                        return (false, None, 0);
                     }
-                    return (true, Some(lease.lease_token));
+                    // Same owner_uuid -> refresh without altering epoch/fencing_token!
+                    lease.expires_at = now + 3600;
+                    if write_shadow_lease_atomic(&lease).is_ok() {
+                        return (true, Some(lease.lease_token), lease.fencing_token);
+                    }
                 }
 
                 // If held by another symbol and unexpired, verify if holder's shadow trade finished early
@@ -759,35 +845,39 @@ pub fn try_acquire_shadow_cluster_lease(symbol: &str) -> (bool, Option<String>) 
                         .map(|t| !t.is_active)
                         .unwrap_or(false);
                     if !owner_finished_early {
-                        return (false, None);
+                        return (false, None, 0);
                     }
                 }
             }
         }
     }
 
-    let new_token = get_and_inc_shadow_counter();
+    let new_token = match get_and_inc_shadow_counter() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("❌ [SHADOW LEASE ERROR] Counter failure: {}", e);
+            return (false, None, 0);
+        }
+    };
     let lease_token = format!("{}_{}_{}", symbol, new_token, Utc::now().timestamp_subsec_nanos());
     let new_lease = ShadowClusterLease {
         symbol: symbol.to_string(),
+        owner_uuid: owner_uuid.to_string(),
         lease_token: lease_token.clone(),
         acquired_at: now,
         expires_at: now + 3600,
         fencing_token: new_token,
     };
 
-    if let Ok(content) = serde_json::to_string_pretty(&new_lease) {
-        if fs::write(SHADOW_CLUSTER_LOCK, content).is_ok() {
-            (true, Some(lease_token))
-        } else {
-            (false, None)
-        }
+    if write_shadow_lease_atomic(&new_lease).is_ok() {
+        (true, Some(lease_token), new_token)
     } else {
-        (false, None)
+        (false, None, 0)
     }
 }
 
 /// Renews the active shadow cluster lease heartbeat while a position is held under flock guard.
+/// PRESERVES fencing_token (does not increment epoch on heartbeat).
 pub fn refresh_shadow_cluster_lease(symbol: &str, token: &str) -> bool {
     let _guard = match FlockGuard::acquire(SHADOW_CLUSTER_LOCK_GUARD) {
         Ok(g) => g,
@@ -797,13 +887,9 @@ pub fn refresh_shadow_cluster_lease(symbol: &str, token: &str) -> bool {
     if let Ok(c) = fs::read_to_string(SHADOW_CLUSTER_LOCK) {
         if let Ok(mut lease) = serde_json::from_str::<ShadowClusterLease>(&c) {
             if lease.symbol == symbol && lease.lease_token == token {
-                let new_token = get_and_inc_shadow_counter();
+                // Heartbeat extends expiration only. Do NOT alter fencing_token!
                 lease.expires_at = now + 3600;
-                lease.fencing_token = new_token;
-                if let Ok(pretty) = serde_json::to_string_pretty(&lease) {
-                    let _ = fs::write(SHADOW_CLUSTER_LOCK, pretty);
-                    return true;
-                }
+                return write_shadow_lease_atomic(&lease).is_ok();
             }
         }
     }
@@ -811,23 +897,24 @@ pub fn refresh_shadow_cluster_lease(symbol: &str, token: &str) -> bool {
 }
 
 /// Releases the shadow cluster lease safely verifying token ownership under flock guard.
-pub fn release_shadow_cluster_lease(symbol: &str, token: Option<&str>) {
+pub fn release_shadow_cluster_lease(symbol: &str, token: Option<&str>) -> bool {
     let _guard = match FlockGuard::acquire(SHADOW_CLUSTER_LOCK_GUARD) {
         Ok(g) => g,
-        Err(_) => return,
+        Err(_) => return false,
     };
     if let Ok(c) = fs::read_to_string(SHADOW_CLUSTER_LOCK) {
         if let Ok(lease) = serde_json::from_str::<ShadowClusterLease>(&c) {
             if lease.symbol == symbol {
                 if let Some(tok) = token {
                     if lease.lease_token != tok {
-                        return; // Token mismatch: lease was already superseded
+                        return false; // Token mismatch: lease was already superseded
                     }
                 }
-                let _ = fs::remove_file(SHADOW_CLUSTER_LOCK);
+                return fs::remove_file(SHADOW_CLUSTER_LOCK).is_ok();
             }
         }
     }
+    false
 }
 
 pub fn shadow_state_path(symbol: &str) -> String {
@@ -1267,7 +1354,7 @@ mod tests {
         assert!(eth_tok_str.contains("ETH"));
 
         let eth_lease: ShadowClusterLease = serde_json::from_str(&fs::read_to_string(SHADOW_CLUSTER_LOCK).unwrap()).unwrap();
-        assert_eq!(eth_lease.fencing_token, 3, "Fencing token monotonically preserved across releases");
+        assert_eq!(eth_lease.fencing_token, 2, "Fencing token monotonically preserved across releases");
 
         release_shadow_cluster_lease("ETH", Some(&eth_tok_str));
         let _ = fs::remove_file(SHADOW_CLUSTER_LOCK);

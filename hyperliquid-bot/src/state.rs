@@ -236,14 +236,50 @@ pub fn save_armed_signal(file_path: &str, armed: &ArmedSignal) {
 
 pub const CLUSTER_COUNTER_FILE: &str = "hl_portfolio_cluster.counter";
 
-pub fn get_and_inc_cluster_counter() -> u64 {
-    let current: u64 = fs::read_to_string(CLUSTER_COUNTER_FILE)
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(0);
-    let next = current + 1;
-    let _ = fs::write(CLUSTER_COUNTER_FILE, next.to_string());
-    next
+/// Atomically reads and increments the monotonic cluster counter.
+/// Fails closed if the counter file exists but is corrupted or unparseable.
+pub fn get_and_inc_cluster_counter() -> Result<u64, String> {
+    let counter_path = std::path::Path::new(CLUSTER_COUNTER_FILE);
+    let current = if counter_path.exists() {
+        let content = fs::read_to_string(counter_path)
+            .map_err(|e| format!("Failed to read cluster counter file: {}", e))?;
+        content
+            .trim()
+            .parse::<u64>()
+            .map_err(|e| format!("Corrupted cluster counter '{}': {}", content.trim(), e))?
+    } else {
+        0u64
+    };
+
+    let next = current
+        .checked_add(1)
+        .ok_or_else(|| "Cluster counter overflow".to_string())?;
+
+    let tmp_path = format!("{}.tmp.{}", CLUSTER_COUNTER_FILE, std::process::id());
+    {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(|e| format!("Failed to open temp counter file: {}", e))?;
+        file.write_all(next.to_string().as_bytes())
+            .map_err(|e| format!("Failed to write temp counter: {}", e))?;
+        file.sync_all()
+            .map_err(|e| format!("Failed to sync temp counter: {}", e))?;
+    }
+
+    fs::rename(&tmp_path, counter_path)
+        .map_err(|e| format!("Failed to atomically rename counter file: {}", e))?;
+
+    if let Some(parent) = counter_path.parent() {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+
+    Ok(next)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,6 +293,34 @@ pub struct ClusterLease {
     pub expires_at: String,
     #[serde(default)]
     pub fencing_token: u64,
+}
+
+fn write_lease_atomic(lease: &ClusterLease) -> Result<(), String> {
+    let content = serde_json::to_string_pretty(lease)
+        .map_err(|e| format!("Failed to serialize cluster lease: {}", e))?;
+    let lock_path = std::path::Path::new(CLUSTER_LOCK_FILE);
+    let tmp_path = format!("{}.tmp.{}", CLUSTER_LOCK_FILE, std::process::id());
+    {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(|e| format!("Failed to open temp lease file: {}", e))?;
+        file.write_all(content.as_bytes())
+            .map_err(|e| format!("Failed to write temp lease: {}", e))?;
+        file.sync_all()
+            .map_err(|e| format!("Failed to sync temp lease: {}", e))?;
+    }
+    fs::rename(&tmp_path, lock_path)
+        .map_err(|e| format!("Failed to rename lease file: {}", e))?;
+    if let Some(parent) = lock_path.parent() {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 /// Returns the active cluster lease, if any
@@ -298,33 +362,38 @@ pub fn try_acquire_cluster_lease_for_engine_with_uuid(
     if std::path::Path::new(CLUSTER_LOCK_FILE).exists() {
         if let Ok(content) = fs::read_to_string(CLUSTER_LOCK_FILE) {
             if let Ok(mut lease) = serde_json::from_str::<ClusterLease>(&content) {
-                if lease.owner == symbol {
-                    let new_token = get_and_inc_cluster_counter();
-                    lease.engine_owner = engine_owner.to_string();
-                    if !owner_uuid.is_empty() {
-                        lease.owner_uuid = owner_uuid.to_string();
+                let exp_dt = chrono::DateTime::parse_from_rfc3339(&lease.expires_at)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .ok();
+                let is_unexpired = exp_dt.map(|exp| now < exp).unwrap_or(true);
+
+                if is_unexpired {
+                    if lease.owner == symbol {
+                        // Same symbol: only the same UUID/process is authorized to refresh!
+                        if !lease.owner_uuid.is_empty() && lease.owner_uuid == owner_uuid {
+                            lease.engine_owner = engine_owner.to_string();
+                            lease.expires_at = expires.to_rfc3339();
+                            if write_lease_atomic(&lease).is_ok() {
+                                return (true, lease.fencing_token);
+                            }
+                        } else {
+                            eprintln!(
+                                "⚠️ [CLUSTER LEASE REJECTED] Active lease for {} held by another UUID ('{}' != '{}'). Rejecting duplicate takeover.",
+                                symbol, lease.owner_uuid, owner_uuid
+                            );
+                            return (false, 0);
+                        }
                     }
-                    lease.expires_at = expires.to_rfc3339();
-                    lease.fencing_token = new_token;
-                    if let Ok(pretty) = serde_json::to_string_pretty(&lease) {
-                        let _ = fs::write(CLUSTER_LOCK_FILE, pretty);
-                    }
-                    return (true, new_token);
-                }
 
-                let owner_state_file = format!("hl_hmm_state_{}.json", lease.owner);
-                let owner_has_pos = load_state(&owner_state_file)
-                    .ok()
-                    .and_then(|s| s.get(&lease.owner).cloned())
-                    .map(|p| p.is_occupied())
-                    .unwrap_or(false);
+                    // Different symbol and active: verify if owner has open position
+                    let owner_state_file = format!("hl_hmm_state_{}.json", lease.owner);
+                    let owner_has_pos = load_state(&owner_state_file)
+                        .ok()
+                        .and_then(|s| s.get(&lease.owner).cloned())
+                        .map(|p| p.is_occupied())
+                        .unwrap_or(false);
 
-                if owner_has_pos {
-                    return (false, 0);
-                }
-
-                if let Ok(exp_dt) = chrono::DateTime::parse_from_rfc3339(&lease.expires_at) {
-                    if now < exp_dt.with_timezone(&chrono::Utc) {
+                    if owner_has_pos || is_unexpired {
                         return (false, 0);
                     }
                 }
@@ -332,7 +401,15 @@ pub fn try_acquire_cluster_lease_for_engine_with_uuid(
         }
     }
 
-    let new_token = get_and_inc_cluster_counter();
+    // Acquire brand-new lease epoch with incremented monotonic fencing token
+    let new_token = match get_and_inc_cluster_counter() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("❌ [CLUSTER LEASE ERROR] Counter failure: {}", e);
+            return (false, 0);
+        }
+    };
+
     let lease = ClusterLease {
         owner: symbol.to_string(),
         engine_owner: engine_owner.to_string(),
@@ -341,18 +418,16 @@ pub fn try_acquire_cluster_lease_for_engine_with_uuid(
         expires_at: expires.to_rfc3339(),
         fencing_token: new_token,
     };
-    if let Ok(content) = serde_json::to_string_pretty(&lease) {
-        if fs::write(CLUSTER_LOCK_FILE, content).is_ok() {
-            (true, new_token)
-        } else {
-            (false, 0)
-        }
+
+    if write_lease_atomic(&lease).is_ok() {
+        (true, new_token)
     } else {
         (false, 0)
     }
 }
 
 /// Refreshes/renews the active cluster lease while position or entry order is open
+#[allow(dead_code)]
 pub fn refresh_cluster_lease(symbol: &str, duration_secs: i64) -> bool {
     refresh_cluster_lease_authenticated(symbol, None, None, duration_secs)
 }
@@ -385,13 +460,9 @@ pub fn refresh_cluster_lease_authenticated(
                         return false;
                     }
                 }
-                let new_token = get_and_inc_cluster_counter();
+                // PRESERVE fencing_token! Heartbeat extends expiry only without changing epoch.
                 lease.expires_at = expires.to_rfc3339();
-                lease.fencing_token = new_token;
-                if let Ok(pretty) = serde_json::to_string_pretty(&lease) {
-                    let _ = fs::write(CLUSTER_LOCK_FILE, pretty);
-                    return true;
-                }
+                return write_lease_atomic(&lease).is_ok();
             }
         }
     }
@@ -399,6 +470,7 @@ pub fn refresh_cluster_lease_authenticated(
 }
 
 /// Releases the portfolio cluster lease if held by symbol
+#[allow(dead_code)]
 pub fn release_cluster_lease(symbol: &str) {
     let _ = release_cluster_lease_authenticated(symbol, None, None);
 }
@@ -674,30 +746,70 @@ mod tests {
         assert_eq!(tok1, 1);
         assert_eq!(lease1.owner_uuid, "uuid_btc");
 
-        // Authenticated Refresh increases fencing token
+        // Authenticated Refresh PRESERVES fencing token epoch (does NOT change token during heartbeat)
         assert!(refresh_cluster_lease_authenticated("BTC", Some("uuid_btc"), Some(1), 60));
         let lease2 = get_current_cluster_lease().expect("lease2");
-        assert_eq!(lease2.fencing_token, 2);
+        assert_eq!(lease2.fencing_token, 1);
 
         // Wrong token or UUID rejects refresh
-        assert!(!refresh_cluster_lease_authenticated("BTC", Some("wrong_uuid"), Some(2), 60));
+        assert!(!refresh_cluster_lease_authenticated("BTC", Some("wrong_uuid"), Some(1), 60));
         assert!(!refresh_cluster_lease_authenticated("BTC", Some("uuid_btc"), Some(999), 60));
 
-        // Authenticated release succeeds
-        assert!(release_cluster_lease_authenticated("BTC", Some("uuid_btc"), Some(2)));
+        // Authenticated release succeeds with original token 1
+        assert!(release_cluster_lease_authenticated("BTC", Some("uuid_btc"), Some(1)));
         assert!(get_current_cluster_lease().is_none());
 
-        // Re-acquire by ETH increments from persistent counter (strictly monotonic > lease2 token!)
-        let (acq_eth, tok3) = try_acquire_cluster_lease_for_engine_with_uuid("ETH", "EngineB", "uuid_eth", 60);
+        // Re-acquire by ETH increments from persistent counter to token 2 (strictly monotonic epoch)
+        let (acq_eth, tok2) = try_acquire_cluster_lease_for_engine_with_uuid("ETH", "EngineB", "uuid_eth", 60);
         assert!(acq_eth);
         let lease3 = get_current_cluster_lease().expect("lease3");
-        assert_eq!(lease3.fencing_token, 3);
-        assert_eq!(tok3, 3);
+        assert_eq!(lease3.fencing_token, 2);
+        assert_eq!(tok2, 2);
         assert_eq!(lease3.engine_owner, "EngineB");
 
-        assert!(release_cluster_lease_authenticated("ETH", Some("uuid_eth"), Some(3)));
+        assert!(release_cluster_lease_authenticated("ETH", Some("uuid_eth"), Some(2)));
         let _ = fs::remove_file(CLUSTER_LOCK_FILE);
         let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
+        let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
+    }
+
+    #[test]
+    fn test_cluster_lease_rejects_duplicate_instance_with_different_uuid() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let _ = fs::remove_file(CLUSTER_LOCK_FILE);
+        let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
+        let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
+
+        let (acq1, tok1) = try_acquire_cluster_lease_for_engine_with_uuid("BTC", "EngineA", "process_1_uuid", 60);
+        assert!(acq1);
+        assert_eq!(tok1, 1);
+
+        // Second instance with SAME symbol "BTC" but DIFFERENT UUID must be REJECTED while lease is valid!
+        let (acq2, tok2) = try_acquire_cluster_lease_for_engine_with_uuid("BTC", "EngineA", "process_2_duplicate_uuid", 60);
+        assert!(!acq2);
+        assert_eq!(tok2, 0);
+
+        // Same UUID is permitted (treated as idempotent re-acquire/refresh)
+        let (acq_same, tok_same) = try_acquire_cluster_lease_for_engine_with_uuid("BTC", "EngineA", "process_1_uuid", 60);
+        assert!(acq_same);
+        assert_eq!(tok_same, 1);
+
+        assert!(release_cluster_lease_authenticated("BTC", Some("process_1_uuid"), Some(1)));
+        let _ = fs::remove_file(CLUSTER_LOCK_FILE);
+        let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
+        let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
+    }
+
+    #[test]
+    fn test_cluster_counter_fails_closed_on_corrupted_file() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
+
+        // Valid write
+        fs::write(CLUSTER_COUNTER_FILE, "corrupted_garbage_text").unwrap();
+        let res = get_and_inc_cluster_counter();
+        assert!(res.is_err(), "Corrupted counter must return Err, never reset to 0!");
+
         let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
     }
 

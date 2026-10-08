@@ -3,7 +3,7 @@ use crate::hyperliquid::{
     round_to_decimals, place_post_only_order,
 };
 use crate::state::{
-    release_cluster_lease, release_cluster_lease_authenticated, save_state,
+    release_cluster_lease_authenticated, save_state,
     try_acquire_cluster_lease_for_engine_with_uuid, PositionState, Side, StateMap,
 };
 use chrono::Utc;
@@ -205,13 +205,19 @@ pub async fn emergency_flatten(
     }
 
     // 3. Reconcile open orders on exchange: confirm entry order is no longer resting
-    let open_orders = info.open_orders(wallet_address).await.unwrap_or_default();
+    let open_orders = info
+        .open_orders(wallet_address)
+        .await
+        .map_err(|e| format!("Failed to query open_orders in emergency_flatten: {}", e))?;
     if !pos.order_id.is_empty() {
         if let Ok(entry_oid) = pos.order_id.parse::<u64>() {
             if open_orders.iter().any(|o| o.oid == entry_oid) {
                 tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
                 let _ = cancel_order(exchange, symbol, entry_oid).await;
-                let post_cancel_orders = info.open_orders(wallet_address).await.unwrap_or_default();
+                let post_cancel_orders = info
+                    .open_orders(wallet_address)
+                    .await
+                    .map_err(|e| format!("Failed to query post-cancel open_orders: {}", e))?;
                 if post_cancel_orders.iter().any(|o| o.oid == entry_oid) {
                     let err = format!(
                         "Emergency flatten failed: entry order {} still active on exchange. Retaining state and lease.",
@@ -252,25 +258,39 @@ pub async fn emergency_flatten(
 
     // 5. Final multi-step verification: position == 0 AND no orders remain for symbol
     let (final_szi, _) = get_user_position(info, wallet_address, symbol).await?;
-    let final_orders = info.open_orders(wallet_address).await.unwrap_or_default();
+    let final_orders = info
+        .open_orders(wallet_address)
+        .await
+        .map_err(|e| format!("Failed to query final open_orders: {}", e))?;
     let symbol_orders_remaining = final_orders.iter().any(|o| o.coin == symbol);
 
     if final_szi.abs() <= eps && !symbol_orders_remaining {
+        let released = if !pos.lease_owner_uuid.is_empty() {
+            release_cluster_lease_authenticated(
+                symbol,
+                Some(&pos.lease_owner_uuid),
+                Some(pos.lease_fencing_token),
+            )
+        } else {
+            release_cluster_lease_authenticated(symbol, None, None)
+        };
+
+        if !released {
+            let err = format!(
+                "Exchange flat for {}, but cluster lease release authentication failed. Retaining state.",
+                symbol
+            );
+            eprintln!("❌ [EMERGENCY FLATTEN BLOCKED] {}", err);
+            crate::discord::send_alert(discord_url.as_deref(), &format!("🚨 {}", err)).await;
+            return Err(err);
+        }
+
         println!(
-            "✅ [EMERGENCY FLATTEN] Successfully verified zero position and zero open orders for {}. Clearing state and releasing cluster lease.",
+            "✅ [EMERGENCY FLATTEN] Successfully verified zero position, zero open orders, and released cluster lease for {}. Clearing state.",
             symbol
         );
         state.remove(symbol);
         let _ = save_state(state_file_path, state);
-        if !pos.lease_owner_uuid.is_empty() {
-            let _ = release_cluster_lease_authenticated(
-                symbol,
-                Some(&pos.lease_owner_uuid),
-                Some(pos.lease_fencing_token),
-            );
-        } else {
-            release_cluster_lease(symbol);
-        }
         let ok_msg = format!(
             "✅ **EMERGENCY FLATTEN COMPLETE:** Position and all orders for {} flattened and verified zero.",
             symbol

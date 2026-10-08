@@ -30,7 +30,7 @@ use crate::order::{emergency_flatten, place_ou_maker_entry};
 use crate::ou_process::{calculate_features, calculate_net_edge_bps};
 use crate::state::{
     has_active_cluster_position, load_armed_signal, load_circuit_breaker, load_state,
-    release_cluster_lease, save_armed_signal, save_circuit_breaker, save_state, Side, StateMap,
+    save_armed_signal, save_circuit_breaker, save_state, Side, StateMap,
 };
 use crate::trend::{
     append_candidate_log, calculate_atr, calculate_donchian, check_trend_alignment,
@@ -50,16 +50,36 @@ async fn backfill_missing_1m_candles(
     if start_ms >= end_ms {
         return Ok(0);
     }
-    let candles = info_client
+    let mut candles = info_client
         .candles_snapshot(coin.to_string(), "1m".to_string(), start_ms, end_ms)
         .await
         .map_err(|e| format!("REST candles_snapshot error: {}", e))?;
 
+    // 1. Sort strictly by time_open
+    candles.sort_by_key(|c| c.time_open);
+
+    // 2. Filter to range [start_ms, end_ms) and deduplicate
+    candles.retain(|c| c.time_open >= start_ms && c.time_open < end_ms);
+    candles.dedup_by_key(|c| c.time_open);
+
+    // 3. Construct expected sequence of consecutive 60s bars
+    let expected: Vec<u64> = (start_ms..end_ms).step_by(60_000).collect();
+    let received: Vec<u64> = candles.iter().map(|c| c.time_open).collect();
+
+    // 4. Require exact equality for data continuity certification
+    if received != expected {
+        return Err(format!(
+            "incomplete backfill for {}: expected {} bars ({:?}), received {} bars ({:?})",
+            coin,
+            expected.len(),
+            expected,
+            received.len(),
+            received
+        ));
+    }
+
     let mut backfilled_count = 0;
     for c in candles {
-        if c.time_open < start_ms || c.time_open >= end_ms {
-            continue;
-        }
         let open_f = c.open.parse::<f64>().map_err(|e| e.to_string())?;
         let high_f = c.high.parse::<f64>().map_err(|e| e.to_string())?;
         let low_f = c.low.parse::<f64>().map_err(|e| e.to_string())?;
@@ -488,10 +508,17 @@ async fn main() {
 
             let mut state_lock = watcher_state.lock().await;
             if let Some(pos) = state_lock.get(&watcher_symbol).cloned() {
-                // Cross-reference user position on live exchange
-                let (current_szi, _) = get_user_position(&watcher_info, user_address, &watcher_symbol)
-                    .await
-                    .unwrap_or((0.0, None));
+                // Cross-reference user position on live exchange (Fail-Closed)
+                let (current_szi, _) = match get_user_position(&watcher_info, user_address, &watcher_symbol).await {
+                    Ok(res) => res,
+                    Err(e) => {
+                        eprintln!(
+                            "⚠️ [FAST-SENTINEL] API failure fetching position for {}: {}. Retaining state (fail-closed).",
+                            watcher_symbol, e
+                        );
+                        continue;
+                    }
+                };
                 let pos_exists = if pos.side == "LONG" {
                     current_szi > 0.0
                 } else {
@@ -550,7 +577,16 @@ async fn main() {
 
                     if !pos.order_id.is_empty() {
                         if let Ok(oid) = pos.order_id.parse::<u64>() {
-                            let open_orders = watcher_info.open_orders(user_address).await.unwrap_or_default();
+                            let open_orders = match watcher_info.open_orders(user_address).await {
+                                Ok(o) => o,
+                                Err(e) => {
+                                    eprintln!(
+                                        "⚠️ [FAST-SENTINEL] API failure querying open_orders for {}: {}. Retaining state (fail-closed).",
+                                        watcher_symbol, e
+                                    );
+                                    continue;
+                                }
+                            };
                             let is_resting = open_orders.iter().any(|o| o.oid == oid);
 
                             if is_resting {
@@ -633,21 +669,50 @@ async fn main() {
                             let _ = cancel_order(&watcher_exchange, &watcher_symbol, oid).await;
                         }
 
-                        println!(
-                            "⚪ [FAST-SENTINEL] Entry for {} dead (status: {}). Cleaning up state.",
-                            watcher_symbol, reported_status
-                        );
-                        state_lock.remove(&watcher_symbol);
-                        let _ = save_state(&watcher_state_path, &state_lock);
-                        release_cluster_lease(&watcher_symbol);
+                        // Reconcile open orders and position before cleaning up state
+                        let eps = 1e-5;
+                        let verify_orders = match watcher_info.open_orders(user_address).await {
+                            Ok(orders) => orders,
+                            Err(e) => {
+                                eprintln!(
+                                    "⚠️ [FAST-SENTINEL] Failed to verify open_orders before cleanup for {}: {}. Retaining state.",
+                                    watcher_symbol, e
+                                );
+                                continue;
+                            }
+                        };
+                        let entry_oid_num = pos.order_id.parse::<u64>().unwrap_or(0);
+                        let is_still_resting = verify_orders.iter().any(|o| o.oid == entry_oid_num);
+
+                        if current_szi.abs() <= eps && !is_still_resting {
+                            let released = crate::state::release_cluster_lease_authenticated(
+                                &watcher_symbol,
+                                Some(&pos.lease_owner_uuid),
+                                Some(pos.lease_fencing_token),
+                            );
+                            if !released {
+                                eprintln!(
+                                    "⚠️ [FAST-SENTINEL] Lease release authentication failed for {}. Retaining state.",
+                                    watcher_symbol
+                                );
+                                continue;
+                            }
+                            println!(
+                                "⚪ [FAST-SENTINEL] Entry for {} dead (status: {}). Position flat, lease released, clearing state.",
+                                watcher_symbol, reported_status
+                            );
+                            state_lock.remove(&watcher_symbol);
+                            let _ = save_state(&watcher_state_path, &state_lock);
+                        }
                     }
                 }
                 // -------------------------------------------------------------
                 // Scenario 2: TP order resting on book. Check if filled or position closed
                 // -------------------------------------------------------------
                 else if !pos.tp_order_id.is_empty() {
-                    let is_flat = current_szi.abs() == 0.0;
-                    let mut is_tp_filled = is_flat;
+                    let eps = 1e-5;
+                    let is_flat = current_szi.abs() <= eps;
+                    let mut is_tp_filled = false;
 
                     if let Ok(tp_oid) = pos.tp_order_id.parse::<u64>() {
                         if let Ok(order_status) = watcher_info.query_order_by_oid(user_address, tp_oid).await {
@@ -663,25 +728,51 @@ async fn main() {
                         }
                     }
 
-                    if is_tp_filled {
-                        println!(
-                            "🎉 [FAST-SENTINEL] Take Profit for {} (Side: {}) has FILLED / Position Flat!",
-                            watcher_symbol, pos.side
-                        );
-                        state_lock.remove(&watcher_symbol);
-                        let _ = save_state(&watcher_state_path, &state_lock);
-                        release_cluster_lease(&watcher_symbol);
+                    if is_tp_filled || is_flat {
+                        let final_orders = match watcher_info.open_orders(user_address).await {
+                            Ok(orders) => orders,
+                            Err(e) => {
+                                eprintln!(
+                                    "⚠️ [FAST-SENTINEL] Failed to query open_orders on TP close for {}: {}. Retaining state.",
+                                    watcher_symbol, e
+                                );
+                                continue;
+                            }
+                        };
+                        let symbol_orders_remain = final_orders.iter().any(|o| o.coin == watcher_symbol);
 
-                        // Reset circuit breaker
-                        let mut cb_lock = watcher_cb.lock().await;
-                        cb_lock.record_win();
-                        save_circuit_breaker(&watcher_cb_path, &cb_lock);
+                        if is_flat && !symbol_orders_remain {
+                            let released = crate::state::release_cluster_lease_authenticated(
+                                &watcher_symbol,
+                                Some(&pos.lease_owner_uuid),
+                                Some(pos.lease_fencing_token),
+                            );
+                            if !released {
+                                eprintln!(
+                                    "⚠️ [FAST-SENTINEL] Cluster lease release failed authentication on TP close for {}. Retaining state.",
+                                    watcher_symbol
+                                );
+                                continue;
+                            }
 
-                        let msg = format!(
-                            "🎉 **TRADE CLOSED IN PROFIT (HYPERLIQUID)!** {} {} Take Profit has filled successfully.",
-                            watcher_symbol, pos.side
-                        );
-                        crate::discord::send_alert(watcher_discord.as_deref(), &msg).await;
+                            println!(
+                                "🎉 [FAST-SENTINEL] Take Profit for {} (Side: {}) verified flat & zero orders! State cleared, lease released.",
+                                watcher_symbol, pos.side
+                            );
+                            state_lock.remove(&watcher_symbol);
+                            let _ = save_state(&watcher_state_path, &state_lock);
+
+                            // Reset circuit breaker
+                            let mut cb_lock = watcher_cb.lock().await;
+                            cb_lock.record_win();
+                            save_circuit_breaker(&watcher_cb_path, &cb_lock);
+
+                            let msg = format!(
+                                "🎉 **TRADE CLOSED IN PROFIT (HYPERLIQUID)!** {} {} Take Profit has filled successfully.",
+                                watcher_symbol, pos.side
+                            );
+                            crate::discord::send_alert(watcher_discord.as_deref(), &msg).await;
+                        }
                     }
                 }
             }
@@ -858,7 +949,6 @@ async fn main() {
                         "⚠️ [CANDLE GAP DETECTED] Missing {} candle(s) between {} and {}. Entering degraded mode and initiating REST backfill...",
                         gap_minutes, last_processed_1m_open, completed_bar.time_open
                     );
-                    candle_feed_degraded = true;
                     controller.force_neutral_data_quality();
                     let mut armed_state = load_armed_signal(&arm_file_path);
                     if armed_state.is_armed {
@@ -897,14 +987,20 @@ async fn main() {
                     ).await;
 
                     match backfill_res {
+                        Ok(0) => {
+                            eprintln!("❌ [BACKFILL EMPTY] Expected missing candles but received 0. Retaining candle_feed_degraded=true (fail-closed).");
+                            is_candle_gap = true;
+                            candle_feed_degraded = true;
+                        }
                         Ok(count) => {
-                            println!("✅ [BACKFILL COMPLETE] Successfully recovered {} missing 1m bars from REST.", count);
+                            println!("✅ [BACKFILL COMPLETE] Successfully recovered and validated {} missing 1m bars from REST.", count);
                             is_candle_gap = false;
                             candle_feed_degraded = false;
                         }
                         Err(e) => {
-                            eprintln!("❌ [BACKFILL FAILED] Could not fetch missing candles via REST: {}. Retaining candle_feed_degraded=true (fail-closed).", e);
+                            eprintln!("❌ [BACKFILL FAILED] Could not validate missing candles via REST: {}. Retaining candle_feed_degraded=true (fail-closed).", e);
                             is_candle_gap = true;
+                            candle_feed_degraded = true;
                         }
                     }
                 }
@@ -1468,7 +1564,30 @@ async fn main() {
                             save_armed_signal(&arm_path_clone, &armed_state);
                         }
 
-                        let _ = crate::state::refresh_cluster_lease(&symbol_clone, 3600);
+                        if let Some(pos) = state_lock.get(&symbol_clone) {
+                            let refresh_ok = crate::state::refresh_cluster_lease_authenticated(
+                                &symbol_clone,
+                                Some(&pos.lease_owner_uuid),
+                                Some(pos.lease_fencing_token),
+                                3600,
+                            );
+                            if !refresh_ok {
+                                eprintln!(
+                                    "⚠️ [PORTFOLIO LEASE LOST] Cluster lease refresh failed for {}. Logging warning.",
+                                    symbol_clone
+                                );
+                                crate::state::log_to_journal(
+                                    &format!("Cluster lease heartbeat failed for {} (token: {}).", symbol_clone, pos.lease_fencing_token),
+                                    "PORTFOLIO_LEASE_LOST",
+                                    serde_json::json!({
+                                        "symbol": symbol_clone,
+                                        "token": pos.lease_fencing_token,
+                                        "owner_uuid": pos.lease_owner_uuid,
+                                        "timestamp_ms": chrono::Utc::now().timestamp_millis(),
+                                    }),
+                                );
+                            }
+                        }
 
                             let mut entry_ttl_expired = false;
                             let mut time_stop_triggered = false;
