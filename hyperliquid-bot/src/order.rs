@@ -3,7 +3,8 @@ use crate::hyperliquid::{
     round_to_decimals, place_post_only_order,
 };
 use crate::state::{
-    release_cluster_lease, save_state, try_acquire_cluster_lease, PositionState, Side, StateMap,
+    release_cluster_lease, release_cluster_lease_authenticated, save_state,
+    try_acquire_cluster_lease_for_engine_with_uuid, PositionState, Side, StateMap,
 };
 use chrono::Utc;
 use ethers::types::H160;
@@ -34,8 +35,16 @@ pub async fn place_ou_maker_entry(
         }));
     }
 
+    let lease_uuid = format!("{}_{}", symbol, Utc::now().timestamp_micros());
+
     // Atomically acquire the portfolio cluster lease (1 hour renewed continuously while holding)
-    if !try_acquire_cluster_lease(symbol, 3600) {
+    let (acquired, fencing_token) = try_acquire_cluster_lease_for_engine_with_uuid(
+        symbol,
+        "EngineA",
+        &lease_uuid,
+        3600,
+    );
+    if !acquired {
         return Ok(json!({
             "status": "REJECTED",
             "reason": "Cluster lock currently acquired by another portfolio symbol."
@@ -46,13 +55,13 @@ pub async fn place_ou_maker_entry(
     let (top_bid, top_ask) = match fetch_book_ticker(info, symbol).await {
         Ok(quotes) => quotes,
         Err(e) => {
-            release_cluster_lease(symbol);
+            let _ = release_cluster_lease_authenticated(symbol, Some(&lease_uuid), Some(fencing_token));
             return Err(format!("Failed to query live book ticker: {}", e));
         }
     };
 
     if top_bid <= 0.0 || top_ask <= 0.0 || top_bid >= top_ask {
-        release_cluster_lease(symbol);
+        let _ = release_cluster_lease_authenticated(symbol, Some(&lease_uuid), Some(fencing_token));
         return Err(format!(
             "Invalid or crossed book ticker quotes: bid={}, ask={}",
             top_bid, top_ask
@@ -73,7 +82,7 @@ pub async fn place_ou_maker_entry(
     let amount_f = round_to_decimals(amount_raw, sz_decimals);
 
     if amount_f <= 0.0 {
-        release_cluster_lease(symbol);
+        let _ = release_cluster_lease_authenticated(symbol, Some(&lease_uuid), Some(fencing_token));
         return Err(format!(
             "Calculated size {:.6} is zero or below minimum size decimals {}",
             amount_raw, sz_decimals
@@ -95,7 +104,7 @@ pub async fn place_ou_maker_entry(
     {
         Ok(id) => id,
         Err(e) => {
-            release_cluster_lease(symbol);
+            let _ = release_cluster_lease_authenticated(symbol, Some(&lease_uuid), Some(fencing_token));
             return Err(e);
         }
     };
@@ -142,6 +151,8 @@ pub async fn place_ou_maker_entry(
         engine_type: "EngineA".to_string(),
         chandelier_stop: 0.0,
         current_atr: 0.0,
+        lease_fencing_token: fencing_token,
+        lease_owner_uuid: lease_uuid,
     };
 
     state.insert(symbol.to_string(), new_state.clone());
@@ -193,10 +204,32 @@ pub async fn emergency_flatten(
         }
     }
 
-    // 3. Query actual live position on Hyperliquid
-    let (szi, _) = get_user_position(info, wallet_address, symbol).await?;
+    // 3. Reconcile open orders on exchange: confirm entry order is no longer resting
+    let open_orders = info.open_orders(wallet_address).await.unwrap_or_default();
+    if !pos.order_id.is_empty() {
+        if let Ok(entry_oid) = pos.order_id.parse::<u64>() {
+            if open_orders.iter().any(|o| o.oid == entry_oid) {
+                tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                let _ = cancel_order(exchange, symbol, entry_oid).await;
+                let post_cancel_orders = info.open_orders(wallet_address).await.unwrap_or_default();
+                if post_cancel_orders.iter().any(|o| o.oid == entry_oid) {
+                    let err = format!(
+                        "Emergency flatten failed: entry order {} still active on exchange. Retaining state and lease.",
+                        entry_oid
+                    );
+                    eprintln!("❌ [EMERGENCY FLATTEN BLOCKED] {}", err);
+                    crate::discord::send_alert(discord_url.as_deref(), &format!("🚨 {}", err)).await;
+                    return Err(err);
+                }
+            }
+        }
+    }
 
-    if szi.abs() > 0.0 {
+    // 4. Query actual live position on Hyperliquid with epsilon tolerance
+    let (szi, _) = get_user_position(info, wallet_address, symbol).await?;
+    let eps = 1e-5;
+
+    if szi.abs() > eps {
         println!(
             "🚨 [EMERGENCY FLATTEN] Active open position detected for {} (szi: {:.5}). Executing Market Close...",
             symbol, szi
@@ -207,50 +240,58 @@ pub async fn emergency_flatten(
         );
         crate::discord::send_alert(discord_url.as_deref(), &msg).await;
 
-        match close_market_position(exchange, symbol, 0.02).await {
-            Ok(_) => {
-                // Post-Close Verification Invariant: Confirm exchange position == 0
-                tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
-                match get_user_position(info, wallet_address, symbol).await {
-                    Ok((residual_szi, _)) if residual_szi.abs() > 0.0 => {
-                        eprintln!(
-                            "🚨 [EMERGENCY FLATTEN WARNING] Residual position still open after close attempt (szi: {:.5}). Keeping state active for supervisor retry!",
-                            residual_szi
-                        );
-                        let warn_msg = format!(
-                            "⚠️ **EMERGENCY FLATTEN INCOMPLETE:** Residual size {:.5} remains on {}. Retaining state for supervisor retry.",
-                            residual_szi, symbol
-                        );
-                        crate::discord::send_alert(discord_url.as_deref(), &warn_msg).await;
-                        return Err(format!("Residual position remaining: {}", residual_szi));
-                    }
-                    _ => {
-                        println!("✅ [EMERGENCY FLATTEN] Successfully closed and verified zero position for {}.", symbol);
-                        state.remove(symbol);
-                        let _ = save_state(state_file_path, state);
-                        release_cluster_lease(symbol);
-                        let ok_msg = format!("✅ **EMERGENCY FLATTEN COMPLETE:** Position for {} flattened and verified zero.", symbol);
-                        crate::discord::send_alert(discord_url.as_deref(), &ok_msg).await;
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("❌ [EMERGENCY FLATTEN FAILED] Failed to close position for {}: {}", symbol, e);
-                let err_msg = format!("❌ **EMERGENCY FLATTEN FAILED:** Close failed for {}: {}", symbol, e);
-                crate::discord::send_alert(discord_url.as_deref(), &err_msg).await;
-                return Err(e);
-            }
+        if let Err(e) = close_market_position(exchange, symbol, 0.02).await {
+            eprintln!("❌ [EMERGENCY FLATTEN FAILED] Close failed for {}: {}", symbol, e);
+            let err_msg = format!("❌ **EMERGENCY FLATTEN FAILED:** Close failed for {}: {}", symbol, e);
+            crate::discord::send_alert(discord_url.as_deref(), &err_msg).await;
+            return Err(e);
         }
-    } else {
-        // Zero open position (entry never filled or was cleanly cancelled)
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    }
+
+    // 5. Final multi-step verification: position == 0 AND no orders remain for symbol
+    let (final_szi, _) = get_user_position(info, wallet_address, symbol).await?;
+    let final_orders = info.open_orders(wallet_address).await.unwrap_or_default();
+    let symbol_orders_remaining = final_orders.iter().any(|o| o.coin == symbol);
+
+    if final_szi.abs() <= eps && !symbol_orders_remaining {
         println!(
-            "⚪ [EMERGENCY FLATTEN] Zero open position for {}. State and cluster lease cleared.",
+            "✅ [EMERGENCY FLATTEN] Successfully verified zero position and zero open orders for {}. Clearing state and releasing cluster lease.",
             symbol
         );
         state.remove(symbol);
         let _ = save_state(state_file_path, state);
-        release_cluster_lease(symbol);
+        if !pos.lease_owner_uuid.is_empty() {
+            let _ = release_cluster_lease_authenticated(
+                symbol,
+                Some(&pos.lease_owner_uuid),
+                Some(pos.lease_fencing_token),
+            );
+        } else {
+            release_cluster_lease(symbol);
+        }
+        let ok_msg = format!(
+            "✅ **EMERGENCY FLATTEN COMPLETE:** Position and all orders for {} flattened and verified zero.",
+            symbol
+        );
+        crate::discord::send_alert(discord_url.as_deref(), &ok_msg).await;
+        Ok(())
+    } else {
+        let reason = if final_szi.abs() > eps {
+            format!("Residual size {:.5} remains", final_szi)
+        } else {
+            format!("Uncancelled open orders remain for {}", symbol)
+        };
+        eprintln!(
+            "⚠️ [EMERGENCY FLATTEN WARNING] {} on {}. Retaining state and lease for supervisor retry!",
+            reason, symbol
+        );
+        let warn_msg = format!(
+            "⚠️ **EMERGENCY FLATTEN INCOMPLETE:** {} on {}. Retaining state for supervisor retry.",
+            reason, symbol
+        );
+        crate::discord::send_alert(discord_url.as_deref(), &warn_msg).await;
+        Err(format!("Emergency flatten reconciliation incomplete: {}", reason))
     }
-
-    Ok(())
 }

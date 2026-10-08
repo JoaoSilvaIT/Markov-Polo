@@ -98,6 +98,20 @@ impl RegimeController {
         self.epoch += 1;
     }
 
+    /// Forces immediate fallback to Neutral due to feed gaps or data quality anomalies
+    pub fn force_neutral_data_quality(&mut self) {
+        let was_different = self.current_mode != ControllerMode::Neutral;
+        self.current_mode = ControllerMode::Neutral;
+        self.trend_streak = 0;
+        self.consolidation_streak = 0;
+        self.breakout_seen_in_streak = false;
+        self.last_reason = "Feed Gap or Data Quality Degradation -> Forced Neutral".to_string();
+        if was_different {
+            self.last_transition_time = Utc::now().to_rfc3339();
+            self.epoch += 1;
+        }
+    }
+
     /// Evaluates 15-minute bar metrics idempotently by checking bar close timestamp.
     /// If bar_close_ms <= self.last_evaluated_close_ms, returns None without state change.
     pub fn evaluate_15m_bar_idempotent(
@@ -709,5 +723,21 @@ mod tests {
         let (gate_a_shock, gate_b_shock) = controller.inspect_gates(0.85, 0.10, 0.5, 1.0, false, true, true, BASE_TIME_MS);
         assert!(gate_a_shock.contains("BLOCKED(Cooldown 2b"));
         assert!(gate_b_shock.contains("BLOCKED(Cooldown 2b"));
+    }
+
+    #[test]
+    fn test_force_neutral_data_quality() {
+        let mut controller = RegimeController::default();
+        controller.current_mode = ControllerMode::MeanReversion;
+        controller.consolidation_streak = 3;
+        controller.breakout_seen_in_streak = true;
+
+        controller.force_neutral_data_quality();
+
+        assert_eq!(controller.current_mode, ControllerMode::Neutral);
+        assert_eq!(controller.consolidation_streak, 0);
+        assert_eq!(controller.trend_streak, 0);
+        assert!(!controller.breakout_seen_in_streak);
+        assert!(controller.last_reason.contains("Feed Gap or Data Quality"));
     }
 }

@@ -196,6 +196,10 @@ pub struct L2ObiTracker {
     pub tau_2_ms: f64,
     #[serde(default = "default_regime_label")]
     pub current_regime_label: String,
+    #[serde(default)]
+    pub low_latency_streak: u32,
+    #[serde(default)]
+    pub stable_start_ms: u64,
     #[serde(skip)]
     pub last_instant: Option<std::time::Instant>,
     #[serde(default)]
@@ -221,6 +225,8 @@ impl Default for L2ObiTracker {
             tau_1_ms: 250.0,
             tau_2_ms: 1000.0,
             current_regime_label: "LowLatency".to_string(),
+            low_latency_streak: 0,
+            stable_start_ms: 0,
             last_instant: None,
             gaps_over_3s: 0,
         }
@@ -299,14 +305,31 @@ impl L2ObiTracker {
         // Amortized dynamic EWMA recalibration: evaluate every 64 updates to avoid hot-path sort overhead
         if (self.updates_since_reconnect + 1) % 64 == 0 && self.inter_arrival_samples.len() >= 10 {
             if let Some(qual) = self.compute_feed_quality() {
-                if qual.p50_ms <= 150.0 && qual.mad_ms <= 80.0 {
-                    self.tau_1_ms = 250.0;
-                    self.tau_2_ms = 1000.0;
-                    self.current_regime_label = "LowLatency".to_string();
-                } else {
+                let is_degraded = qual.p50_ms > 150.0 || qual.mad_ms > 80.0;
+                if is_degraded {
+                    // Fail-Safe: Instant degradation on single cycle
+                    self.low_latency_streak = 0;
+                    self.stable_start_ms = 0;
                     self.tau_1_ms = 500.0;
                     self.tau_2_ms = 2000.0;
                     self.current_regime_label = "JitterSubsampled".to_string();
+                } else if self.current_regime_label == "JitterSubsampled" {
+                    // Asymmetric recovery hysteresis: require >= 2 consecutive cycles (128 updates)
+                    // and stability duration >= 30_000ms before returning to LowLatency
+                    self.low_latency_streak = self.low_latency_streak.saturating_add(1);
+                    if self.stable_start_ms == 0 {
+                        self.stable_start_ms = local_recv_ms;
+                    }
+                    let stable_duration = local_recv_ms.saturating_sub(self.stable_start_ms);
+                    if self.low_latency_streak >= 2 && (stable_duration >= 30_000 || self.low_latency_streak >= 3) {
+                        self.tau_1_ms = 250.0;
+                        self.tau_2_ms = 1000.0;
+                        self.current_regime_label = "LowLatency".to_string();
+                        self.low_latency_streak = 0;
+                        self.stable_start_ms = 0;
+                    }
+                } else {
+                    self.low_latency_streak = self.low_latency_streak.saturating_add(1);
                 }
             }
         }
@@ -393,12 +416,12 @@ impl L2ObiTracker {
             0.0
         };
 
-        let status = if p95 <= 1500.0 && mean_lag <= 1000.0 {
-            "GOOD".to_string()
-        } else if p95 > 2500.0 || mean_lag > 2000.0 {
-            "DEGRADED".to_string()
+        let status = if p95 > self.tau_2_ms || (self.gaps_over_3s > 0 && self.last_update_ms.saturating_sub(self.reconnect_time_ms) < 60_000) {
+            "SIGNAL_UNUSABLE".to_string()
+        } else if p95 <= self.tau_1_ms && age_p99 <= self.tau_2_ms {
+            "SIGNAL_GOOD".to_string()
         } else {
-            "ACCEPTABLE".to_string()
+            "SIGNAL_DEGRADED".to_string()
         };
 
         Some(FeedQualityStats {
@@ -416,6 +439,17 @@ impl L2ObiTracker {
             tau_2_ms: self.tau_2_ms,
             regime: self.current_regime_label.clone(),
         })
+    }
+
+    /// Explicit hook invoked upon WebSocket reconnection to reset epoch statistics
+    pub fn on_l2_reconnect(&mut self, now_ms: u64) {
+        self.updates_since_reconnect = 0;
+        self.reconnect_time_ms = now_ms;
+        self.inter_arrival_samples.clear();
+        self.transport_lag_samples.clear();
+        self.last_instant = None;
+        self.low_latency_streak = 0;
+        self.stable_start_ms = 0;
     }
 }
 
@@ -461,6 +495,36 @@ pub fn append_l2_telemetry_record(
     }
 }
 
+/// Frozen snapshot of candidate telemetry evaluated at decision/entry time
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngineBCandidateLog {
+    pub candidate_id: String,
+    pub symbol: String,
+    pub decision_time_ms: u64,
+    pub side: String,
+    pub tau_regime: String,
+    pub tau1_ms: f64,
+    pub tau2_ms: f64,
+    pub obi_instant: f64,
+    pub obi_tau1: f64,
+    pub obi_tau2: f64,
+    pub obi_5s: f64,
+    pub p_trend: f64,
+    pub donchian_distance_bps: f64,
+    pub feed_quality: String,
+    pub hurdle_passed: bool,
+    pub portfolio_selected: bool,
+}
+
+pub fn append_candidate_log(log_entry: &EngineBCandidateLog) {
+    if let Ok(line) = serde_json::to_string(log_entry) {
+        let file_path = format!("hl_candidates_{}.jsonl", log_entry.symbol);
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&file_path) {
+            let _ = writeln!(file, "{}", line);
+        }
+    }
+}
+
 impl L2ObiTracker {
     pub fn is_fresh_and_uncrossed(&self, now_ms: u64, max_latency_ms: u64) -> bool {
         if self.last_update_ms == 0 || now_ms < self.last_update_ms {
@@ -477,6 +541,13 @@ impl L2ObiTracker {
         let elapsed_since_reconnect = now_ms.saturating_sub(self.reconnect_time_ms);
         if self.updates_since_reconnect < 3 || elapsed_since_reconnect < 500 {
             return (false, "L2 Book Warming Up After Reconnect (requires >=3 updates and >=500ms continuous stream)");
+        }
+
+        // Fail-Closed when Signal Resolution is incompatible with EWMA half-lives
+        if let Some(qual) = self.compute_feed_quality() {
+            if qual.status == "SIGNAL_UNUSABLE" {
+                return (false, "Feed Quality SIGNAL_UNUSABLE (resolution incompatible with EWMA half-lives or recent transport gap >3s)");
+            }
         }
 
         match side {
@@ -636,6 +707,17 @@ pub struct ShadowTrade {
 
 pub const SHADOW_CLUSTER_LOCK: &str = "hl_shadow_cluster.lock";
 pub const SHADOW_CLUSTER_LOCK_GUARD: &str = "hl_shadow_cluster.lock.guard";
+pub const SHADOW_CLUSTER_COUNTER: &str = "hl_shadow_cluster.counter";
+
+pub fn get_and_inc_shadow_counter() -> u64 {
+    let current: u64 = fs::read_to_string(SHADOW_CLUSTER_COUNTER)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let next = current + 1;
+    let _ = fs::write(SHADOW_CLUSTER_COUNTER, next.to_string());
+    next
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShadowClusterLease {
@@ -655,17 +737,16 @@ pub fn try_acquire_shadow_cluster_lease(symbol: &str) -> (bool, Option<String>) 
         Err(_) => return (false, None),
     };
     let now = Utc::now().timestamp();
-    let mut prev_token = 0u64;
 
     // Check if an existing lease file exists
     if std::path::Path::new(SHADOW_CLUSTER_LOCK).exists() {
         if let Ok(c) = fs::read_to_string(SHADOW_CLUSTER_LOCK) {
             if let Ok(mut lease) = serde_json::from_str::<ShadowClusterLease>(&c) {
-                prev_token = lease.fencing_token;
                 // If this symbol already holds the lease, refresh it
                 if lease.symbol == symbol {
+                    let new_token = get_and_inc_shadow_counter();
                     lease.expires_at = now + 3600;
-                    lease.fencing_token += 1;
+                    lease.fencing_token = new_token;
                     if let Ok(pretty) = serde_json::to_string_pretty(&lease) {
                         let _ = fs::write(SHADOW_CLUSTER_LOCK, pretty);
                     }
@@ -685,7 +766,7 @@ pub fn try_acquire_shadow_cluster_lease(symbol: &str) -> (bool, Option<String>) 
         }
     }
 
-    let new_token = prev_token + 1;
+    let new_token = get_and_inc_shadow_counter();
     let lease_token = format!("{}_{}_{}", symbol, new_token, Utc::now().timestamp_subsec_nanos());
     let new_lease = ShadowClusterLease {
         symbol: symbol.to_string(),
@@ -716,8 +797,9 @@ pub fn refresh_shadow_cluster_lease(symbol: &str, token: &str) -> bool {
     if let Ok(c) = fs::read_to_string(SHADOW_CLUSTER_LOCK) {
         if let Ok(mut lease) = serde_json::from_str::<ShadowClusterLease>(&c) {
             if lease.symbol == symbol && lease.lease_token == token {
+                let new_token = get_and_inc_shadow_counter();
                 lease.expires_at = now + 3600;
-                lease.fencing_token += 1;
+                lease.fencing_token = new_token;
                 if let Ok(pretty) = serde_json::to_string_pretty(&lease) {
                     let _ = fs::write(SHADOW_CLUSTER_LOCK, pretty);
                     return true;
@@ -1077,7 +1159,7 @@ mod tests {
         }
 
         let qual = tracker.compute_feed_quality().expect("Quality stats computed");
-        assert_eq!(qual.status, "GOOD");
+        assert_eq!(qual.status, "SIGNAL_GOOD");
         assert!((qual.mean_lag_ms - 25.0).abs() < 1.0);
         assert!((qual.p50_ms - 100.0).abs() < 5.0);
     }
@@ -1118,6 +1200,7 @@ mod tests {
         assert_eq!(tracker.tau_2_ms, 1000.0);
 
         // Phase 2: feed experiences high jitter and packet gaps (p50 = 300ms, MAD = 50ms)
+        // Fail-Safe: switches instantly on cycle 1 to JitterSubsampled
         for i in 65..=128 {
             let dt = if i % 2 == 0 { 350 } else { 250 };
             let t = tracker.last_local_recv_ms + dt;
@@ -1126,6 +1209,23 @@ mod tests {
         assert_eq!(tracker.current_regime_label, "JitterSubsampled");
         assert_eq!(tracker.tau_1_ms, 500.0);
         assert_eq!(tracker.tau_2_ms, 2000.0);
+
+        // Phase 3 (Asymmetric Hysteresis Recovery):
+        // 1st cycle of clean traffic (updates 129..=192): must NOT recover immediately (prevents flapping!)
+        for _ in 129..=192 {
+            let t = tracker.last_local_recv_ms + 100;
+            tracker.update(&bids, &asks, t - 20, t);
+        }
+        assert_eq!(tracker.current_regime_label, "JitterSubsampled", "Hysteresis blocks premature flip on 1st cycle");
+
+        // Subsequent clean cycles (each 64 updates at 100ms) until 30s of stable clean traffic has elapsed:
+        for _ in 193..=512 {
+            let t = tracker.last_local_recv_ms + 100;
+            tracker.update(&bids, &asks, t - 20, t);
+        }
+        assert_eq!(tracker.current_regime_label, "LowLatency", "Recovered to LowLatency after consecutive cycles & 30s");
+        assert_eq!(tracker.tau_1_ms, 250.0);
+        assert_eq!(tracker.tau_2_ms, 1000.0);
     }
 
     static TEST_SHADOW_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1135,6 +1235,7 @@ mod tests {
         let _guard = TEST_SHADOW_MUTEX.lock().unwrap();
         let _ = fs::remove_file(SHADOW_CLUSTER_LOCK);
         let _ = fs::remove_file(SHADOW_CLUSTER_LOCK_GUARD);
+        let _ = fs::remove_file(SHADOW_CLUSTER_COUNTER);
 
         // 1. Symbol BTC acquires lease
         let (btc_ok, btc_tok) = try_acquire_shadow_cluster_lease("BTC");
@@ -1159,15 +1260,19 @@ mod tests {
         release_shadow_cluster_lease("BTC", Some(&tok1));
         assert!(!std::path::Path::new(SHADOW_CLUSTER_LOCK).exists());
 
-        // 7. ETH can now acquire with incremented fencing token
+        // 7. ETH can now acquire with incremented fencing token (strictly monotonic across release)
         let (eth_ok2, eth_tok) = try_acquire_shadow_cluster_lease("ETH");
         assert!(eth_ok2);
         let eth_tok_str = eth_tok.expect("ETH token");
         assert!(eth_tok_str.contains("ETH"));
 
+        let eth_lease: ShadowClusterLease = serde_json::from_str(&fs::read_to_string(SHADOW_CLUSTER_LOCK).unwrap()).unwrap();
+        assert_eq!(eth_lease.fencing_token, 3, "Fencing token monotonically preserved across releases");
+
         release_shadow_cluster_lease("ETH", Some(&eth_tok_str));
         let _ = fs::remove_file(SHADOW_CLUSTER_LOCK);
         let _ = fs::remove_file(SHADOW_CLUSTER_LOCK_GUARD);
+        let _ = fs::remove_file(SHADOW_CLUSTER_COUNTER);
     }
 
     #[test]

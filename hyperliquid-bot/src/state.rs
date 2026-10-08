@@ -96,6 +96,10 @@ pub struct PositionState {
     pub chandelier_stop: f64,
     #[serde(default)]
     pub current_atr: f64,
+    #[serde(default)]
+    pub lease_fencing_token: u64,
+    #[serde(default)]
+    pub lease_owner_uuid: String,
 }
 
 impl PositionState {
@@ -230,11 +234,25 @@ pub fn save_armed_signal(file_path: &str, armed: &ArmedSignal) {
     }
 }
 
+pub const CLUSTER_COUNTER_FILE: &str = "hl_portfolio_cluster.counter";
+
+pub fn get_and_inc_cluster_counter() -> u64 {
+    let current: u64 = fs::read_to_string(CLUSTER_COUNTER_FILE)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let next = current + 1;
+    let _ = fs::write(CLUSTER_COUNTER_FILE, next.to_string());
+    next
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterLease {
     pub owner: String,
     #[serde(default = "default_engine_owner")]
     pub engine_owner: String,
+    #[serde(default)]
+    pub owner_uuid: String,
     pub acquired_at: String,
     pub expires_at: String,
     #[serde(default)]
@@ -253,31 +271,45 @@ pub fn get_current_cluster_lease() -> Option<ClusterLease> {
 }
 
 /// Atomically attempts to acquire the portfolio cluster lease protected by flock guard
+#[allow(dead_code)]
 pub fn try_acquire_cluster_lease(symbol: &str, duration_secs: i64) -> bool {
     try_acquire_cluster_lease_for_engine(symbol, "EngineA", duration_secs)
 }
 
+#[allow(dead_code)]
 pub fn try_acquire_cluster_lease_for_engine(symbol: &str, engine_owner: &str, duration_secs: i64) -> bool {
+    let owner_uuid = format!("{}_{}", symbol, chrono::Utc::now().timestamp_micros());
+    try_acquire_cluster_lease_for_engine_with_uuid(symbol, engine_owner, &owner_uuid, duration_secs).0
+}
+
+pub fn try_acquire_cluster_lease_for_engine_with_uuid(
+    symbol: &str,
+    engine_owner: &str,
+    owner_uuid: &str,
+    duration_secs: i64,
+) -> (bool, u64) {
     let _guard = match FlockGuard::acquire(CLUSTER_LOCK_GUARD_FILE) {
         Ok(g) => g,
-        Err(_) => return false,
+        Err(_) => return (false, 0),
     };
     let now = chrono::Utc::now();
     let expires = now + chrono::Duration::seconds(duration_secs);
-    let mut prev_token = 0u64;
 
     if std::path::Path::new(CLUSTER_LOCK_FILE).exists() {
         if let Ok(content) = fs::read_to_string(CLUSTER_LOCK_FILE) {
             if let Ok(mut lease) = serde_json::from_str::<ClusterLease>(&content) {
-                prev_token = lease.fencing_token;
                 if lease.owner == symbol {
+                    let new_token = get_and_inc_cluster_counter();
                     lease.engine_owner = engine_owner.to_string();
+                    if !owner_uuid.is_empty() {
+                        lease.owner_uuid = owner_uuid.to_string();
+                    }
                     lease.expires_at = expires.to_rfc3339();
-                    lease.fencing_token += 1;
+                    lease.fencing_token = new_token;
                     if let Ok(pretty) = serde_json::to_string_pretty(&lease) {
                         let _ = fs::write(CLUSTER_LOCK_FILE, pretty);
                     }
-                    return true;
+                    return (true, new_token);
                 }
 
                 let owner_state_file = format!("hl_hmm_state_{}.json", lease.owner);
@@ -288,34 +320,49 @@ pub fn try_acquire_cluster_lease_for_engine(symbol: &str, engine_owner: &str, du
                     .unwrap_or(false);
 
                 if owner_has_pos {
-                    return false;
+                    return (false, 0);
                 }
 
                 if let Ok(exp_dt) = chrono::DateTime::parse_from_rfc3339(&lease.expires_at) {
                     if now < exp_dt.with_timezone(&chrono::Utc) {
-                        return false;
+                        return (false, 0);
                     }
                 }
             }
         }
     }
 
+    let new_token = get_and_inc_cluster_counter();
     let lease = ClusterLease {
         owner: symbol.to_string(),
         engine_owner: engine_owner.to_string(),
+        owner_uuid: owner_uuid.to_string(),
         acquired_at: now.to_rfc3339(),
         expires_at: expires.to_rfc3339(),
-        fencing_token: prev_token + 1,
+        fencing_token: new_token,
     };
     if let Ok(content) = serde_json::to_string_pretty(&lease) {
-        fs::write(CLUSTER_LOCK_FILE, content).is_ok()
+        if fs::write(CLUSTER_LOCK_FILE, content).is_ok() {
+            (true, new_token)
+        } else {
+            (false, 0)
+        }
     } else {
-        false
+        (false, 0)
     }
 }
 
 /// Refreshes/renews the active cluster lease while position or entry order is open
 pub fn refresh_cluster_lease(symbol: &str, duration_secs: i64) -> bool {
+    refresh_cluster_lease_authenticated(symbol, None, None, duration_secs)
+}
+
+pub fn refresh_cluster_lease_authenticated(
+    symbol: &str,
+    owner_uuid: Option<&str>,
+    fencing_token: Option<u64>,
+    duration_secs: i64,
+) -> bool {
     let _guard = match FlockGuard::acquire(CLUSTER_LOCK_GUARD_FILE) {
         Ok(g) => g,
         Err(_) => return false,
@@ -325,13 +372,25 @@ pub fn refresh_cluster_lease(symbol: &str, duration_secs: i64) -> bool {
     if std::path::Path::new(CLUSTER_LOCK_FILE).exists() {
         if let Ok(content) = fs::read_to_string(CLUSTER_LOCK_FILE) {
             if let Ok(mut lease) = serde_json::from_str::<ClusterLease>(&content) {
-                if lease.owner == symbol {
-                    lease.expires_at = expires.to_rfc3339();
-                    lease.fencing_token += 1;
-                    if let Ok(pretty) = serde_json::to_string_pretty(&lease) {
-                        let _ = fs::write(CLUSTER_LOCK_FILE, pretty);
-                        return true;
+                if lease.owner != symbol {
+                    return false;
+                }
+                if let Some(expected_uuid) = owner_uuid {
+                    if !lease.owner_uuid.is_empty() && lease.owner_uuid != expected_uuid {
+                        return false;
                     }
+                }
+                if let Some(expected_token) = fencing_token {
+                    if lease.fencing_token != expected_token {
+                        return false;
+                    }
+                }
+                let new_token = get_and_inc_cluster_counter();
+                lease.expires_at = expires.to_rfc3339();
+                lease.fencing_token = new_token;
+                if let Ok(pretty) = serde_json::to_string_pretty(&lease) {
+                    let _ = fs::write(CLUSTER_LOCK_FILE, pretty);
+                    return true;
                 }
             }
         }
@@ -341,19 +400,61 @@ pub fn refresh_cluster_lease(symbol: &str, duration_secs: i64) -> bool {
 
 /// Releases the portfolio cluster lease if held by symbol
 pub fn release_cluster_lease(symbol: &str) {
+    let _ = release_cluster_lease_authenticated(symbol, None, None);
+}
+
+pub fn release_cluster_lease_authenticated(
+    symbol: &str,
+    owner_uuid: Option<&str>,
+    fencing_token: Option<u64>,
+) -> bool {
     let _guard = match FlockGuard::acquire(CLUSTER_LOCK_GUARD_FILE) {
         Ok(g) => g,
-        Err(_) => return,
+        Err(_) => return false,
     };
     if std::path::Path::new(CLUSTER_LOCK_FILE).exists() {
         if let Ok(content) = fs::read_to_string(CLUSTER_LOCK_FILE) {
             if let Ok(lease) = serde_json::from_str::<ClusterLease>(&content) {
                 if lease.owner == symbol {
+                    if let Some(expected_uuid) = owner_uuid {
+                        if !lease.owner_uuid.is_empty() && lease.owner_uuid != expected_uuid {
+                            return false;
+                        }
+                    }
+                    if let Some(expected_token) = fencing_token {
+                        if lease.fencing_token != expected_token {
+                            return false;
+                        }
+                    }
                     let _ = fs::remove_file(CLUSTER_LOCK_FILE);
+                    return true;
                 }
             }
         }
     }
+    false
+}
+
+/// Returns configured universe of symbols participating in portfolio cluster
+pub fn configured_portfolio_symbols() -> Vec<String> {
+    if let Ok(val) = std::env::var("HL_PORTFOLIO_SYMBOLS")
+        .or_else(|_| std::env::var("PORTFOLIO_SYMBOLS"))
+    {
+        let syms: Vec<String> = val
+            .split(',')
+            .map(|s| s.trim().to_uppercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !syms.is_empty() {
+            return syms;
+        }
+    }
+    vec![
+        "BTC".to_string(),
+        "ETH".to_string(),
+        "SOL".to_string(),
+        "AVAX".to_string(),
+    ]
 }
 
 /// Checks if any other symbol in the portfolio cluster currently has an active open position or active atomic lease
@@ -385,21 +486,43 @@ pub fn has_active_cluster_position(current_symbol: &str) -> Option<String> {
         }
     }
 
-    // 2. Check position state files across all symbols
-    let all_symbols = ["BTC", "ETH", "SOL"];
+    // 2. Check position state files across all portfolio symbols
+    let all_symbols = configured_portfolio_symbols();
     for sym in &all_symbols {
-        if *sym == current_symbol {
+        if sym == current_symbol {
             continue;
         }
         let state_file = format!("hl_hmm_state_{}.json", sym);
         if let Ok(state) = load_state(&state_file) {
-            if let Some(pos) = state.get(*sym) {
+            if let Some(pos) = state.get(sym) {
                 if pos.is_occupied() {
                     return Some(sym.to_string());
                 }
             }
         }
     }
+
+    // 3. Dynamic scan of any existing state files in directory to prevent orphan leaks
+    if let Ok(entries) = fs::read_dir(".") {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name.starts_with("hl_hmm_state_") && file_name.ends_with(".json") {
+                let symbol_part = file_name
+                    .trim_start_matches("hl_hmm_state_")
+                    .trim_end_matches(".json");
+                if symbol_part != current_symbol && !all_symbols.iter().any(|s| s == symbol_part) {
+                    if let Ok(state) = load_state(&file_name) {
+                        if let Some(pos) = state.get(symbol_part) {
+                            if pos.is_occupied() {
+                                return Some(symbol_part.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     None
 }
 
@@ -526,6 +649,7 @@ mod tests {
         let _guard = TEST_MUTEX.lock().unwrap();
         let _ = fs::remove_file(CLUSTER_LOCK_FILE);
         let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
+        let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
         assert!(try_acquire_cluster_lease("BTC", 60));
         assert!(!try_acquire_cluster_lease("ETH", 60));
         assert_eq!(has_active_cluster_position("ETH"), Some("BTC".to_string()));
@@ -534,6 +658,7 @@ mod tests {
         release_cluster_lease("ETH");
         let _ = fs::remove_file(CLUSTER_LOCK_FILE);
         let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
+        let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
     }
 
     #[test]
@@ -541,25 +666,39 @@ mod tests {
         let _guard = TEST_MUTEX.lock().unwrap();
         let _ = fs::remove_file(CLUSTER_LOCK_FILE);
         let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
-        assert!(try_acquire_cluster_lease("BTC", 60));
+        let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
+        let (acq, tok1) = try_acquire_cluster_lease_for_engine_with_uuid("BTC", "EngineA", "uuid_btc", 60);
+        assert!(acq);
         let lease1 = get_current_cluster_lease().expect("lease1");
         assert_eq!(lease1.fencing_token, 1);
+        assert_eq!(tok1, 1);
+        assert_eq!(lease1.owner_uuid, "uuid_btc");
 
-        // Refresh increases fencing token
-        assert!(refresh_cluster_lease("BTC", 60));
+        // Authenticated Refresh increases fencing token
+        assert!(refresh_cluster_lease_authenticated("BTC", Some("uuid_btc"), Some(1), 60));
         let lease2 = get_current_cluster_lease().expect("lease2");
         assert_eq!(lease2.fencing_token, 2);
 
-        release_cluster_lease("BTC");
-        // Re-acquire by ETH increments from previous token
-        assert!(try_acquire_cluster_lease_for_engine("ETH", "EngineB", 60));
+        // Wrong token or UUID rejects refresh
+        assert!(!refresh_cluster_lease_authenticated("BTC", Some("wrong_uuid"), Some(2), 60));
+        assert!(!refresh_cluster_lease_authenticated("BTC", Some("uuid_btc"), Some(999), 60));
+
+        // Authenticated release succeeds
+        assert!(release_cluster_lease_authenticated("BTC", Some("uuid_btc"), Some(2)));
+        assert!(get_current_cluster_lease().is_none());
+
+        // Re-acquire by ETH increments from persistent counter (strictly monotonic > lease2 token!)
+        let (acq_eth, tok3) = try_acquire_cluster_lease_for_engine_with_uuid("ETH", "EngineB", "uuid_eth", 60);
+        assert!(acq_eth);
         let lease3 = get_current_cluster_lease().expect("lease3");
-        assert!(lease3.fencing_token >= 1);
+        assert_eq!(lease3.fencing_token, 3);
+        assert_eq!(tok3, 3);
         assert_eq!(lease3.engine_owner, "EngineB");
 
-        release_cluster_lease("ETH");
+        assert!(release_cluster_lease_authenticated("ETH", Some("uuid_eth"), Some(3)));
         let _ = fs::remove_file(CLUSTER_LOCK_FILE);
         let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
+        let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
     }
 
     #[test]
@@ -587,6 +726,8 @@ mod tests {
             engine_type: "EngineA".to_string(),
             chandelier_stop: 0.0,
             current_atr: 0.0,
+            lease_fencing_token: 0,
+            lease_owner_uuid: "".to_string(),
         };
         assert!(!empty_pos.is_occupied());
 

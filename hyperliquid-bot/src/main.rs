@@ -33,10 +33,80 @@ use crate::state::{
     release_cluster_lease, save_armed_signal, save_circuit_breaker, save_state, Side, StateMap,
 };
 use crate::trend::{
-    calculate_atr, calculate_donchian, check_trend_alignment,
+    append_candidate_log, calculate_atr, calculate_donchian, check_trend_alignment,
     load_shadow_trade, record_shadow_entry, record_shadow_exit, save_shadow_trade, CandleBar,
-    ChandelierExitState, L2ObiTracker, TrendAlignment,
+    ChandelierExitState, EngineBCandidateLog, L2ObiTracker, TrendAlignment,
 };
+
+async fn backfill_missing_1m_candles(
+    info_client: &InfoClient,
+    coin: &str,
+    start_ms: u64,
+    end_ms: u64,
+    rolling_closes: &mut Vec<f64>,
+    rolling_15m_bars: &mut Vec<CandleBar>,
+    current_15m_bar: &mut Option<CandleBar>,
+) -> Result<usize, String> {
+    if start_ms >= end_ms {
+        return Ok(0);
+    }
+    let candles = info_client
+        .candles_snapshot(coin.to_string(), "1m".to_string(), start_ms, end_ms)
+        .await
+        .map_err(|e| format!("REST candles_snapshot error: {}", e))?;
+
+    let mut backfilled_count = 0;
+    for c in candles {
+        if c.time_open < start_ms || c.time_open >= end_ms {
+            continue;
+        }
+        let open_f = c.open.parse::<f64>().map_err(|e| e.to_string())?;
+        let high_f = c.high.parse::<f64>().map_err(|e| e.to_string())?;
+        let low_f = c.low.parse::<f64>().map_err(|e| e.to_string())?;
+        let close_f = c.close.parse::<f64>().map_err(|e| e.to_string())?;
+        let vol_f = c.vlm.parse::<f64>().unwrap_or(0.0);
+
+        rolling_closes.push(close_f);
+        if rolling_closes.len() > 60 {
+            rolling_closes.remove(0);
+        }
+
+        let candle_bucket_15m = (c.time_open / (15 * 60 * 1000)) * (15 * 60 * 1000);
+        if let Some(ref mut cur_15m) = current_15m_bar {
+            if cur_15m.time_open == candle_bucket_15m {
+                cur_15m.high = cur_15m.high.max(high_f);
+                cur_15m.low = cur_15m.low.min(low_f);
+                cur_15m.close = close_f;
+                cur_15m.volume += vol_f;
+            } else {
+                let closed = cur_15m.clone();
+                rolling_15m_bars.push(closed);
+                if rolling_15m_bars.len() > 100 {
+                    rolling_15m_bars.remove(0);
+                }
+                *cur_15m = CandleBar {
+                    time_open: candle_bucket_15m,
+                    open: open_f,
+                    high: high_f,
+                    low: low_f,
+                    close: close_f,
+                    volume: vol_f,
+                };
+            }
+        } else {
+            *current_15m_bar = Some(CandleBar {
+                time_open: candle_bucket_15m,
+                open: open_f,
+                high: high_f,
+                low: low_f,
+                close: close_f,
+                volume: vol_f,
+            });
+        }
+        backfilled_count += 1;
+    }
+    Ok(backfilled_count)
+}
 
 #[tokio::main]
 async fn main() {
@@ -199,6 +269,7 @@ async fn main() {
     let window_start_ms = now_ms.saturating_sub(480 * 60 * 1000);
     let cur_bucket_15m = (now_ms / (15 * 60 * 1000)) * (15 * 60 * 1000);
     let mut initial_15m_bar: Option<CandleBar> = None;
+    let mut initial_last_1m_open: u64 = 0;
 
     match info_client
         .candles_snapshot(
@@ -215,6 +286,9 @@ async fn main() {
                 if last.time_open + 60_000 > now_ms {
                     candles.pop();
                 }
+            }
+            if let Some(last) = candles.last() {
+                initial_last_1m_open = last.time_open;
             }
             for c in candles {
                 if let (Ok(open_f), Ok(high_f), Ok(low_f), Ok(close_f)) = (
@@ -385,6 +459,8 @@ async fn main() {
                         engine_type: "EngineA".to_string(),
                         chandelier_stop: 0.0,
                         current_atr: 0.0,
+                        lease_fencing_token: 0,
+                        lease_owner_uuid: "".to_string(),
                     },
                 );
             }
@@ -676,9 +752,15 @@ async fn main() {
                 }
             }
             eprintln!("⚠️ [L2 WEBSOCKET] Disconnected. Reconnecting in 3s...");
+            let reconn_now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+            obi_tracker_bg.write().await.on_l2_reconnect(reconn_now);
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
     });
+
+    let mut pending_1m: Option<CandleBar> = None;
+    let mut last_processed_1m_open: u64 = initial_last_1m_open;
+    let mut candle_feed_degraded: bool = false;
 
     loop {
         let (sender, mut receiver) = unbounded_channel();
@@ -707,9 +789,6 @@ async fn main() {
         }
 
         println!("📡 [WEBSOCKET] Successfully subscribed to 1m candles for {}.", trading_symbol);
-
-        let mut pending_1m: Option<CandleBar> = None;
-        let mut last_processed_1m_open: u64 = 0;
 
         while let Some(msg) = receiver.recv().await {
             if let Message::Candle(candle_msg) = msg {
@@ -776,10 +855,58 @@ async fn main() {
                 if last_processed_1m_open > 0 && completed_bar.time_open > last_processed_1m_open + 60_000 {
                     let gap_minutes = (completed_bar.time_open - last_processed_1m_open) / 60_000;
                     println!(
-                        "⚠️ [CANDLE GAP DETECTED] Missing {} candle(s) between {} and {}. Blocking new entries until stream contiguous.",
+                        "⚠️ [CANDLE GAP DETECTED] Missing {} candle(s) between {} and {}. Entering degraded mode and initiating REST backfill...",
                         gap_minutes, last_processed_1m_open, completed_bar.time_open
                     );
-                    is_candle_gap = true;
+                    candle_feed_degraded = true;
+                    controller.force_neutral_data_quality();
+                    let mut armed_state = load_armed_signal(&arm_file_path);
+                    if armed_state.is_armed {
+                        armed_state.is_armed = false;
+                        save_armed_signal(&arm_file_path, &armed_state);
+                    }
+
+                    // Severe macro gap (>= 30m): emergency flatten any resting entry and purge windows
+                    if gap_minutes >= 30 {
+                        println!("🛑 [MACRO GAP >= 30m] Severe data gap detected ({} min). Cancelling resting maker orders...", gap_minutes);
+                        let mut state_lock = active_state.lock().await;
+                        if let Some(pos) = state_lock.get(&trading_symbol) {
+                            if !pos.is_filled {
+                                let _ = emergency_flatten(
+                                    &state_file_path,
+                                    &exchange,
+                                    &info_client,
+                                    user_address,
+                                    &mut state_lock,
+                                    &trading_symbol,
+                                    discord_url.clone(),
+                                ).await;
+                            }
+                        }
+                    }
+
+                    // REST backfill of missing candles
+                    let backfill_res = backfill_missing_1m_candles(
+                        &info_client,
+                        &trading_symbol,
+                        last_processed_1m_open + 60_000,
+                        completed_bar.time_open,
+                        &mut rolling_closes,
+                        &mut rolling_15m_bars,
+                        &mut current_15m_bar,
+                    ).await;
+
+                    match backfill_res {
+                        Ok(count) => {
+                            println!("✅ [BACKFILL COMPLETE] Successfully recovered {} missing 1m bars from REST.", count);
+                            is_candle_gap = false;
+                            candle_feed_degraded = false;
+                        }
+                        Err(e) => {
+                            eprintln!("❌ [BACKFILL FAILED] Could not fetch missing candles via REST: {}. Retaining candle_feed_degraded=true (fail-closed).", e);
+                            is_candle_gap = true;
+                        }
+                    }
                 }
                 last_processed_1m_open = completed_bar.time_open;
 
@@ -1129,6 +1256,16 @@ async fn main() {
                                             "⚠️ [PORTFOLIO LEASE LOST] Shadow lease renewal failed for {}. Unselecting from portfolio.",
                                             symbol_clone
                                         );
+                                        crate::state::log_to_journal(
+                                            &format!("Shadow cluster lease lost for {} (token: {}). Unselecting from portfolio.", symbol_clone, tok),
+                                            "PORTFOLIO_LEASE_LOST",
+                                            serde_json::json!({
+                                                "symbol": symbol_clone,
+                                                "token": tok,
+                                                "timestamp_ms": chrono::Utc::now().timestamp_millis(),
+                                                "reason": "heartbeat_refresh_failed"
+                                            }),
+                                        );
                                         shadow_trade.is_portfolio_selected = false;
                                         shadow_trade.lease_token = None;
                                         save_shadow_trade(&symbol_clone, Some(&shadow_trade));
@@ -1205,8 +1342,8 @@ async fn main() {
                                     let closes_15m: Vec<f64> = rolling_15m_bars.iter().map(|b| b.close).collect();
                                     let alignment = check_trend_alignment(&closes_15m);
                                     // Engine B Execution: Trend Regime confirmed by 15m candle close. Entry confirmed by 1m close breakout + Continuous L2 OBI hurdle (never wicks).
-                                    let is_long_breakout = !is_candle_gap && close_price > donchian.upper && alignment == TrendAlignment::Bullish;
-                                    let is_short_breakout = !is_candle_gap && close_price < donchian.lower && alignment == TrendAlignment::Bearish;
+                                    let is_long_breakout = !candle_feed_degraded && !is_candle_gap && close_price > donchian.upper && alignment == TrendAlignment::Bullish;
+                                    let is_short_breakout = !candle_feed_degraded && !is_candle_gap && close_price < donchian.lower && alignment == TrendAlignment::Bearish;
 
                                     if is_long_breakout || is_short_breakout {
                                         let side = if is_long_breakout { Side::Long } else { Side::Short };
@@ -1220,7 +1357,21 @@ async fn main() {
                                             let obi_250ms = obi_lock.ewma_250ms_obi;
                                             let obi_1s = obi_lock.ewma_1s_obi;
                                             let obi_5s = obi_lock.ewma_5s_obi;
+                                            let qual_opt = obi_lock.compute_feed_quality();
+                                            let tau_regime = qual_opt.as_ref().map(|q| q.regime.clone()).unwrap_or_else(|| "Unknown".to_string());
+                                            let tau1_ms = qual_opt.as_ref().map(|q| q.tau_1_ms).unwrap_or(obi_lock.tau_1_ms);
+                                            let tau2_ms = qual_opt.as_ref().map(|q| q.tau_2_ms).unwrap_or(obi_lock.tau_2_ms);
+                                            let feed_quality = qual_opt.as_ref().map(|q| q.status.clone()).unwrap_or_else(|| "SIGNAL_GOOD".to_string());
                                             drop(obi_lock);
+
+                                            let donchian_distance_bps = if side == Side::Long {
+                                                ((close_price - donchian.upper) / donchian.upper) * 10_000.0
+                                            } else {
+                                                ((donchian.lower - close_price) / donchian.lower) * 10_000.0
+                                            };
+
+                                            let candidate_id = format!("{}-{}-{}", symbol_clone, now_ms, if side == Side::Long { "L" } else { "S" });
+                                            let mut portfolio_selected = false;
 
                                             if obi_favorable {
                                                 let trend_notional = position_size_usdc * trend_risk_fraction;
@@ -1235,6 +1386,7 @@ async fn main() {
                                                         current_atr,
                                                         chandelier_atr_mult,
                                                     );
+                                                    portfolio_selected = shadow_trade.is_portfolio_selected;
                                                     let side_str = if side == Side::Long { "LONG" } else { "SHORT" };
                                                     println!(
                                                         "🟣 [SHADOW-TREND ENTRY] {} {} breakout entered at ${:.2} | Size: {:.4} (${:.2}) | Initial Stop: ${:.2} | Multiscale OBI (inst: {:.2}, 250ms: {:.2}, 1s: {:.2}, 5s: {:.2})",
@@ -1254,6 +1406,26 @@ async fn main() {
                                                     obi_reason, obi_inst, obi_250ms, obi_1s, obi_5s
                                                 );
                                             }
+
+                                            let candidate_log = EngineBCandidateLog {
+                                                candidate_id,
+                                                symbol: symbol_clone.clone(),
+                                                decision_time_ms: now_ms,
+                                                side: if side == Side::Long { "LONG".to_string() } else { "SHORT".to_string() },
+                                                tau_regime,
+                                                tau1_ms,
+                                                tau2_ms,
+                                                obi_instant: obi_inst,
+                                                obi_tau1: obi_250ms,
+                                                obi_tau2: obi_1s,
+                                                obi_5s,
+                                                p_trend: current_p_t,
+                                                donchian_distance_bps,
+                                                feed_quality,
+                                                hurdle_passed: obi_favorable,
+                                                portfolio_selected,
+                                            };
+                                            append_candidate_log(&candidate_log);
                                         } else {
                                             println!("⚠️ [SHADOW-TREND VETO] Missing or non-positive 20-period ATR. Entry aborted.");
                                         }
@@ -1623,7 +1795,8 @@ async fn main() {
                             // ------------------------------------------------------------------
                             let mut armed_state = load_armed_signal(&arm_path_clone);
                             let consolidation_vol_ok = z_15.abs() < 1.5 && z_60.abs() < 2.5;
-                            let is_eligible = !is_candle_gap
+                            let is_eligible = !candle_feed_degraded
+                                && !is_candle_gap
                                 && is_consolidation
                                 && consolidation_vol_ok
                                 && is_valid_half_life
