@@ -160,6 +160,8 @@ pub struct L2ObiTracker {
     pub best_ask: f64,
     #[serde(default)]
     pub updates_since_reconnect: u32,
+    #[serde(default)]
+    pub reconnect_time_ms: u64,
 }
 
 impl Default for L2ObiTracker {
@@ -173,6 +175,7 @@ impl Default for L2ObiTracker {
             best_bid: 0.0,
             best_ask: 0.0,
             updates_since_reconnect: 0,
+            reconnect_time_ms: 0,
         }
     }
 }
@@ -243,6 +246,7 @@ impl L2ObiTracker {
             self.ewma_1s_obi = obi_inst;
             self.ewma_5s_obi = obi_inst;
             self.updates_since_reconnect = 1;
+            self.reconnect_time_ms = now_ms;
         }
 
         self.last_update_ms = now_ms;
@@ -260,8 +264,9 @@ impl L2ObiTracker {
         if !self.is_fresh_and_uncrossed(now_ms, 2500) {
             return (false, "L2 Book Stale or Crossed");
         }
-        if self.updates_since_reconnect < 3 {
-            return (false, "L2 Book Warming Up After Reconnect");
+        let elapsed_since_reconnect = now_ms.saturating_sub(self.reconnect_time_ms);
+        if self.updates_since_reconnect < 3 || elapsed_since_reconnect < 500 {
+            return (false, "L2 Book Warming Up After Reconnect (requires >=3 updates and >=500ms continuous stream)");
         }
 
         match side {

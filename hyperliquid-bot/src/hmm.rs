@@ -414,7 +414,12 @@ impl GaussianHMM {
         }
 
         let json = serde_json::to_string_pretty(&weights)?;
-        fs::write(path, json)?;
+        let tmp_path = format!("{}.tmp", path);
+        let mut file = fs::File::create(&tmp_path)?;
+        use std::io::Write;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&tmp_path, path)?;
         Ok(())
     }
 
@@ -513,6 +518,17 @@ pub fn train_hmm_offline(closes: &[f64]) -> Option<GaussianHMM> {
     hmm.fit(&x, 100);
     if !hmm.sort_semantically() {
         // Degenerate state moments: fail safe
+        return None;
+    }
+
+    // Numerical Finiteness Guard (P0 Quant Specification):
+    // Reject model if any parameter became NaN or Inf
+    if !hmm.means.iter().all(|v| v.is_finite())
+        || !hmm.covars.iter().all(|v| v.is_finite())
+        || !hmm.transmat.iter().all(|v| v.is_finite())
+        || !hmm.startprob.iter().all(|v| v.is_finite())
+    {
+        println!("⚠️ [COLD-PATH] HMM model candidate rejected: Non-finite numerical parameter detected (NaN/Inf)");
         return None;
     }
 

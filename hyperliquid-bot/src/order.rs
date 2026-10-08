@@ -209,12 +209,30 @@ pub async fn emergency_flatten(
 
         match close_market_position(exchange, symbol, 0.02).await {
             Ok(_) => {
-                println!("✅ [EMERGENCY FLATTEN] Successfully closed position for {}.", symbol);
-                state.remove(symbol);
-                let _ = save_state(state_file_path, state);
-                release_cluster_lease(symbol);
-                let ok_msg = format!("✅ **EMERGENCY FLATTEN COMPLETE:** Position for {} flattened.", symbol);
-                crate::discord::send_alert(discord_url.as_deref(), &ok_msg).await;
+                // Post-Close Verification Invariant: Confirm exchange position == 0
+                tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                match get_user_position(info, wallet_address, symbol).await {
+                    Ok((residual_szi, _)) if residual_szi.abs() > 0.0 => {
+                        eprintln!(
+                            "🚨 [EMERGENCY FLATTEN WARNING] Residual position still open after close attempt (szi: {:.5}). Keeping state active for supervisor retry!",
+                            residual_szi
+                        );
+                        let warn_msg = format!(
+                            "⚠️ **EMERGENCY FLATTEN INCOMPLETE:** Residual size {:.5} remains on {}. Retaining state for supervisor retry.",
+                            residual_szi, symbol
+                        );
+                        crate::discord::send_alert(discord_url.as_deref(), &warn_msg).await;
+                        return Err(format!("Residual position remaining: {}", residual_szi));
+                    }
+                    _ => {
+                        println!("✅ [EMERGENCY FLATTEN] Successfully closed and verified zero position for {}.", symbol);
+                        state.remove(symbol);
+                        let _ = save_state(state_file_path, state);
+                        release_cluster_lease(symbol);
+                        let ok_msg = format!("✅ **EMERGENCY FLATTEN COMPLETE:** Position for {} flattened and verified zero.", symbol);
+                        crate::discord::send_alert(discord_url.as_deref(), &ok_msg).await;
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("❌ [EMERGENCY FLATTEN FAILED] Failed to close position for {}: {}", symbol, e);
