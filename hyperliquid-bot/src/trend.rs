@@ -166,8 +166,8 @@ pub struct FeedQualityStats {
     pub regime: String,
 }
 
-fn default_tau_1() -> f64 { 250.0 }
-fn default_tau_2() -> f64 { 1000.0 }
+fn default_tau_1() -> f64 { 10_000.0 }
+fn default_tau_2() -> f64 { 30_000.0 }
 fn default_regime_label() -> String { "LowLatency".to_string() }
 
 /// Real-time L2 continuous order book tracker with basis-point distance weighting, multiscale physical-time dynamic EWMA, and local latency instrumentation
@@ -220,10 +220,10 @@ impl Default for L2ObiTracker {
             best_ask: 0.0,
             updates_since_reconnect: 0,
             reconnect_time_ms: 0,
-            inter_arrival_samples: Vec::with_capacity(120),
-            transport_lag_samples: Vec::with_capacity(120),
-            tau_1_ms: 250.0,
-            tau_2_ms: 1000.0,
+            inter_arrival_samples: Vec::with_capacity(30),
+            transport_lag_samples: Vec::with_capacity(30),
+            tau_1_ms: 10_000.0,
+            tau_2_ms: 30_000.0,
             current_regime_label: "LowLatency".to_string(),
             low_latency_streak: 0,
             stable_start_ms: 0,
@@ -287,7 +287,7 @@ impl L2ObiTracker {
 
         if inter_arrival_dt > 0.0 {
             self.inter_arrival_samples.push(inter_arrival_dt);
-            if self.inter_arrival_samples.len() > 120 {
+            if self.inter_arrival_samples.len() > 30 {
                 self.inter_arrival_samples.remove(0);
             }
         }
@@ -297,33 +297,33 @@ impl L2ObiTracker {
         if local_recv_ms >= exchange_time_ms {
             let lag = (local_recv_ms - exchange_time_ms) as f64;
             self.transport_lag_samples.push(lag);
-            if self.transport_lag_samples.len() > 120 {
+            if self.transport_lag_samples.len() > 30 {
                 self.transport_lag_samples.remove(0);
             }
         }
 
-        // Amortized dynamic EWMA recalibration: evaluate every 64 updates to avoid hot-path sort overhead
-        if (self.updates_since_reconnect + 1) % 64 == 0 && self.inter_arrival_samples.len() >= 10 {
+        // Amortized dynamic EWMA recalibration: evaluate every 12 updates to avoid hot-path sort overhead (~65s at 5.4s cadence)
+        if (self.updates_since_reconnect + 1) % 12 == 0 && self.inter_arrival_samples.len() >= 8 {
             if let Some(qual) = self.compute_feed_quality() {
-                let is_degraded = qual.p50_ms > 150.0 || qual.mad_ms > 80.0;
+                let is_degraded = qual.p95_ms > 7500.0 || qual.observed_age_p99_ms > 1500.0 || qual.mad_ms > 2500.0;
                 if is_degraded {
                     // Fail-Safe: Instant degradation on single cycle
                     self.low_latency_streak = 0;
                     self.stable_start_ms = 0;
-                    self.tau_1_ms = 500.0;
-                    self.tau_2_ms = 2000.0;
+                    self.tau_1_ms = 20_000.0;
+                    self.tau_2_ms = 60_000.0;
                     self.current_regime_label = "JitterSubsampled".to_string();
                 } else if self.current_regime_label == "JitterSubsampled" {
-                    // Asymmetric recovery hysteresis: require >= 2 consecutive cycles (128 updates)
-                    // and stability duration >= 30_000ms before returning to LowLatency
+                    // Asymmetric recovery hysteresis: require >= 2 consecutive cycles (24 updates)
+                    // and stability duration >= 60_000ms before returning to LowLatency
                     self.low_latency_streak = self.low_latency_streak.saturating_add(1);
                     if self.stable_start_ms == 0 {
                         self.stable_start_ms = local_recv_ms;
                     }
                     let stable_duration = local_recv_ms.saturating_sub(self.stable_start_ms);
-                    if self.low_latency_streak >= 2 && stable_duration >= 30_000 {
-                        self.tau_1_ms = 250.0;
-                        self.tau_2_ms = 1000.0;
+                    if self.low_latency_streak >= 2 && stable_duration >= 60_000 {
+                        self.tau_1_ms = 10_000.0;
+                        self.tau_2_ms = 30_000.0;
                         self.current_regime_label = "LowLatency".to_string();
                         self.low_latency_streak = 0;
                         self.stable_start_ms = 0;
@@ -343,26 +343,26 @@ impl L2ObiTracker {
             0.0
         };
 
-        if dt_ms > 0.0 && dt_ms <= 3000.0 {
+        if dt_ms > 0.0 && dt_ms <= 12000.0 {
             let ln2 = std::f64::consts::LN_2;
 
             // Multiscale physical-time EWMA decay with dynamic tau_1 and tau_2:
-            // tau_1 (250ms / 500ms): immediate queue pressure
+            // tau_1 (10,000ms / 20,000ms): immediate queue / snapshot pressure (~2 snapshots)
             let alpha_tau1 = 1.0 - (-ln2 * dt_ms / self.tau_1_ms).exp();
             self.ewma_250ms_obi = (1.0 - alpha_tau1) * self.ewma_250ms_obi + alpha_tau1 * obi_inst;
 
-            // tau_2 (1000ms / 2000ms): primary execution feature
+            // tau_2 (30,000ms / 60,000ms): primary microstructure execution feature (~5-6 snapshots)
             let alpha_tau2 = 1.0 - (-ln2 * dt_ms / self.tau_2_ms).exp();
             self.ewma_1s_obi = (1.0 - alpha_tau2) * self.ewma_1s_obi + alpha_tau2 * obi_inst;
 
-            // 5000ms (5s): institutional persistence filter (fixed)
-            let alpha_5s = 1.0 - (-ln2 * dt_ms / 5000.0).exp();
-            self.ewma_5s_obi = (1.0 - alpha_5s) * self.ewma_5s_obi + alpha_5s * obi_inst;
+            // tau_3 = 60,000ms (1 min): institutional persistence filter
+            let alpha_60s = 1.0 - (-ln2 * dt_ms / 60_000.0).exp();
+            self.ewma_5s_obi = (1.0 - alpha_60s) * self.ewma_5s_obi + alpha_60s * obi_inst;
 
             self.updates_since_reconnect = self.updates_since_reconnect.saturating_add(1);
         } else {
-            // Disconnect or stale interval (>3s): record gap and reinitialize
-            if dt_ms > 3000.0 {
+            // Disconnect or stale interval (>12s): record gap and reinitialize
+            if dt_ms > 12000.0 {
                 self.gaps_over_3s = self.gaps_over_3s.saturating_add(1);
             }
             self.ewma_250ms_obi = obi_inst;
@@ -416,12 +416,12 @@ impl L2ObiTracker {
             0.0
         };
 
-        let status = if p95 > self.tau_2_ms || (self.gaps_over_3s > 0 && self.last_update_ms.saturating_sub(self.reconnect_time_ms) < 60_000) {
+        let status = if p95 > 12_000.0 || age_p99 > 3_000.0 || mean_lag > 3_000.0 || (self.gaps_over_3s > 0 && self.last_update_ms.saturating_sub(self.reconnect_time_ms) < 60_000) {
             "SIGNAL_UNUSABLE".to_string()
-        } else if p95 <= self.tau_1_ms && age_p99 <= self.tau_2_ms {
-            "SIGNAL_GOOD".to_string()
-        } else {
+        } else if p95 > 7_500.0 || age_p99 > 1_500.0 || mean_lag > 1_500.0 {
             "SIGNAL_DEGRADED".to_string()
+        } else {
+            "SIGNAL_GOOD".to_string()
         };
 
         Some(FeedQualityStats {
@@ -456,6 +456,10 @@ impl L2ObiTracker {
         self.best_bid = 0.0;
         self.best_ask = 0.0;
         self.gaps_over_3s = 0;
+        self.instant_obi = 0.0;
+        self.ewma_250ms_obi = 0.0;
+        self.ewma_1s_obi = 0.0;
+        self.ewma_5s_obi = 0.0;
     }
 }
 
@@ -541,18 +545,18 @@ impl L2ObiTracker {
     }
 
     pub fn satisfies_entry_hurdle(&self, side: &Side, now_ms: u64) -> (bool, &'static str) {
-        if !self.is_fresh_and_uncrossed(now_ms, 2500) {
+        if !self.is_fresh_and_uncrossed(now_ms, 7500) {
             return (false, "L2 Book Stale or Crossed");
         }
         let elapsed_since_reconnect = now_ms.saturating_sub(self.reconnect_time_ms);
-        if self.updates_since_reconnect < 3 || elapsed_since_reconnect < 500 {
-            return (false, "L2 Book Warming Up After Reconnect (requires >=3 updates and >=500ms continuous stream)");
+        if self.updates_since_reconnect < 3 || elapsed_since_reconnect < 15_000 {
+            return (false, "L2 Book Warming Up After Reconnect (requires >=3 updates and >=15s continuous stream)");
         }
 
         // Fail-Closed when Signal Resolution is incompatible with EWMA half-lives
         if let Some(qual) = self.compute_feed_quality() {
             if qual.status == "SIGNAL_UNUSABLE" {
-                return (false, "Feed Quality SIGNAL_UNUSABLE (resolution incompatible with EWMA half-lives or recent transport gap >3s)");
+                return (false, "Feed Quality SIGNAL_UNUSABLE (resolution incompatible with EWMA half-lives or recent transport gap >12s)");
             }
         }
 
@@ -1229,8 +1233,8 @@ mod tests {
         assert!(tracker.ewma_1s_obi > tracker.instant_obi);
 
         // Check freshness
-        assert!(tracker.is_fresh_and_uncrossed(t1 + 500, 2500));
-        assert!(!tracker.is_fresh_and_uncrossed(t1 + 3000, 2500), "Should expire stale books > 2500ms");
+        assert!(tracker.is_fresh_and_uncrossed(t1 + 500, 7500));
+        assert!(!tracker.is_fresh_and_uncrossed(t1 + 8000, 7500), "Should expire stale books > 7500ms");
     }
 
     #[test]
@@ -1240,15 +1244,15 @@ mod tests {
         let asks = vec![(101.0, 10.0)];
 
         for i in 1..=20 {
-            let t_exch = i * 100;
-            let t_local = t_exch + 25; // 25ms transport lag
+            let t_exch = i * 5400;
+            let t_local = t_exch + 250; // 250ms transport lag
             tracker.update(&bids, &asks, t_exch, t_local);
         }
 
         let qual = tracker.compute_feed_quality().expect("Quality stats computed");
         assert_eq!(qual.status, "SIGNAL_GOOD");
-        assert!((qual.mean_lag_ms - 25.0).abs() < 1.0);
-        assert!((qual.p50_ms - 100.0).abs() < 5.0);
+        assert!((qual.mean_lag_ms - 250.0).abs() < 1.0);
+        assert!((qual.p50_ms - 5400.0).abs() < 50.0);
     }
 
     #[test]
@@ -1277,42 +1281,71 @@ mod tests {
         let bids = vec![(100.0, 10.0)];
         let asks = vec![(101.0, 10.0)];
 
-        // Phase 1: feed arrives with low latency (p50 = 100ms, MAD = 10ms)
-        for i in 1..=64 {
-            let t = i * 100;
-            tracker.update(&bids, &asks, t, t + 20);
+        // Phase 1: feed arrives with nominal low latency snapshot cadence (p50 = 5400ms, MAD ~ 10ms)
+        for i in 1..=12 {
+            let t = i * 5400;
+            tracker.update(&bids, &asks, t, t + 200);
         }
         assert_eq!(tracker.current_regime_label, "LowLatency");
-        assert_eq!(tracker.tau_1_ms, 250.0);
-        assert_eq!(tracker.tau_2_ms, 1000.0);
+        assert_eq!(tracker.tau_1_ms, 10_000.0);
+        assert_eq!(tracker.tau_2_ms, 30_000.0);
 
-        // Phase 2: feed experiences high jitter and packet gaps (p50 = 300ms, MAD = 50ms)
+        // Phase 2: feed experiences high jitter and packet gaps (p95 > 7500ms, e.g. 8500ms / 8000ms)
         // Fail-Safe: switches instantly on cycle 1 to JitterSubsampled
-        for i in 65..=128 {
-            let dt = if i % 2 == 0 { 350 } else { 250 };
+        for i in 13..=24 {
+            let dt = if i % 2 == 0 { 8500 } else { 8000 };
             let t = tracker.last_local_recv_ms + dt;
-            tracker.update(&bids, &asks, t - 50, t);
+            tracker.update(&bids, &asks, t - 200, t);
         }
         assert_eq!(tracker.current_regime_label, "JitterSubsampled");
-        assert_eq!(tracker.tau_1_ms, 500.0);
-        assert_eq!(tracker.tau_2_ms, 2000.0);
+        assert_eq!(tracker.tau_1_ms, 20_000.0);
+        assert_eq!(tracker.tau_2_ms, 60_000.0);
 
         // Phase 3 (Asymmetric Hysteresis Recovery):
-        // 1st cycle of clean traffic (updates 129..=192): must NOT recover immediately (prevents flapping!)
-        for _ in 129..=192 {
-            let t = tracker.last_local_recv_ms + 100;
-            tracker.update(&bids, &asks, t - 20, t);
+        // 1st cycle of clean traffic (updates 25..=36): must NOT recover immediately (prevents flapping!)
+        for _ in 25..=36 {
+            let t = tracker.last_local_recv_ms + 5400;
+            tracker.update(&bids, &asks, t - 200, t);
         }
         assert_eq!(tracker.current_regime_label, "JitterSubsampled", "Hysteresis blocks premature flip on 1st cycle");
 
-        // Subsequent clean cycles (each 64 updates at 100ms) until 30s of stable clean traffic has elapsed:
-        for _ in 193..=512 {
-            let t = tracker.last_local_recv_ms + 100;
-            tracker.update(&bids, &asks, t - 20, t);
+        // Subsequent clean cycles until >=2 cycles and 60s of stable clean traffic has elapsed:
+        for _ in 37..=72 {
+            let t = tracker.last_local_recv_ms + 5400;
+            tracker.update(&bids, &asks, t - 200, t);
         }
-        assert_eq!(tracker.current_regime_label, "LowLatency", "Recovered to LowLatency after consecutive cycles & 30s");
-        assert_eq!(tracker.tau_1_ms, 250.0);
-        assert_eq!(tracker.tau_2_ms, 1000.0);
+        assert_eq!(tracker.current_regime_label, "LowLatency", "Recovered to LowLatency after consecutive cycles & 60s");
+        assert_eq!(tracker.tau_1_ms, 10_000.0);
+        assert_eq!(tracker.tau_2_ms, 30_000.0);
+    }
+
+    #[test]
+    fn test_satisfies_entry_hurdle_warmup_and_freshness() {
+        let mut tracker = L2ObiTracker::default();
+        let bids = vec![(100.0, 50.0), (99.0, 50.0)];
+        let asks = vec![(101.0, 10.0), (102.0, 10.0)];
+
+        let t0 = 100_000;
+        tracker.update(&bids, &asks, t0, t0);
+
+        // 1. Stale book check (> 7500ms)
+        assert!(!tracker.satisfies_entry_hurdle(&Side::Long, t0 + 8000).0);
+
+        // 2. Warmup check (<3 updates, <15s continuous)
+        let (ok, reason) = tracker.satisfies_entry_hurdle(&Side::Long, t0 + 1000);
+        assert!(!ok);
+        assert!(reason.contains("Warming Up"));
+
+        // 2nd update at +5400ms
+        tracker.update(&bids, &asks, t0 + 5400, t0 + 5400);
+        let (ok2, _) = tracker.satisfies_entry_hurdle(&Side::Long, t0 + 6000);
+        assert!(!ok2);
+
+        // 3rd update at +16200ms (> 15s elapsed, >= 3 updates)
+        tracker.update(&bids, &asks, t0 + 16200, t0 + 16200);
+        let (ok3, reason3) = tracker.satisfies_entry_hurdle(&Side::Long, t0 + 16300);
+        assert!(ok3);
+        assert_eq!(reason3, "Bullish Multiscale Depth Alignment");
     }
 
     static TEST_SHADOW_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());

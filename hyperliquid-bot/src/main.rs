@@ -1521,7 +1521,7 @@ async fn main() {
                             guard.instant_obi,
                             guard.ewma_1s_obi,
                             guard.ewma_5s_obi,
-                            guard.is_fresh_and_uncrossed(chrono::Utc::now().timestamp_millis() as u64, 2500),
+                            guard.is_fresh_and_uncrossed(chrono::Utc::now().timestamp_millis() as u64, 7500),
                         )
                     };
 
