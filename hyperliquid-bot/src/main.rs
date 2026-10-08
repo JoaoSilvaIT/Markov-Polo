@@ -129,6 +129,7 @@ async fn main() {
     let initial_hmm = GaussianHMM::load_weights(&config.hmm_config_path)
         .unwrap_or_else(|_| GaussianHMM::new(3, 4));
     let hmm_model = Arc::new(RwLock::new(initial_hmm));
+    let hmm_generation = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
     let discord_url = config.discord_webhook_url.clone();
 
@@ -136,6 +137,7 @@ async fn main() {
     // COLD-PATH: 24-Hour HMM Recalibration Loop
     // ------------------------------------------------------------------------
     let hmm_trainer_clone = hmm_model.clone();
+    let hmm_gen_trainer = hmm_generation.clone();
     let info_trainer_clone = info_client.clone();
     let config_trainer_path = config.hmm_config_path.clone();
     let config_trainer_symbol = trading_symbol.clone();
@@ -176,7 +178,11 @@ async fn main() {
                         let _ = new_hmm.save_weights(&config_trainer_path);
                         let mut lock = hmm_trainer_clone.write().await;
                         *lock = new_hmm;
-                        println!("✅ [COLD-PATH] HMM recalibrated and hot-swapped into live memory successfully.");
+                        let new_gen = hmm_gen_trainer.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        println!(
+                            "✅ [COLD-PATH] HMM recalibrated and hot-swapped into live memory successfully (Generation {}).",
+                            new_gen
+                        );
                     }
                 }
             }
@@ -756,7 +762,7 @@ async fn main() {
                 let vol_val = completed_bar.volume;
 
                 let candle_bucket_15m = (completed_bar.time_open / (15 * 60 * 1000)) * (15 * 60 * 1000);
-                let mut finalized_15m_bar = false;
+                let mut finalized_15m_bar: Option<CandleBar> = None;
 
                 if let Some(ref mut cur_15m) = current_15m_bar {
                     if cur_15m.time_open == candle_bucket_15m {
@@ -765,11 +771,12 @@ async fn main() {
                         cur_15m.close = close_price;
                         cur_15m.volume += vol_val;
                     } else {
-                        rolling_15m_bars.push(cur_15m.clone());
+                        let closed = cur_15m.clone();
+                        rolling_15m_bars.push(closed.clone());
                         if rolling_15m_bars.len() > 100 {
                             rolling_15m_bars.remove(0);
                         }
-                        finalized_15m_bar = true;
+                        finalized_15m_bar = Some(closed);
                         *cur_15m = CandleBar {
                             time_open: candle_bucket_15m,
                             open: open_price,
@@ -901,21 +908,32 @@ async fn main() {
                     // ------------------------------------------------------------------
                     // 3-MODE CONTROLLER REGIME INFERENCE (HMM Causal Filter + Hysteresis)
                     // ------------------------------------------------------------------
+                    // 3-MODE CONTROLLER REGIME INFERENCE (HMM Causal Filter + Hysteresis)
+                    // ------------------------------------------------------------------
                     // Fast-path safety: Severe shock on ANY 1m candle immediately forces Neutral
                     if z_15.abs() >= 3.0 || z_60.abs() >= 3.0 {
+                        let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
                         if controller.current_mode != ControllerMode::Neutral {
                             println!(
                                 "🚨 [CONTROLLER SHOCK VETO] Immediate downgrade to Neutral on severe shock (Z15: {:.2}, Z60: {:.2})",
                                 z_15, z_60
                             );
                         }
-                        controller.force_shock_cooldown(z_15, z_60);
+                        controller.force_shock_cooldown(z_15, z_60, now_ms);
+                        save_controller_state(&symbol_clone, &controller);
+                    }
+
+                    let active_gen = hmm_generation.load(std::sync::atomic::Ordering::Relaxed);
+                    if active_gen != controller.model_generation {
+                        controller.notify_model_hotswap();
+                        controller.model_generation = active_gen;
                         save_controller_state(&symbol_clone, &controller);
                     }
 
                     // Strictly evaluate 15m dwell streaks & state transitions on finalized 15m candle closes!
-                    if finalized_15m_bar {
-                        let bar_close_ms = rolling_15m_bars.last().map(|b| b.time_open + 15 * 60 * 1000).unwrap_or(0);
+                    if let Some(ref closed_15m) = finalized_15m_bar {
+                        let bar_close_ms = closed_15m.time_open + 15 * 60 * 1000;
+                        let decision_close = closed_15m.close;
                         let closes_15m: Vec<f64> = rolling_15m_bars.iter().map(|b| b.close).collect();
                         let (p_c, p_t, p_s) = if closes_15m.len() >= 15 {
                             let hmm_lock = hmm_model.read().await;
@@ -935,25 +953,18 @@ async fn main() {
                             &rolling_15m_bars[..]
                         };
                         let donchian_opt = calculate_donchian(prior_bars, donchian_period);
+                        // Strict Close-confirmed breakout (wicks eliminated to prevent false breakouts)
                         let has_donchian_breakout = if let Some(ref d) = donchian_opt {
-                            close_price > d.upper || close_price < d.lower || high_price > d.upper || low_price < d.lower
+                            decision_close > d.upper || decision_close < d.lower
                         } else {
                             false
                         };
 
-                        let (gate_a, gate_b) = controller.inspect_gates(
-                            p_c,
-                            p_t,
-                            z_15,
-                            z_60,
-                            has_donchian_breakout,
-                            is_stationary,
-                            is_valid_half_life,
-                        );
-
+                        let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
                         let prev_mode = controller.current_mode;
                         if let Some(new_mode) = controller.evaluate_15m_bar_idempotent(
                             bar_close_ms,
+                            now_ms,
                             p_c,
                             p_t,
                             z_15,
@@ -967,6 +978,17 @@ async fn main() {
                             println!(
                                 "🧭 [3-MODE CONTROLLER 15m EVAL] Mode: {} (was {}) | Streaks: Trend={}, Consolidation={} | P_C: {:.1}% | P_T: {:.1}% | P_Shock: {:.1}% | Reason: {}",
                                 new_mode, prev_mode, controller.trend_streak, controller.consolidation_streak, p_c * 100.0, p_t * 100.0, p_s * 100.0, controller.last_reason
+                            );
+
+                            let (gate_a, gate_b) = controller.inspect_gates(
+                                p_c,
+                                p_t,
+                                z_15,
+                                z_60,
+                                has_donchian_breakout,
+                                is_stationary,
+                                is_valid_half_life,
+                                now_ms,
                             );
                             println!(
                                 "🔍 [GATE FUNNEL] {} | Vol: (Z15:{:.2}, Z60:{:.2}) | Cooldown: {}b | Donchian: {} | Engine A Gate: {} | Engine B Gate: {}",
@@ -1152,7 +1174,7 @@ async fn main() {
                             if is_cluster_blocked {
                                 println!("⏸️ [SHADOW-TREND VETO] Active cluster lease in place. Vetoing Engine B entry to prevent cross-engine conflict.");
                             } else {
-                                let prior_bars = if finalized_15m_bar && rolling_15m_bars.len() > 1 {
+                                let prior_bars = if finalized_15m_bar.is_some() && rolling_15m_bars.len() > 1 {
                                     &rolling_15m_bars[..rolling_15m_bars.len() - 1]
                                 } else {
                                     &rolling_15m_bars[..]
@@ -1161,8 +1183,8 @@ async fn main() {
                                 if let Some(ref donchian) = donchian_opt {
                                     let closes_15m: Vec<f64> = rolling_15m_bars.iter().map(|b| b.close).collect();
                                     let alignment = check_trend_alignment(&closes_15m);
-                                    let is_long_breakout = (close_price > donchian.upper || high_price > donchian.upper) && alignment == TrendAlignment::Bullish;
-                                    let is_short_breakout = (close_price < donchian.lower || low_price < donchian.lower) && alignment == TrendAlignment::Bearish;
+                                    let is_long_breakout = close_price > donchian.upper && alignment == TrendAlignment::Bullish;
+                                    let is_short_breakout = close_price < donchian.lower && alignment == TrendAlignment::Bearish;
 
                                     if is_long_breakout || is_short_breakout {
                                         let side = if is_long_breakout { Side::Long } else { Side::Short };
@@ -1555,16 +1577,18 @@ async fn main() {
                             // BI-DIRECTIONAL REVERSAL-CONFIRMED ENTRY PROTOCOL (Long & Short)
                             // ------------------------------------------------------------------
                             let mut armed_state = load_armed_signal(&arm_path_clone);
+                            let consolidation_vol_ok = z_15.abs() < 1.5 && z_60.abs() < 2.5;
                             let is_eligible = is_consolidation
+                                && consolidation_vol_ok
                                 && is_valid_half_life
                                 && !is_cb_paused
                                 && !is_cluster_blocked
                                 && controller.current_mode == ControllerMode::MeanReversion;
 
-                            if armed_state.is_armed && controller.current_mode != ControllerMode::MeanReversion {
+                            if armed_state.is_armed && (!consolidation_vol_ok || controller.current_mode != ControllerMode::MeanReversion) {
                                 println!(
-                                    "⏸️ [MEAN REVERSION VETO] Controller mode is {} (not MeanReversion). Clearing armed state for {}.",
-                                    controller.current_mode, symbol_clone
+                                    "⏸️ [MEAN REVERSION VETO] Volatility breach or mode is {} (vol_ok: {}, Z15: {:.2}, Z60: {:.2}). Clearing armed state for {}.",
+                                    controller.current_mode, consolidation_vol_ok, z_15, z_60, symbol_clone
                                 );
                                 armed_state.is_armed = false;
                                 save_armed_signal(&arm_path_clone, &armed_state);

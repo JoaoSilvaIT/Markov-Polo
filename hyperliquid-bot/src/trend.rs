@@ -418,6 +418,42 @@ pub struct ShadowTrade {
     pub pnl_usdc: Option<f64>,
     pub return_bps: Option<f64>,
     pub exit_reason: Option<String>,
+    #[serde(default)]
+    pub is_portfolio_selected: bool,
+}
+
+pub const SHADOW_CLUSTER_LOCK: &str = "hl_shadow_cluster.lock";
+
+pub fn try_acquire_shadow_cluster_lease(symbol: &str) -> bool {
+    let now = Utc::now().timestamp();
+    if let Ok(c) = fs::read_to_string(SHADOW_CLUSTER_LOCK) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&c) {
+            let holder = val.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+            let expires_at = val.get("expires_at").and_then(|v| v.as_i64()).unwrap_or(0);
+            if holder == symbol {
+                return true;
+            }
+            if expires_at > now {
+                return false;
+            }
+        }
+    }
+    let lease = serde_json::json!({
+        "symbol": symbol,
+        "expires_at": now + 3600,
+    });
+    fs::write(SHADOW_CLUSTER_LOCK, lease.to_string()).is_ok()
+}
+
+pub fn release_shadow_cluster_lease(symbol: &str) {
+    if let Ok(c) = fs::read_to_string(SHADOW_CLUSTER_LOCK) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&c) {
+            let holder = val.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+            if holder == symbol {
+                let _ = fs::remove_file(SHADOW_CLUSTER_LOCK);
+            }
+        }
+    }
 }
 
 pub fn shadow_state_path(symbol: &str) -> String {
@@ -458,6 +494,7 @@ pub fn record_shadow_entry(
         Side::Long => entry_price - atr_mult * atr,
         Side::Short => entry_price + atr_mult * atr,
     };
+    let is_portfolio_selected = try_acquire_shadow_cluster_lease(symbol);
 
     let trade = ShadowTrade {
         symbol: symbol.to_string(),
@@ -476,6 +513,7 @@ pub fn record_shadow_entry(
         pnl_usdc: None,
         return_bps: None,
         exit_reason: None,
+        is_portfolio_selected,
     };
 
     save_shadow_trade(symbol, Some(&trade));
@@ -490,6 +528,7 @@ pub fn record_shadow_entry(
         "size": trade.size,
         "initial_stop": trade.initial_stop,
         "atr": trade.atr_at_entry,
+        "is_portfolio_selected": trade.is_portfolio_selected,
     });
     if let Ok(mut f) = OpenOptions::new()
         .create(true)
@@ -540,6 +579,9 @@ pub fn record_shadow_exit(
     trade.return_bps = Some(return_bps);
     trade.exit_reason = Some(exit_reason.to_string());
 
+    if trade.is_portfolio_selected {
+        release_shadow_cluster_lease(&trade.symbol);
+    }
     save_shadow_trade(&trade.symbol, None); // Clear active file
 
     // Append exit to JSONL Journal
@@ -554,6 +596,7 @@ pub fn record_shadow_exit(
         "net_pnl_usdc": net_pnl,
         "return_bps": return_bps,
         "exit_reason": exit_reason,
+        "is_portfolio_selected": trade.is_portfolio_selected,
     });
     if let Ok(mut f) = OpenOptions::new()
         .create(true)
@@ -693,6 +736,7 @@ mod tests {
             pnl_usdc: None,
             return_bps: None,
             exit_reason: None,
+            is_portfolio_selected: true,
         };
 
         // Exit at 105.0
