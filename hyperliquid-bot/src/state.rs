@@ -190,6 +190,19 @@ pub struct ClusterLease {
     pub engine_owner: String,
     pub acquired_at: String,
     pub expires_at: String,
+    #[serde(default)]
+    pub fencing_token: u64,
+}
+
+/// Returns the active cluster lease, if any
+#[allow(dead_code)]
+pub fn get_current_cluster_lease() -> Option<ClusterLease> {
+    if std::path::Path::new(CLUSTER_LOCK_FILE).exists() {
+        if let Ok(content) = fs::read_to_string(CLUSTER_LOCK_FILE) {
+            return serde_json::from_str::<ClusterLease>(&content).ok();
+        }
+    }
+    None
 }
 
 /// Atomically attempts to acquire the portfolio cluster lease via POSIX O_CREAT|O_EXCL
@@ -200,16 +213,19 @@ pub fn try_acquire_cluster_lease(symbol: &str, duration_secs: i64) -> bool {
 pub fn try_acquire_cluster_lease_for_engine(symbol: &str, engine_owner: &str, duration_secs: i64) -> bool {
     let now = chrono::Utc::now();
     let expires = now + chrono::Duration::seconds(duration_secs);
+    let mut prev_token = 0u64;
 
     if std::path::Path::new(CLUSTER_LOCK_FILE).exists() {
         if let Ok(content) = fs::read_to_string(CLUSTER_LOCK_FILE) {
             if let Ok(lease) = serde_json::from_str::<ClusterLease>(&content) {
+                prev_token = lease.fencing_token;
                 if lease.owner == symbol {
                     let new_lease = ClusterLease {
                         owner: symbol.to_string(),
                         engine_owner: engine_owner.to_string(),
                         acquired_at: lease.acquired_at,
                         expires_at: expires.to_rfc3339(),
+                        fencing_token: lease.fencing_token + 1,
                     };
                     let _ = fs::write(
                         CLUSTER_LOCK_FILE,
@@ -244,6 +260,7 @@ pub fn try_acquire_cluster_lease_for_engine(symbol: &str, engine_owner: &str, du
         engine_owner: engine_owner.to_string(),
         acquired_at: now.to_rfc3339(),
         expires_at: expires.to_rfc3339(),
+        fencing_token: prev_token + 1,
     };
     let content = match serde_json::to_string_pretty(&lease) {
         Ok(c) => c,
@@ -272,6 +289,7 @@ pub fn refresh_cluster_lease(symbol: &str, duration_secs: i64) -> bool {
             if let Ok(mut lease) = serde_json::from_str::<ClusterLease>(&content) {
                 if lease.owner == symbol {
                     lease.expires_at = expires.to_rfc3339();
+                    lease.fencing_token += 1;
                     if let Ok(pretty) = serde_json::to_string_pretty(&lease) {
                         let tmp = format!("{}.tmp_{}", CLUSTER_LOCK_FILE, symbol);
                         let _ = fs::write(&tmp, pretty);
@@ -461,14 +479,41 @@ mod tests {
         assert!(!cb.is_paused());
     }
 
+    static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_cluster_lease_isolation() {
+        let _guard = TEST_MUTEX.lock().unwrap();
         let _ = fs::remove_file(CLUSTER_LOCK_FILE);
         assert!(try_acquire_cluster_lease("BTC", 60));
         assert!(!try_acquire_cluster_lease("ETH", 60));
         assert_eq!(has_active_cluster_position("ETH"), Some("BTC".to_string()));
         release_cluster_lease("BTC");
         assert!(try_acquire_cluster_lease("ETH", 60));
+        release_cluster_lease("ETH");
+        let _ = fs::remove_file(CLUSTER_LOCK_FILE);
+    }
+
+    #[test]
+    fn test_cluster_lease_fencing_token_monotone() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let _ = fs::remove_file(CLUSTER_LOCK_FILE);
+        assert!(try_acquire_cluster_lease("BTC", 60));
+        let lease1 = get_current_cluster_lease().expect("lease1");
+        assert_eq!(lease1.fencing_token, 1);
+
+        // Refresh increases fencing token
+        assert!(refresh_cluster_lease("BTC", 60));
+        let lease2 = get_current_cluster_lease().expect("lease2");
+        assert_eq!(lease2.fencing_token, 2);
+
+        release_cluster_lease("BTC");
+        // Re-acquire by ETH increments from previous token
+        assert!(try_acquire_cluster_lease_for_engine("ETH", "EngineB", 60));
+        let lease3 = get_current_cluster_lease().expect("lease3");
+        assert!(lease3.fencing_token >= 1);
+        assert_eq!(lease3.engine_owner, "EngineB");
+
         release_cluster_lease("ETH");
         let _ = fs::remove_file(CLUSTER_LOCK_FILE);
     }

@@ -34,9 +34,9 @@ use crate::state::{
     release_cluster_lease, save_armed_signal, save_circuit_breaker, save_state, Side, StateMap,
 };
 use crate::trend::{
-    calculate_atr, calculate_donchian, calculate_obi_score, check_trend_alignment,
+    calculate_atr, calculate_donchian, check_trend_alignment,
     load_shadow_trade, record_shadow_entry, record_shadow_exit, save_shadow_trade, CandleBar,
-    ChandelierExitState, TrendAlignment,
+    ChandelierExitState, L2ObiTracker, TrendAlignment,
 };
 
 #[tokio::main]
@@ -123,9 +123,9 @@ async fn main() {
     // Armed Signal State
     let arm_file_path = format!("hl_hmm_arm_{}.json", trading_symbol);
 
-    // Initialize HMM
+    // Initialize HMM (4D: normalized return, log vol, Kaufman ER, directional drift)
     let initial_hmm = GaussianHMM::load_weights(&config.hmm_config_path)
-        .unwrap_or_else(|_| GaussianHMM::new(3, 2));
+        .unwrap_or_else(|_| GaussianHMM::new(3, 4));
     let hmm_model = Arc::new(RwLock::new(initial_hmm));
 
     let discord_url = config.discord_webhook_url.clone();
@@ -475,6 +475,58 @@ async fn main() {
     let mut current_p_t = 0.25;
     let mut current_p_s = 0.15;
 
+    let obi_tracker = Arc::new(RwLock::new(L2ObiTracker::default()));
+    let obi_tracker_bg = obi_tracker.clone();
+    let symbol_bg = trading_symbol.clone();
+    let base_url_bg = base_url.clone();
+
+    tokio::spawn(async move {
+        loop {
+            let (l2_sender, mut l2_receiver) = unbounded_channel();
+            let mut l2_client = match InfoClient::new(None, Some(base_url_bg.clone())).await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("❌ [L2 WS ERROR] Failed to connect InfoClient: {}. Retrying in 5s...", e);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+
+            if let Err(e) = l2_client
+                .subscribe(
+                    Subscription::L2Book {
+                        coin: symbol_bg.clone(),
+                    },
+                    l2_sender,
+                )
+                .await
+            {
+                eprintln!("❌ [L2 WS ERROR] Subscription failed: {}. Retrying in 5s...", e);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+
+            println!("📡 [L2 WEBSOCKET] Subscribed to continuous L2Book stream for {}.", symbol_bg);
+
+            while let Some(msg) = l2_receiver.recv().await {
+                if let Message::L2Book(l2_msg) = msg {
+                    let l2_data = l2_msg.data;
+                    let bids: Vec<(f64, f64)> = l2_data.levels.first().cloned().unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|l| Some((l.px.parse::<f64>().ok()?, l.sz.parse::<f64>().ok()?)))
+                        .collect();
+                    let asks: Vec<(f64, f64)> = l2_data.levels.get(1).cloned().unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|l| Some((l.px.parse::<f64>().ok()?, l.sz.parse::<f64>().ok()?)))
+                        .collect();
+                    obi_tracker_bg.write().await.update(&bids, &asks, l2_data.time);
+                }
+            }
+            eprintln!("⚠️ [L2 WEBSOCKET] Disconnected. Reconnecting in 3s...");
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    });
+
     loop {
         let (sender, mut receiver) = unbounded_channel();
         let mut ws_info_client = match InfoClient::new(None, Some(base_url.clone())).await {
@@ -709,15 +761,13 @@ async fn main() {
                                 z_15, z_60
                             );
                         }
-                        controller.current_mode = ControllerMode::Neutral;
-                        controller.trend_streak = 0;
-                        controller.consolidation_streak = 0;
-                        controller.last_reason = format!("Severe Shock (|Z15|={:.2}, |Z60|={:.2}) -> Force Neutral", z_15, z_60);
+                        controller.force_shock_cooldown(z_15, z_60);
                         save_controller_state(&symbol_clone, &controller);
                     }
 
                     // Strictly evaluate 15m dwell streaks & state transitions on finalized 15m candle closes!
                     if finalized_15m_bar {
+                        let bar_close_ms = rolling_15m_bars.last().map(|b| b.time_open + 15 * 60 * 1000).unwrap_or(0);
                         let closes_15m: Vec<f64> = rolling_15m_bars.iter().map(|b| b.close).collect();
                         let (p_c, p_t, p_s) = if closes_15m.len() >= 15 {
                             let hmm_lock = hmm_model.read().await;
@@ -739,7 +789,8 @@ async fn main() {
                         };
 
                         let prev_mode = controller.current_mode;
-                        controller.evaluate_15m_bar(
+                        if let Some(new_mode) = controller.evaluate_15m_bar_idempotent(
+                            bar_close_ms,
                             p_c,
                             p_t,
                             z_15,
@@ -747,13 +798,14 @@ async fn main() {
                             has_donchian_breakout,
                             is_stationary,
                             is_valid_half_life,
-                        );
-                        save_controller_state(&symbol_clone, &controller);
+                        ) {
+                            save_controller_state(&symbol_clone, &controller);
 
-                        println!(
-                            "🧭 [3-MODE CONTROLLER 15m EVAL] Mode: {} (was {}) | Streaks: Trend={}, Consolidation={} | P_C: {:.1}% | P_T: {:.1}% | P_Shock: {:.1}% | Reason: {}",
-                            controller.current_mode, prev_mode, controller.trend_streak, controller.consolidation_streak, p_c * 100.0, p_t * 100.0, p_s * 100.0, controller.last_reason
-                        );
+                            println!(
+                                "🧭 [3-MODE CONTROLLER 15m EVAL] Mode: {} (was {}) | Streaks: Trend={}, Consolidation={} | P_C: {:.1}% | P_T: {:.1}% | P_Shock: {:.1}% | Reason: {}",
+                                new_mode, prev_mode, controller.trend_streak, controller.consolidation_streak, p_c * 100.0, p_t * 100.0, p_s * 100.0, controller.last_reason
+                            );
+                        }
                     }
 
                     let (target_buy_str, target_short_str) = match thresholds_opt {
@@ -782,17 +834,18 @@ async fn main() {
                                 current_stop: shadow_trade.current_stop,
                                 initial_stop: shadow_trade.initial_stop,
                                 base_multiplier: chandelier_atr_mult,
-                                active_multiplier: chandelier_atr_mult,
+                                active_multiplier: shadow_trade.active_multiplier,
                             };
 
-                            let new_stop = chandelier.update(high_price, low_price, current_atr, current_p_t);
+                            let new_stop = chandelier.update_with_cap(high_price, low_price, current_atr, current_p_t, Some(0.5));
                             shadow_trade.current_stop = new_stop;
                             shadow_trade.extreme_favorable_price = chandelier.extreme_favorable_price;
+                            shadow_trade.active_multiplier = chandelier.active_multiplier;
                             save_shadow_trade(&symbol_clone, Some(&shadow_trade));
 
                             println!(
-                                "🟣 [SHADOW-TREND MONITOR] {} {} | Price: ${:.2} (H: ${:.2}, L: ${:.2}) | Ratchet Stop: ${:.2} | Extreme: ${:.2}",
-                                symbol_clone, shadow_trade.side, close_price, high_price, low_price, new_stop, shadow_trade.extreme_favorable_price
+                                "🟣 [SHADOW-TREND MONITOR] {} {} | Price: ${:.2} (H: ${:.2}, L: ${:.2}) | Ratchet Stop: ${:.2} (mult: {:.2}) | Extreme: ${:.2}",
+                                symbol_clone, shadow_trade.side, close_price, high_price, low_price, new_stop, chandelier.active_multiplier, shadow_trade.extreme_favorable_price
                             );
 
                             if chandelier.is_bar_stopped_out(high_price, low_price) {
@@ -801,7 +854,7 @@ async fn main() {
                                 } else {
                                     open_price.max(chandelier.current_stop)
                                 };
-                                let net_pnl = record_shadow_exit(&mut shadow_trade, exit_price, "3-ATR Chandelier Trailing Stop");
+                                let net_pnl = record_shadow_exit(&mut shadow_trade, exit_price, "Monotone Dynamic Chandelier Trailing Stop");
                                 controller.notify_trend_stopped_out();
                                 save_controller_state(&symbol_clone, &controller);
                                 let ret_bps = shadow_trade.return_bps.unwrap_or(0.0);
@@ -812,7 +865,7 @@ async fn main() {
                                 crate::discord::send_alert(
                                     discord_clone.as_deref(),
                                     &format!(
-                                        "🛑 **[PHASE 0 SHADOW-TREND EXIT]** {} {}\n**Exit Price:** ${:.2} (Stop: ${:.2})\n**Net PnL:** ${:.2} ({:.1} bps)\n**Reason:** 3-ATR Chandelier Trailing Stop",
+                                        "🛑 **[PHASE 0 SHADOW-TREND EXIT]** {} {}\n**Exit Price:** ${:.2} (Stop: ${:.2})\n**Net PnL:** ${:.2} ({:.1} bps)\n**Reason:** Monotone Dynamic Chandelier Trailing Stop",
                                         symbol_clone, shadow_trade.side, exit_price, new_stop, net_pnl, ret_bps
                                     ),
                                 ).await;
@@ -821,7 +874,7 @@ async fn main() {
                     }
 
                     // ------------------------------------------------------------------
-                    // ENGINE B ENTRY: Donchian Breakout + OBI Queue Dancing (Shadow Mode)
+                    // ENGINE B ENTRY: Donchian Breakout + Continuous L2 EWMA OBI Hurdle
                     // ------------------------------------------------------------------
                     if controller.current_mode == ControllerMode::Trend {
                         let active_shadow = load_shadow_trade(&symbol_clone);
@@ -841,26 +894,12 @@ async fn main() {
                                         let atr_opt = calculate_atr(&rolling_15m_bars, 20);
 
                                         if let Some(current_atr) = atr_opt.filter(|&a| a > 0.0) {
-                                            let mut obi_score = 0.0;
-                                            if let Ok(l2_book) = info_clone.l2_snapshot(symbol_clone.clone()).await {
-                                                if l2_book.levels.len() >= 2 {
-                                                    let bids: Vec<(f64, f64)> = l2_book.levels[0]
-                                                        .iter()
-                                                        .filter_map(|l| Some((l.px.parse().ok()?, l.sz.parse().ok()?)))
-                                                        .collect();
-                                                    let asks: Vec<(f64, f64)> = l2_book.levels[1]
-                                                        .iter()
-                                                        .filter_map(|l| Some((l.px.parse().ok()?, l.sz.parse().ok()?)))
-                                                        .collect();
-                                                    obi_score = calculate_obi_score(&bids, &asks, 20);
-                                                }
-                                            }
-
-                                            let obi_favorable = if side == Side::Long {
-                                                obi_score >= 0.10
-                                            } else {
-                                                obi_score <= -0.10
-                                            };
+                                            let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                                            let obi_lock = obi_tracker.read().await;
+                                            let (obi_favorable, obi_reason) = obi_lock.satisfies_entry_hurdle(&side, now_ms);
+                                            let obi_inst = obi_lock.instant_obi;
+                                            let obi_1s = obi_lock.ewma_1s_obi;
+                                            drop(obi_lock);
 
                                             if obi_favorable {
                                                 let trend_notional = position_size_usdc * trend_risk_fraction;
@@ -877,21 +916,21 @@ async fn main() {
                                                     );
                                                     let side_str = if side == Side::Long { "LONG" } else { "SHORT" };
                                                     println!(
-                                                        "🟣 [SHADOW-TREND ENTRY] {} {} breakout entered at ${:.2} | Size: {:.4} (${:.2}) | Initial Stop: ${:.2} | 20-Lvl OBI: {:.2}",
-                                                        symbol_clone, side_str, close_price, shadow_size, trend_notional, shadow_trade.initial_stop, obi_score
+                                                        "🟣 [SHADOW-TREND ENTRY] {} {} breakout entered at ${:.2} | Size: {:.4} (${:.2}) | Initial Stop: ${:.2} | Streaming EWMA OBI (inst: {:.2}, 1s: {:.2})",
+                                                        symbol_clone, side_str, close_price, shadow_size, trend_notional, shadow_trade.initial_stop, obi_inst, obi_1s
                                                     );
                                                     crate::discord::send_alert(
                                                         discord_clone.as_deref(),
                                                         &format!(
-                                                            "🟣 **[PHASE 0 SHADOW-TREND ENTRY]** {} {}\n**Simulated Entry:** ${:.2}\n**Initial 3-ATR Stop:** ${:.2}\n**Size:** {:.4} (${:.2})\n**20-Level OBI:** {:.2} | **ATR:** ${:.2}",
-                                                            symbol_clone, side_str, close_price, shadow_trade.initial_stop, shadow_size, trend_notional, obi_score, current_atr
+                                                            "🟣 **[PHASE 0 SHADOW-TREND ENTRY]** {} {}\n**Simulated Entry:** ${:.2}\n**Initial Stop:** ${:.2}\n**Size:** {:.4} (${:.2})\n**Continuous EWMA OBI:** inst={:.2}, 1s={:.2} | **ATR:** ${:.2}",
+                                                            symbol_clone, side_str, close_price, shadow_trade.initial_stop, shadow_size, trend_notional, obi_inst, obi_1s, current_atr
                                                         ),
                                                     ).await;
                                                 }
                                             } else {
                                                 println!(
-                                                    "⚠️ [SHADOW-TREND VETO] 20-Level OBI {:.3} does not meet directional hurdle (>= +0.10 for Long, <= -0.10 for Short). Queue dancing veto.",
-                                                    obi_score
+                                                    "⚠️ [SHADOW-TREND VETO] Continuous EWMA OBI entry hurdle failed: {} (inst: {:.3}, 1s: {:.3}). Queue dancing veto.",
+                                                    obi_reason, obi_inst, obi_1s
                                                 );
                                             }
                                         } else {

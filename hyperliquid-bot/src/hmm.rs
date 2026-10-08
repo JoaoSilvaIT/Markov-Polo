@@ -51,10 +51,12 @@ impl GaussianHMM {
         let n_samples = x.nrows();
         let n_features = x.ncols();
         
-        // K-Means-ish init for means
+        // Quantile initialization for means to seed distinct market regimes
+        let step = (n_samples / (self.n_components + 1)).max(1);
         for c in 0..self.n_components {
+            let sample_idx = ((c + 1) * step).min(n_samples - 1);
             for d in 0..n_features {
-                self.means[[c, d]] = x[[c % n_samples, d]]; // Dumb init
+                self.means[[c, d]] = x[[sample_idx, d]];
             }
         }
 
@@ -169,6 +171,7 @@ impl GaussianHMM {
         }
     }
 
+    #[allow(dead_code)]
     pub fn predict(&self, x: &Array2<f64>) -> usize {
         let log_emiss = self.log_gaussian_prob(x);
         let n_samples = x.nrows();
@@ -243,33 +246,63 @@ impl GaussianHMM {
         post
     }
 
-    pub fn sort_by_energy(&mut self) {
-        // Institutional state labeling (Research consensus):
-        // Sort states by emission return-energy: q_k = mu_k^2 + sigma_k^2
-        // - State 0: Lowest return-energy / variance (Calm Consolidation)
-        // - State 1: Moderate energy (Directional / Transition)
-        // - State 2: Highest return-energy / variance (High-volatility cascade / stress shock)
-        let mut energies = vec![(0, 0.0); self.n_components];
-        for c in 0..self.n_components {
-            let mean = self.means[[c, 0]]; // Feature 0 is return
-            let var = self.covars[[c, 0]].max(1e-8);
-            let energy = mean.powi(2) + var;
-            energies[c] = (c, energy);
+    pub fn sort_semantically(&mut self) -> bool {
+        // Institutional semantic state labeling:
+        // - State 0: Consolidation (low ER, calm/moderate volatility)
+        // - State 1: Directional Trend (high ER, high directional drift |D|)
+        // - State 2: Volatility Shock (extreme volatility / return energy)
+        if self.n_components != 3 || self.means.ncols() < 4 {
+            return false;
         }
-        energies.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
+        // 1. Identify Shock state: state with maximum volatility (Feature 1: ln_sigma)
+        let mut shock_state = 0;
+        let mut max_vol = f64::NEG_INFINITY;
+        for c in 0..3 {
+            let vol_score = self.means[[c, 1]];
+            if vol_score > max_vol {
+                max_vol = vol_score;
+                shock_state = c;
+            }
+        }
+
+        // 2. Between the remaining two states, identify Trend vs Consolidation by ER
+        let remaining: Vec<usize> = (0..3).filter(|&c| c != shock_state).collect();
+        let s_a = remaining[0];
+        let s_b = remaining[1];
+
+        let er_a = self.means[[s_a, 2]];
+        let er_b = self.means[[s_b, 2]];
+
+        let (consol_state, trend_state) = if er_a <= er_b {
+            (s_a, s_b)
+        } else {
+            (s_b, s_a)
+        };
+
+        // If both states have virtually indistinguishable ER, verify if directional drift |D| separates them
+        let er_diff = (self.means[[trend_state, 2]] - self.means[[consol_state, 2]]).abs();
+        if er_diff < 1e-4 {
+            let d_trend = self.means[[trend_state, 3]];
+            let d_consol = self.means[[consol_state, 3]];
+            if (d_trend - d_consol).abs() < 1e-4 {
+                return false;
+            }
+        }
+
+        let order = [consol_state, trend_state, shock_state];
         let mut new_means = self.means.clone();
         let mut new_covars = self.covars.clone();
         let mut new_startprob = self.startprob.clone();
         let mut new_transmat = self.transmat.clone();
 
-        for (i, &(old_idx, _)) in energies.iter().enumerate() {
-            new_means.row_mut(i).assign(&self.means.row(old_idx));
-            new_covars.row_mut(i).assign(&self.covars.row(old_idx));
-            new_startprob[i] = self.startprob[old_idx];
-            
-            for (j, &(old_col, _)) in energies.iter().enumerate() {
-                new_transmat[[i, j]] = self.transmat[[old_idx, old_col]];
+        for (new_idx, &old_idx) in order.iter().enumerate() {
+            new_means.row_mut(new_idx).assign(&self.means.row(old_idx));
+            new_covars.row_mut(new_idx).assign(&self.covars.row(old_idx));
+            new_startprob[new_idx] = self.startprob[old_idx];
+
+            for (new_col, &old_col) in order.iter().enumerate() {
+                new_transmat[[new_idx, new_col]] = self.transmat[[old_idx, old_col]];
             }
         }
 
@@ -277,48 +310,13 @@ impl GaussianHMM {
         self.covars = new_covars;
         self.startprob = new_startprob;
         self.transmat = new_transmat;
+        true
     }
 
     #[allow(dead_code)]
-    pub fn sort_by_sharpe(&mut self) {
-        self.sort_by_energy();
+    pub fn sort_by_energy(&mut self) {
+        let _ = self.sort_semantically();
     }
-}
-
-#[allow(dead_code)]
-pub fn detect_hmm_regime(closes: &[f64]) -> i32 {
-    if closes.len() < 12 { return 0; }
-    
-    // Create returns
-    let mut returns = Vec::with_capacity(closes.len() - 1);
-    for i in 1..closes.len() {
-        returns.push(closes[i] / closes[i-1] - 1.0);
-    }
-    
-    // Create rolling vol (10-period)
-    let mut vols = vec![0.0; returns.len()];
-    for i in 10..returns.len() {
-        let slice = &returns[i-10..i];
-        let mean: f64 = slice.iter().sum::<f64>() / 10.0;
-        let var: f64 = slice.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / 10.0;
-        vols[i] = var.sqrt();
-    }
-    
-    let valid_start = 10;
-    if returns.len() - valid_start < 5 { return 0; }
-    
-    let n_samples = returns.len() - valid_start;
-    let mut x = Array2::zeros((n_samples, 2));
-    for i in 0..n_samples {
-        x[[i, 0]] = returns[i + valid_start];
-        x[[i, 1]] = vols[i + valid_start];
-    }
-    
-    let mut hmm = GaussianHMM::new(3, 2);
-    hmm.fit(&x, 100);
-    hmm.sort_by_energy(); // Energy-based state labeling
-    
-    hmm.predict(&x) as i32
 }
 
 use serde::{Serialize, Deserialize};
@@ -345,7 +343,7 @@ impl GaussianHMM {
             transmat: vec![vec![0.0; self.n_components]; self.n_components],
             startprob: self.startprob.to_vec(),
         };
-        
+
         for i in 0..self.n_components {
             for j in 0..n_features {
                 weights.means[i][j] = self.means[[i, j]];
@@ -355,7 +353,7 @@ impl GaussianHMM {
                 weights.transmat[i][j] = self.transmat[[i, j]];
             }
         }
-        
+
         let json = serde_json::to_string_pretty(&weights)?;
         fs::write(path, json)?;
         Ok(())
@@ -364,10 +362,13 @@ impl GaussianHMM {
     pub fn load_weights(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let json = fs::read_to_string(path)?;
         let weights: HmmWeights = serde_json::from_str(&json)?;
-        
+        if weights.n_features != 4 || weights.n_components != 3 {
+            return Err("Incompatible HMM weights shape: requires 3 components and 4 features".into());
+        }
+
         let mut hmm = Self::new(weights.n_components, weights.n_features);
         hmm.startprob = Array1::from_vec(weights.startprob);
-        
+
         for i in 0..weights.n_components {
             for j in 0..weights.n_features {
                 hmm.means[[i, j]] = weights.means[i][j];
@@ -377,73 +378,88 @@ impl GaussianHMM {
                 hmm.transmat[[i, j]] = weights.transmat[i][j];
             }
         }
-        
+
         Ok(hmm)
     }
 }
 use serde_json;
 
+/// Extracts 4D causal observation features:
+/// 0: Normalized return (r_t / sigma_t)
+/// 1: Log volatility ln(sigma_t)
+/// 2: Kaufman Efficiency Ratio ER_t(16)
+/// 3: Absolute Directional Drift |D_t(16)|
+pub fn extract_4d_features(closes: &[f64], n_lookback: usize) -> Option<Array2<f64>> {
+    let n = closes.len();
+    if n <= n_lookback + 2 {
+        return None;
+    }
+
+    let mut returns = Vec::with_capacity(n - 1);
+    for i in 1..n {
+        returns.push((closes[i] / closes[i - 1]).ln());
+    }
+
+    let n_samples = n - 1 - n_lookback;
+    let mut x = Array2::zeros((n_samples, 4));
+
+    for (sample_idx, t) in (n_lookback..n - 1).enumerate() {
+        // Prior window of returns for volatility estimation
+        let start_idx = t + 1 - n_lookback;
+        let ret_slice = &returns[start_idx..=t];
+        let mean_ret: f64 = ret_slice.iter().sum::<f64>() / ret_slice.len() as f64;
+        let var_ret: f64 = ret_slice.iter().map(|&r| (r - mean_ret).powi(2)).sum::<f64>()
+            / (ret_slice.len() - 1).max(1) as f64;
+        let sigma = var_ret.sqrt().max(1e-6);
+
+        let r_t = returns[t];
+        let norm_ret = r_t / sigma;
+        let ln_sigma = sigma.ln();
+
+        // Kaufman Efficiency Ratio (KER):
+        // Net change over lookback window / sum of absolute incremental changes
+        let p_end = closes[t + 1].ln();
+        let p_start = closes[t + 1 - n_lookback].ln();
+        let net_change = (p_end - p_start).abs();
+
+        let mut path_length = 0.0;
+        for i in (t + 1 - n_lookback + 1)..=t + 1 {
+            path_length += (closes[i].ln() - closes[i - 1].ln()).abs();
+        }
+        let er = (net_change / (path_length + 1e-8)).clamp(0.0, 1.0);
+
+        // Absolute Directional Drift:
+        let d_t = net_change / (sigma * (n_lookback as f64).sqrt());
+
+        x[[sample_idx, 0]] = norm_ret;
+        x[[sample_idx, 1]] = ln_sigma;
+        x[[sample_idx, 2]] = er;
+        x[[sample_idx, 3]] = d_t;
+    }
+
+    Some(x)
+}
+
 pub fn train_hmm_offline(closes: &[f64]) -> Option<GaussianHMM> {
-    if closes.len() < 12 { return None; }
-    
-    let mut returns = Vec::with_capacity(closes.len() - 1);
-    for i in 1..closes.len() {
-        returns.push(closes[i] / closes[i-1] - 1.0);
+    let x = extract_4d_features(closes, 16)?;
+    if x.nrows() < 10 {
+        return None;
     }
-    
-    let mut vols = vec![0.0; returns.len()];
-    for i in 10..returns.len() {
-        let slice = &returns[i-10..i];
-        let mean: f64 = slice.iter().sum::<f64>() / 10.0;
-        let var: f64 = slice.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / 10.0;
-        vols[i] = var.sqrt();
-    }
-    
-    let valid_start = 10;
-    if returns.len() - valid_start < 5 { return None; }
-    
-    let n_samples = returns.len() - valid_start;
-    let mut x = Array2::zeros((n_samples, 2));
-    for i in 0..n_samples {
-        x[[i, 0]] = returns[i + valid_start];
-        x[[i, 1]] = vols[i + valid_start];
-    }
-    
-    let mut hmm = GaussianHMM::new(3, 2);
+
+    let mut hmm = GaussianHMM::new(3, 4);
     hmm.fit(&x, 100);
-    hmm.sort_by_energy();
-    
+    if !hmm.sort_semantically() {
+        // Degenerate state moments: fail safe
+        return None;
+    }
+
     Some(hmm)
 }
 
 pub fn compute_hmm_posteriors(hmm: &GaussianHMM, closes: &[f64]) -> Option<(f64, f64, f64)> {
-    if closes.len() < 15 {
+    let x = extract_4d_features(closes, 16)?;
+    if x.nrows() == 0 {
         return None;
-    }
-
-    let mut returns = Vec::with_capacity(closes.len() - 1);
-    for i in 1..closes.len() {
-        returns.push(closes[i] / closes[i - 1] - 1.0);
-    }
-
-    let mut vols = vec![0.0; returns.len()];
-    for i in 10..returns.len() {
-        let slice = &returns[i - 10..i];
-        let mean: f64 = slice.iter().sum::<f64>() / 10.0;
-        let var: f64 = slice.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / 10.0;
-        vols[i] = var.sqrt();
-    }
-
-    let valid_start = 10;
-    if returns.len() - valid_start < 5 {
-        return None;
-    }
-
-    let n_samples = returns.len() - valid_start;
-    let mut x = Array2::zeros((n_samples, 2));
-    for i in 0..n_samples {
-        x[[i, 0]] = returns[i + valid_start];
-        x[[i, 1]] = vols[i + valid_start];
     }
 
     let post = hmm.filtered_posteriors(&x);
@@ -462,12 +478,23 @@ mod tests {
     fn test_hmm_filtered_posteriors_sum_to_one() {
         let mut closes = Vec::new();
         let mut p = 100.0;
-        for i in 0..100 {
-            p += (i as f64 * 0.1).sin();
+        // Generate price series with trending and consolidation phases
+        for i in 0..120 {
+            if i < 40 {
+                p += 0.8 + 0.1 * (i as f64 * 0.2).sin(); // Steady trend
+            } else if i < 80 {
+                p += 0.05 * (i as f64 * 0.8).sin(); // Calm consolidation
+            } else {
+                p += 1.5 * (i as f64 * 1.5).cos(); // High vol shock
+            }
             closes.push(p);
         }
 
-        let hmm = train_hmm_offline(&closes).expect("Trained HMM");
+        let hmm_opt = train_hmm_offline(&closes);
+        assert!(hmm_opt.is_some(), "HMM training should succeed on structured series");
+        let hmm = hmm_opt.unwrap();
+        assert_eq!(hmm.means.ncols(), 4, "Should have 4 feature dimensions");
+
         let posteriors = compute_hmm_posteriors(&hmm, &closes);
         assert!(posteriors.is_some());
         let (p_c, p_t, p_s) = posteriors.unwrap();

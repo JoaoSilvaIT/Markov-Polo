@@ -24,6 +24,8 @@ pub struct RegimeController {
     pub current_mode: ControllerMode,
     pub trend_streak: u32,
     pub consolidation_streak: u32,
+    pub shock_cooldown_bars: u32,
+    pub last_evaluated_close_ms: u64,
     pub last_transition_time: String,
     pub last_reason: String,
     pub epoch: u64,
@@ -35,6 +37,8 @@ impl Default for RegimeController {
             current_mode: ControllerMode::Neutral,
             trend_streak: 0,
             consolidation_streak: 0,
+            shock_cooldown_bars: 0,
+            last_evaluated_close_ms: 0,
             last_transition_time: Utc::now().to_rfc3339(),
             last_reason: "Initial system startup (Safe Cash Buffer)".to_string(),
             epoch: 1,
@@ -43,6 +47,51 @@ impl Default for RegimeController {
 }
 
 impl RegimeController {
+    /// Forces immediate shock downgrade to Neutral with a 2-bar (30m) cooldown
+    pub fn force_shock_cooldown(&mut self, z_15: f64, z_60: f64) {
+        let was_different = self.current_mode != ControllerMode::Neutral;
+        self.current_mode = ControllerMode::Neutral;
+        self.trend_streak = 0;
+        self.consolidation_streak = 0;
+        self.shock_cooldown_bars = 2;
+        self.last_reason = format!(
+            "Immediate Shock Downgrade (|Z15|={:.2}, |Z60|={:.2}) -> Neutral Cooldown (2 bars)",
+            z_15, z_60
+        );
+        if was_different {
+            self.last_transition_time = Utc::now().to_rfc3339();
+            self.epoch += 1;
+        }
+    }
+
+    /// Evaluates 15-minute bar metrics idempotently by checking bar close timestamp.
+    /// If bar_close_ms <= self.last_evaluated_close_ms, returns None without state change.
+    pub fn evaluate_15m_bar_idempotent(
+        &mut self,
+        bar_close_ms: u64,
+        p_consolidation: f64,
+        p_trend: f64,
+        z_15: f64,
+        z_60: f64,
+        has_donchian_breakout: bool,
+        is_ou_stationary: bool,
+        is_half_life_valid: bool,
+    ) -> Option<ControllerMode> {
+        if bar_close_ms > 0 && bar_close_ms <= self.last_evaluated_close_ms {
+            return None;
+        }
+        self.last_evaluated_close_ms = bar_close_ms;
+        Some(self.evaluate_15m_bar(
+            p_consolidation,
+            p_trend,
+            z_15,
+            z_60,
+            has_donchian_breakout,
+            is_ou_stationary,
+            is_half_life_valid,
+        ))
+    }
+
     /// Evaluates 15-minute bar metrics and advances the state machine.
     ///
     /// Parameters:
@@ -68,20 +117,34 @@ impl RegimeController {
         // 1. SEVERE SHOCK OVERRIDE (100% Cash Protection):
         // Severe volatility spikes (|Z| >= 3.0) and liquidation cascades must NEVER trigger
         // an immediate Trend entry (which risks buying the top of a squeeze).
-        // They exclusively route to Neutral (safe cash buffer) and reset streaks.
+        // They exclusively route to Neutral (safe cash buffer), reset streaks, and trigger cooldown.
         if is_severe_shock {
             let was_different = self.current_mode != ControllerMode::Neutral;
             self.current_mode = ControllerMode::Neutral;
             self.trend_streak = 0;
             self.consolidation_streak = 0;
+            self.shock_cooldown_bars = 2; // 2 bars = 30-minute re-entry freeze
             self.last_reason = format!(
-                "Severe Volatility Shock Veto (|Z15|={:.2}, |Z60|={:.2}) -> Safe Neutral Cash Buffer",
+                "Severe Volatility Shock Veto (|Z15|={:.2}, |Z60|={:.2}) -> Safe Neutral Cash Buffer (Cooldown 2 bars)",
                 z_15, z_60
             );
             if was_different {
                 self.last_transition_time = Utc::now().to_rfc3339();
                 self.epoch += 1;
             }
+            return self.current_mode;
+        }
+
+        // 2. SHOCK COOLDOWN PACING
+        if self.shock_cooldown_bars > 0 {
+            self.shock_cooldown_bars -= 1;
+            self.current_mode = ControllerMode::Neutral;
+            self.trend_streak = 0;
+            self.consolidation_streak = 0;
+            self.last_reason = format!(
+                "Shock Re-Entry Cooldown Active ({} bars remaining) -> Forced Neutral",
+                self.shock_cooldown_bars
+            );
             return self.current_mode;
         }
 
@@ -298,5 +361,54 @@ mod tests {
         controller.notify_trend_stopped_out();
         assert_eq!(controller.current_mode, ControllerMode::Neutral);
         assert!(controller.last_reason.contains("Chandelier Stop"));
+    }
+
+    #[test]
+    fn test_severe_shock_cooldown_bars() {
+        let mut controller = RegimeController::default();
+        // Severe shock hits
+        let mode = controller.evaluate_15m_bar(0.05, 0.95, 3.4, 1.5, true, false, false);
+        assert_eq!(mode, ControllerMode::Neutral);
+        assert_eq!(controller.shock_cooldown_bars, 2);
+
+        // Next bar: strong trend signal arrives, but cooldown is active (bar 1 of cooldown)
+        let mode1 = controller.evaluate_15m_bar(0.05, 0.95, 1.0, 0.5, true, false, false);
+        assert_eq!(mode1, ControllerMode::Neutral);
+        assert_eq!(controller.shock_cooldown_bars, 1);
+        assert!(controller.last_reason.contains("Shock Re-Entry Cooldown"));
+
+        // Bar 2 of cooldown: still forced neutral
+        let mode2 = controller.evaluate_15m_bar(0.05, 0.95, 1.0, 0.5, true, false, false);
+        assert_eq!(mode2, ControllerMode::Neutral);
+        assert_eq!(controller.shock_cooldown_bars, 0);
+
+        // Now cooldown is finished. Next bars can accumulate streak toward trend.
+        let mode3 = controller.evaluate_15m_bar(0.05, 0.95, 1.0, 0.5, true, false, false);
+        assert_eq!(mode3, ControllerMode::Neutral);
+        assert_eq!(controller.trend_streak, 1);
+    }
+
+    #[test]
+    fn test_idempotent_bar_evaluation() {
+        let mut controller = RegimeController::default();
+        let bar_ts = 1712000000_000u64;
+
+        // First evaluation succeeds
+        let res1 = controller.evaluate_15m_bar_idempotent(bar_ts, 0.80, 0.15, 0.2, 0.1, false, true, true);
+        assert!(res1.is_some());
+        assert_eq!(controller.last_evaluated_close_ms, bar_ts);
+
+        // Duplicate evaluation with same timestamp is dropped
+        let res2 = controller.evaluate_15m_bar_idempotent(bar_ts, 0.80, 0.15, 0.2, 0.1, false, true, true);
+        assert!(res2.is_none());
+
+        // Stale evaluation with earlier timestamp is dropped
+        let res3 = controller.evaluate_15m_bar_idempotent(bar_ts - 900_000, 0.80, 0.15, 0.2, 0.1, false, true, true);
+        assert!(res3.is_none());
+
+        // Next bar (later timestamp) succeeds
+        let res4 = controller.evaluate_15m_bar_idempotent(bar_ts + 900_000, 0.80, 0.15, 0.2, 0.1, false, true, true);
+        assert!(res4.is_some());
+        assert_eq!(controller.last_evaluated_close_ms, bar_ts + 900_000);
     }
 }

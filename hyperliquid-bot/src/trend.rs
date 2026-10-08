@@ -132,6 +132,7 @@ pub fn check_trend_alignment(closes: &[f64]) -> TrendAlignment {
 /// Computes Order Book Imbalance (OBI) across top K levels:
 /// OBI = (Sum(Bid_Vlm) - Sum(Ask_Vlm)) / (Sum(Bid_Vlm) + Sum(Ask_Vlm))
 /// Bounded in [-1.0, 1.0]
+#[allow(dead_code)]
 pub fn calculate_obi_score(bids: &[(f64, f64)], asks: &[(f64, f64)], depth: usize) -> f64 {
     let top_bids = &bids[0..depth.min(bids.len())];
     let top_asks = &asks[0..depth.min(asks.len())];
@@ -145,6 +146,110 @@ pub fn calculate_obi_score(bids: &[(f64, f64)], asks: &[(f64, f64)], depth: usiz
     }
 
     (sum_bid_vlm - sum_ask_vlm) / total
+}
+
+/// Real-time L2 continuous order book tracker with physical-time decayed EWMA
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct L2ObiTracker {
+    pub instant_obi: f64,
+    pub ewma_1s_obi: f64,
+    pub ewma_5s_obi: f64,
+    pub last_update_ms: u64,
+    pub best_bid: f64,
+    pub best_ask: f64,
+}
+
+impl Default for L2ObiTracker {
+    fn default() -> Self {
+        Self {
+            instant_obi: 0.0,
+            ewma_1s_obi: 0.0,
+            ewma_5s_obi: 0.0,
+            last_update_ms: 0,
+            best_bid: 0.0,
+            best_ask: 0.0,
+        }
+    }
+}
+
+impl L2ObiTracker {
+    pub fn update(&mut self, bids: &[(f64, f64)], asks: &[(f64, f64)], now_ms: u64) {
+        if bids.is_empty() || asks.is_empty() {
+            return;
+        }
+        self.best_bid = bids[0].0;
+        self.best_ask = asks[0].0;
+
+        // Distance-weighted OBI across top 20 levels:
+        // Level rank decay: w_i = exp(-0.15 * i)
+        let depth = 20.min(bids.len()).min(asks.len());
+        let lambda = 0.15;
+        let mut sum_bid_w = 0.0;
+        let mut sum_ask_w = 0.0;
+
+        for i in 0..depth {
+            let w = (-lambda * i as f64).exp();
+            sum_bid_w += w * bids[i].1;
+            sum_ask_w += w * asks[i].1;
+        }
+
+        let denom = sum_bid_w + sum_ask_w;
+        if denom <= 1e-9 {
+            return;
+        }
+        let obi_inst = ((sum_bid_w - sum_ask_w) / denom).clamp(-1.0, 1.0);
+        self.instant_obi = obi_inst;
+
+        if self.last_update_ms > 0 && now_ms > self.last_update_ms {
+            let dt_ms = (now_ms - self.last_update_ms) as f64;
+            let ln2 = std::f64::consts::LN_2;
+
+            // Physical-time EWMA decay: alpha = 1 - exp(-ln2 * dt / h)
+            let alpha_1s = 1.0 - (-ln2 * dt_ms / 1000.0).exp();
+            self.ewma_1s_obi = (1.0 - alpha_1s) * self.ewma_1s_obi + alpha_1s * obi_inst;
+
+            let alpha_5s = 1.0 - (-ln2 * dt_ms / 5000.0).exp();
+            self.ewma_5s_obi = (1.0 - alpha_5s) * self.ewma_5s_obi + alpha_5s * obi_inst;
+        } else {
+            self.ewma_1s_obi = obi_inst;
+            self.ewma_5s_obi = obi_inst;
+        }
+
+        self.last_update_ms = now_ms;
+    }
+
+    pub fn is_fresh_and_uncrossed(&self, now_ms: u64, max_latency_ms: u64) -> bool {
+        if self.last_update_ms == 0 || now_ms < self.last_update_ms {
+            return false;
+        }
+        let latency = now_ms - self.last_update_ms;
+        latency <= max_latency_ms && self.best_ask > self.best_bid && self.best_bid > 0.0
+    }
+
+    pub fn satisfies_entry_hurdle(&self, side: &Side, now_ms: u64) -> (bool, &'static str) {
+        if !self.is_fresh_and_uncrossed(now_ms, 2500) {
+            return (false, "L2 Book Stale or Crossed");
+        }
+
+        match side {
+            Side::Long => {
+                // Dual hurdle: instantaneous >= +0.10 and persistent 1s EWMA >= +0.05
+                if self.instant_obi >= 0.10 && self.ewma_1s_obi >= 0.05 {
+                    (true, "Bullish Depth Alignment")
+                } else {
+                    (false, "Insufficient Bid Depth / Fleeting Ask Asymmetry")
+                }
+            }
+            Side::Short => {
+                // Dual hurdle: instantaneous <= -0.10 and persistent 1s EWMA <= -0.05
+                if self.instant_obi <= -0.10 && self.ewma_1s_obi <= -0.05 {
+                    (true, "Bearish Depth Alignment")
+                } else {
+                    (false, "Insufficient Ask Depth / Fleeting Bid Asymmetry")
+                }
+            }
+        }
+    }
 }
 
 /// Monotone Hybrid Ratchet Chandelier Exit State
@@ -178,13 +283,40 @@ impl ChandelierExitState {
         }
     }
 
-    /// Updates trailing stop on bar close / price tick.
-    /// Never loosens the stop (strictly monotone).
-    /// Uses continuous probability-decay compression:
-    /// k(P_T) = 1.5 + (base - 1.5) * clip((P_T - 0.55) / (0.85 - 0.55), 0, 1)
+    /// Updates trailing stop on bar close / price tick with finite guards and optional contraction cap.
+    #[allow(dead_code)]
     pub fn update(&mut self, current_high: f64, current_low: f64, current_atr: f64, p_trend: f64) -> f64 {
+        self.update_with_cap(current_high, current_low, current_atr, p_trend, None)
+    }
+
+    pub fn update_with_cap(
+        &mut self,
+        current_high: f64,
+        current_low: f64,
+        current_atr: f64,
+        p_trend: f64,
+        max_contraction_step: Option<f64>,
+    ) -> f64 {
+        // Guard against non-finite or invalid inputs
+        if current_atr <= 0.0 || current_atr.is_nan() || current_atr.is_infinite()
+            || p_trend.is_nan() || p_trend.is_infinite()
+            || current_high.is_nan() || current_low.is_nan()
+        {
+            return self.current_stop;
+        }
+
         let decay_factor = ((p_trend - 0.55) / (0.85 - 0.55)).clamp(0.0, 1.0);
-        self.active_multiplier = 1.5 + (self.base_multiplier - 1.5) * decay_factor;
+        let target_multiplier = 1.5 + (self.base_multiplier - 1.5) * decay_factor;
+
+        if let Some(max_step) = max_contraction_step {
+            if target_multiplier < self.active_multiplier {
+                self.active_multiplier = (self.active_multiplier - max_step).max(target_multiplier);
+            } else {
+                self.active_multiplier = (self.active_multiplier + max_step).min(target_multiplier);
+            }
+        } else {
+            self.active_multiplier = target_multiplier;
+        }
 
         match self.side {
             Side::Long => {
@@ -224,6 +356,10 @@ impl ChandelierExitState {
     }
 }
 
+fn default_chandelier_mult() -> f64 {
+    3.0
+}
+
 /// Shadow Trading Record for Paper-Execution Validation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShadowTrade {
@@ -236,6 +372,8 @@ pub struct ShadowTrade {
     pub current_stop: f64,
     pub extreme_favorable_price: f64,
     pub atr_at_entry: f64,
+    #[serde(default = "default_chandelier_mult")]
+    pub active_multiplier: f64,
     pub is_active: bool,
     pub exit_time: Option<String>,
     pub exit_price: Option<f64>,
@@ -293,6 +431,7 @@ pub fn record_shadow_entry(
         current_stop: initial_stop,
         extreme_favorable_price: entry_price,
         atr_at_entry: atr,
+        active_multiplier: atr_mult,
         is_active: true,
         exit_time: None,
         exit_price: None,
@@ -509,6 +648,7 @@ mod tests {
             current_stop: 94.0,
             extreme_favorable_price: 100.0,
             atr_at_entry: 2.0,
+            active_multiplier: 3.0,
             is_active: true,
             exit_time: None,
             exit_price: None,
@@ -522,5 +662,49 @@ mod tests {
         // Gross = $5.0, friction = $0.11226 (maker entry + taker exit + 5 bps slippage) -> net ~ $4.8877
         assert!(pnl > 4.80 && pnl < 4.95);
         assert_eq!(trade.is_active, false);
+    }
+
+    #[test]
+    fn test_l2_obi_tracker_physical_time_decay() {
+        let mut tracker = L2ObiTracker::default();
+        let bids = vec![(100.0, 10.0), (99.0, 10.0)];
+        let asks = vec![(101.0, 5.0), (102.0, 5.0)];
+
+        let t0 = 1_000_000;
+        tracker.update(&bids, &asks, t0);
+        assert!(tracker.instant_obi > 0.0, "Bids outweigh asks");
+        assert_eq!(tracker.ewma_1s_obi, tracker.instant_obi);
+
+        // 1 second (1000ms) later, asks heavily surge
+        let t1 = t0 + 1000;
+        let surge_asks = vec![(101.0, 50.0), (102.0, 50.0)];
+        tracker.update(&bids, &surge_asks, t1);
+        assert!(tracker.instant_obi < -0.50, "Instantaneous flipped heavily bearish");
+        // 1s EWMA should smoothly decay towards negative, but not instantly equal instant_obi
+        assert!(tracker.ewma_1s_obi > tracker.instant_obi);
+
+        // Check freshness
+        assert!(tracker.is_fresh_and_uncrossed(t1 + 500, 2500));
+        assert!(!tracker.is_fresh_and_uncrossed(t1 + 3000, 2500), "Should expire stale books > 2500ms");
+    }
+
+    #[test]
+    fn test_chandelier_single_update_contraction_cap() {
+        let mut chandelier = ChandelierExitState::new(Side::Long, 100.0, 2.0, 3.0);
+        chandelier.update_with_cap(110.0, 105.0, 2.0, 0.90, Some(0.5));
+        assert_eq!(chandelier.current_stop, 104.0);
+        assert_eq!(chandelier.active_multiplier, 3.0);
+
+        // Sudden drop in P_T to 0.40 (target is 1.5 ATR)
+        // With cap = 0.5, active multiplier contracts from 3.0 to 2.5 (not straight to 1.5)
+        chandelier.update_with_cap(110.0, 108.0, 2.0, 0.40, Some(0.5));
+        assert_eq!(chandelier.active_multiplier, 2.5);
+        // Candidate stop: 110.0 - 2.5 * 2.0 = 105.0
+        assert_eq!(chandelier.current_stop, 105.0);
+
+        // Next 15m update: contracts further by 0.5 to 2.0
+        chandelier.update_with_cap(110.0, 108.0, 2.0, 0.40, Some(0.5));
+        assert_eq!(chandelier.active_multiplier, 2.0);
+        assert_eq!(chandelier.current_stop, 106.0);
     }
 }
