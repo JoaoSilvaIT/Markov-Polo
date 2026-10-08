@@ -8,6 +8,7 @@ pub struct GaussianHMM {
     pub covars: Array2<f64>,
     pub transmat: Array2<f64>,
     pub startprob: Array1<f64>,
+    pub eff_sample_sizes: Array1<f64>,
 }
 
 fn logsumexp(arr: &Array1<f64>) -> f64 {
@@ -25,6 +26,7 @@ impl GaussianHMM {
             covars: Array2::ones((n_components, n_features)),
             transmat: Array2::from_elem((n_components, n_components), 1.0 / n_components as f64),
             startprob: Array1::from_elem(n_components, 1.0 / n_components as f64),
+            eff_sample_sizes: Array1::zeros(n_components),
         }
     }
 
@@ -59,6 +61,8 @@ impl GaussianHMM {
                 self.means[[c, d]] = x[[sample_idx, d]];
             }
         }
+
+        let mut final_n_eff = Array1::zeros(self.n_components);
 
         for _ in 0..n_iter {
             let log_emiss = self.log_gaussian_prob(x);
@@ -172,6 +176,7 @@ impl GaussianHMM {
                         sum_sq_gamma += gamma[[t, c]].powi(2);
                     }
                     let n_eff = (denom * denom) / sum_sq_gamma.max(1e-10);
+                    final_n_eff[c] = n_eff;
 
                     // Base shrinkage rho = 0.10, scaling up if effective sample size is small (< 80)
                     let rho_k = if n_eff < 80.0 {
@@ -213,6 +218,8 @@ impl GaussianHMM {
                 }
             }
         }
+
+        self.eff_sample_sizes = final_n_eff;
     }
 
     #[allow(dead_code)]
@@ -339,11 +346,15 @@ impl GaussianHMM {
         let mut new_covars = self.covars.clone();
         let mut new_startprob = self.startprob.clone();
         let mut new_transmat = self.transmat.clone();
+        let mut new_eff = self.eff_sample_sizes.clone();
 
         for (new_idx, &old_idx) in order.iter().enumerate() {
             new_means.row_mut(new_idx).assign(&self.means.row(old_idx));
             new_covars.row_mut(new_idx).assign(&self.covars.row(old_idx));
             new_startprob[new_idx] = self.startprob[old_idx];
+            if old_idx < self.eff_sample_sizes.len() && new_idx < new_eff.len() {
+                new_eff[new_idx] = self.eff_sample_sizes[old_idx];
+            }
 
             for (new_col, &old_col) in order.iter().enumerate() {
                 new_transmat[[new_idx, new_col]] = self.transmat[[old_idx, old_col]];
@@ -354,6 +365,7 @@ impl GaussianHMM {
         self.covars = new_covars;
         self.startprob = new_startprob;
         self.transmat = new_transmat;
+        self.eff_sample_sizes = new_eff;
         true
     }
 
@@ -374,6 +386,8 @@ pub struct HmmWeights {
     pub covars: Vec<Vec<f64>>,
     pub transmat: Vec<Vec<f64>>,
     pub startprob: Vec<f64>,
+    #[serde(default)]
+    pub eff_sample_sizes: Vec<f64>,
 }
 
 impl GaussianHMM {
@@ -386,6 +400,7 @@ impl GaussianHMM {
             covars: vec![vec![0.0; n_features]; self.n_components],
             transmat: vec![vec![0.0; self.n_components]; self.n_components],
             startprob: self.startprob.to_vec(),
+            eff_sample_sizes: self.eff_sample_sizes.to_vec(),
         };
 
         for i in 0..self.n_components {
@@ -421,6 +436,10 @@ impl GaussianHMM {
             for j in 0..weights.n_components {
                 hmm.transmat[[i, j]] = weights.transmat[i][j];
             }
+        }
+
+        if weights.eff_sample_sizes.len() == weights.n_components {
+            hmm.eff_sample_sizes = Array1::from_vec(weights.eff_sample_sizes);
         }
 
         Ok(hmm)
@@ -486,7 +505,7 @@ pub fn extract_4d_features(closes: &[f64], n_lookback: usize) -> Option<Array2<f
 
 pub fn train_hmm_offline(closes: &[f64]) -> Option<GaussianHMM> {
     let x = extract_4d_features(closes, 16)?;
-    if x.nrows() < 10 {
+    if x.nrows() < 120 {
         return None;
     }
 
@@ -495,6 +514,19 @@ pub fn train_hmm_offline(closes: &[f64]) -> Option<GaussianHMM> {
     if !hmm.sort_semantically() {
         // Degenerate state moments: fail safe
         return None;
+    }
+
+    // Rare-State Rejection Gate (P0 Quant Specification):
+    // If any fitted regime has Neff,k < 40, reject the model rather than hot-swapping
+    // an under-identified or data-starved regime into live memory.
+    for (state_idx, &n_eff) in hmm.eff_sample_sizes.iter().enumerate() {
+        if n_eff < 40.0 {
+            println!(
+                "⚠️ [COLD-PATH] HMM candidate rejected: State {} has insufficient effective sample size (N_eff = {:.1} < 40.0)",
+                state_idx, n_eff
+            );
+            return None;
+        }
     }
 
     Some(hmm)
@@ -522,11 +554,11 @@ mod tests {
     fn test_hmm_filtered_posteriors_sum_to_one() {
         let mut closes = Vec::new();
         let mut p = 100.0;
-        // Generate price series with trending and consolidation phases
-        for i in 0..120 {
-            if i < 40 {
+        // Generate price series with trending, consolidation, and shock phases (300 bars)
+        for i in 0..300 {
+            if i < 100 {
                 p += 0.8 + 0.1 * (i as f64 * 0.2).sin(); // Steady trend
-            } else if i < 80 {
+            } else if i < 200 {
                 p += 0.05 * (i as f64 * 0.8).sin(); // Calm consolidation
             } else {
                 p += 1.5 * (i as f64 * 1.5).cos(); // High vol shock
@@ -547,5 +579,18 @@ mod tests {
         assert!(p_c >= 0.0 && p_c <= 1.0);
         assert!(p_t >= 0.0 && p_t <= 1.0);
         assert!(p_s >= 0.0 && p_s <= 1.0);
+    }
+
+    #[test]
+    fn test_hmm_rare_state_rejection() {
+        let mut closes = Vec::new();
+        let mut p = 100.0;
+        // Series with insufficient observations (< 120 bars) should fail Neff >= 40 gate
+        for i in 0..80 {
+            p += 0.1 * (i as f64 * 0.1).sin();
+            closes.push(p);
+        }
+        let hmm_opt = train_hmm_offline(&closes);
+        assert!(hmm_opt.is_none(), "Under-identified series must be rejected by rare-state gate");
     }
 }

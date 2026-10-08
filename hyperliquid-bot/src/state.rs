@@ -67,6 +67,18 @@ pub struct PositionState {
     pub current_atr: f64,
 }
 
+impl PositionState {
+    /// Comprehensive symbol occupancy invariant:
+    /// occupied = position || opening order || partial fill || closing order || non-zero size || pending submission
+    pub fn is_occupied(&self) -> bool {
+        self.is_filled
+            || !self.order_id.is_empty()
+            || !self.tp_order_id.is_empty()
+            || self.amount > 0.0
+            || !self.client_order_id.is_empty()
+    }
+}
+
 pub fn default_engine_owner() -> String {
     "EngineA".to_string()
 }
@@ -242,7 +254,7 @@ pub fn try_acquire_cluster_lease_for_engine(symbol: &str, engine_owner: &str, du
                 let owner_has_pos = load_state(&owner_state_file)
                     .ok()
                     .and_then(|s| s.get(&lease.owner).cloned())
-                    .map(|p| !p.order_id.is_empty())
+                    .map(|p| p.is_occupied())
                     .unwrap_or(false);
 
                 if owner_has_pos {
@@ -332,7 +344,7 @@ pub fn has_active_cluster_position(current_symbol: &str) -> Option<String> {
                     let owner_has_pos = load_state(&owner_state_file)
                         .ok()
                         .and_then(|s| s.get(&lease.owner).cloned())
-                        .map(|p| !p.order_id.is_empty())
+                        .map(|p| p.is_occupied())
                         .unwrap_or(false);
 
                     if owner_has_pos {
@@ -358,7 +370,7 @@ pub fn has_active_cluster_position(current_symbol: &str) -> Option<String> {
         let state_file = format!("hl_hmm_state_{}.json", sym);
         if let Ok(state) = load_state(&state_file) {
             if let Some(pos) = state.get(*sym) {
-                if !pos.order_id.is_empty() {
+                if pos.is_occupied() {
                     return Some(sym.to_string());
                 }
             }
@@ -520,5 +532,54 @@ mod tests {
 
         release_cluster_lease("ETH");
         let _ = fs::remove_file(CLUSTER_LOCK_FILE);
+    }
+
+    #[test]
+    fn test_is_occupied_invariants() {
+        let empty_pos = PositionState {
+            symbol: "BTC".to_string(),
+            side: "LONG".to_string(),
+            amount: 0.0,
+            entry_price: 0.0,
+            order_id: "".to_string(),
+            tp_order_id: "".to_string(),
+            client_order_id: "".to_string(),
+            is_filled: false,
+            stop_loss_price: 0.0,
+            take_profit_price: 0.0,
+            opened_at: "".to_string(),
+            risk_amount_usdc: 0.0,
+            half_life_minutes: 0.0,
+            max_progress: 0.0,
+            max_favorable_price: 0.0,
+            effective_tp: 0.0,
+            last_reprice_time: 0,
+            reprice_count: 0,
+            candidate_lower_count: 0,
+            engine_type: "EngineA".to_string(),
+            chandelier_stop: 0.0,
+            current_atr: 0.0,
+        };
+        assert!(!empty_pos.is_occupied());
+
+        let mut with_entry_order = empty_pos.clone();
+        with_entry_order.order_id = "12345".to_string();
+        assert!(with_entry_order.is_occupied());
+
+        let mut with_tp_order = empty_pos.clone();
+        with_tp_order.tp_order_id = "67890".to_string();
+        assert!(with_tp_order.is_occupied());
+
+        let mut with_client_id = empty_pos.clone();
+        with_client_id.client_order_id = "cid_99".to_string();
+        assert!(with_client_id.is_occupied());
+
+        let mut with_amount = empty_pos.clone();
+        with_amount.amount = 0.01;
+        assert!(with_amount.is_occupied());
+
+        let mut with_filled = empty_pos.clone();
+        with_filled.is_filled = true;
+        assert!(with_filled.is_occupied());
     }
 }

@@ -47,18 +47,27 @@ impl Default for RegimeController {
 }
 
 impl RegimeController {
-    /// Forces immediate shock downgrade to Neutral with a 2-bar (30m) cooldown
+    /// Forces immediate shock downgrade to Neutral with a 2-bar (30m) cooldown.
+    /// If already in cooldown, restarts the clock to full 2 bars (30m).
     pub fn force_shock_cooldown(&mut self, z_15: f64, z_60: f64) {
         let was_different = self.current_mode != ControllerMode::Neutral;
+        let prev_cd = self.shock_cooldown_bars;
         self.current_mode = ControllerMode::Neutral;
         self.trend_streak = 0;
         self.consolidation_streak = 0;
         self.shock_cooldown_bars = 2;
-        self.last_reason = format!(
-            "Immediate Shock Downgrade (|Z15|={:.2}, |Z60|={:.2}) -> Neutral Cooldown (2 bars)",
-            z_15, z_60
-        );
-        if was_different {
+        self.last_reason = if prev_cd > 0 {
+            format!(
+                "Secondary Shock in Cooldown (|Z15|={:.2}, |Z60|={:.2}) -> Cooldown Clock Restarted to 2 bars (30m)",
+                z_15, z_60
+            )
+        } else {
+            format!(
+                "Immediate Shock Downgrade (|Z15|={:.2}, |Z60|={:.2}) -> Neutral Cooldown (2 bars)",
+                z_15, z_60
+            )
+        };
+        if was_different || prev_cd > 0 {
             self.last_transition_time = Utc::now().to_rfc3339();
             self.epoch += 1;
         }
@@ -120,15 +129,23 @@ impl RegimeController {
         // They exclusively route to Neutral (safe cash buffer), reset streaks, and trigger cooldown.
         if is_severe_shock {
             let was_different = self.current_mode != ControllerMode::Neutral;
+            let prev_cd = self.shock_cooldown_bars;
             self.current_mode = ControllerMode::Neutral;
             self.trend_streak = 0;
             self.consolidation_streak = 0;
             self.shock_cooldown_bars = 2; // 2 bars = 30-minute re-entry freeze
-            self.last_reason = format!(
-                "Severe Volatility Shock Veto (|Z15|={:.2}, |Z60|={:.2}) -> Safe Neutral Cash Buffer (Cooldown 2 bars)",
-                z_15, z_60
-            );
-            if was_different {
+            self.last_reason = if prev_cd > 0 {
+                format!(
+                    "Secondary Severe Shock in Cooldown (|Z15|={:.2}, |Z60|={:.2}) -> Cooldown Clock Restarted to 2 bars (30m)",
+                    z_15, z_60
+                )
+            } else {
+                format!(
+                    "Severe Volatility Shock Veto (|Z15|={:.2}, |Z60|={:.2}) -> Safe Neutral Cash Buffer (Cooldown 2 bars)",
+                    z_15, z_60
+                )
+            };
+            if was_different || prev_cd > 0 {
                 self.last_transition_time = Utc::now().to_rfc3339();
                 self.epoch += 1;
             }
@@ -424,5 +441,25 @@ mod tests {
         let res4 = controller.evaluate_15m_bar_idempotent(bar_ts + 900_000, 0.80, 0.15, 0.2, 0.1, false, true, true);
         assert!(res4.is_some());
         assert_eq!(controller.last_evaluated_close_ms, bar_ts + 900_000);
+    }
+
+    #[test]
+    fn test_secondary_shock_restarts_cooldown_clock() {
+        let mut controller = RegimeController::default();
+        // 1. Initial shock hits
+        let mode1 = controller.evaluate_15m_bar(0.05, 0.95, 3.4, 1.5, true, false, false);
+        assert_eq!(mode1, ControllerMode::Neutral);
+        assert_eq!(controller.shock_cooldown_bars, 2);
+
+        // 2. Bar 1 of cooldown: 1 bar remaining
+        let mode2 = controller.evaluate_15m_bar(0.05, 0.95, 1.0, 0.5, true, false, false);
+        assert_eq!(mode2, ControllerMode::Neutral);
+        assert_eq!(controller.shock_cooldown_bars, 1);
+
+        // 3. Secondary shock hits during cooldown! Clock must restart to full 2 bars (30m)
+        let mode3 = controller.evaluate_15m_bar(0.05, 0.95, -3.8, -2.0, true, false, false);
+        assert_eq!(mode3, ControllerMode::Neutral);
+        assert_eq!(controller.shock_cooldown_bars, 2);
+        assert!(controller.last_reason.contains("Secondary Severe Shock in Cooldown"));
     }
 }

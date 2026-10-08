@@ -167,7 +167,7 @@ async fn main() {
                     }
                 }
 
-                if closes.len() >= 100 {
+                if closes.len() >= 140 {
                     if let Ok(Some(new_hmm)) =
                         tokio::task::spawn_blocking(move || train_hmm_offline(&closes)).await
                     {

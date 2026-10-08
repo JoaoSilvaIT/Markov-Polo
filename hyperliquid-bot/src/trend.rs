@@ -158,6 +158,8 @@ pub struct L2ObiTracker {
     pub last_update_ms: u64,
     pub best_bid: f64,
     pub best_ask: f64,
+    #[serde(default)]
+    pub updates_since_reconnect: u32,
 }
 
 impl Default for L2ObiTracker {
@@ -170,6 +172,7 @@ impl Default for L2ObiTracker {
             last_update_ms: 0,
             best_bid: 0.0,
             best_ask: 0.0,
+            updates_since_reconnect: 0,
         }
     }
 }
@@ -188,8 +191,8 @@ impl L2ObiTracker {
         }
 
         // Multiscale Distance-Weighted OBI across top 20 levels:
-        // Asset-invariant basis-point exponential decay: w_i = exp(-d_bps / tau_bps), tau_bps = 10.0 bps
-        let tau_bps = 10.0;
+        // Asset-invariant basis-point exponential decay: w_i = exp(-d_bps / tau_bps), tau_bps = 5.0 bps (near-touch priority)
+        let tau_bps = 5.0;
         let depth = 20.min(bids.len()).min(asks.len());
         let mut sum_bid_w = 0.0;
         let mut sum_ask_w = 0.0;
@@ -211,8 +214,13 @@ impl L2ObiTracker {
         let obi_inst = ((sum_bid_w - sum_ask_w) / denom).clamp(-1.0, 1.0);
         self.instant_obi = obi_inst;
 
-        if self.last_update_ms > 0 && now_ms > self.last_update_ms {
-            let dt_ms = (now_ms - self.last_update_ms) as f64;
+        let dt_ms = if self.last_update_ms > 0 && now_ms > self.last_update_ms {
+            (now_ms - self.last_update_ms) as f64
+        } else {
+            0.0
+        };
+
+        if dt_ms > 0.0 && dt_ms <= 3000.0 {
             let ln2 = std::f64::consts::LN_2;
 
             // Multiscale physical-time EWMA decay: alpha = 1 - exp(-ln2 * dt / h)
@@ -227,10 +235,14 @@ impl L2ObiTracker {
             // 5000ms (5s): institutional persistence filter
             let alpha_5s = 1.0 - (-ln2 * dt_ms / 5000.0).exp();
             self.ewma_5s_obi = (1.0 - alpha_5s) * self.ewma_5s_obi + alpha_5s * obi_inst;
+
+            self.updates_since_reconnect = self.updates_since_reconnect.saturating_add(1);
         } else {
+            // Disconnect or stale interval (>3s): invalidate stale memory and reinitialize
             self.ewma_250ms_obi = obi_inst;
             self.ewma_1s_obi = obi_inst;
             self.ewma_5s_obi = obi_inst;
+            self.updates_since_reconnect = 1;
         }
 
         self.last_update_ms = now_ms;
@@ -247,6 +259,9 @@ impl L2ObiTracker {
     pub fn satisfies_entry_hurdle(&self, side: &Side, now_ms: u64) -> (bool, &'static str) {
         if !self.is_fresh_and_uncrossed(now_ms, 2500) {
             return (false, "L2 Book Stale or Crossed");
+        }
+        if self.updates_since_reconnect < 3 {
+            return (false, "L2 Book Warming Up After Reconnect");
         }
 
         match side {
