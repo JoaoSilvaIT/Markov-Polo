@@ -1044,7 +1044,9 @@ async fn main() {
                                             let obi_lock = obi_tracker.read().await;
                                             let (obi_favorable, obi_reason) = obi_lock.satisfies_entry_hurdle(&side, now_ms);
                                             let obi_inst = obi_lock.instant_obi;
+                                            let obi_250ms = obi_lock.ewma_250ms_obi;
                                             let obi_1s = obi_lock.ewma_1s_obi;
+                                            let obi_5s = obi_lock.ewma_5s_obi;
                                             drop(obi_lock);
 
                                             if obi_favorable {
@@ -1062,21 +1064,21 @@ async fn main() {
                                                     );
                                                     let side_str = if side == Side::Long { "LONG" } else { "SHORT" };
                                                     println!(
-                                                        "🟣 [SHADOW-TREND ENTRY] {} {} breakout entered at ${:.2} | Size: {:.4} (${:.2}) | Initial Stop: ${:.2} | Streaming EWMA OBI (inst: {:.2}, 1s: {:.2})",
-                                                        symbol_clone, side_str, close_price, shadow_size, trend_notional, shadow_trade.initial_stop, obi_inst, obi_1s
+                                                        "🟣 [SHADOW-TREND ENTRY] {} {} breakout entered at ${:.2} | Size: {:.4} (${:.2}) | Initial Stop: ${:.2} | Multiscale OBI (inst: {:.2}, 250ms: {:.2}, 1s: {:.2}, 5s: {:.2})",
+                                                        symbol_clone, side_str, close_price, shadow_size, trend_notional, shadow_trade.initial_stop, obi_inst, obi_250ms, obi_1s, obi_5s
                                                     );
                                                     crate::discord::send_alert(
                                                         discord_clone.as_deref(),
                                                         &format!(
-                                                            "🟣 **[PHASE 0 SHADOW-TREND ENTRY]** {} {}\n**Simulated Entry:** ${:.2}\n**Initial Stop:** ${:.2}\n**Size:** {:.4} (${:.2})\n**Continuous EWMA OBI:** inst={:.2}, 1s={:.2} | **ATR:** ${:.2}",
-                                                            symbol_clone, side_str, close_price, shadow_trade.initial_stop, shadow_size, trend_notional, obi_inst, obi_1s, current_atr
+                                                            "🟣 **[PHASE 0 SHADOW-TREND ENTRY]** {} {}\n**Simulated Entry:** ${:.2}\n**Initial Stop:** ${:.2}\n**Size:** {:.4} (${:.2})\n**Multiscale EWMA OBI:** inst={:.2}, 250ms={:.2}, 1s={:.2}, 5s={:.2} | **ATR:** ${:.2}",
+                                                            symbol_clone, side_str, close_price, shadow_trade.initial_stop, shadow_size, trend_notional, obi_inst, obi_250ms, obi_1s, obi_5s, current_atr
                                                         ),
                                                     ).await;
                                                 }
                                             } else {
                                                 println!(
-                                                    "⚠️ [SHADOW-TREND VETO] Continuous EWMA OBI entry hurdle failed: {} (inst: {:.3}, 1s: {:.3}). Queue dancing veto.",
-                                                    obi_reason, obi_inst, obi_1s
+                                                    "⚠️ [SHADOW-TREND VETO] Multiscale OBI hurdle failed: {} (inst: {:.3}, 250ms: {:.3}, 1s: {:.3}, 5s: {:.3}).",
+                                                    obi_reason, obi_inst, obi_250ms, obi_1s, obi_5s
                                                 );
                                             }
                                         } else {

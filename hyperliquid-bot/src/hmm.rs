@@ -150,11 +150,36 @@ impl GaussianHMM {
                 }
             }
 
-            // Means and Covars
+            // Pooled feature variance target T_d
+            let mut pooled_var = Array1::<f64>::zeros(n_features);
+            for d in 0..n_features {
+                let mean_d: f64 = x.column(d).mean().unwrap_or(0.0);
+                let mut sum_sq = 0.0;
+                for t in 0..n_samples {
+                    sum_sq += (x[[t, d]] - mean_d).powi(2);
+                }
+                pooled_var[d] = (sum_sq / (n_samples as f64).max(1.0)).max(1e-3);
+            }
+
+            // Means and Covars with State-Weighted Ledoit-Wolf Linear Shrinkage
             for c in 0..self.n_components {
                 let mut denom = 0.0;
                 for t in 0..n_samples { denom += gamma[[t, c]]; }
                 if denom > 1e-10 {
+                    // Effective sample size Neff_k = (sum gamma)^2 / (sum gamma^2)
+                    let mut sum_sq_gamma = 0.0;
+                    for t in 0..n_samples {
+                        sum_sq_gamma += gamma[[t, c]].powi(2);
+                    }
+                    let n_eff = (denom * denom) / sum_sq_gamma.max(1e-10);
+
+                    // Base shrinkage rho = 0.10, scaling up if effective sample size is small (< 80)
+                    let rho_k = if n_eff < 80.0 {
+                        (1.0 - (n_eff / 80.0) * 0.90).clamp(0.10, 0.90)
+                    } else {
+                        0.10
+                    };
+
                     for d in 0..n_features {
                         let mut num_mean = 0.0;
                         for t in 0..n_samples { num_mean += gamma[[t, c]] * x[[t, d]]; }
@@ -164,7 +189,26 @@ impl GaussianHMM {
                         for t in 0..n_samples {
                             num_var += gamma[[t, c]] * (x[[t, d]] - self.means[[c, d]]).powi(2);
                         }
-                        self.covars[[c, d]] = (num_var / denom).max(1e-6);
+                        let sample_var = (num_var / denom).max(1e-6);
+
+                        // Linear shrinkage toward pooled target T_d
+                        let target_var = pooled_var[d];
+                        let shrunk_var = (1.0 - rho_k) * sample_var + rho_k * target_var;
+
+                        // Eigenvalue / variance floor at 1e-3
+                        self.covars[[c, d]] = shrunk_var.max(1e-3);
+                    }
+                }
+            }
+
+            // Condition number guard: ensure max_var / min_var <= 1e4
+            for c in 0..self.n_components {
+                let min_v = (0..n_features).map(|d| self.covars[[c, d]]).fold(f64::INFINITY, f64::min);
+                let max_v = (0..n_features).map(|d| self.covars[[c, d]]).fold(f64::NEG_INFINITY, f64::max);
+                if min_v > 0.0 && (max_v / min_v) > 1e4 {
+                    let floor_v = max_v / 1e4;
+                    for d in 0..n_features {
+                        self.covars[[c, d]] = self.covars[[c, d]].max(floor_v);
                     }
                 }
             }

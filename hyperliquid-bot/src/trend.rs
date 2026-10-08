@@ -148,10 +148,11 @@ pub fn calculate_obi_score(bids: &[(f64, f64)], asks: &[(f64, f64)], depth: usiz
     (sum_bid_vlm - sum_ask_vlm) / total
 }
 
-/// Real-time L2 continuous order book tracker with physical-time decayed EWMA
+/// Real-time L2 continuous order book tracker with basis-point distance weighting and multiscale physical-time EWMA
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct L2ObiTracker {
     pub instant_obi: f64,
+    pub ewma_250ms_obi: f64,
     pub ewma_1s_obi: f64,
     pub ewma_5s_obi: f64,
     pub last_update_ms: u64,
@@ -163,6 +164,7 @@ impl Default for L2ObiTracker {
     fn default() -> Self {
         Self {
             instant_obi: 0.0,
+            ewma_250ms_obi: 0.0,
             ewma_1s_obi: 0.0,
             ewma_5s_obi: 0.0,
             last_update_ms: 0,
@@ -180,17 +182,26 @@ impl L2ObiTracker {
         self.best_bid = bids[0].0;
         self.best_ask = asks[0].0;
 
-        // Distance-weighted OBI across top 20 levels:
-        // Level rank decay: w_i = exp(-0.15 * i)
+        let mid_price = (self.best_bid + self.best_ask) / 2.0;
+        if mid_price <= 0.0 {
+            return;
+        }
+
+        // Multiscale Distance-Weighted OBI across top 20 levels:
+        // Asset-invariant basis-point exponential decay: w_i = exp(-d_bps / tau_bps), tau_bps = 10.0 bps
+        let tau_bps = 10.0;
         let depth = 20.min(bids.len()).min(asks.len());
-        let lambda = 0.15;
         let mut sum_bid_w = 0.0;
         let mut sum_ask_w = 0.0;
 
         for i in 0..depth {
-            let w = (-lambda * i as f64).exp();
-            sum_bid_w += w * bids[i].1;
-            sum_ask_w += w * asks[i].1;
+            let bid_dist_bps = ((mid_price - bids[i].0) / mid_price).max(0.0) * 10_000.0;
+            let w_bid = (-bid_dist_bps / tau_bps).exp();
+            sum_bid_w += w_bid * bids[i].1;
+
+            let ask_dist_bps = ((asks[i].0 - mid_price) / mid_price).max(0.0) * 10_000.0;
+            let w_ask = (-ask_dist_bps / tau_bps).exp();
+            sum_ask_w += w_ask * asks[i].1;
         }
 
         let denom = sum_bid_w + sum_ask_w;
@@ -204,13 +215,20 @@ impl L2ObiTracker {
             let dt_ms = (now_ms - self.last_update_ms) as f64;
             let ln2 = std::f64::consts::LN_2;
 
-            // Physical-time EWMA decay: alpha = 1 - exp(-ln2 * dt / h)
+            // Multiscale physical-time EWMA decay: alpha = 1 - exp(-ln2 * dt / h)
+            // 250ms: immediate queue pressure
+            let alpha_250ms = 1.0 - (-ln2 * dt_ms / 250.0).exp();
+            self.ewma_250ms_obi = (1.0 - alpha_250ms) * self.ewma_250ms_obi + alpha_250ms * obi_inst;
+
+            // 1000ms (1s): primary execution feature
             let alpha_1s = 1.0 - (-ln2 * dt_ms / 1000.0).exp();
             self.ewma_1s_obi = (1.0 - alpha_1s) * self.ewma_1s_obi + alpha_1s * obi_inst;
 
+            // 5000ms (5s): institutional persistence filter
             let alpha_5s = 1.0 - (-ln2 * dt_ms / 5000.0).exp();
             self.ewma_5s_obi = (1.0 - alpha_5s) * self.ewma_5s_obi + alpha_5s * obi_inst;
         } else {
+            self.ewma_250ms_obi = obi_inst;
             self.ewma_1s_obi = obi_inst;
             self.ewma_5s_obi = obi_inst;
         }
@@ -233,17 +251,17 @@ impl L2ObiTracker {
 
         match side {
             Side::Long => {
-                // Dual hurdle: instantaneous >= +0.10 and persistent 1s EWMA >= +0.05
-                if self.instant_obi >= 0.10 && self.ewma_1s_obi >= 0.05 {
-                    (true, "Bullish Depth Alignment")
+                // Multiscale hurdle: instant >= +0.15, 1s >= +0.10, and persistent 5s > 0.0
+                if self.instant_obi >= 0.15 && self.ewma_1s_obi >= 0.10 && self.ewma_5s_obi > 0.0 {
+                    (true, "Bullish Multiscale Depth Alignment")
                 } else {
                     (false, "Insufficient Bid Depth / Fleeting Ask Asymmetry")
                 }
             }
             Side::Short => {
-                // Dual hurdle: instantaneous <= -0.10 and persistent 1s EWMA <= -0.05
-                if self.instant_obi <= -0.10 && self.ewma_1s_obi <= -0.05 {
-                    (true, "Bearish Depth Alignment")
+                // Multiscale hurdle: instant <= -0.15, 1s <= -0.10, and persistent 5s < 0.0
+                if self.instant_obi <= -0.15 && self.ewma_1s_obi <= -0.10 && self.ewma_5s_obi < 0.0 {
+                    (true, "Bearish Multiscale Depth Alignment")
                 } else {
                     (false, "Insufficient Ask Depth / Fleeting Bid Asymmetry")
                 }

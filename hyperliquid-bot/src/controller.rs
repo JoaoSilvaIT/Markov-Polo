@@ -135,7 +135,7 @@ impl RegimeController {
             return self.current_mode;
         }
 
-        // 2. SHOCK COOLDOWN PACING
+        // 2. SHOCK COOLDOWN PACING (Hybrid Policy: 30-min minimum floor + volatility normalization gate)
         if self.shock_cooldown_bars > 0 {
             self.shock_cooldown_bars -= 1;
             self.current_mode = ControllerMode::Neutral;
@@ -148,11 +148,25 @@ impl RegimeController {
             return self.current_mode;
         }
 
+        // Lingering extreme shock gate: do not accumulate streaks if extreme shock energy lingers (|Z| >= 2.5)
+        let extreme_shock_lingers = z_15.abs() >= 2.5 || z_60.abs() >= 2.5;
+        if extreme_shock_lingers {
+            self.current_mode = ControllerMode::Neutral;
+            self.trend_streak = 0;
+            self.consolidation_streak = 0;
+            self.last_reason = format!(
+                "Extreme Shock Energy Lingers (|Z15|={:.2}>=2.5 or |Z60|={:.2}>=2.5) -> Hold Neutral",
+                z_15, z_60
+            );
+            return self.current_mode;
+        }
+
         // 3. UPDATE STREAK COUNTERS (Score-Margin Hysteresis)
         if p_trend >= 0.85 {
             self.trend_streak += 1;
             self.consolidation_streak = 0;
-        } else if p_consolidation >= 0.75 {
+        } else if p_consolidation >= 0.75 && z_15.abs() < 1.5 && z_60.abs() < 2.0 {
+            // Engine A requires normalized, low volatility (|Z15| < 1.5 and |Z60| < 2.0)
             self.consolidation_streak += 1;
             self.trend_streak = 0;
         } else {
