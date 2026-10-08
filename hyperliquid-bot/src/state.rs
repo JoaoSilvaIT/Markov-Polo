@@ -100,18 +100,114 @@ pub struct PositionState {
     pub lease_fencing_token: u64,
     #[serde(default)]
     pub lease_owner_uuid: String,
+    #[serde(default = "default_lifecycle")]
+    pub lifecycle: PositionLifecycle,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PositionLifecycle {
+    Active,
+    CloseConfirmed,
+    LeaseReleased,
+}
+
+pub fn default_lifecycle() -> PositionLifecycle {
+    PositionLifecycle::Active
 }
 
 impl PositionState {
     /// Comprehensive symbol occupancy invariant:
     /// occupied = position || opening order || partial fill || closing order || non-zero size || pending submission
     pub fn is_occupied(&self) -> bool {
+        if self.lifecycle != PositionLifecycle::Active {
+            return false;
+        }
         self.is_filled
             || !self.order_id.is_empty()
             || !self.tp_order_id.is_empty()
             || self.amount > 0.0
             || !self.client_order_id.is_empty()
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OrderIntentStatus {
+    PendingSubmission,
+    Submitted,
+    Acknowledged,
+    Completed,
+    Aborted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderIntent {
+    pub symbol: String,
+    pub client_order_id: String,
+    #[serde(default)]
+    pub cloid_hex: Option<String>,
+    pub owner_uuid: String,
+    pub fencing_token: u64,
+    pub engine_type: String,
+    pub side: Side,
+    pub limit_px: f64,
+    pub sz: f64,
+    pub sz_decimals: u32,
+    pub target_tp: f64,
+    pub stop_loss: f64,
+    pub half_life_minutes: f64,
+    pub position_size_usdc: f64,
+    pub status: OrderIntentStatus,
+    #[serde(default)]
+    pub exchange_order_id: Option<u64>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+pub fn order_intent_path(symbol: &str) -> String {
+    format!("hl_order_intent_{}.json", symbol)
+}
+
+pub fn save_order_intent_atomic(intent: &OrderIntent) -> Result<(), String> {
+    let path = order_intent_path(&intent.symbol);
+    let tmp_path = format!("{}.tmp.{}", path, std::process::id());
+    let content = serde_json::to_string_pretty(intent)
+        .map_err(|e| format!("Failed to serialize OrderIntent: {}", e))?;
+    {
+        use std::io::Write;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(|e| format!("Failed to open temp intent file: {}", e))?;
+        file.write_all(content.as_bytes())
+            .map_err(|e| format!("Failed to write temp intent file: {}", e))?;
+        file.sync_all()
+            .map_err(|e| format!("Failed to fsync temp intent file: {}", e))?;
+    }
+    fs::rename(&tmp_path, &path)
+        .map_err(|e| format!("Failed to atomically rename intent file: {}", e))?;
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
+pub fn load_order_intent(symbol: &str) -> Option<OrderIntent> {
+    let path = order_intent_path(symbol);
+    if std::path::Path::new(&path).exists() {
+        if let Ok(content) = fs::read_to_string(&path) {
+            return serde_json::from_str::<OrderIntent>(&content).ok();
+        }
+    }
+    None
+}
+
+pub fn clear_order_intent(symbol: &str) {
+    let path = order_intent_path(symbol);
+    let _ = fs::remove_file(path);
 }
 
 pub fn default_engine_owner() -> String {
@@ -507,6 +603,53 @@ pub fn release_cluster_lease_authenticated(
     false
 }
 
+/// Asserts that the caller owns the active cluster lease immediately before an exchange operation.
+/// Fails closed if lease is missing, expired, owned by another symbol/UUID, or has different fencing token.
+pub fn assert_current_lease(
+    symbol: &str,
+    expected_owner_uuid: &str,
+    expected_fencing_token: u64,
+) -> Result<(), String> {
+    let _guard = match FlockGuard::acquire(CLUSTER_LOCK_GUARD_FILE) {
+        Ok(g) => g,
+        Err(e) => return Err(format!("Failed to acquire cluster flock guard for lease assertion: {}", e)),
+    };
+
+    if let Some(lease) = get_current_cluster_lease() {
+        if lease.owner != symbol {
+            return Err(format!(
+                "Lease owned by different symbol '{}' (expected '{}')",
+                lease.owner, symbol
+            ));
+        }
+        if !expected_owner_uuid.is_empty() && lease.owner_uuid != expected_owner_uuid {
+            return Err(format!(
+                "Lease owner UUID mismatch: '{}' (expected '{}')",
+                lease.owner_uuid, expected_owner_uuid
+            ));
+        }
+        if expected_fencing_token > 0 && lease.fencing_token != expected_fencing_token {
+            return Err(format!(
+                "Lease fencing token mismatch: epoch {} superseded by {}",
+                expected_fencing_token, lease.fencing_token
+            ));
+        }
+        let now = chrono::Utc::now();
+        if let Ok(exp_dt) = chrono::DateTime::parse_from_rfc3339(&lease.expires_at) {
+            let exp_utc = exp_dt.with_timezone(&chrono::Utc);
+            if now >= exp_utc {
+                return Err(format!(
+                    "Lease expired at {} (current time {})",
+                    lease.expires_at, now
+                ));
+            }
+        }
+        Ok(())
+    } else {
+        Err("No active cluster lease found on disk".to_string())
+    }
+}
+
 /// Returns configured universe of symbols participating in portfolio cluster
 pub fn configured_portfolio_symbols() -> Vec<String> {
     if let Ok(val) = std::env::var("HL_PORTFOLIO_SYMBOLS")
@@ -840,6 +983,7 @@ mod tests {
             current_atr: 0.0,
             lease_fencing_token: 0,
             lease_owner_uuid: "".to_string(),
+            lifecycle: PositionLifecycle::Active,
         };
         assert!(!empty_pos.is_occupied());
 
@@ -862,5 +1006,87 @@ mod tests {
         let mut with_filled = empty_pos.clone();
         with_filled.is_filled = true;
         assert!(with_filled.is_occupied());
+
+        // Lifecycle invariant: CloseConfirmed or LeaseReleased is NEVER occupied!
+        let mut confirmed_closed = with_filled.clone();
+        confirmed_closed.lifecycle = PositionLifecycle::CloseConfirmed;
+        assert!(!confirmed_closed.is_occupied());
+
+        let mut released_closed = with_filled.clone();
+        released_closed.lifecycle = PositionLifecycle::LeaseReleased;
+        assert!(!released_closed.is_occupied());
+    }
+
+    #[test]
+    fn test_order_intent_wal_roundtrip_and_crash_recovery() {
+        let sym = "ETH";
+        clear_order_intent(sym);
+
+        let intent = OrderIntent {
+            symbol: sym.to_string(),
+            client_order_id: "cloid_eth_101".to_string(),
+            cloid_hex: Some("hex_uuid_101".to_string()),
+            owner_uuid: "uuid_test".to_string(),
+            fencing_token: 5,
+            engine_type: "EngineA".to_string(),
+            side: Side::Long,
+            limit_px: 2500.0,
+            sz: 0.1,
+            sz_decimals: 3,
+            target_tp: 2520.0,
+            stop_loss: 2460.0,
+            half_life_minutes: 25.0,
+            position_size_usdc: 250.0,
+            status: OrderIntentStatus::PendingSubmission,
+            exchange_order_id: None,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+        };
+
+        // 1. Atomic write with fsync
+        assert!(save_order_intent_atomic(&intent).is_ok());
+
+        // 2. Recovery on startup reads exact intent
+        let loaded = load_order_intent(sym).expect("Loaded intent");
+        assert_eq!(loaded.client_order_id, "cloid_eth_101");
+        assert_eq!(loaded.status, OrderIntentStatus::PendingSubmission);
+        assert_eq!(loaded.fencing_token, 5);
+
+        // 3. Clear intent
+        clear_order_intent(sym);
+        assert!(load_order_intent(sym).is_none());
+    }
+
+    #[test]
+    fn test_assert_current_lease_boundary_fencing() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let _ = fs::remove_file(CLUSTER_LOCK_FILE);
+        let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
+        let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
+
+        let (acq, tok) = try_acquire_cluster_lease_for_engine_with_uuid("BTC", "EngineA", "uuid_owner_1", 60);
+        assert!(acq);
+
+        // Valid assertion succeeds
+        assert!(assert_current_lease("BTC", "uuid_owner_1", tok).is_ok());
+
+        // Wrong symbol fails
+        assert!(assert_current_lease("ETH", "uuid_owner_1", tok).is_err());
+
+        // Wrong owner UUID fails
+        assert!(assert_current_lease("BTC", "zombie_process_uuid", tok).is_err());
+
+        // Stale fencing token fails
+        assert!(assert_current_lease("BTC", "uuid_owner_1", tok + 1).is_err());
+
+        // Release lease
+        assert!(release_cluster_lease_authenticated("BTC", Some("uuid_owner_1"), Some(tok)));
+
+        // Assertion after release fails (lease missing)
+        assert!(assert_current_lease("BTC", "uuid_owner_1", tok).is_err());
+
+        let _ = fs::remove_file(CLUSTER_LOCK_FILE);
+        let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
+        let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
     }
 }

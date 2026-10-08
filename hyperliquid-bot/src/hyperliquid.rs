@@ -74,6 +74,7 @@ pub async fn place_post_only_order(
     price: f64,
     size: f64,
     reduce_only: bool,
+    cloid: Option<uuid::Uuid>,
 ) -> Result<u64, String> {
     // Hyperliquid rule: Reduce-only closing orders (like Take Profit) cannot use "Alo" (Post-Only);
     // they must use "Gtc" (Good-Til-Cancelled). Entries use "Alo" for maker rebates and anti-taker protection.
@@ -89,7 +90,7 @@ pub async fn place_post_only_order(
         reduce_only,
         limit_px: price,
         sz: size,
-        cloid: None,
+        cloid,
         order_type: ClientOrder::Limit(ClientLimit {
             tif,
         }),

@@ -1422,4 +1422,45 @@ mod tests {
         let is_gap4 = bar4_gap > last_processed_1m_open + 60_000;
         assert!(is_gap4, "Gap identified correctly");
     }
+
+    #[test]
+    fn test_ohlcv_geometric_and_positivity_invariants() {
+        let validate_candle = |open: f64, high: f64, low: f64, close: f64, vol: f64| -> Result<(), &'static str> {
+            if !open.is_finite() || open <= 0.0
+                || !high.is_finite() || high <= 0.0
+                || !low.is_finite() || low <= 0.0
+                || !close.is_finite() || close <= 0.0
+                || !vol.is_finite() || vol < 0.0
+            {
+                return Err("Non-finite or non-positive value");
+            }
+            if high < open.max(close) || low > open.min(close) || high < low {
+                return Err("Geometric violation");
+            }
+            Ok(())
+        };
+
+        // 1. Valid candle
+        assert!(validate_candle(100.0, 105.0, 95.0, 102.0, 50.0).is_ok());
+
+        // 2. High lower than open/close
+        assert!(validate_candle(100.0, 99.0, 95.0, 98.0, 10.0).is_err());
+
+        // 3. Low higher than open/close
+        assert!(validate_candle(100.0, 105.0, 101.0, 102.0, 10.0).is_err());
+
+        // 4. Inverted high < low
+        assert!(validate_candle(100.0, 90.0, 110.0, 95.0, 10.0).is_err());
+
+        // 5. Zero or negative price
+        assert!(validate_candle(0.0, 10.0, 0.0, 5.0, 1.0).is_err());
+        assert!(validate_candle(-100.0, 105.0, 95.0, 102.0, 1.0).is_err());
+
+        // 6. Negative volume
+        assert!(validate_candle(100.0, 105.0, 95.0, 102.0, -1.0).is_err());
+
+        // 7. NaN / Infinity
+        assert!(validate_candle(f64::NAN, 105.0, 95.0, 102.0, 1.0).is_err());
+        assert!(validate_candle(100.0, f64::INFINITY, 95.0, 102.0, 1.0).is_err());
+    }
 }

@@ -3,8 +3,9 @@ use crate::hyperliquid::{
     round_to_decimals, place_post_only_order,
 };
 use crate::state::{
-    release_cluster_lease_authenticated, save_state,
-    try_acquire_cluster_lease_for_engine_with_uuid, PositionState, Side, StateMap,
+    assert_current_lease, clear_order_intent, release_cluster_lease_authenticated, save_order_intent_atomic,
+    save_state, try_acquire_cluster_lease_for_engine_with_uuid, OrderIntent, OrderIntentStatus,
+    PositionLifecycle, PositionState, Side, StateMap,
 };
 use chrono::Utc;
 use ethers::types::H160;
@@ -89,26 +90,6 @@ pub async fn place_ou_maker_entry(
         ));
     }
 
-    let client_order_id = format!("{}_{}", symbol, Utc::now().timestamp_millis());
-
-    // Submit Post-Only (Alo) Maker order
-    let oid = match place_post_only_order(
-        exchange,
-        symbol,
-        is_buy,
-        post_only_price,
-        amount_f,
-        false, // reduce_only = false for entry
-    )
-    .await
-    {
-        Ok(id) => id,
-        Err(e) => {
-            let _ = release_cluster_lease_authenticated(symbol, Some(&lease_uuid), Some(fencing_token));
-            return Err(e);
-        }
-    };
-
     // Epsilon Shave: front-run the mean by 5 bps (min 2 ticks) to avoid Schelling point liquidity walls
     let epsilon_shave = (target_mu * 0.0005).max(0.02);
     let target_tp = if is_buy {
@@ -127,6 +108,74 @@ pub async fn place_ou_maker_entry(
         post_only_price + sl_dist
     };
     let stop_loss_price = quantize_price(raw_sl, sz_decimals);
+
+    let cloid_uuid = uuid::Uuid::new_v4();
+    let client_order_id = format!("{}_{}", symbol, Utc::now().timestamp_millis());
+
+    // ------------------------------------------------------------------------
+    // PROTOCOL P0: WRITE-AHEAD ORDER INTENT (WAL) BEFORE EXCHANGE TRANSMISSION
+    // ------------------------------------------------------------------------
+    let mut order_intent = OrderIntent {
+        symbol: symbol.to_string(),
+        client_order_id: client_order_id.clone(),
+        cloid_hex: Some(cloid_uuid.to_string()),
+        owner_uuid: lease_uuid.clone(),
+        fencing_token,
+        engine_type: "EngineA".to_string(),
+        side: side.clone(),
+        limit_px: post_only_price,
+        sz: amount_f,
+        sz_decimals,
+        target_tp: target_tp_quantized,
+        stop_loss: stop_loss_price,
+        half_life_minutes,
+        position_size_usdc,
+        status: OrderIntentStatus::PendingSubmission,
+        exchange_order_id: None,
+        created_at_ms: Utc::now().timestamp_millis() as u64,
+        updated_at_ms: Utc::now().timestamp_millis() as u64,
+    };
+    save_order_intent_atomic(&order_intent)?;
+
+    // ------------------------------------------------------------------------
+    // PROTOCOL P0: FENCING ASSERTION IMMEDIATELY AT ORDER BOUNDARY
+    // ------------------------------------------------------------------------
+    if let Err(e) = assert_current_lease(symbol, &lease_uuid, fencing_token) {
+        order_intent.status = OrderIntentStatus::Aborted;
+        let _ = save_order_intent_atomic(&order_intent);
+        clear_order_intent(symbol);
+        let _ = release_cluster_lease_authenticated(symbol, Some(&lease_uuid), Some(fencing_token));
+        return Err(format!("Order boundary fencing assertion rejected: {}", e));
+    }
+
+    // Submit Post-Only (Alo) Maker order with cloid
+    let oid = match place_post_only_order(
+        exchange,
+        symbol,
+        is_buy,
+        post_only_price,
+        amount_f,
+        false, // reduce_only = false for entry
+        Some(cloid_uuid),
+    )
+    .await
+    {
+        Ok(id) => {
+            // Persist order_id into intent WAL
+            order_intent.exchange_order_id = Some(id);
+            order_intent.status = OrderIntentStatus::Submitted;
+            order_intent.updated_at_ms = Utc::now().timestamp_millis() as u64;
+            let _ = save_order_intent_atomic(&order_intent);
+            id
+        }
+        Err(e) => {
+            order_intent.status = OrderIntentStatus::Aborted;
+            let _ = save_order_intent_atomic(&order_intent);
+            clear_order_intent(symbol);
+            let _ = release_cluster_lease_authenticated(symbol, Some(&lease_uuid), Some(fencing_token));
+            return Err(e);
+        }
+    };
 
     let new_state = PositionState {
         symbol: symbol.to_string(),
@@ -153,10 +202,16 @@ pub async fn place_ou_maker_entry(
         current_atr: 0.0,
         lease_fencing_token: fencing_token,
         lease_owner_uuid: lease_uuid,
+        lifecycle: PositionLifecycle::Active,
     };
 
     state.insert(symbol.to_string(), new_state.clone());
     let _ = save_state(state_file_path, state);
+
+    // Intent successfully acknowledged and incorporated into state
+    order_intent.status = OrderIntentStatus::Acknowledged;
+    let _ = save_order_intent_atomic(&order_intent);
+    clear_order_intent(symbol);
 
     let max_hold = (2.0 * half_life_minutes).clamp(15.0, 360.0);
     let side_label = if is_buy { "LONG" } else { "SHORT" };
@@ -265,6 +320,13 @@ pub async fn emergency_flatten(
     let symbol_orders_remaining = final_orders.iter().any(|o| o.coin == symbol);
 
     if final_szi.abs() <= eps && !symbol_orders_remaining {
+        // Defensive sequence step 1: Mark state as CloseConfirmed and fsync
+        if let Some(p) = state.get_mut(symbol) {
+            p.lifecycle = PositionLifecycle::CloseConfirmed;
+        }
+        let _ = save_state(state_file_path, state);
+
+        // Defensive sequence step 2: Release authenticated lease
         let released = if !pos.lease_owner_uuid.is_empty() {
             release_cluster_lease_authenticated(
                 symbol,
@@ -284,6 +346,12 @@ pub async fn emergency_flatten(
             crate::discord::send_alert(discord_url.as_deref(), &format!("🚨 {}", err)).await;
             return Err(err);
         }
+
+        // Defensive sequence step 3: Mark state as LeaseReleased and fsync
+        if let Some(p) = state.get_mut(symbol) {
+            p.lifecycle = PositionLifecycle::LeaseReleased;
+        }
+        let _ = save_state(state_file_path, state);
 
         println!(
             "✅ [EMERGENCY FLATTEN] Successfully verified zero position, zero open orders, and released cluster lease for {}. Clearing state.",

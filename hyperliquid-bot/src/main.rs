@@ -80,11 +80,30 @@ async fn backfill_missing_1m_candles(
 
     let mut backfilled_count = 0;
     for c in candles {
-        let open_f = c.open.parse::<f64>().map_err(|e| e.to_string())?;
-        let high_f = c.high.parse::<f64>().map_err(|e| e.to_string())?;
-        let low_f = c.low.parse::<f64>().map_err(|e| e.to_string())?;
-        let close_f = c.close.parse::<f64>().map_err(|e| e.to_string())?;
+        let open_f = c.open.parse::<f64>().map_err(|e| format!("Invalid open: {}", e))?;
+        let high_f = c.high.parse::<f64>().map_err(|e| format!("Invalid high: {}", e))?;
+        let low_f = c.low.parse::<f64>().map_err(|e| format!("Invalid low: {}", e))?;
+        let close_f = c.close.parse::<f64>().map_err(|e| format!("Invalid close: {}", e))?;
         let vol_f = c.vlm.parse::<f64>().unwrap_or(0.0);
+
+        if !open_f.is_finite() || open_f <= 0.0
+            || !high_f.is_finite() || high_f <= 0.0
+            || !low_f.is_finite() || low_f <= 0.0
+            || !close_f.is_finite() || close_f <= 0.0
+            || !vol_f.is_finite() || vol_f < 0.0
+        {
+            return Err(format!(
+                "Non-finite or non-positive OHLCV detected in candle bar at {}",
+                c.time_open
+            ));
+        }
+
+        if high_f < open_f.max(close_f) || low_f > open_f.min(close_f) || high_f < low_f {
+            return Err(format!(
+                "Geometric OHLC violation at {}: high={:.2}, low={:.2}, open={:.2}, close={:.2}",
+                c.time_open, high_f, low_f, open_f, close_f
+            ));
+        }
 
         rolling_closes.push(close_f);
         if rolling_closes.len() > 60 {
@@ -418,14 +437,50 @@ async fn main() {
     .await;
 
     // ------------------------------------------------------------------------
-    // STARTUP RECONCILIATION: Sync Local State with Live Hyperliquid Position
+    // STARTUP RECONCILIATION: Deep Sync with Live Exchange Positions & Orders
     // ------------------------------------------------------------------------
-    let (startup_szi, startup_entry_px) = get_user_position(&info_client, user_address, &trading_symbol)
-        .await
-        .unwrap_or((0.0, None));
+    println!("🔍 [STARTUP RECONCILIATION] Initiating deep exchange synchronization for {}...", trading_symbol);
+
+    // 1. Query live positions with fail-closed retries
+    let mut retry_count = 0;
+    let (startup_szi, startup_entry_px) = loop {
+        match get_user_position(&info_client, user_address, &trading_symbol).await {
+            Ok(pos) => break pos,
+            Err(e) => {
+                retry_count += 1;
+                if retry_count >= 3 {
+                    panic!("❌ [FATAL STARTUP] Could not query user position for {}: {}. Halting startup fail-closed.", trading_symbol, e);
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+            }
+        }
+    };
+
+    // 2. Query live open orders with fail-closed retries
+    retry_count = 0;
+    let open_orders_res = loop {
+        match info_client.open_orders(user_address).await {
+            Ok(orders) => break orders,
+            Err(e) => {
+                retry_count += 1;
+                if retry_count >= 3 {
+                    panic!("❌ [FATAL STARTUP] Could not query open orders for {}: {}. Halting startup fail-closed.", trading_symbol, e);
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+            }
+        }
+    };
+    let symbol_open_orders: Vec<_> = open_orders_res.into_iter().filter(|o| o.coin == trading_symbol).collect();
+
+    // 3. Load local state and order intent WAL
+    let pending_intent = crate::state::load_order_intent(&trading_symbol);
+
     {
         let mut state_lock = active_state.lock().await;
-        if startup_szi.abs() > 0.0 {
+        let eps = 1e-5;
+
+        if startup_szi.abs() > eps {
+            // Case A: Real open position exists on Hyperliquid
             let ep = startup_entry_px.unwrap_or(0.0);
             let is_long = startup_szi > 0.0;
             let side_str = if is_long { "LONG" } else { "SHORT" };
@@ -435,15 +490,36 @@ async fn main() {
                 trading_sz_decimals,
             );
 
+            // Ensure cluster lease is held or acquired
+            let current_lease = crate::state::get_current_cluster_lease();
+            let (lease_uuid, fencing_tok) = if let Some(lease) = current_lease {
+                if lease.owner == trading_symbol {
+                    (lease.owner_uuid, lease.fencing_token)
+                } else {
+                    let uuid = format!("{}_{}", trading_symbol, chrono::Utc::now().timestamp_micros());
+                    let (_, tok) = crate::state::try_acquire_cluster_lease_for_engine_with_uuid(&trading_symbol, "EngineA", &uuid, 3600);
+                    (uuid, tok)
+                }
+            } else {
+                let uuid = format!("{}_{}", trading_symbol, chrono::Utc::now().timestamp_micros());
+                let (_, tok) = crate::state::try_acquire_cluster_lease_for_engine_with_uuid(&trading_symbol, "EngineA", &uuid, 3600);
+                (uuid, tok)
+            };
+
             if let Some(pos) = state_lock.get_mut(&trading_symbol) {
                 println!(
-                    "🔍 [STARTUP RECONCILIATION] Active position detected on Hyperliquid for {} (size: {:.5}, entry: ${:.2}). Matching local state.",
+                    "🔍 [STARTUP RECONCILIATION] Active position confirmed on Hyperliquid for {} (size: {:.5}, entry: ${:.2}). Matching local state.",
                     trading_symbol, startup_szi, pos.entry_price
                 );
                 pos.is_filled = true;
                 pos.amount = startup_szi.abs();
+                pos.lifecycle = crate::state::PositionLifecycle::Active;
                 if pos.stop_loss_price <= 0.0 {
                     pos.stop_loss_price = default_sl;
+                }
+                if pos.lease_owner_uuid.is_empty() {
+                    pos.lease_owner_uuid = lease_uuid;
+                    pos.lease_fencing_token = fencing_tok;
                 }
             } else {
                 let default_tp = quantize_price(
@@ -479,14 +555,132 @@ async fn main() {
                         engine_type: "EngineA".to_string(),
                         chandelier_stop: 0.0,
                         current_atr: 0.0,
-                        lease_fencing_token: 0,
-                        lease_owner_uuid: "".to_string(),
+                        lease_fencing_token: fencing_tok,
+                        lease_owner_uuid: lease_uuid,
+                        lifecycle: crate::state::PositionLifecycle::Active,
                     },
                 );
             }
+
+            // Cancel any lingering entry orders on exchange since position is already filled
+            for o in &symbol_open_orders {
+                let is_tp = state_lock.get(&trading_symbol).map(|p| p.tp_order_id == o.oid.to_string()).unwrap_or(false);
+                if !is_tp {
+                    println!("🧹 [STARTUP RECONCILIATION] Cancelling obsolete resting order {} for filled position on {}.", o.oid, trading_symbol);
+                    let _ = cancel_order(&exchange, &trading_symbol, o.oid).await;
+                }
+            }
+
+            // Clear any pending intent WAL
+            crate::state::clear_order_intent(&trading_symbol);
             let _ = save_state(&state_file_path, &state_lock);
+        } else {
+            // Case B: Position is flat on exchange (szi == 0.0)
+            if !symbol_open_orders.is_empty() {
+                let mut matched_entry_oid: Option<u64> = None;
+
+                // Correlate with intent WAL
+                if let Some(ref intent) = pending_intent {
+                    for o in &symbol_open_orders {
+                        let matches_oid = intent.exchange_order_id == Some(o.oid);
+                        let matches_price_sz = (o.limit_px.parse::<f64>().unwrap_or(0.0) - intent.limit_px).abs() < 1e-4
+                            && (o.sz.parse::<f64>().unwrap_or(0.0) - intent.sz).abs() < 1e-4;
+                        if matches_oid || matches_price_sz {
+                            matched_entry_oid = Some(o.oid);
+                            println!("✅ [STARTUP RECONCILIATION] Adopted resting order {} from OrderIntent WAL for {}.", o.oid, trading_symbol);
+
+                            let reconstructed = crate::state::PositionState {
+                                symbol: trading_symbol.clone(),
+                                side: intent.side.to_string(),
+                                order_id: o.oid.to_string(),
+                                tp_order_id: "".to_string(),
+                                entry_price: intent.limit_px,
+                                amount: intent.sz,
+                                stop_loss_price: intent.stop_loss,
+                                take_profit_price: intent.target_tp,
+                                opened_at: chrono::Utc::now().to_rfc3339(),
+                                risk_amount_usdc: intent.position_size_usdc,
+                                is_filled: false,
+                                half_life_minutes: intent.half_life_minutes,
+                                client_order_id: intent.client_order_id.clone(),
+                                max_progress: 0.0,
+                                max_favorable_price: intent.limit_px,
+                                effective_tp: intent.target_tp,
+                                last_reprice_time: chrono::Utc::now().timestamp_millis(),
+                                reprice_count: 0,
+                                candidate_lower_count: 0,
+                                engine_type: intent.engine_type.clone(),
+                                chandelier_stop: 0.0,
+                                current_atr: 0.0,
+                                lease_fencing_token: intent.fencing_token,
+                                lease_owner_uuid: intent.owner_uuid.clone(),
+                                lifecycle: crate::state::PositionLifecycle::Active,
+                            };
+                            state_lock.insert(trading_symbol.clone(), reconstructed);
+                            let _ = save_state(&state_file_path, &state_lock);
+                            break;
+                        }
+                    }
+                }
+
+                // If not matched with intent, check existing local state
+                if matched_entry_oid.is_none() {
+                    if let Some(pos) = state_lock.get_mut(&trading_symbol) {
+                        for o in &symbol_open_orders {
+                            if pos.order_id == o.oid.to_string() {
+                                matched_entry_oid = Some(o.oid);
+                                pos.is_filled = false;
+                                pos.lifecycle = crate::state::PositionLifecycle::Active;
+                                println!("✅ [STARTUP RECONCILIATION] Reconciled existing resting entry order {} for {}.", o.oid, trading_symbol);
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Any order NOT matched with intent or state is an orphaned unrecognized order: cancel it!
+                for o in &symbol_open_orders {
+                    if Some(o.oid) != matched_entry_oid {
+                        println!("⚠️ [STARTUP RECONCILIATION] Cancelling unrecognized orphan order {} on Hyperliquid for {}.", o.oid, trading_symbol);
+                        let _ = cancel_order(&exchange, &trading_symbol, o.oid).await;
+                    }
+                }
+
+                crate::state::clear_order_intent(&trading_symbol);
+            } else {
+                // Both position and open orders are zero on exchange!
+                if pending_intent.is_some() {
+                    println!("🧹 [STARTUP RECONCILIATION] Cleared unfulfilled OrderIntent WAL for {}.", trading_symbol);
+                    crate::state::clear_order_intent(&trading_symbol);
+                }
+
+                // If local state exists, execute defensive release sequence
+                if let Some(pos_clone) = state_lock.get(&trading_symbol).cloned() {
+                    println!("🧹 [STARTUP RECONCILIATION] Local state present but exchange flat with zero orders. Executing defensive release sequence for {}...", trading_symbol);
+                    if let Some(pos) = state_lock.get_mut(&trading_symbol) {
+                        pos.lifecycle = crate::state::PositionLifecycle::CloseConfirmed;
+                    }
+                    let _ = save_state(&state_file_path, &state_lock);
+
+                    let _ = crate::state::release_cluster_lease_authenticated(
+                        &trading_symbol,
+                        Some(&pos_clone.lease_owner_uuid),
+                        Some(pos_clone.lease_fencing_token),
+                    );
+
+                    if let Some(pos) = state_lock.get_mut(&trading_symbol) {
+                        pos.lifecycle = crate::state::PositionLifecycle::LeaseReleased;
+                    }
+                    let _ = save_state(&state_file_path, &state_lock);
+
+                    state_lock.remove(&trading_symbol);
+                    let _ = save_state(&state_file_path, &state_lock);
+                }
+            }
         }
     }
+
+    println!("🚀 [STARTUP RECONCILIATION COMPLETE] Position and orders verified on Hyperliquid. Bot status: READY for {}.", trading_symbol);
 
     // ------------------------------------------------------------------------
     // FAST ORDER SUPERVISOR (1.5-Second State Reconciliation & TP Execution)
@@ -634,6 +828,12 @@ async fn main() {
                         let tp_price = quantize_price(pos.take_profit_price, watcher_sz_decimals);
                         let tp_amount = if current_szi.abs() > 0.0 { current_szi.abs() } else { pos.amount };
 
+                        if let Err(e) = crate::state::assert_current_lease(&watcher_symbol, &pos.lease_owner_uuid, pos.lease_fencing_token) {
+                            eprintln!("❌ [FAST-SENTINEL] TP order boundary fencing assertion failed for {}: {}", watcher_symbol, e);
+                            continue;
+                        }
+
+                        let tp_cloid = uuid::Uuid::new_v4();
                         match place_post_only_order(
                             &watcher_exchange,
                             &watcher_symbol,
@@ -641,6 +841,7 @@ async fn main() {
                             tp_price,
                             tp_amount,
                             true, // reduce_only = true (routes as Gtc in hyperliquid.rs)
+                            Some(tp_cloid),
                         )
                         .await
                         {
@@ -685,6 +886,12 @@ async fn main() {
                         let is_still_resting = verify_orders.iter().any(|o| o.oid == entry_oid_num);
 
                         if current_szi.abs() <= eps && !is_still_resting {
+                            // Defensive sequence step 1: CloseConfirmed
+                            if let Some(p) = state_lock.get_mut(&watcher_symbol) {
+                                p.lifecycle = crate::state::PositionLifecycle::CloseConfirmed;
+                            }
+                            let _ = save_state(&watcher_state_path, &state_lock);
+
                             let released = crate::state::release_cluster_lease_authenticated(
                                 &watcher_symbol,
                                 Some(&pos.lease_owner_uuid),
@@ -697,6 +904,13 @@ async fn main() {
                                 );
                                 continue;
                             }
+
+                            // Defensive sequence step 2: LeaseReleased
+                            if let Some(p) = state_lock.get_mut(&watcher_symbol) {
+                                p.lifecycle = crate::state::PositionLifecycle::LeaseReleased;
+                            }
+                            let _ = save_state(&watcher_state_path, &state_lock);
+
                             println!(
                                 "⚪ [FAST-SENTINEL] Entry for {} dead (status: {}). Position flat, lease released, clearing state.",
                                 watcher_symbol, reported_status
@@ -742,6 +956,12 @@ async fn main() {
                         let symbol_orders_remain = final_orders.iter().any(|o| o.coin == watcher_symbol);
 
                         if is_flat && !symbol_orders_remain {
+                            // Defensive sequence step 1: CloseConfirmed
+                            if let Some(p) = state_lock.get_mut(&watcher_symbol) {
+                                p.lifecycle = crate::state::PositionLifecycle::CloseConfirmed;
+                            }
+                            let _ = save_state(&watcher_state_path, &state_lock);
+
                             let released = crate::state::release_cluster_lease_authenticated(
                                 &watcher_symbol,
                                 Some(&pos.lease_owner_uuid),
@@ -754,6 +974,12 @@ async fn main() {
                                 );
                                 continue;
                             }
+
+                            // Defensive sequence step 2: LeaseReleased
+                            if let Some(p) = state_lock.get_mut(&watcher_symbol) {
+                                p.lifecycle = crate::state::PositionLifecycle::LeaseReleased;
+                            }
+                            let _ = save_state(&watcher_state_path, &state_lock);
 
                             println!(
                                 "🎉 [FAST-SENTINEL] Take Profit for {} (Side: {}) verified flat & zero orders! State cleared, lease released.",
@@ -1741,6 +1967,12 @@ async fn main() {
 
                             // Handle Adaptive Reprice Execution on Hyperliquid
                             if should_reprice && new_reprice_target > 0.0 && reprice_qty > 0.0 {
+                                if let Some(pos) = state_lock.get(&symbol_clone) {
+                                    if let Err(e) = crate::state::assert_current_lease(&symbol_clone, &pos.lease_owner_uuid, pos.lease_fencing_token) {
+                                        eprintln!("❌ [ONE-WAY RATCHET REPRICE HL] Lease assertion failed for {}: {}", symbol_clone, e);
+                                        continue;
+                                    }
+                                }
                                 let rounded_target =
                                     quantize_price(new_reprice_target, sz_decimals);
                                 println!(
@@ -1752,6 +1984,7 @@ async fn main() {
                                         let _ = cancel_order(&exchange_clone, &symbol_clone, old_oid).await;
                                     }
                                 }
+                                let reprice_cloid = uuid::Uuid::new_v4();
                                 match place_post_only_order(
                                     &exchange_clone,
                                     &symbol_clone,
@@ -1759,6 +1992,7 @@ async fn main() {
                                     rounded_target,
                                     reprice_qty,
                                     true, // reduce_only = true
+                                    Some(reprice_cloid),
                                 )
                                 .await
                                 {
