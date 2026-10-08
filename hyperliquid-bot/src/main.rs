@@ -22,7 +22,7 @@ use crate::controller::{
 };
 use crate::hmm::{compute_hmm_posteriors, train_hmm_offline, GaussianHMM};
 use crate::hyperliquid::{
-    cancel_order, fetch_sz_decimals_map, get_user_position, place_post_only_order, quantize_price,
+    cancel_order, fetch_book_ticker, fetch_sz_decimals_map, get_user_position, place_post_only_order, quantize_price,
 };
 use crate::order::{emergency_flatten, place_ou_maker_entry};
 use crate::ou_process::{
@@ -319,6 +319,75 @@ async fn main() {
     .await;
 
     // ------------------------------------------------------------------------
+    // STARTUP RECONCILIATION: Sync Local State with Live Hyperliquid Position
+    // ------------------------------------------------------------------------
+    let (startup_szi, startup_entry_px) = get_user_position(&info_client, user_address, &trading_symbol)
+        .await
+        .unwrap_or((0.0, None));
+    {
+        let mut state_lock = active_state.lock().await;
+        if startup_szi.abs() > 0.0 {
+            let ep = startup_entry_px.unwrap_or(0.0);
+            let is_long = startup_szi > 0.0;
+            let side_str = if is_long { "LONG" } else { "SHORT" };
+            let sl_dist = ep * 0.015;
+            let default_sl = quantize_price(
+                if is_long { ep - sl_dist } else { ep + sl_dist },
+                trading_sz_decimals,
+            );
+
+            if let Some(pos) = state_lock.get_mut(&trading_symbol) {
+                println!(
+                    "🔍 [STARTUP RECONCILIATION] Active position detected on Hyperliquid for {} (size: {:.5}, entry: ${:.2}). Matching local state.",
+                    trading_symbol, startup_szi, pos.entry_price
+                );
+                pos.is_filled = true;
+                pos.amount = startup_szi.abs();
+                if pos.stop_loss_price <= 0.0 {
+                    pos.stop_loss_price = default_sl;
+                }
+            } else {
+                let default_tp = quantize_price(
+                    if is_long { ep * 1.008 } else { ep * 0.992 },
+                    trading_sz_decimals,
+                );
+                println!(
+                    "⚠️ [STARTUP RECONCILIATION] Found unmanaged live position on Hyperliquid for {} (size: {:.5}, entry: ${:.2}). Adopting into active state with 1.5% catastrophe stop (${:.2}) and target TP (${:.2}).",
+                    trading_symbol, startup_szi, ep, default_sl, default_tp
+                );
+                state_lock.insert(
+                    trading_symbol.clone(),
+                    crate::state::PositionState {
+                        symbol: trading_symbol.clone(),
+                        side: side_str.to_string(),
+                        order_id: "".to_string(),
+                        tp_order_id: "".to_string(),
+                        entry_price: ep,
+                        amount: startup_szi.abs(),
+                        stop_loss_price: default_sl,
+                        take_profit_price: default_tp,
+                        opened_at: chrono::Utc::now().to_rfc3339(),
+                        risk_amount_usdc: config.position_size_usdc,
+                        is_filled: true,
+                        half_life_minutes: 30.0,
+                        client_order_id: "".to_string(),
+                        max_progress: 0.0,
+                        max_favorable_price: ep,
+                        effective_tp: default_tp,
+                        last_reprice_time: chrono::Utc::now().timestamp_millis(),
+                        reprice_count: 0,
+                        candidate_lower_count: 0,
+                        engine_type: "EngineA".to_string(),
+                        chandelier_stop: 0.0,
+                        current_atr: 0.0,
+                    },
+                );
+            }
+            let _ = save_state(&state_file_path, &state_lock);
+        }
+    }
+
+    // ------------------------------------------------------------------------
     // FAST ORDER SUPERVISOR (1.5-Second State Reconciliation & TP Execution)
     // ------------------------------------------------------------------------
     let watcher_state = active_state.clone();
@@ -338,124 +407,168 @@ async fn main() {
 
             let mut state_lock = watcher_state.lock().await;
             if let Some(pos) = state_lock.get(&watcher_symbol).cloned() {
-                // Scenario 1: Entry order is pending, TP not yet placed
-                if pos.tp_order_id.is_empty() && !pos.order_id.is_empty() {
-                    if let Ok(oid) = pos.order_id.parse::<u64>() {
-                        // Cross-reference user position to see if order filled
-                        let (current_szi, _) = get_user_position(&watcher_info, user_address, &watcher_symbol)
-                            .await
-                            .unwrap_or((0.0, None));
-                        let pos_exists = if pos.side == "LONG" {
-                            current_szi > 0.0
+                // Cross-reference user position on live exchange
+                let (current_szi, _) = get_user_position(&watcher_info, user_address, &watcher_symbol)
+                    .await
+                    .unwrap_or((0.0, None));
+                let pos_exists = if pos.side == "LONG" {
+                    current_szi > 0.0
+                } else {
+                    current_szi < 0.0
+                };
+
+                // -------------------------------------------------------------
+                // Defense Layer 1: Live Order Book Catastrophe Stop Loss (1.5s Sentinel)
+                // -------------------------------------------------------------
+                if (pos.is_filled || pos_exists) && pos.stop_loss_price > 0.0 {
+                    if let Ok((best_bid, best_ask)) = fetch_book_ticker(&watcher_info, &watcher_symbol).await {
+                        let is_breached = if pos.side == "LONG" {
+                            best_bid > 0.0 && best_bid <= pos.stop_loss_price
                         } else {
-                            current_szi < 0.0
+                            best_ask > 0.0 && best_ask >= pos.stop_loss_price
                         };
 
-                        // 1. Check open orders directly from matching engine (zero indexing lag)
-                        let open_orders = watcher_info.open_orders(user_address).await.unwrap_or_default();
-                        let is_resting = open_orders.iter().any(|o| o.oid == oid);
-
-                        let mut is_filled = pos_exists;
-                        let mut is_truly_dead = false;
-                        let mut reported_status = "UNKNOWN".to_string();
-
-                        if is_resting {
-                            // Order is physically resting on the order book!
-                            // Do nothing, let it rest peacefully.
-                        } else if !pos_exists {
-                            // Not resting and position not detected yet. Check order status & age.
-                            let order_age_secs = if let Ok(opened_dt) = chrono::DateTime::parse_from_rfc3339(&pos.opened_at) {
-                                (chrono::Utc::now() - opened_dt.with_timezone(&chrono::Utc)).num_seconds()
-                            } else {
-                                10
-                            };
-
-                            if let Ok(order_status) = watcher_info.query_order_by_oid(user_address, oid).await {
-                                reported_status = if let Some(ref o) = order_status.order {
-                                    o.status.to_uppercase()
-                                } else {
-                                    order_status.status.to_uppercase()
-                                };
-
-                                if reported_status == "FILLED" {
-                                    is_filled = true;
-                                } else if reported_status == "CANCELED"
-                                    || reported_status == "REJECTED"
-                                    || reported_status == "MARGINCANCELED"
-                                {
-                                    is_truly_dead = true;
-                                } else if reported_status == "UNKNOWNOID" && order_age_secs >= 5 {
-                                    // Only consider unknownOid dead if it has had at least 5s to index and is not in open orders
-                                    is_truly_dead = true;
-                                }
-                            } else if order_age_secs >= 15 {
-                                is_truly_dead = true;
-                            }
-                        }
-
-                        if is_filled {
+                        if is_breached {
+                            let breach_px = if pos.side == "LONG" { best_bid } else { best_ask };
                             println!(
-                                "🟢 [FAST-SENTINEL] Entry Filled for {} (Side: {})! Placing Take Profit Limit order at ${:.2}",
-                                watcher_symbol, pos.side, pos.take_profit_price
+                                "🛑 [FAST-SENTINEL 1.5s STOP LOSS] {} breached catastrophe stop at ${:.2} (Current: ${:.2})! Emergency flattening...",
+                                watcher_symbol, pos.stop_loss_price, breach_px
                             );
+                            let stop_msg = format!(
+                                "🛑 **CATASTROPHE STOP LOSS HIT (1.5s FAST-SENTINEL):** {}\n**Side:** {}\n**Breach Price:** ${:.2}\n**Hard Stop:** ${:.2}\nEmergency flattening immediately.",
+                                watcher_symbol, pos.side, breach_px, pos.stop_loss_price
+                            );
+                            crate::discord::send_alert(watcher_discord.as_deref(), &stop_msg).await;
 
-                            // Long position -> TP Sell (is_buy = false, reduce_only = true)
-                            // Short position -> TP Buy (is_buy = true, reduce_only = true)
-                            let tp_is_buy = pos.side == "SHORT";
-                            let tp_price = quantize_price(pos.take_profit_price, watcher_sz_decimals);
-
-                            match place_post_only_order(
+                            let _ = emergency_flatten(
+                                &watcher_state_path,
                                 &watcher_exchange,
+                                &watcher_info,
+                                user_address,
+                                &mut state_lock,
                                 &watcher_symbol,
-                                tp_is_buy,
-                                tp_price,
-                                pos.amount,
-                                true, // reduce_only = true
+                                watcher_discord.clone(),
                             )
-                            .await
-                            {
-                                Ok(tp_oid) => {
-                                    if let Some(p) = state_lock.get_mut(&watcher_symbol) {
-                                        p.tp_order_id = tp_oid.to_string();
-                                        p.is_filled = true;
-                                        p.opened_at = chrono::Utc::now().to_rfc3339(); // Clock starts at fill
-                                        let _ = save_state(&watcher_state_path, &state_lock);
-                                        let msg = format!(
-                                            "🟢 **TAKE PROFIT PLACED (HYPERLIQUID):** {}\n**Side:** {} TP\n**Target:** ${:.2}\n**Size:** {:.5}",
-                                            watcher_symbol, pos.side, tp_price, pos.amount
-                                        );
-                                        crate::discord::send_alert(watcher_discord.as_deref(), &msg).await;
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "❌ [FAST-SENTINEL] Failed to place TP for {}: {}",
-                                        watcher_symbol, e
-                                    );
-                                }
-                            }
-                        } else if is_truly_dead {
-                            // Ensure order is cancelled on exchange so no orphaned orders remain
-                            let _ = cancel_order(&watcher_exchange, &watcher_symbol, oid).await;
+                            .await;
 
-                            println!(
-                                "⚪ [FAST-SENTINEL] Entry for {} dead (status: {}). Cleaning up state.",
-                                watcher_symbol, reported_status
-                            );
-                            state_lock.remove(&watcher_symbol);
-                            let _ = save_state(&watcher_state_path, &state_lock);
-                            release_cluster_lease(&watcher_symbol);
+                            let mut cb_lock = watcher_cb.lock().await;
+                            cb_lock.record_loss();
+                            save_circuit_breaker(&watcher_cb_path, &cb_lock);
+                            continue;
                         }
                     }
                 }
-                // Scenario 2: TP order is resting on book. Check if filled
-                else if !pos.tp_order_id.is_empty() {
-                    if let Ok(tp_oid) = pos.tp_order_id.parse::<u64>() {
-                        let (current_szi, _) = get_user_position(&watcher_info, user_address, &watcher_symbol)
-                            .await
-                            .unwrap_or((0.0, None));
-                        let is_flat = current_szi.abs() == 0.0;
 
+                // -------------------------------------------------------------
+                // Scenario 1: Entry order pending or position open without resting TP
+                // -------------------------------------------------------------
+                if pos.tp_order_id.is_empty() {
+                    let mut is_filled = pos_exists || pos.is_filled;
+                    let mut is_truly_dead = false;
+                    let mut reported_status = "UNKNOWN".to_string();
+
+                    if !pos.order_id.is_empty() {
+                        if let Ok(oid) = pos.order_id.parse::<u64>() {
+                            let open_orders = watcher_info.open_orders(user_address).await.unwrap_or_default();
+                            let is_resting = open_orders.iter().any(|o| o.oid == oid);
+
+                            if is_resting {
+                                // Order is physically resting on matching engine
+                            } else if !pos_exists {
+                                let order_age_secs = if let Ok(opened_dt) = chrono::DateTime::parse_from_rfc3339(&pos.opened_at) {
+                                    (chrono::Utc::now() - opened_dt.with_timezone(&chrono::Utc)).num_seconds()
+                                } else {
+                                    10
+                                };
+
+                                if let Ok(order_status) = watcher_info.query_order_by_oid(user_address, oid).await {
+                                    reported_status = if let Some(ref o) = order_status.order {
+                                        o.status.to_uppercase()
+                                    } else {
+                                        order_status.status.to_uppercase()
+                                    };
+
+                                    if reported_status == "FILLED" {
+                                        is_filled = true;
+                                    } else if reported_status == "CANCELED"
+                                        || reported_status == "REJECTED"
+                                        || reported_status == "MARGINCANCELED"
+                                    {
+                                        is_truly_dead = true;
+                                    } else if reported_status == "UNKNOWNOID" && order_age_secs >= 5 {
+                                        is_truly_dead = true;
+                                    }
+                                } else if order_age_secs >= 15 {
+                                    is_truly_dead = true;
+                                }
+                            }
+                        }
+                    }
+
+                    if is_filled && pos.take_profit_price > 0.0 {
+                        println!(
+                            "🟢 [FAST-SENTINEL] Position Active for {} (Side: {})! Placing Take Profit Limit order at ${:.2}",
+                            watcher_symbol, pos.side, pos.take_profit_price
+                        );
+
+                        // Long position -> TP Sell (is_buy = false, reduce_only = true)
+                        // Short position -> TP Buy (is_buy = true, reduce_only = true)
+                        let tp_is_buy = pos.side == "SHORT";
+                        let tp_price = quantize_price(pos.take_profit_price, watcher_sz_decimals);
+                        let tp_amount = if current_szi.abs() > 0.0 { current_szi.abs() } else { pos.amount };
+
+                        match place_post_only_order(
+                            &watcher_exchange,
+                            &watcher_symbol,
+                            tp_is_buy,
+                            tp_price,
+                            tp_amount,
+                            true, // reduce_only = true (routes as Gtc in hyperliquid.rs)
+                        )
+                        .await
+                        {
+                            Ok(tp_oid) => {
+                                if let Some(p) = state_lock.get_mut(&watcher_symbol) {
+                                    p.tp_order_id = tp_oid.to_string();
+                                    p.is_filled = true;
+                                    p.opened_at = chrono::Utc::now().to_rfc3339();
+                                    let _ = save_state(&watcher_state_path, &state_lock);
+                                    let msg = format!(
+                                        "🟢 **TAKE PROFIT PLACED (HYPERLIQUID):** {}\n**Side:** {} TP\n**Target:** ${:.2}\n**Size:** {:.5}",
+                                        watcher_symbol, pos.side, tp_price, tp_amount
+                                    );
+                                    crate::discord::send_alert(watcher_discord.as_deref(), &msg).await;
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "❌ [FAST-SENTINEL] Failed to place TP for {}: {}",
+                                    watcher_symbol, e
+                                );
+                            }
+                        }
+                    } else if is_truly_dead && !pos.order_id.is_empty() {
+                        if let Ok(oid) = pos.order_id.parse::<u64>() {
+                            let _ = cancel_order(&watcher_exchange, &watcher_symbol, oid).await;
+                        }
+
+                        println!(
+                            "⚪ [FAST-SENTINEL] Entry for {} dead (status: {}). Cleaning up state.",
+                            watcher_symbol, reported_status
+                        );
+                        state_lock.remove(&watcher_symbol);
+                        let _ = save_state(&watcher_state_path, &state_lock);
+                        release_cluster_lease(&watcher_symbol);
+                    }
+                }
+                // -------------------------------------------------------------
+                // Scenario 2: TP order resting on book. Check if filled or position closed
+                // -------------------------------------------------------------
+                else if !pos.tp_order_id.is_empty() {
+                    let is_flat = current_szi.abs() == 0.0;
+                    let mut is_tp_filled = is_flat;
+
+                    if let Ok(tp_oid) = pos.tp_order_id.parse::<u64>() {
                         if let Ok(order_status) = watcher_info.query_order_by_oid(user_address, tp_oid).await {
                             let inner_status = if let Some(ref o) = order_status.order {
                                 o.status.to_uppercase()
@@ -463,27 +576,31 @@ async fn main() {
                                 order_status.status.to_uppercase()
                             };
 
-                            if inner_status == "FILLED" || is_flat {
-                                println!(
-                                    "🎉 [FAST-SENTINEL] Take Profit for {} (Side: {}) has FILLED!",
-                                    watcher_symbol, pos.side
-                                );
-                                state_lock.remove(&watcher_symbol);
-                                let _ = save_state(&watcher_state_path, &state_lock);
-                                release_cluster_lease(&watcher_symbol);
-
-                                // Reset circuit breaker
-                                let mut cb_lock = watcher_cb.lock().await;
-                                cb_lock.record_win();
-                                save_circuit_breaker(&watcher_cb_path, &cb_lock);
-
-                                let msg = format!(
-                                    "🎉 **TRADE CLOSED IN PROFIT (HYPERLIQUID)!** {} {} Take Profit has filled successfully.",
-                                    watcher_symbol, pos.side
-                                );
-                                crate::discord::send_alert(watcher_discord.as_deref(), &msg).await;
+                            if inner_status == "FILLED" {
+                                is_tp_filled = true;
                             }
                         }
+                    }
+
+                    if is_tp_filled {
+                        println!(
+                            "🎉 [FAST-SENTINEL] Take Profit for {} (Side: {}) has FILLED / Position Flat!",
+                            watcher_symbol, pos.side
+                        );
+                        state_lock.remove(&watcher_symbol);
+                        let _ = save_state(&watcher_state_path, &state_lock);
+                        release_cluster_lease(&watcher_symbol);
+
+                        // Reset circuit breaker
+                        let mut cb_lock = watcher_cb.lock().await;
+                        cb_lock.record_win();
+                        save_circuit_breaker(&watcher_cb_path, &cb_lock);
+
+                        let msg = format!(
+                            "🎉 **TRADE CLOSED IN PROFIT (HYPERLIQUID)!** {} {} Take Profit has filled successfully.",
+                            watcher_symbol, pos.side
+                        );
+                        crate::discord::send_alert(watcher_discord.as_deref(), &msg).await;
                     }
                 }
             }
@@ -985,6 +1102,7 @@ async fn main() {
 
                             let mut entry_ttl_expired = false;
                             let mut time_stop_triggered = false;
+                            let mut hard_sl_triggered = false;
                             let mut giveback_triggered = false;
                             let mut elapsed_mins = 0.0;
                             let mut max_allowed_mins = 120.0;
@@ -1009,6 +1127,15 @@ async fn main() {
                                             entry_ttl_expired = true;
                                         }
                                     } else {
+                                        // Hard Catastrophe Stop Loss check
+                                        if pos.stop_loss_price > 0.0 {
+                                            if pos.side == "LONG" && close_price <= pos.stop_loss_price {
+                                                hard_sl_triggered = true;
+                                            } else if pos.side == "SHORT" && close_price >= pos.stop_loss_price {
+                                                hard_sl_triggered = true;
+                                            }
+                                        }
+
                                         max_allowed_mins = if pos.half_life_minutes > 0.0 {
                                             (2.0 * pos.half_life_minutes).clamp(15.0, 360.0)
                                         } else {
@@ -1164,7 +1291,34 @@ async fn main() {
                                 }
                             }
 
-                            if entry_ttl_expired {
+                            if hard_sl_triggered {
+                                let sl_px = state_lock
+                                    .get(&symbol_clone)
+                                    .map(|p| p.stop_loss_price)
+                                    .unwrap_or(0.0);
+                                println!(
+                                    "🛑 [CATASTROPHE STOP-LOSS EXECUTED HL] {} close price ${:.2} breached hard stop ${:.2}. Emergency flattening!",
+                                    symbol_clone, close_price, sl_px
+                                );
+                                let sl_msg = format!(
+                                    "🛑 **CATASTROPHE STOP-LOSS EXECUTED (HL):** {} breached hard stop at ${:.2} (Close: ${:.2}). Emergency flattening position.",
+                                    symbol_clone, sl_px, close_price
+                                );
+                                crate::discord::send_alert(discord_clone.as_deref(), &sl_msg).await;
+                                let mut cb_lock = cb_clone.lock().await;
+                                cb_lock.record_loss();
+                                save_circuit_breaker(&cb_path_clone, &cb_lock);
+                                let _ = emergency_flatten(
+                                    &state_path_clone,
+                                    &exchange_clone,
+                                    &info_clone,
+                                    user_address,
+                                    &mut state_lock,
+                                    &symbol_clone,
+                                    discord_clone.clone(),
+                                )
+                                .await;
+                            } else if entry_ttl_expired {
                                 println!(
                                     "⏱️ [ENTRY TTL EXPIRED] Resting order for {} unfilled after {:.1}m. Flattening.",
                                     symbol_clone, elapsed_mins

@@ -123,6 +123,10 @@ impl CircuitBreaker {
         false
     }
 
+    pub fn record_loss(&mut self) -> bool {
+        self.record_time_stop()
+    }
+
     pub fn record_win(&mut self) {
         self.consecutive_time_stops = 0;
         self.paused_until = None;

@@ -109,6 +109,16 @@ pub async fn place_ou_maker_entry(
     };
     let target_tp_quantized = quantize_price(target_tp, sz_decimals);
 
+    // Structural Catastrophe Stop Loss: 2.0x expected target edge (min 1.5% from entry)
+    let edge_dist = (post_only_price - target_tp_quantized).abs();
+    let sl_dist = (2.0 * edge_dist).max(post_only_price * 0.015);
+    let raw_sl = if is_buy {
+        post_only_price - sl_dist
+    } else {
+        post_only_price + sl_dist
+    };
+    let stop_loss_price = quantize_price(raw_sl, sz_decimals);
+
     let new_state = PositionState {
         symbol: symbol.to_string(),
         side: side.to_string(),
@@ -116,7 +126,7 @@ pub async fn place_ou_maker_entry(
         tp_order_id: "".to_string(), // Populated when entry fills and TP is placed
         entry_price: post_only_price,
         amount: amount_f,
-        stop_loss_price: 0.0, // No structural stop loss in O-U mean reversion
+        stop_loss_price,
         take_profit_price: target_tp_quantized,
         opened_at: Utc::now().to_rfc3339(),
         risk_amount_usdc: position_size_usdc,
@@ -142,8 +152,8 @@ pub async fn place_ou_maker_entry(
     let side_emoji = if is_buy { "🟢" } else { "🔴" };
 
     let msg = format!(
-        "{} **O-U {} ENTRY SIGNAL (MAKER):** {}\n**Limit Maker {}:** ${:.2} (Best Bid: ${:.2}, Ask: ${:.2})\n**Target Mean (μ):** ${:.2}\n**Size:** {:.5} (${:.2})\n**Half-Life:** {:.1}m (Max Hold: {:.1}m)",
-        side_emoji, side_label, symbol, side_label, post_only_price, top_bid, top_ask, target_mu_quantized, amount_f, position_size_usdc, half_life_minutes, max_hold
+        "{} **O-U {} ENTRY SIGNAL (MAKER):** {}\n**Limit Maker {}:** ${:.2} (Best Bid: ${:.2}, Ask: ${:.2})\n**Target Mean (μ):** ${:.2}\n**Take Profit Target:** ${:.2}\n**Hard Stop Loss:** ${:.2}\n**Size:** {:.5} (${:.2})\n**Half-Life:** {:.1}m (Max Hold: {:.1}m)",
+        side_emoji, side_label, symbol, side_label, post_only_price, top_bid, top_ask, target_mu_quantized, target_tp_quantized, stop_loss_price, amount_f, position_size_usdc, half_life_minutes, max_hold
     );
     crate::discord::send_alert(discord_url.as_deref(), &msg).await;
 
