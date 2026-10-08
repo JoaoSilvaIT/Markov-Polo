@@ -65,37 +65,23 @@ impl RegimeController {
     ) -> ControllerMode {
         let is_severe_shock = z_15.abs() >= 3.0 || z_60.abs() >= 3.0;
 
-        // 1. FAST-PATH OVERRIDE:
-        // Explosive institutional momentum (P_T >= 0.90 with |Z_15| >= 3.0 and Donchian breakout)
-        if self.current_mode != ControllerMode::Trend
-            && p_trend >= 0.90
-            && z_15.abs() >= 3.0
-            && has_donchian_breakout
-        {
-            self.current_mode = ControllerMode::Trend;
-            self.trend_streak = 3;
-            self.consolidation_streak = 0;
-            self.last_transition_time = Utc::now().to_rfc3339();
-            self.last_reason = format!(
-                "Fast-Path Override: P_T={:.2} >= 0.90 with |Z15|={:.2} and Donchian breakout",
-                p_trend, z_15
-            );
-            self.epoch += 1;
-            return self.current_mode;
-        }
-
-        // 2. SEVERE SHOCK OVERRIDE:
-        // If in MeanReversion, a severe shock immediately drops to Neutral to avoid falling knife
-        if self.current_mode == ControllerMode::MeanReversion && is_severe_shock {
+        // 1. SEVERE SHOCK OVERRIDE (100% Cash Protection):
+        // Severe volatility spikes (|Z| >= 3.0) and liquidation cascades must NEVER trigger
+        // an immediate Trend entry (which risks buying the top of a squeeze).
+        // They exclusively route to Neutral (safe cash buffer) and reset streaks.
+        if is_severe_shock {
+            let was_different = self.current_mode != ControllerMode::Neutral;
             self.current_mode = ControllerMode::Neutral;
             self.trend_streak = 0;
             self.consolidation_streak = 0;
-            self.last_transition_time = Utc::now().to_rfc3339();
             self.last_reason = format!(
-                "Severe Volatility Shock Veto (|Z15|={:.2}, |Z60|={:.2}) -> Safe Neutral",
+                "Severe Volatility Shock Veto (|Z15|={:.2}, |Z60|={:.2}) -> Safe Neutral Cash Buffer",
                 z_15, z_60
             );
-            self.epoch += 1;
+            if was_different {
+                self.last_transition_time = Utc::now().to_rfc3339();
+                self.epoch += 1;
+            }
             return self.current_mode;
         }
 
@@ -293,14 +279,15 @@ mod tests {
     }
 
     #[test]
-    fn test_fast_path_override() {
+    fn test_severe_shock_blocks_trend_override() {
         let mut controller = RegimeController::default();
         assert_eq!(controller.current_mode, ControllerMode::Neutral);
 
-        // Single bar with P_T = 0.92, Z_15 = +3.4, and breakout
-        let mode = controller.evaluate_15m_bar(0.05, 0.92, 3.4, 1.5, true, false, false);
-        assert_eq!(mode, ControllerMode::Trend);
-        assert!(controller.last_reason.contains("Fast-Path Override"));
+        // Single bar with P_T = 0.95, Z_15 = +3.4 (severe shock), and breakout
+        // Severe shock MUST route to Neutral (100% Cash Buffer), NOT Trend!
+        let mode = controller.evaluate_15m_bar(0.05, 0.95, 3.4, 1.5, true, false, false);
+        assert_eq!(mode, ControllerMode::Neutral);
+        assert!(controller.last_reason.contains("Severe Volatility Shock"));
     }
 
     #[test]

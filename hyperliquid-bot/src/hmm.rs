@@ -111,18 +111,33 @@ impl GaussianHMM {
             let sum_sp = self.startprob.sum();
             self.startprob.mapv_inplace(|v| v / sum_sp);
 
-            // transmat (Skipping full xi matrix for simplicity, just normalizing)
-            for i in 0..self.n_components {
-                let mut denom = 0.0;
-                for t in 0..n_samples-1 { denom += gamma[[t, i]]; }
-                if denom > 0.0 {
+            // transmat: Calculate normalized xi_t(i, j) in log space before exponentiation
+            let mut xi_sum = Array2::<f64>::zeros((self.n_components, self.n_components));
+            for t in 0..n_samples - 1 {
+                // Compute normalization constant C_t = logsumexp_{i, j}(...)
+                let mut joint_terms = Vec::with_capacity(self.n_components * self.n_components);
+                for i in 0..self.n_components {
                     for j in 0..self.n_components {
-                        let mut num = 0.0;
-                        for t in 0..n_samples-1 {
-                            let p = log_alpha[[t, i]] + log_transmat[[i, j]] + log_emiss[[t+1, j]] + log_beta[[t+1, j]];
-                            num += p.exp();
-                        }
-                        self.transmat[[i, j]] = num / denom;
+                        let term = log_alpha[[t, i]] + log_transmat[[i, j]] + log_emiss[[t + 1, j]] + log_beta[[t + 1, j]];
+                        joint_terms.push(term);
+                    }
+                }
+                let joint_arr = Array1::from_vec(joint_terms);
+                let c_t = logsumexp(&joint_arr);
+
+                for i in 0..self.n_components {
+                    for j in 0..self.n_components {
+                        let log_xi = log_alpha[[t, i]] + log_transmat[[i, j]] + log_emiss[[t + 1, j]] + log_beta[[t + 1, j]] - c_t;
+                        xi_sum[[i, j]] += log_xi.exp();
+                    }
+                }
+            }
+
+            for i in 0..self.n_components {
+                let denom = gamma.slice(ndarray::s![0..n_samples - 1, i]).sum();
+                if denom > 1e-10 {
+                    for j in 0..self.n_components {
+                        self.transmat[[i, j]] = (xi_sum[[i, j]] / denom).max(1e-15);
                     }
                 }
                 // Normalize row

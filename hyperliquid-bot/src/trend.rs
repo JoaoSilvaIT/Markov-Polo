@@ -180,14 +180,11 @@ impl ChandelierExitState {
 
     /// Updates trailing stop on bar close / price tick.
     /// Never loosens the stop (strictly monotone).
-    /// If HMM trend probability falls below 0.60, cinches multiplier to 1.5 ATR.
+    /// Uses continuous probability-decay compression:
+    /// k(P_T) = 1.5 + (base - 1.5) * clip((P_T - 0.55) / (0.85 - 0.55), 0, 1)
     pub fn update(&mut self, current_high: f64, current_low: f64, current_atr: f64, p_trend: f64) -> f64 {
-        // Probability decay compression
-        self.active_multiplier = if p_trend < 0.60 {
-            (self.base_multiplier * 0.5).max(1.5)
-        } else {
-            self.base_multiplier
-        };
+        let decay_factor = ((p_trend - 0.55) / (0.85 - 0.55)).clamp(0.0, 1.0);
+        self.active_multiplier = 1.5 + (self.base_multiplier - 1.5) * decay_factor;
 
         match self.side {
             Side::Long => {
@@ -195,7 +192,7 @@ impl ChandelierExitState {
                     self.extreme_favorable_price = current_high;
                 }
                 let candidate_stop = self.extreme_favorable_price - self.active_multiplier * current_atr;
-                // Monotone Ratchet: stop only moves UP
+                // Monotone Ratchet: stop strictly moves UP
                 self.current_stop = f64::max(self.current_stop, candidate_stop);
             }
             Side::Short => {
@@ -203,7 +200,7 @@ impl ChandelierExitState {
                     self.extreme_favorable_price = current_low;
                 }
                 let candidate_stop = self.extreme_favorable_price + self.active_multiplier * current_atr;
-                // Monotone Ratchet: stop only moves DOWN
+                // Monotone Ratchet: stop strictly moves DOWN
                 self.current_stop = f64::min(self.current_stop, candidate_stop);
             }
         }
@@ -211,10 +208,18 @@ impl ChandelierExitState {
         self.current_stop
     }
 
+    #[allow(dead_code)]
     pub fn is_stopped_out(&self, current_price: f64) -> bool {
         match self.side {
             Side::Long => current_price <= self.current_stop,
             Side::Short => current_price >= self.current_stop,
+        }
+    }
+
+    pub fn is_bar_stopped_out(&self, bar_high: f64, bar_low: f64) -> bool {
+        match self.side {
+            Side::Long => bar_low <= self.current_stop,
+            Side::Short => bar_high >= self.current_stop,
         }
     }
 }
@@ -335,12 +340,15 @@ pub fn record_shadow_exit(
         (trade.entry_price - exit_price) * trade.size
     };
 
-    // Conservative Hyperliquid fee modeling:
-    // Maker entry: 0.00% (or 0.0144%), Taker stop exit: 0.0432%
+    // Institutional Hyperliquid fee and slippage modeling:
+    // Maker entry: 0.0144%, Taker stop exit: 0.0432%, Conservative stop slippage: 0.0500% (5 bps)
     let notional_entry = trade.entry_price * trade.size;
     let notional_exit = exit_price * trade.size;
-    let est_fees = notional_exit * 0.000432;
-    let net_pnl = gross_pnl - est_fees;
+    let maker_entry_fee = notional_entry * 0.000144;
+    let taker_exit_fee = notional_exit * 0.000432;
+    let stop_slippage = notional_exit * 0.0005;
+    let total_friction = maker_entry_fee + taker_exit_fee + stop_slippage;
+    let net_pnl = gross_pnl - total_friction;
 
     let return_bps = if notional_entry > 0.0 {
         (net_pnl / notional_entry) * 10000.0
@@ -511,8 +519,8 @@ mod tests {
 
         // Exit at 105.0
         let pnl = record_shadow_exit(&mut trade, 105.0, "Chandelier Stop");
-        // Gross = $5.0, fees = 105.0 * 0.000432 = $0.04536 -> net ~ $4.954
-        assert!(pnl > 4.90 && pnl < 5.0);
+        // Gross = $5.0, friction = $0.11226 (maker entry + taker exit + 5 bps slippage) -> net ~ $4.8877
+        assert!(pnl > 4.80 && pnl < 4.95);
         assert_eq!(trade.is_active, false);
     }
 }
