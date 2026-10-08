@@ -75,6 +75,14 @@ pub async fn place_post_only_order(
     size: f64,
     reduce_only: bool,
 ) -> Result<u64, String> {
+    // Hyperliquid rule: Reduce-only closing orders (like Take Profit) cannot use "Alo" (Post-Only);
+    // they must use "Gtc" (Good-Til-Cancelled). Entries use "Alo" for maker rebates and anti-taker protection.
+    let tif = if reduce_only {
+        "Gtc".to_string()
+    } else {
+        "Alo".to_string()
+    };
+
     let order_req = ClientOrderRequest {
         asset: coin.to_string(),
         is_buy,
@@ -83,7 +91,7 @@ pub async fn place_post_only_order(
         sz: size,
         cloid: None,
         order_type: ClientOrder::Limit(ClientLimit {
-            tif: "Alo".to_string(),
+            tif,
         }),
     };
 
