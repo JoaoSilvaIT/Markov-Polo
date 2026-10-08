@@ -709,6 +709,7 @@ async fn main() {
         println!("📡 [WEBSOCKET] Successfully subscribed to 1m candles for {}.", trading_symbol);
 
         let mut pending_1m: Option<CandleBar> = None;
+        let mut last_processed_1m_open: u64 = 0;
 
         while let Some(msg) = receiver.recv().await {
             if let Message::Candle(candle_msg) = msg {
@@ -746,6 +747,14 @@ async fn main() {
                         pending.volume = update_bar.volume;
                         None
                     }
+                    Some(ref pending) if update_bar.time_open < pending.time_open => {
+                        // Drop backwards/out-of-order candle update without replacing pending
+                        println!(
+                            "⚠️ [OUT-OF-ORDER CANDLE DROPPED] Arrived open_ms: {} < pending: {}",
+                            update_bar.time_open, pending.time_open
+                        );
+                        None
+                    }
                     Some(_) => pending_1m.replace(update_bar),
                 };
 
@@ -753,6 +762,26 @@ async fn main() {
                     Some(b) => b,
                     None => continue,
                 };
+
+                // Strict Monotonicity Guard: drop duplicate or backwards completed candles
+                if completed_bar.time_open <= last_processed_1m_open {
+                    println!(
+                        "⚠️ [DROPPED CANDLE] Completed bar open_ms {} <= last processed open_ms {} (out-of-order or duplicate).",
+                        completed_bar.time_open, last_processed_1m_open
+                    );
+                    continue;
+                }
+
+                let mut is_candle_gap = false;
+                if last_processed_1m_open > 0 && completed_bar.time_open > last_processed_1m_open + 60_000 {
+                    let gap_minutes = (completed_bar.time_open - last_processed_1m_open) / 60_000;
+                    println!(
+                        "⚠️ [CANDLE GAP DETECTED] Missing {} candle(s) between {} and {}. Blocking new entries until stream contiguous.",
+                        gap_minutes, last_processed_1m_open, completed_bar.time_open
+                    );
+                    is_candle_gap = true;
+                }
+                last_processed_1m_open = completed_bar.time_open;
 
                 let close_price = completed_bar.close;
                 let high_price = completed_bar.high;
@@ -964,9 +993,26 @@ async fn main() {
 
                     if let Some(qual) = obi_tracker.read().await.compute_feed_quality() {
                         if qual.sample_count >= 10 && finalized_15m_bar.is_some() {
+                            let (inst_obi, ewma_250, ewma_1s, ewma_5s, gaps) = {
+                                let tr = obi_tracker.read().await;
+                                (tr.instant_obi, tr.ewma_250ms_obi, tr.ewma_1s_obi, tr.ewma_5s_obi, tr.gaps_over_3s)
+                            };
+                            let window_end = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                            let window_start = window_end.saturating_sub(15 * 60 * 1000);
+                            crate::trend::append_l2_telemetry_record(
+                                &symbol_clone,
+                                window_start,
+                                window_end,
+                                &qual,
+                                gaps,
+                                inst_obi,
+                                ewma_250,
+                                ewma_1s,
+                                ewma_5s,
+                            );
                             println!(
-                                "📶 [L2 FEED QUALITY] {} | Status: {} | Inter-Arrival: (p50: {:.0}ms, p95: {:.0}ms, MAD: {:.0}ms) | Mean Lag: {:.0}ms ({} samples)",
-                                symbol_clone, qual.status, qual.p50_ms, qual.p95_ms, qual.mad_ms, qual.mean_lag_ms, qual.sample_count
+                                "📶 [L2 FEED QUALITY] {} | Status: {} ({}) | Inter-Arrival: (p50: {:.0}ms, p90: {:.0}ms, p95: {:.0}ms, p99: {:.0}ms, MAD: {:.0}ms) | Observed Age: (p95: {:.0}ms, p99: {:.0}ms, Mean: {:.0}ms) | EWMAs: (tau1: {:.0}ms, tau2: {:.0}ms) ({} samples)",
+                                symbol_clone, qual.status, qual.regime, qual.p50_ms, qual.p90_ms, qual.p95_ms, qual.p99_ms, qual.mad_ms, qual.observed_age_p95_ms, qual.observed_age_p99_ms, qual.mean_lag_ms, qual.tau_1_ms, qual.tau_2_ms, qual.sample_count
                             );
                         }
                     }
@@ -1078,7 +1124,18 @@ async fn main() {
                         if shadow_trade.is_active {
                             if shadow_trade.is_portfolio_selected {
                                 if let Some(ref tok) = shadow_trade.lease_token {
-                                    crate::trend::refresh_shadow_cluster_lease(&symbol_clone, tok);
+                                    if !crate::trend::refresh_shadow_cluster_lease(&symbol_clone, tok) {
+                                        println!(
+                                            "⚠️ [PORTFOLIO LEASE LOST] Shadow lease renewal failed for {}. Unselecting from portfolio.",
+                                            symbol_clone
+                                        );
+                                        shadow_trade.is_portfolio_selected = false;
+                                        shadow_trade.lease_token = None;
+                                        save_shadow_trade(&symbol_clone, Some(&shadow_trade));
+                                    }
+                                } else {
+                                    shadow_trade.is_portfolio_selected = false;
+                                    save_shadow_trade(&symbol_clone, Some(&shadow_trade));
                                 }
                             }
 
@@ -1148,8 +1205,8 @@ async fn main() {
                                     let closes_15m: Vec<f64> = rolling_15m_bars.iter().map(|b| b.close).collect();
                                     let alignment = check_trend_alignment(&closes_15m);
                                     // Engine B Execution: Trend Regime confirmed by 15m candle close. Entry confirmed by 1m close breakout + Continuous L2 OBI hurdle (never wicks).
-                                    let is_long_breakout = close_price > donchian.upper && alignment == TrendAlignment::Bullish;
-                                    let is_short_breakout = close_price < donchian.lower && alignment == TrendAlignment::Bearish;
+                                    let is_long_breakout = !is_candle_gap && close_price > donchian.upper && alignment == TrendAlignment::Bullish;
+                                    let is_short_breakout = !is_candle_gap && close_price < donchian.lower && alignment == TrendAlignment::Bearish;
 
                                     if is_long_breakout || is_short_breakout {
                                         let side = if is_long_breakout { Side::Long } else { Side::Short };
@@ -1566,7 +1623,8 @@ async fn main() {
                             // ------------------------------------------------------------------
                             let mut armed_state = load_armed_signal(&arm_path_clone);
                             let consolidation_vol_ok = z_15.abs() < 1.5 && z_60.abs() < 2.5;
-                            let is_eligible = is_consolidation
+                            let is_eligible = !is_candle_gap
+                                && is_consolidation
                                 && consolidation_vol_ok
                                 && is_valid_half_life
                                 && !is_cb_paused

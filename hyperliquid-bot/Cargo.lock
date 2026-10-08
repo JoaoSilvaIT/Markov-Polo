@@ -1728,6 +1728,7 @@ dependencies = [
  "ethers",
  "futures-util",
  "hyperliquid_rust_sdk",
+ "libc",
  "ndarray",
  "reqwest 0.12.28",
  "serde",

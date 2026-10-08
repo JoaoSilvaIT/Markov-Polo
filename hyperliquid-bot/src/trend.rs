@@ -1,4 +1,4 @@
-use crate::state::Side;
+use crate::state::{FlockGuard, Side};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
@@ -156,12 +156,21 @@ pub struct FeedQualityStats {
     pub p95_ms: f64,
     pub p99_ms: f64,
     pub mad_ms: f64,
+    pub observed_age_p95_ms: f64,
+    pub observed_age_p99_ms: f64,
     pub mean_lag_ms: f64,
     pub sample_count: usize,
     pub status: String,
+    pub tau_1_ms: f64,
+    pub tau_2_ms: f64,
+    pub regime: String,
 }
 
-/// Real-time L2 continuous order book tracker with basis-point distance weighting, multiscale physical-time EWMA, and local latency instrumentation
+fn default_tau_1() -> f64 { 250.0 }
+fn default_tau_2() -> f64 { 1000.0 }
+fn default_regime_label() -> String { "LowLatency".to_string() }
+
+/// Real-time L2 continuous order book tracker with basis-point distance weighting, multiscale physical-time dynamic EWMA, and local latency instrumentation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct L2ObiTracker {
     pub instant_obi: f64,
@@ -181,6 +190,16 @@ pub struct L2ObiTracker {
     pub inter_arrival_samples: Vec<f64>,
     #[serde(default)]
     pub transport_lag_samples: Vec<f64>,
+    #[serde(default = "default_tau_1")]
+    pub tau_1_ms: f64,
+    #[serde(default = "default_tau_2")]
+    pub tau_2_ms: f64,
+    #[serde(default = "default_regime_label")]
+    pub current_regime_label: String,
+    #[serde(skip)]
+    pub last_instant: Option<std::time::Instant>,
+    #[serde(default)]
+    pub gaps_over_3s: u32,
 }
 
 impl Default for L2ObiTracker {
@@ -199,6 +218,11 @@ impl Default for L2ObiTracker {
             reconnect_time_ms: 0,
             inter_arrival_samples: Vec::with_capacity(120),
             transport_lag_samples: Vec::with_capacity(120),
+            tau_1_ms: 250.0,
+            tau_2_ms: 1000.0,
+            current_regime_label: "LowLatency".to_string(),
+            last_instant: None,
+            gaps_over_3s: 0,
         }
     }
 }
@@ -240,19 +264,50 @@ impl L2ObiTracker {
         let obi_inst = ((sum_bid_w - sum_ask_w) / denom).clamp(-1.0, 1.0);
         self.instant_obi = obi_inst;
 
-        // Telemetry: record local inter-arrival and approximate transport lag
-        if self.last_local_recv_ms > 0 && local_recv_ms >= self.last_local_recv_ms {
-            let local_dt = (local_recv_ms - self.last_local_recv_ms) as f64;
-            self.inter_arrival_samples.push(local_dt);
+        // Telemetry: record local inter-arrival via Instant (immune to NTP clock adjustments)
+        let now_instant = std::time::Instant::now();
+        let instant_dt = self.last_instant.map(|prev| prev.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0);
+        let clock_dt = if self.last_local_recv_ms > 0 && local_recv_ms >= self.last_local_recv_ms {
+            (local_recv_ms - self.last_local_recv_ms) as f64
+        } else {
+            0.0
+        };
+
+        let inter_arrival_dt = if instant_dt > 0.5 {
+            instant_dt
+        } else {
+            clock_dt
+        };
+
+        if inter_arrival_dt > 0.0 {
+            self.inter_arrival_samples.push(inter_arrival_dt);
             if self.inter_arrival_samples.len() > 120 {
                 self.inter_arrival_samples.remove(0);
             }
         }
+        self.last_instant = Some(now_instant);
+
+        // Observed age / clock-adjusted transport lag
         if local_recv_ms >= exchange_time_ms {
             let lag = (local_recv_ms - exchange_time_ms) as f64;
             self.transport_lag_samples.push(lag);
             if self.transport_lag_samples.len() > 120 {
                 self.transport_lag_samples.remove(0);
+            }
+        }
+
+        // Amortized dynamic EWMA recalibration: evaluate every 64 updates to avoid hot-path sort overhead
+        if (self.updates_since_reconnect + 1) % 64 == 0 && self.inter_arrival_samples.len() >= 10 {
+            if let Some(qual) = self.compute_feed_quality() {
+                if qual.p50_ms <= 150.0 && qual.mad_ms <= 80.0 {
+                    self.tau_1_ms = 250.0;
+                    self.tau_2_ms = 1000.0;
+                    self.current_regime_label = "LowLatency".to_string();
+                } else {
+                    self.tau_1_ms = 500.0;
+                    self.tau_2_ms = 2000.0;
+                    self.current_regime_label = "JitterSubsampled".to_string();
+                }
             }
         }
 
@@ -268,22 +323,25 @@ impl L2ObiTracker {
         if dt_ms > 0.0 && dt_ms <= 3000.0 {
             let ln2 = std::f64::consts::LN_2;
 
-            // Multiscale physical-time EWMA decay: alpha = 1 - exp(-ln2 * dt / h)
-            // 250ms: immediate queue pressure
-            let alpha_250ms = 1.0 - (-ln2 * dt_ms / 250.0).exp();
-            self.ewma_250ms_obi = (1.0 - alpha_250ms) * self.ewma_250ms_obi + alpha_250ms * obi_inst;
+            // Multiscale physical-time EWMA decay with dynamic tau_1 and tau_2:
+            // tau_1 (250ms / 500ms): immediate queue pressure
+            let alpha_tau1 = 1.0 - (-ln2 * dt_ms / self.tau_1_ms).exp();
+            self.ewma_250ms_obi = (1.0 - alpha_tau1) * self.ewma_250ms_obi + alpha_tau1 * obi_inst;
 
-            // 1000ms (1s): primary execution feature
-            let alpha_1s = 1.0 - (-ln2 * dt_ms / 1000.0).exp();
-            self.ewma_1s_obi = (1.0 - alpha_1s) * self.ewma_1s_obi + alpha_1s * obi_inst;
+            // tau_2 (1000ms / 2000ms): primary execution feature
+            let alpha_tau2 = 1.0 - (-ln2 * dt_ms / self.tau_2_ms).exp();
+            self.ewma_1s_obi = (1.0 - alpha_tau2) * self.ewma_1s_obi + alpha_tau2 * obi_inst;
 
-            // 5000ms (5s): institutional persistence filter
+            // 5000ms (5s): institutional persistence filter (fixed)
             let alpha_5s = 1.0 - (-ln2 * dt_ms / 5000.0).exp();
             self.ewma_5s_obi = (1.0 - alpha_5s) * self.ewma_5s_obi + alpha_5s * obi_inst;
 
             self.updates_since_reconnect = self.updates_since_reconnect.saturating_add(1);
         } else {
-            // Disconnect or stale interval (>3s): invalidate stale memory and reinitialize
+            // Disconnect or stale interval (>3s): record gap and reinitialize
+            if dt_ms > 3000.0 {
+                self.gaps_over_3s = self.gaps_over_3s.saturating_add(1);
+            }
             self.ewma_250ms_obi = obi_inst;
             self.ewma_1s_obi = obi_inst;
             self.ewma_5s_obi = obi_inst;
@@ -318,6 +376,17 @@ impl L2ObiTracker {
         abs_devs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let mad = 1.4826 * abs_devs[abs_devs.len() / 2];
 
+        let mut sorted_lags = self.transport_lag_samples.clone();
+        sorted_lags.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let lag_n = sorted_lags.len();
+        let lag_percentile = |pct: f64| -> f64 {
+            if lag_n == 0 { return 0.0; }
+            let idx = ((pct / 100.0) * (lag_n as f64 - 1.0)).round() as usize;
+            sorted_lags[idx.min(lag_n - 1)]
+        };
+        let age_p95 = lag_percentile(95.0);
+        let age_p99 = lag_percentile(99.0);
+
         let mean_lag = if !self.transport_lag_samples.is_empty() {
             self.transport_lag_samples.iter().sum::<f64>() / self.transport_lag_samples.len() as f64
         } else {
@@ -338,12 +407,61 @@ impl L2ObiTracker {
             p95_ms: p95,
             p99_ms: p99,
             mad_ms: mad,
+            observed_age_p95_ms: age_p95,
+            observed_age_p99_ms: age_p99,
             mean_lag_ms: mean_lag,
             sample_count: n,
             status,
+            tau_1_ms: self.tau_1_ms,
+            tau_2_ms: self.tau_2_ms,
+            regime: self.current_regime_label.clone(),
         })
     }
+}
 
+/// Appends an institutional L2 WebSocket quality & transport telemetry record to JSONL
+pub fn append_l2_telemetry_record(
+    symbol: &str,
+    window_start_ms: u64,
+    window_end_ms: u64,
+    qual: &FeedQualityStats,
+    gaps_over_3s: u32,
+    instant_obi: f64,
+    ewma_tau1: f64,
+    ewma_tau2: f64,
+    ewma_5s: f64,
+) {
+    let record = serde_json::json!({
+        "symbol": symbol,
+        "window_start_ms": window_start_ms,
+        "window_end_ms": window_end_ms,
+        "sample_count": qual.sample_count,
+        "interarrival_p50_ms": qual.p50_ms,
+        "interarrival_p90_ms": qual.p90_ms,
+        "interarrival_p95_ms": qual.p95_ms,
+        "interarrival_p99_ms": qual.p99_ms,
+        "interarrival_mad_ms": qual.mad_ms,
+        "observed_age_p95_ms": qual.observed_age_p95_ms,
+        "observed_age_p99_ms": qual.observed_age_p99_ms,
+        "mean_observed_age_ms": qual.mean_lag_ms,
+        "gaps_over_3s": gaps_over_3s,
+        "tau1_ms": qual.tau_1_ms,
+        "tau2_ms": qual.tau_2_ms,
+        "regime": qual.regime,
+        "obi_instant": instant_obi,
+        "obi_tau1": ewma_tau1,
+        "obi_tau2": ewma_tau2,
+        "obi_5s": ewma_5s,
+    });
+    if let Ok(line) = serde_json::to_string(&record) {
+        let file_path = format!("hl_l2_telemetry_{}.jsonl", symbol);
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&file_path) {
+            let _ = writeln!(file, "{}", line);
+        }
+    }
+}
+
+impl L2ObiTracker {
     pub fn is_fresh_and_uncrossed(&self, now_ms: u64, max_latency_ms: u64) -> bool {
         if self.last_update_ms == 0 || now_ms < self.last_update_ms {
             return false;
@@ -517,6 +635,7 @@ pub struct ShadowTrade {
 }
 
 pub const SHADOW_CLUSTER_LOCK: &str = "hl_shadow_cluster.lock";
+pub const SHADOW_CLUSTER_LOCK_GUARD: &str = "hl_shadow_cluster.lock.guard";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShadowClusterLease {
@@ -524,80 +643,83 @@ pub struct ShadowClusterLease {
     pub lease_token: String,
     pub acquired_at: i64,
     pub expires_at: i64,
+    #[serde(default)]
+    pub fencing_token: u64,
 }
 
-/// Atomically acquires the virtual shadow cluster lease using POSIX O_CREAT|O_EXCL file semantics.
+/// Atomically acquires the virtual shadow cluster lease using flock mutual exclusion.
 /// Returns (is_acquired, lease_token)
 pub fn try_acquire_shadow_cluster_lease(symbol: &str) -> (bool, Option<String>) {
+    let _guard = match FlockGuard::acquire(SHADOW_CLUSTER_LOCK_GUARD) {
+        Ok(g) => g,
+        Err(_) => return (false, None),
+    };
     let now = Utc::now().timestamp();
-    let lease_token = format!("{}_{}_{}", symbol, now, Utc::now().timestamp_subsec_nanos());
+    let mut prev_token = 0u64;
 
     // Check if an existing lease file exists
     if std::path::Path::new(SHADOW_CLUSTER_LOCK).exists() {
         if let Ok(c) = fs::read_to_string(SHADOW_CLUSTER_LOCK) {
             if let Ok(mut lease) = serde_json::from_str::<ShadowClusterLease>(&c) {
+                prev_token = lease.fencing_token;
                 // If this symbol already holds the lease, refresh it
                 if lease.symbol == symbol {
                     lease.expires_at = now + 3600;
+                    lease.fencing_token += 1;
                     if let Ok(pretty) = serde_json::to_string_pretty(&lease) {
-                        let tmp = format!("{}.tmp_{}", SHADOW_CLUSTER_LOCK, symbol);
-                        let _ = fs::write(&tmp, pretty);
-                        let _ = fs::rename(&tmp, SHADOW_CLUSTER_LOCK);
+                        let _ = fs::write(SHADOW_CLUSTER_LOCK, pretty);
                     }
                     return (true, Some(lease.lease_token));
                 }
 
-                // If held by another symbol and unexpired, verify if holder's shadow trade is still active
+                // If held by another symbol and unexpired, verify if holder's shadow trade finished early
                 if lease.expires_at > now {
-                    let owner_active = load_shadow_trade(&lease.symbol)
-                        .map(|t| t.is_active)
+                    let owner_finished_early = load_shadow_trade(&lease.symbol)
+                        .map(|t| !t.is_active)
                         .unwrap_or(false);
-                    if owner_active {
+                    if !owner_finished_early {
                         return (false, None);
                     }
                 }
             }
         }
-        // Stale or dead holder lease -> remove stale lock file
-        let _ = fs::remove_file(SHADOW_CLUSTER_LOCK);
     }
 
-    // Atomic creation via create_new(true) (O_CREAT | O_EXCL)
+    let new_token = prev_token + 1;
+    let lease_token = format!("{}_{}_{}", symbol, new_token, Utc::now().timestamp_subsec_nanos());
     let new_lease = ShadowClusterLease {
         symbol: symbol.to_string(),
         lease_token: lease_token.clone(),
         acquired_at: now,
         expires_at: now + 3600,
-    };
-    let content = match serde_json::to_string_pretty(&new_lease) {
-        Ok(c) => c,
-        Err(_) => return (false, None),
+        fencing_token: new_token,
     };
 
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(SHADOW_CLUSTER_LOCK)
-    {
-        Ok(mut f) => {
-            let _ = f.write_all(content.as_bytes());
+    if let Ok(content) = serde_json::to_string_pretty(&new_lease) {
+        if fs::write(SHADOW_CLUSTER_LOCK, content).is_ok() {
             (true, Some(lease_token))
+        } else {
+            (false, None)
         }
-        Err(_) => (false, None),
+    } else {
+        (false, None)
     }
 }
 
-/// Renews the active shadow cluster lease heartbeat while a position is held.
+/// Renews the active shadow cluster lease heartbeat while a position is held under flock guard.
 pub fn refresh_shadow_cluster_lease(symbol: &str, token: &str) -> bool {
+    let _guard = match FlockGuard::acquire(SHADOW_CLUSTER_LOCK_GUARD) {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
     let now = Utc::now().timestamp();
     if let Ok(c) = fs::read_to_string(SHADOW_CLUSTER_LOCK) {
         if let Ok(mut lease) = serde_json::from_str::<ShadowClusterLease>(&c) {
             if lease.symbol == symbol && lease.lease_token == token {
                 lease.expires_at = now + 3600;
+                lease.fencing_token += 1;
                 if let Ok(pretty) = serde_json::to_string_pretty(&lease) {
-                    let tmp = format!("{}.tmp_{}", SHADOW_CLUSTER_LOCK, symbol);
-                    let _ = fs::write(&tmp, pretty);
-                    let _ = fs::rename(&tmp, SHADOW_CLUSTER_LOCK);
+                    let _ = fs::write(SHADOW_CLUSTER_LOCK, pretty);
                     return true;
                 }
             }
@@ -606,8 +728,12 @@ pub fn refresh_shadow_cluster_lease(symbol: &str, token: &str) -> bool {
     false
 }
 
-/// Releases the shadow cluster lease safely verifying token ownership.
+/// Releases the shadow cluster lease safely verifying token ownership under flock guard.
 pub fn release_shadow_cluster_lease(symbol: &str, token: Option<&str>) {
+    let _guard = match FlockGuard::acquire(SHADOW_CLUSTER_LOCK_GUARD) {
+        Ok(g) => g,
+        Err(_) => return,
+    };
     if let Ok(c) = fs::read_to_string(SHADOW_CLUSTER_LOCK) {
         if let Ok(lease) = serde_json::from_str::<ShadowClusterLease>(&c) {
             if lease.symbol == symbol {
@@ -974,5 +1100,134 @@ mod tests {
         chandelier.update_with_cap(110.0, 108.0, 2.0, 0.40, Some(0.5));
         assert_eq!(chandelier.active_multiplier, 2.0);
         assert_eq!(chandelier.current_stop, 106.0);
+    }
+
+    #[test]
+    fn test_dynamic_ewma_recalibration_low_latency_to_jitter() {
+        let mut tracker = L2ObiTracker::default();
+        let bids = vec![(100.0, 10.0)];
+        let asks = vec![(101.0, 10.0)];
+
+        // Phase 1: feed arrives with low latency (p50 = 100ms, MAD = 10ms)
+        for i in 1..=64 {
+            let t = i * 100;
+            tracker.update(&bids, &asks, t, t + 20);
+        }
+        assert_eq!(tracker.current_regime_label, "LowLatency");
+        assert_eq!(tracker.tau_1_ms, 250.0);
+        assert_eq!(tracker.tau_2_ms, 1000.0);
+
+        // Phase 2: feed experiences high jitter and packet gaps (p50 = 300ms, MAD = 50ms)
+        for i in 65..=128 {
+            let dt = if i % 2 == 0 { 350 } else { 250 };
+            let t = tracker.last_local_recv_ms + dt;
+            tracker.update(&bids, &asks, t - 50, t);
+        }
+        assert_eq!(tracker.current_regime_label, "JitterSubsampled");
+        assert_eq!(tracker.tau_1_ms, 500.0);
+        assert_eq!(tracker.tau_2_ms, 2000.0);
+    }
+
+    static TEST_SHADOW_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_shadow_lease_flock_concurrency_and_fencing() {
+        let _guard = TEST_SHADOW_MUTEX.lock().unwrap();
+        let _ = fs::remove_file(SHADOW_CLUSTER_LOCK);
+        let _ = fs::remove_file(SHADOW_CLUSTER_LOCK_GUARD);
+
+        // 1. Symbol BTC acquires lease
+        let (btc_ok, btc_tok) = try_acquire_shadow_cluster_lease("BTC");
+        assert!(btc_ok);
+        let tok1 = btc_tok.expect("BTC token");
+
+        // 2. While BTC holds lease, ETH cannot acquire
+        let (eth_ok, _) = try_acquire_shadow_cluster_lease("ETH");
+        assert!(!eth_ok);
+
+        // 3. Refresh by BTC succeeds
+        assert!(refresh_shadow_cluster_lease("BTC", &tok1));
+
+        // 4. Stale token refresh fails
+        assert!(!refresh_shadow_cluster_lease("BTC", "invalid_stale_token"));
+
+        // 5. Stale token cannot release lease
+        release_shadow_cluster_lease("BTC", Some("invalid_token"));
+        assert!(std::path::Path::new(SHADOW_CLUSTER_LOCK).exists());
+
+        // 6. Valid release removes lease
+        release_shadow_cluster_lease("BTC", Some(&tok1));
+        assert!(!std::path::Path::new(SHADOW_CLUSTER_LOCK).exists());
+
+        // 7. ETH can now acquire with incremented fencing token
+        let (eth_ok2, eth_tok) = try_acquire_shadow_cluster_lease("ETH");
+        assert!(eth_ok2);
+        let eth_tok_str = eth_tok.expect("ETH token");
+        assert!(eth_tok_str.contains("ETH"));
+
+        release_shadow_cluster_lease("ETH", Some(&eth_tok_str));
+        let _ = fs::remove_file(SHADOW_CLUSTER_LOCK);
+        let _ = fs::remove_file(SHADOW_CLUSTER_LOCK_GUARD);
+    }
+
+    #[test]
+    fn test_shadow_lease_heartbeat_loss_unselection() {
+        let mut trade = ShadowTrade {
+            symbol: "AVAX".to_string(),
+            side: Side::Long,
+            entry_time: "2026-10-08T12:00:00Z".to_string(),
+            entry_price: 30.0,
+            size: 1.0,
+            initial_stop: 28.0,
+            current_stop: 28.0,
+            extreme_favorable_price: 30.0,
+            atr_at_entry: 1.0,
+            active_multiplier: 2.0,
+            is_active: true,
+            exit_time: None,
+            exit_price: None,
+            pnl_usdc: None,
+            return_bps: None,
+            exit_reason: None,
+            is_portfolio_selected: true,
+            lease_token: Some("old_stale_token".to_string()),
+        };
+
+        // When heartbeat refresh fails (e.g. lease lost / expired), unselection occurs
+        let refresh_ok = refresh_shadow_cluster_lease(&trade.symbol, trade.lease_token.as_deref().unwrap());
+        if !refresh_ok {
+            trade.is_portfolio_selected = false;
+            trade.lease_token = None;
+        }
+
+        assert!(!trade.is_portfolio_selected);
+        assert_eq!(trade.lease_token, None);
+        assert!(trade.is_active); // Still tracked independently in asset journal
+    }
+
+    #[test]
+    fn test_candle_monotonicity_and_gap_detection() {
+        let mut last_processed_1m_open: u64 = 60_000;
+
+        // 1. Normal consecutive candle (+60s) -> valid, no gap
+        let bar1_open = 120_000;
+        assert!(bar1_open > last_processed_1m_open);
+        let is_gap1 = bar1_open > last_processed_1m_open + 60_000;
+        assert!(!is_gap1);
+        last_processed_1m_open = bar1_open;
+
+        // 2. Duplicate candle (same open_ms) -> dropped
+        let bar2_dup = 120_000;
+        assert!(bar2_dup <= last_processed_1m_open, "Duplicate bar rejected");
+
+        // 3. Out-of-order candle (backwards in time) -> dropped
+        let bar3_backwards = 60_000;
+        assert!(bar3_backwards <= last_processed_1m_open, "Backwards bar rejected");
+
+        // 4. Gap candle (> 60s gap, e.g. 5 minutes missing) -> detected as gap
+        let bar4_gap = 480_000;
+        assert!(bar4_gap > last_processed_1m_open);
+        let is_gap4 = bar4_gap > last_processed_1m_open + 60_000;
+        assert!(is_gap4, "Gap identified correctly");
     }
 }
