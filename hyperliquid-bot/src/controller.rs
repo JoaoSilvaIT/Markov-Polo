@@ -158,10 +158,14 @@ impl RegimeController {
             self.current_mode = ControllerMode::Neutral;
             self.trend_streak = 0;
             self.consolidation_streak = 0;
-            self.last_reason = format!(
-                "Shock Re-Entry Cooldown Active ({} bars remaining) -> Forced Neutral",
-                self.shock_cooldown_bars
-            );
+            if self.shock_cooldown_bars > 0 {
+                self.last_reason = format!(
+                    "Shock Re-Entry Cooldown Active ({} bars remaining) -> Forced Neutral",
+                    self.shock_cooldown_bars
+                );
+            } else {
+                self.last_reason = "Shock Re-Entry Cooldown Completed -> Holding Neutral Awaiting Valid Regime Setup".to_string();
+            }
             return self.current_mode;
         }
 
@@ -218,6 +222,11 @@ impl RegimeController {
                         self.consolidation_streak
                     );
                     self.epoch += 1;
+                } else {
+                    self.last_reason = format!(
+                        "Awaiting regime confirmation (Trend streak: {}/3, Consolidation streak: {}/3)",
+                        self.trend_streak, self.consolidation_streak
+                    );
                 }
             }
 
