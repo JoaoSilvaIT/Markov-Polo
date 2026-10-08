@@ -44,6 +44,22 @@ services:
     volumes:
       - ./hl_bot_data:/app
 
+  hl_bot_avax:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hl_bot_avax
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - HL_TRADING_SYMBOL=AVAX
+      - HL_LEVERAGE=${HL_LEVERAGE:-3}
+      - HL_IS_CROSS=${HL_IS_CROSS:-true}
+      - HL_TREND_ENGINE_MODE=shadow
+    volumes:
+      - ./hl_bot_data:/app
+
   hl_dashboard:
     image: python:3.11-alpine
     container_name: hl_dashboard

@@ -175,57 +175,73 @@ impl RegimeController {
             return self.current_mode;
         }
 
-        // Lingering extreme shock gate: do not accumulate streaks if extreme shock energy lingers (|Z| >= 2.5)
-        let extreme_shock_lingers = z_15.abs() >= 2.5 || z_60.abs() >= 2.5;
-        if extreme_shock_lingers {
+        // 2b. LINGERING SHOCK GATES (Engine-Separated Recovery)
+        // Extreme short-term shock (|Z15| >= 2.5) blocks all regime accumulation.
+        let extreme_short_term_shock = z_15.abs() >= 2.5;
+        let extreme_macro_shock = z_60.abs() >= 2.5;
+
+        if extreme_short_term_shock {
             self.current_mode = ControllerMode::Neutral;
-            self.trend_streak = 0;
-            self.consolidation_streak = 0;
-            self.breakout_seen_in_streak = false;
+            self.trend_streak = self.trend_streak.saturating_sub(1);
+            self.consolidation_streak = self.consolidation_streak.saturating_sub(1);
+            if self.trend_streak == 0 {
+                self.breakout_seen_in_streak = false;
+            }
             self.last_reason = format!(
-                "Extreme Shock Energy Lingers (|Z15|={:.2}>=2.5 or |Z60|={:.2}>=2.5) -> Hold Neutral",
-                z_15, z_60
+                "Extreme Short-Term Volatility Shock (|Z15|={:.2}>=2.5) -> Hold Neutral",
+                z_15
             );
             return self.current_mode;
         }
 
-        // 3. UPDATE STREAK COUNTERS (Score-Margin Hysteresis)
-        if p_trend >= 0.85 {
+        // 3. UPDATE STREAK COUNTERS (Asymmetric Dwell + Leaky Accumulator)
+        let has_breakout = has_donchian_breakout || self.breakout_seen_in_streak;
+
+        if p_trend >= 0.82 && !extreme_short_term_shock {
             self.trend_streak += 1;
-            self.consolidation_streak = 0;
+            self.consolidation_streak = 0; // Opposite regime actively contradicts
             if has_donchian_breakout {
                 self.breakout_seen_in_streak = true;
             }
-        } else if p_consolidation >= 0.75 && z_15.abs() < 1.5 && z_60.abs() < 2.0 {
-            // Engine A requires normalized, low volatility (|Z15| < 1.5 and |Z60| < 2.0)
+        } else if p_consolidation >= 0.72 && z_15.abs() < 1.5 && !extreme_macro_shock {
+            // Engine A requires normalized, low volatility (|Z15| < 1.5 and |Z60| < 2.5)
             self.consolidation_streak += 1;
-            self.trend_streak = 0;
+            self.trend_streak = 0; // Opposite regime actively contradicts
             self.breakout_seen_in_streak = false;
         } else {
-            // Deadband region: uncertainty buffer
-            self.trend_streak = 0;
-            self.consolidation_streak = 0;
-            self.breakout_seen_in_streak = false;
+            // Deadband / hesitation region: Leaky Integrator decay (perdoar quedas marginais)
+            self.trend_streak = self.trend_streak.saturating_sub(1);
+            self.consolidation_streak = self.consolidation_streak.saturating_sub(1);
+            if self.trend_streak == 0 {
+                self.breakout_seen_in_streak = false;
+            }
         }
 
-        // 4. STATE MACHINE TRANSITIONS
+        // 4. STATE MACHINE TRANSITIONS (Asymmetric Multi-Tier Dwell)
         match self.current_mode {
             ControllerMode::Neutral => {
-                // Neutral -> Trend requires 3-bar confirmation (45m dwell) AND Donchian breakout (or sustained trend dwell >= 4 bars)
-                let valid_trend_trigger = self.trend_streak >= 3
-                    && (has_donchian_breakout || self.breakout_seen_in_streak || self.trend_streak >= 4);
+                // Asymmetric Trend Trigger (Researcher 1 & 2):
+                // - Strong trend (P_T >= 0.90) + Donchian breakout -> 1 bar dwell!
+                // - Moderate trend (P_T >= 0.82) + Donchian breakout -> 2 bars dwell!
+                // - Macro sustained trend dwell -> 3 bars!
+                let valid_trend_trigger = (p_trend >= 0.90 && self.trend_streak >= 1 && has_breakout)
+                    || (self.trend_streak >= 2 && has_breakout)
+                    || (self.trend_streak >= 3);
 
                 if valid_trend_trigger {
                     self.current_mode = ControllerMode::Trend;
                     self.last_transition_time = Utc::now().to_rfc3339();
                     self.last_reason = format!(
-                        "Trend confirmed: P_T >= 0.85 for {} bars + Donchian breakout",
+                        "Trend confirmed: P_T={:.1}% (streak {} bars) + Donchian breakout",
+                        p_trend * 100.0,
                         self.trend_streak
                     );
                     self.epoch += 1;
                 }
-                // Neutral -> MeanReversion requires 3-bar confirmation (45m dwell) + valid O-U
-                else if self.consolidation_streak >= 3
+                // Asymmetric Consolidation Trigger (Researcher 1 & 2):
+                // - Strong consolidation (P_C >= 0.80) -> 2 bars dwell!
+                // - Moderate consolidation (P_C >= 0.72) -> 3 bars dwell!
+                else if ((p_consolidation >= 0.80 && self.consolidation_streak >= 2) || self.consolidation_streak >= 3)
                     && is_ou_stationary
                     && is_half_life_valid
                     && !is_severe_shock
@@ -233,14 +249,17 @@ impl RegimeController {
                     self.current_mode = ControllerMode::MeanReversion;
                     self.last_transition_time = Utc::now().to_rfc3339();
                     self.last_reason = format!(
-                        "Consolidation confirmed: P_C >= 0.75 for {} bars + O-U valid",
+                        "Consolidation confirmed: P_C={:.1}% (streak {} bars) + O-U valid",
+                        p_consolidation * 100.0,
                         self.consolidation_streak
                     );
                     self.epoch += 1;
                 } else {
+                    let required_t_dwell = if p_trend >= 0.90 && has_breakout { 1 } else { 2 };
+                    let required_c_dwell = if p_consolidation >= 0.80 { 2 } else { 3 };
                     self.last_reason = format!(
-                        "Awaiting regime confirmation (Trend streak: {}/3, Consolidation streak: {}/3)",
-                        self.trend_streak, self.consolidation_streak
+                        "Awaiting regime confirmation (Trend streak: {}/{}, Consolidation streak: {}/{})",
+                        self.trend_streak, required_t_dwell, self.consolidation_streak, required_c_dwell
                     );
                 }
             }
@@ -291,6 +310,52 @@ impl RegimeController {
             self.epoch += 1;
         }
     }
+
+    /// Returns gate funnel inspection status for diagnostic telemetry
+    pub fn inspect_gates(
+        &self,
+        p_consolidation: f64,
+        p_trend: f64,
+        z_15: f64,
+        z_60: f64,
+        has_donchian_breakout: bool,
+        is_ou_stationary: bool,
+        is_half_life_valid: bool,
+    ) -> (String, String) {
+        let has_breakout = has_donchian_breakout || self.breakout_seen_in_streak;
+        let required_t_dwell = if p_trend >= 0.90 && has_breakout { 1 } else { 2 };
+        let required_c_dwell = if p_consolidation >= 0.80 { 2 } else { 3 };
+
+        let engine_a_status = if self.shock_cooldown_bars > 0 {
+            format!("BLOCKED(Cooldown {}b)", self.shock_cooldown_bars)
+        } else if z_15.abs() >= 1.5 || z_60.abs() >= 2.5 {
+            format!("BLOCKED(Vol Z15={:.2}, Z60={:.2})", z_15, z_60)
+        } else if p_consolidation < 0.72 {
+            format!("BLOCKED(P_C={:.1}% < 72%)", p_consolidation * 100.0)
+        } else if !is_ou_stationary || !is_half_life_valid {
+            "BLOCKED(O-U non-stationary)".to_string()
+        } else if self.consolidation_streak < required_c_dwell {
+            format!("DWELL({}/{})", self.consolidation_streak, required_c_dwell)
+        } else {
+            "ELIGIBLE".to_string()
+        };
+
+        let engine_b_status = if self.shock_cooldown_bars > 0 {
+            format!("BLOCKED(Cooldown {}b)", self.shock_cooldown_bars)
+        } else if z_15.abs() >= 2.5 {
+            format!("BLOCKED(Z15={:.2}>=2.5)", z_15)
+        } else if p_trend < 0.82 {
+            format!("BLOCKED(P_T={:.1}% < 82%)", p_trend * 100.0)
+        } else if !has_breakout {
+            "BLOCKED(NoBreakout)".to_string()
+        } else if self.trend_streak < required_t_dwell {
+            format!("DWELL({}/{})", self.trend_streak, required_t_dwell)
+        } else {
+            "ELIGIBLE".to_string()
+        };
+
+        (engine_a_status, engine_b_status)
+    }
 }
 
 pub fn controller_state_path(symbol: &str) -> String {
@@ -330,77 +395,99 @@ mod tests {
     }
 
     #[test]
-    fn test_dwell_time_3_bar_requirement_for_trend() {
+    fn test_asymmetric_dwell_strong_trend_triggers_on_bar_1() {
         let mut controller = RegimeController::default();
 
-        // Bar 1: P_T = 0.88 with breakout
-        let mode1 = controller.evaluate_15m_bar(0.10, 0.88, 1.0, 0.5, true, false, false);
-        assert_eq!(mode1, ControllerMode::Neutral); // Bar 1: Not yet, dwell time required!
+        // Strong trend (P_T >= 0.90) with Donchian breakout triggers in 1 bar
+        let mode = controller.evaluate_15m_bar(0.05, 0.92, 1.0, 0.5, true, false, false);
+        assert_eq!(mode, ControllerMode::Trend);
         assert_eq!(controller.trend_streak, 1);
-
-        // Bar 2: P_T = 0.90 with breakout
-        let mode2 = controller.evaluate_15m_bar(0.08, 0.90, 1.5, 0.8, true, false, false);
-        assert_eq!(mode2, ControllerMode::Neutral); // Bar 2: Still holding neutral buffer
-        assert_eq!(controller.trend_streak, 2);
-
-        // Bar 3: P_T = 0.86 with breakout
-        let mode3 = controller.evaluate_15m_bar(0.12, 0.86, 1.8, 1.0, true, false, false);
-        assert_eq!(mode3, ControllerMode::Trend); // Bar 3: Confirmed! Transition to Trend
-        assert_eq!(controller.trend_streak, 3);
+        assert!(controller.last_reason.contains("Trend confirmed"));
     }
 
     #[test]
-    fn test_breakout_seen_in_streak_triggers_trend_on_bar_3() {
+    fn test_asymmetric_dwell_moderate_trend_requires_2_bars() {
         let mut controller = RegimeController::default();
 
-        // Bar 1: P_T = 0.88 WITH initial breakout
-        let mode1 = controller.evaluate_15m_bar(0.10, 0.88, 1.0, 0.5, true, false, false);
+        // Bar 1: Moderate trend (P_T = 0.85) with breakout -> 1/2 dwell required
+        let mode1 = controller.evaluate_15m_bar(0.10, 0.85, 1.0, 0.5, true, false, false);
+        assert_eq!(mode1, ControllerMode::Neutral);
+        assert_eq!(controller.trend_streak, 1);
+
+        // Bar 2: Moderate trend continuation (P_T = 0.86) -> Confirmed on bar 2!
+        let mode2 = controller.evaluate_15m_bar(0.10, 0.86, 1.2, 0.6, true, false, false);
+        assert_eq!(mode2, ControllerMode::Trend);
+        assert_eq!(controller.trend_streak, 2);
+    }
+
+    #[test]
+    fn test_breakout_seen_in_streak_triggers_trend_on_bar_2() {
+        let mut controller = RegimeController::default();
+
+        // Bar 1: P_T = 0.85 WITH initial breakout
+        let mode1 = controller.evaluate_15m_bar(0.10, 0.85, 1.0, 0.5, true, false, false);
         assert_eq!(mode1, ControllerMode::Neutral);
         assert_eq!(controller.trend_streak, 1);
         assert!(controller.breakout_seen_in_streak);
 
-        // Bar 2: P_T = 0.90 WITHOUT breakout (continuation/consolidation above range)
-        let mode2 = controller.evaluate_15m_bar(0.08, 0.90, 1.5, 0.8, false, false, false);
-        assert_eq!(mode2, ControllerMode::Neutral);
+        // Bar 2: P_T = 0.85 WITHOUT new breakout (continuation) -> Triggers on bar 2!
+        let mode2 = controller.evaluate_15m_bar(0.10, 0.85, 1.2, 0.6, false, false, false);
+        assert_eq!(mode2, ControllerMode::Trend);
         assert_eq!(controller.trend_streak, 2);
-        assert!(controller.breakout_seen_in_streak);
-
-        // Bar 3: P_T = 0.86 WITHOUT new breakout
-        let mode3 = controller.evaluate_15m_bar(0.12, 0.86, 1.8, 1.0, false, false, false);
-        assert_eq!(mode3, ControllerMode::Trend); // Successfully transitions because breakout was seen in this streak!
-        assert_eq!(controller.trend_streak, 3);
     }
 
     #[test]
-    fn test_hysteresis_deadband_prevents_whipsaw() {
+    fn test_hysteresis_deadband_leaky_decay() {
         let mut controller = RegimeController::default();
 
-        // 2 bars of trend
-        controller.evaluate_15m_bar(0.10, 0.88, 1.0, 0.5, true, false, false);
-        controller.evaluate_15m_bar(0.10, 0.88, 1.0, 0.5, true, false, false);
+        // 2 bars of moderate trend (without breakout, so staying in Neutral)
+        controller.evaluate_15m_bar(0.10, 0.85, 1.0, 0.5, false, false, false);
+        controller.evaluate_15m_bar(0.10, 0.85, 1.0, 0.5, false, false, false);
         assert_eq!(controller.trend_streak, 2);
 
-        // Bar 3 enters deadband (P_T = 0.70, P_C = 0.20)
-        let mode = controller.evaluate_15m_bar(0.20, 0.70, 0.5, 0.2, true, false, false);
+        // Bar 3 enters deadband (P_T = 0.70, P_C = 0.20): leaky decay decrements to 1 (NOT zero!)
+        let mode = controller.evaluate_15m_bar(0.20, 0.70, 0.5, 0.2, false, false, false);
         assert_eq!(mode, ControllerMode::Neutral);
-        assert_eq!(controller.trend_streak, 0); // Streak reset by deadband!
+        assert_eq!(controller.trend_streak, 1); // Leaky decay saved 1 streak!
+
+        // Bar 4 enters deadband again: decays to 0
+        controller.evaluate_15m_bar(0.20, 0.70, 0.5, 0.2, false, false, false);
+        assert_eq!(controller.trend_streak, 0);
     }
 
     #[test]
-    fn test_dwell_time_3_bar_requirement_for_mean_reversion() {
+    fn test_asymmetric_dwell_strong_consolidation_requires_2_bars() {
         let mut controller = RegimeController::default();
 
-        // Bar 1: P_C = 0.80
-        controller.evaluate_15m_bar(0.80, 0.15, 0.2, 0.1, false, true, true);
-        assert_eq!(controller.current_mode, ControllerMode::Neutral);
+        // Bar 1: Strong consolidation P_C = 0.82
+        let mode1 = controller.evaluate_15m_bar(0.82, 0.12, 0.2, 0.1, false, true, true);
+        assert_eq!(mode1, ControllerMode::Neutral);
+        assert_eq!(controller.consolidation_streak, 1);
 
-        // Bar 2: P_C = 0.82
-        controller.evaluate_15m_bar(0.82, 0.12, 0.1, 0.0, false, true, true);
-        assert_eq!(controller.current_mode, ControllerMode::Neutral);
+        // Bar 2: Strong consolidation P_C = 0.84 -> Confirms on bar 2!
+        let mode2 = controller.evaluate_15m_bar(0.84, 0.10, 0.1, 0.0, false, true, true);
+        assert_eq!(mode2, ControllerMode::MeanReversion);
+        assert_eq!(controller.consolidation_streak, 2);
+    }
 
-        // Bar 3: P_C = 0.78
-        controller.evaluate_15m_bar(0.78, 0.16, 0.0, 0.1, false, true, true);
+    #[test]
+    fn test_asymmetric_dwell_moderate_consolidation_requires_3_bars() {
+        let mut controller = RegimeController::default();
+
+        // Bar 1: Moderate consolidation P_C = 0.75
+        controller.evaluate_15m_bar(0.75, 0.15, 0.2, 0.1, false, true, true);
+        assert_eq!(controller.current_mode, ControllerMode::Neutral);
+        assert_eq!(controller.consolidation_streak, 1);
+
+        // Bar 2: Moderate consolidation P_C = 0.76
+        controller.evaluate_15m_bar(0.76, 0.15, 0.1, 0.1, false, true, true);
+        assert_eq!(controller.current_mode, ControllerMode::Neutral);
+        assert_eq!(controller.consolidation_streak, 2);
+
+        // Bar 3: Moderate consolidation P_C = 0.75 -> Confirms on bar 3!
+        controller.evaluate_15m_bar(0.75, 0.15, 0.0, 0.1, false, true, true);
         assert_eq!(controller.current_mode, ControllerMode::MeanReversion);
+        assert_eq!(controller.consolidation_streak, 3);
     }
 
     #[test]
@@ -459,9 +546,9 @@ mod tests {
         assert_eq!(mode2, ControllerMode::Neutral);
         assert_eq!(controller.shock_cooldown_bars, 0);
 
-        // Now cooldown is finished. Next bars can accumulate streak toward trend.
+        // Now cooldown is finished. Strong trend (P_T = 0.95) with breakout confirms in 1 bar!
         let mode3 = controller.evaluate_15m_bar(0.05, 0.95, 1.0, 0.5, true, false, false);
-        assert_eq!(mode3, ControllerMode::Neutral);
+        assert_eq!(mode3, ControllerMode::Trend);
         assert_eq!(controller.trend_streak, 1);
     }
 

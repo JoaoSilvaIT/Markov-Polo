@@ -941,6 +941,16 @@ async fn main() {
                             false
                         };
 
+                        let (gate_a, gate_b) = controller.inspect_gates(
+                            p_c,
+                            p_t,
+                            z_15,
+                            z_60,
+                            has_donchian_breakout,
+                            is_stationary,
+                            is_valid_half_life,
+                        );
+
                         let prev_mode = controller.current_mode;
                         if let Some(new_mode) = controller.evaluate_15m_bar_idempotent(
                             bar_close_ms,
@@ -957,6 +967,13 @@ async fn main() {
                             println!(
                                 "🧭 [3-MODE CONTROLLER 15m EVAL] Mode: {} (was {}) | Streaks: Trend={}, Consolidation={} | P_C: {:.1}% | P_T: {:.1}% | P_Shock: {:.1}% | Reason: {}",
                                 new_mode, prev_mode, controller.trend_streak, controller.consolidation_streak, p_c * 100.0, p_t * 100.0, p_s * 100.0, controller.last_reason
+                            );
+                            println!(
+                                "🔍 [GATE FUNNEL] {} | Vol: (Z15:{:.2}, Z60:{:.2}) | Cooldown: {}b | Donchian: {} | Engine A Gate: {} | Engine B Gate: {}",
+                                symbol_clone, z_15, z_60, controller.shock_cooldown_bars,
+                                if has_donchian_breakout { "BREAKOUT" } else { "RANGE" },
+                                gate_a,
+                                gate_b
                             );
                         }
                     }
