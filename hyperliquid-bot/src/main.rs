@@ -27,10 +27,7 @@ use crate::hyperliquid::{
     cancel_order, fetch_book_ticker, fetch_sz_decimals_map, get_user_position, place_post_only_order, quantize_price,
 };
 use crate::order::{emergency_flatten, place_ou_maker_entry};
-use crate::ou_process::{
-    calculate_mad_sigma, calculate_net_edge_bps, calculate_optimal_thresholds,
-    estimate_ou_parameters,
-};
+use crate::ou_process::{calculate_features, calculate_net_edge_bps};
 use crate::state::{
     has_active_cluster_position, load_armed_signal, load_circuit_breaker, load_state,
     release_cluster_lease, save_armed_signal, save_circuit_breaker, save_state, Side, StateMap,
@@ -628,6 +625,7 @@ async fn main() {
     let mut current_p_c = 0.60;
     let mut current_p_t = 0.25;
     let mut current_p_s = 0.15;
+    let mut last_shock_bar_ms: u64 = 0;
 
     let obi_tracker = Arc::new(RwLock::new(L2ObiTracker::default()));
     let obi_tracker_bg = obi_tracker.clone();
@@ -664,6 +662,7 @@ async fn main() {
 
             while let Some(msg) = l2_receiver.recv().await {
                 if let Message::L2Book(l2_msg) = msg {
+                    let local_recv_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
                     let l2_data = l2_msg.data;
                     let bids: Vec<(f64, f64)> = l2_data.levels.first().cloned().unwrap_or_default()
                         .into_iter()
@@ -673,7 +672,7 @@ async fn main() {
                         .into_iter()
                         .filter_map(|l| Some((l.px.parse::<f64>().ok()?, l.sz.parse::<f64>().ok()?)))
                         .collect();
-                    obi_tracker_bg.write().await.update(&bids, &asks, l2_data.time);
+                    obi_tracker_bg.write().await.update(&bids, &asks, l2_data.time, local_recv_ms);
                 }
             }
             eprintln!("⚠️ [L2 WEBSOCKET] Disconnected. Reconnecting in 3s...");
@@ -797,7 +796,6 @@ async fn main() {
                     });
                 }
 
-                let closes_clone = rolling_closes.clone();
                 let exchange_clone = exchange.clone();
                 let info_clone = info_client.clone();
                 let state_clone = active_state.clone();
@@ -809,94 +807,43 @@ async fn main() {
                 let arm_path_clone = arm_file_path.clone();
                 let sz_decimals = trading_sz_decimals;
 
-                // In-Sample Signal Leakage Prevention: evaluate on historical closes through t-1
+                // Causal Feature Isolation: evaluate live 1m features and 15m cutoff decision features separately
                 let current_close = close_price;
-                let calc_res = if closes_clone.len() >= 100 {
+                let closes_clone = rolling_closes.clone();
+                let finalized_15m_clone = finalized_15m_bar.clone();
+
+                let (live_features, decision_features) = if closes_clone.len() >= 100 {
                     tokio::task::spawn_blocking(move || {
-                        let hist_last_price = *closes_clone.last().unwrap_or(&0.0);
-
-                        // O-U Parameter Estimation with Phillips & Yu Jackknife bias correction
-                        let (thresholds_opt, half_life_m) =
-                            if let Some(ou_params) = estimate_ou_parameters(&closes_clone, 1.0) {
-                                let hl = ou_params.half_life_minutes();
-                                let tx_cost = hist_last_price * 0.0005; // ~5 bps roundtrip on Hyperliquid Maker
-                                let th = calculate_optimal_thresholds(&ou_params, tx_cost);
-                                (Some(th), hl)
+                        let live_feat = calculate_features(&closes_clone, current_close);
+                        let decision_feat = if let Some(ref closed_15m) = finalized_15m_clone {
+                            if closes_clone.len() > 1 {
+                                calculate_features(&closes_clone[..closes_clone.len() - 1], closed_15m.close)
                             } else {
-                                (None, 999.0)
-                            };
-
-                        // OLS Slope drift calculation
-                        let n_drift = closes_clone.len() as f64;
-                        let mut sum_i = 0.0;
-                        let mut sum_p = 0.0;
-                        let mut sum_ip = 0.0;
-                        let mut sum_ii = 0.0;
-                        for (i, &p) in closes_clone.iter().enumerate() {
-                            let idx = i as f64;
-                            sum_i += idx;
-                            sum_p += p;
-                            sum_ip += idx * p;
-                            sum_ii += idx * idx;
-                        }
-                        let slope = (n_drift * sum_ip - sum_i * sum_p)
-                            / (n_drift * sum_ii - sum_i * sum_i);
-                        let total_drift_pct = (slope * n_drift) / hist_last_price;
-                        let is_drifting = total_drift_pct.abs() > 0.015;
-
-                        // Standardized Downside/Upside Shock Calculation with robust MAD
-                        let n = closes_clone.len();
-                        let mut z_15 = 0.0;
-                        let mut z_60 = 0.0;
-                        if n >= 65 && current_close > 0.0 {
-                            let mut returns_1m = Vec::with_capacity(n - 1);
-                            for i in 1..n {
-                                returns_1m.push((closes_clone[i] / closes_clone[i - 1]).ln());
+                                calculate_features(&closes_clone, closed_15m.close)
                             }
-                            let sigma_mad = calculate_mad_sigma(&returns_1m);
-
-                            let ret_15 = (current_close / closes_clone[n - 15]).ln();
-                            z_15 = ret_15 / (sigma_mad * (15.0_f64).sqrt());
-
-                            let ret_60 = (current_close / closes_clone[n - 60]).ln();
-                            z_60 = ret_60 / (sigma_mad * (60.0_f64).sqrt());
-                        }
-                        let is_downside_shock = z_15 < -3.0 || z_60 < -3.0;
-                        let is_upside_shock = z_15 > 3.0 || z_60 > 3.0;
-
-                        Some((
-                            thresholds_opt,
-                            total_drift_pct,
-                            is_drifting,
-                            half_life_m,
-                            z_15,
-                            z_60,
-                            is_downside_shock,
-                            is_upside_shock,
-                            hist_last_price,
-                        ))
+                        } else {
+                            None
+                        };
+                        (live_feat, decision_feat)
                     })
                     .await
-                    .unwrap_or(None)
+                    .unwrap_or((None, None))
                 } else {
-                    None
+                    (None, None)
                 };
 
-                if let Some((
-                    thresholds_opt,
-                    total_drift_pct,
-                    is_drifting,
-                    half_life_m,
-                    z_15,
-                    z_60,
-                    is_downside_shock,
-                    is_upside_shock,
-                    hist_last_price,
-                )) = calc_res
-                {
-                    let is_stationary = thresholds_opt.is_some();
-                    let is_consolidation = !is_drifting && is_stationary;
-                    let is_valid_half_life = half_life_m >= 15.0 && half_life_m <= 120.0;
+                if let Some(live_feat) = live_features {
+                    let hist_last_price = live_feat.hist_last_price;
+                    let is_stationary = live_feat.is_stationary;
+                    let is_consolidation = live_feat.is_consolidation;
+                    let is_valid_half_life = live_feat.is_valid_half_life;
+                    let total_drift_pct = live_feat.total_drift_pct;
+                    let half_life_m = live_feat.half_life_m;
+                    let z_15 = live_feat.z_15;
+                    let z_60 = live_feat.z_60;
+                    let is_downside_shock = live_feat.is_downside_shock;
+                    let is_upside_shock = live_feat.is_upside_shock;
+                    let thresholds_opt = live_feat.thresholds_opt.clone();
 
                     let cb_lock = cb_clone.lock().await;
                     let is_cb_paused = cb_lock.is_paused();
@@ -908,19 +855,19 @@ async fn main() {
                     // ------------------------------------------------------------------
                     // 3-MODE CONTROLLER REGIME INFERENCE (HMM Causal Filter + Hysteresis)
                     // ------------------------------------------------------------------
-                    // 3-MODE CONTROLLER REGIME INFERENCE (HMM Causal Filter + Hysteresis)
-                    // ------------------------------------------------------------------
-                    // Fast-path safety: Severe shock on ANY 1m candle immediately forces Neutral
+                    // Fast-path safety: Severe shock on ANY 1m candle unconditionally initiates/resets cooldown
+                    // Deduplicated strictly by completed_bar.time_open to prevent clock rolling within the same 1m candle
                     if z_15.abs() >= 3.0 || z_60.abs() >= 3.0 {
-                        let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-                        if controller.current_mode != ControllerMode::Neutral {
+                        if last_shock_bar_ms != completed_bar.time_open {
+                            last_shock_bar_ms = completed_bar.time_open;
+                            let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                            controller.force_shock_cooldown(z_15, z_60, now_ms);
+                            save_controller_state(&symbol_clone, &controller);
                             println!(
-                                "🚨 [CONTROLLER SHOCK VETO] Immediate downgrade to Neutral on severe shock (Z15: {:.2}, Z60: {:.2})",
-                                z_15, z_60
+                                "🚨 [CONTROLLER SHOCK VETO] Severe shock on 1m bar {} (Z15: {:.2}, Z60: {:.2}) -> Neutral cooldown initialized/reset (2 bars & 30m)",
+                                completed_bar.time_open, z_15, z_60
                             );
                         }
-                        controller.force_shock_cooldown(z_15, z_60, now_ms);
-                        save_controller_state(&symbol_clone, &controller);
                     }
 
                     let active_gen = hmm_generation.load(std::sync::atomic::Ordering::Relaxed);
@@ -960,6 +907,8 @@ async fn main() {
                             false
                         };
 
+                        // Features evaluated strictly at the cutoff of the finalized 15m candle
+                        let d_feat = decision_features.as_ref().unwrap_or(&live_feat);
                         let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
                         let prev_mode = controller.current_mode;
                         if let Some(new_mode) = controller.evaluate_15m_bar_idempotent(
@@ -967,11 +916,11 @@ async fn main() {
                             now_ms,
                             p_c,
                             p_t,
-                            z_15,
-                            z_60,
+                            d_feat.z_15,
+                            d_feat.z_60,
                             has_donchian_breakout,
-                            is_stationary,
-                            is_valid_half_life,
+                            d_feat.is_stationary,
+                            d_feat.is_valid_half_life,
                         ) {
                             save_controller_state(&symbol_clone, &controller);
 
@@ -983,16 +932,16 @@ async fn main() {
                             let (gate_a, gate_b) = controller.inspect_gates(
                                 p_c,
                                 p_t,
-                                z_15,
-                                z_60,
+                                d_feat.z_15,
+                                d_feat.z_60,
                                 has_donchian_breakout,
-                                is_stationary,
-                                is_valid_half_life,
+                                d_feat.is_stationary,
+                                d_feat.is_valid_half_life,
                                 now_ms,
                             );
                             println!(
                                 "🔍 [GATE FUNNEL] {} | Vol: (Z15:{:.2}, Z60:{:.2}) | Cooldown: {}b | Donchian: {} | Engine A Gate: {} | Engine B Gate: {}",
-                                symbol_clone, z_15, z_60, controller.shock_cooldown_bars,
+                                symbol_clone, d_feat.z_15, d_feat.z_60, controller.shock_cooldown_bars,
                                 if has_donchian_breakout { "BREAKOUT" } else { "RANGE" },
                                 gate_a,
                                 gate_b
@@ -1012,6 +961,15 @@ async fn main() {
                         "💓 [HOT-PATH] {} Price: ${:.2} | Long Buy: {} | Short Sell: {} | Mode: {} | P_C: {:.0}% | P_T: {:.0}% | P_S: {:.0}% | Drift: {:.2}% | t_half: {:.1}m | Z15: {:.2} | Z60: {:.2}",
                         symbol_clone, close_price, target_buy_str, target_short_str, controller.current_mode, current_p_c * 100.0, current_p_t * 100.0, current_p_s * 100.0, total_drift_pct * 100.0, half_life_m, z_15, z_60
                     );
+
+                    if let Some(qual) = obi_tracker.read().await.compute_feed_quality() {
+                        if qual.sample_count >= 10 && finalized_15m_bar.is_some() {
+                            println!(
+                                "📶 [L2 FEED QUALITY] {} | Status: {} | Inter-Arrival: (p50: {:.0}ms, p95: {:.0}ms, MAD: {:.0}ms) | Mean Lag: {:.0}ms ({} samples)",
+                                symbol_clone, qual.status, qual.p50_ms, qual.p95_ms, qual.mad_ms, qual.mean_lag_ms, qual.sample_count
+                            );
+                        }
+                    }
 
                     // ------------------------------------------------------------------
                     // LIVE TELEMETRY: Real-time Metrics & Proximity for Web Dashboard
@@ -1118,6 +1076,12 @@ async fn main() {
                     // ------------------------------------------------------------------
                     if let Some(mut shadow_trade) = load_shadow_trade(&symbol_clone) {
                         if shadow_trade.is_active {
+                            if shadow_trade.is_portfolio_selected {
+                                if let Some(ref tok) = shadow_trade.lease_token {
+                                    crate::trend::refresh_shadow_cluster_lease(&symbol_clone, tok);
+                                }
+                            }
+
                             let current_atr = calculate_atr(&rolling_15m_bars, 20).unwrap_or(shadow_trade.atr_at_entry);
                             let mut chandelier = ChandelierExitState {
                                 side: shadow_trade.side.clone(),
@@ -1183,6 +1147,7 @@ async fn main() {
                                 if let Some(ref donchian) = donchian_opt {
                                     let closes_15m: Vec<f64> = rolling_15m_bars.iter().map(|b| b.close).collect();
                                     let alignment = check_trend_alignment(&closes_15m);
+                                    // Engine B Execution: Trend Regime confirmed by 15m candle close. Entry confirmed by 1m close breakout + Continuous L2 OBI hurdle (never wicks).
                                     let is_long_breakout = close_price > donchian.upper && alignment == TrendAlignment::Bullish;
                                     let is_short_breakout = close_price < donchian.lower && alignment == TrendAlignment::Bearish;
 
@@ -1242,16 +1207,39 @@ async fn main() {
                     }
 
                     let mut state_lock = state_clone.lock().await;
-                        let has_position = state_lock.contains_key(&symbol_clone);
+                    let has_position = state_lock.contains_key(&symbol_clone);
 
-                        if has_position {
-                            let mut armed_state = load_armed_signal(&arm_path_clone);
-                            if armed_state.is_armed {
-                                armed_state.is_armed = false;
-                                save_armed_signal(&arm_path_clone, &armed_state);
+                    let consolidation_vol_ok = z_15.abs() < 1.5 && z_60.abs() < 2.5;
+                    let mr_invalidated = !consolidation_vol_ok || controller.current_mode != ControllerMode::MeanReversion;
+
+                    if has_position {
+                        if let Some(pos) = state_lock.get(&symbol_clone) {
+                            if !pos.is_filled && mr_invalidated {
+                                println!(
+                                    "🛑 [RESTING ENTRY CANCELLED] Engine A invalidated (vol_ok: {}, mode: {}, Z15: {:.2}, Z60: {:.2}). Cancelling resting maker order for {}.",
+                                    consolidation_vol_ok, controller.current_mode, z_15, z_60, symbol_clone
+                                );
+                                let _ = emergency_flatten(
+                                    &state_path_clone,
+                                    &exchange_clone,
+                                    &info_clone,
+                                    user_address,
+                                    &mut state_lock,
+                                    &symbol_clone,
+                                    discord_clone.clone(),
+                                )
+                                .await;
+                                continue;
                             }
+                        }
 
-                            let _ = crate::state::refresh_cluster_lease(&symbol_clone, 3600);
+                        let mut armed_state = load_armed_signal(&arm_path_clone);
+                        if armed_state.is_armed {
+                            armed_state.is_armed = false;
+                            save_armed_signal(&arm_path_clone, &armed_state);
+                        }
+
+                        let _ = crate::state::refresh_cluster_lease(&symbol_clone, 3600);
 
                             let mut entry_ttl_expired = false;
                             let mut time_stop_triggered = false;

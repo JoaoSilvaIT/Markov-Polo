@@ -181,6 +181,99 @@ pub fn calculate_net_edge_bps(entry_price: f64, exit_target: f64) -> f64 {
     }
 }
 
+/// Feature snapshot capturing O-U, drift, and standardized Z-scores at a specific time cutoff.
+#[derive(Debug, Clone)]
+pub struct FeatureSnapshot {
+    pub thresholds_opt: Option<OptimalThresholds>,
+    pub total_drift_pct: f64,
+    #[allow(dead_code)]
+    pub is_drifting: bool,
+    pub half_life_m: f64,
+    pub z_15: f64,
+    pub z_60: f64,
+    pub is_downside_shock: bool,
+    pub is_upside_shock: bool,
+    pub hist_last_price: f64,
+    pub is_stationary: bool,
+    pub is_consolidation: bool,
+    pub is_valid_half_life: bool,
+}
+
+/// Evaluates stochastic O-U, drift, and Z-score features at an exact time cutoff.
+pub fn calculate_features(closes_history: &[f64], eval_close: f64) -> Option<FeatureSnapshot> {
+    if closes_history.len() < 100 || eval_close <= 0.0 {
+        return None;
+    }
+    let hist_last_price = *closes_history.last().unwrap_or(&eval_close);
+
+    // O-U Parameter Estimation with Phillips & Yu Jackknife bias correction
+    let (thresholds_opt, half_life_m) =
+        if let Some(ou_params) = estimate_ou_parameters(closes_history, 1.0) {
+            let hl = ou_params.half_life_minutes();
+            let tx_cost = hist_last_price * 0.0005; // ~5 bps roundtrip on Hyperliquid Maker
+            let th = calculate_optimal_thresholds(&ou_params, tx_cost);
+            (Some(th), hl)
+        } else {
+            (None, 999.0)
+        };
+
+    // OLS Slope drift calculation
+    let n_drift = closes_history.len() as f64;
+    let mut sum_i = 0.0;
+    let mut sum_p = 0.0;
+    let mut sum_ip = 0.0;
+    let mut sum_ii = 0.0;
+    for (i, &p) in closes_history.iter().enumerate() {
+        let idx = i as f64;
+        sum_i += idx;
+        sum_p += p;
+        sum_ip += idx * p;
+        sum_ii += idx * idx;
+    }
+    let slope = (n_drift * sum_ip - sum_i * sum_p)
+        / (n_drift * sum_ii - sum_i * sum_i);
+    let total_drift_pct = (slope * n_drift) / hist_last_price;
+    let is_drifting = total_drift_pct.abs() > 0.015;
+
+    // Standardized Downside/Upside Shock Calculation with robust MAD
+    let n = closes_history.len();
+    let mut z_15 = 0.0;
+    let mut z_60 = 0.0;
+    if n >= 65 {
+        let mut returns_1m = Vec::with_capacity(n - 1);
+        for i in 1..n {
+            returns_1m.push((closes_history[i] / closes_history[i - 1]).ln());
+        }
+        let sigma_mad = calculate_mad_sigma(&returns_1m);
+
+        let ret_15 = (eval_close / closes_history[n - 15]).ln();
+        z_15 = ret_15 / (sigma_mad * (15.0_f64).sqrt());
+
+        let ret_60 = (eval_close / closes_history[n - 60]).ln();
+        z_60 = ret_60 / (sigma_mad * (60.0_f64).sqrt());
+    }
+    let is_downside_shock = z_15 < -3.0 || z_60 < -3.0;
+    let is_upside_shock = z_15 > 3.0 || z_60 > 3.0;
+    let is_stationary = thresholds_opt.is_some();
+    let is_consolidation = !is_drifting && is_stationary;
+    let is_valid_half_life = (15.0..=120.0).contains(&half_life_m);
+
+    Some(FeatureSnapshot {
+        thresholds_opt,
+        total_drift_pct,
+        is_drifting,
+        half_life_m,
+        z_15,
+        z_60,
+        is_downside_shock,
+        is_upside_shock,
+        hist_last_price,
+        is_stationary,
+        is_consolidation,
+        is_valid_half_life,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,5 +341,17 @@ mod tests {
         // Inverted or flat price: 0 bps
         assert_eq!(calculate_net_edge_bps(100.0, 99.0), 0.0);
         assert_eq!(calculate_net_edge_bps(100.0, 100.0), 0.0);
+    }
+
+    #[test]
+    fn test_calculate_features() {
+        let mut history = Vec::new();
+        for i in 0..120 {
+            history.push(100.0 + (i as f64 * 0.01).sin() * 2.0);
+        }
+        let feat = calculate_features(&history, 100.5).expect("Features calculated");
+        assert!(feat.half_life_m > 0.0);
+        assert!(feat.z_15.is_finite());
+        assert!(feat.z_60.is_finite());
     }
 }

@@ -148,13 +148,28 @@ pub fn calculate_obi_score(bids: &[(f64, f64)], asks: &[(f64, f64)], depth: usiz
     (sum_bid_vlm - sum_ask_vlm) / total
 }
 
-/// Real-time L2 continuous order book tracker with basis-point distance weighting and multiscale physical-time EWMA
+/// Feed quality statistics for WebSocket L2 telemetry monitoring
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedQualityStats {
+    pub p50_ms: f64,
+    pub p90_ms: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
+    pub mad_ms: f64,
+    pub mean_lag_ms: f64,
+    pub sample_count: usize,
+    pub status: String,
+}
+
+/// Real-time L2 continuous order book tracker with basis-point distance weighting, multiscale physical-time EWMA, and local latency instrumentation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct L2ObiTracker {
     pub instant_obi: f64,
     pub ewma_250ms_obi: f64,
     pub ewma_1s_obi: f64,
     pub ewma_5s_obi: f64,
+    pub last_exchange_time_ms: u64,
+    pub last_local_recv_ms: u64,
     pub last_update_ms: u64,
     pub best_bid: f64,
     pub best_ask: f64,
@@ -162,6 +177,10 @@ pub struct L2ObiTracker {
     pub updates_since_reconnect: u32,
     #[serde(default)]
     pub reconnect_time_ms: u64,
+    #[serde(default)]
+    pub inter_arrival_samples: Vec<f64>,
+    #[serde(default)]
+    pub transport_lag_samples: Vec<f64>,
 }
 
 impl Default for L2ObiTracker {
@@ -171,17 +190,21 @@ impl Default for L2ObiTracker {
             ewma_250ms_obi: 0.0,
             ewma_1s_obi: 0.0,
             ewma_5s_obi: 0.0,
+            last_exchange_time_ms: 0,
+            last_local_recv_ms: 0,
             last_update_ms: 0,
             best_bid: 0.0,
             best_ask: 0.0,
             updates_since_reconnect: 0,
             reconnect_time_ms: 0,
+            inter_arrival_samples: Vec::with_capacity(120),
+            transport_lag_samples: Vec::with_capacity(120),
         }
     }
 }
 
 impl L2ObiTracker {
-    pub fn update(&mut self, bids: &[(f64, f64)], asks: &[(f64, f64)], now_ms: u64) {
+    pub fn update(&mut self, bids: &[(f64, f64)], asks: &[(f64, f64)], exchange_time_ms: u64, local_recv_ms: u64) {
         if bids.is_empty() || asks.is_empty() {
             return;
         }
@@ -217,8 +240,27 @@ impl L2ObiTracker {
         let obi_inst = ((sum_bid_w - sum_ask_w) / denom).clamp(-1.0, 1.0);
         self.instant_obi = obi_inst;
 
-        let dt_ms = if self.last_update_ms > 0 && now_ms > self.last_update_ms {
-            (now_ms - self.last_update_ms) as f64
+        // Telemetry: record local inter-arrival and approximate transport lag
+        if self.last_local_recv_ms > 0 && local_recv_ms >= self.last_local_recv_ms {
+            let local_dt = (local_recv_ms - self.last_local_recv_ms) as f64;
+            self.inter_arrival_samples.push(local_dt);
+            if self.inter_arrival_samples.len() > 120 {
+                self.inter_arrival_samples.remove(0);
+            }
+        }
+        if local_recv_ms >= exchange_time_ms {
+            let lag = (local_recv_ms - exchange_time_ms) as f64;
+            self.transport_lag_samples.push(lag);
+            if self.transport_lag_samples.len() > 120 {
+                self.transport_lag_samples.remove(0);
+            }
+        }
+
+        // Physical-time elapsed: evaluate physical time delta
+        let dt_ms = if self.last_local_recv_ms > 0 && local_recv_ms > self.last_local_recv_ms {
+            (local_recv_ms - self.last_local_recv_ms) as f64
+        } else if self.last_exchange_time_ms > 0 && exchange_time_ms > self.last_exchange_time_ms {
+            (exchange_time_ms - self.last_exchange_time_ms) as f64
         } else {
             0.0
         };
@@ -246,10 +288,60 @@ impl L2ObiTracker {
             self.ewma_1s_obi = obi_inst;
             self.ewma_5s_obi = obi_inst;
             self.updates_since_reconnect = 1;
-            self.reconnect_time_ms = now_ms;
+            self.reconnect_time_ms = local_recv_ms;
         }
 
-        self.last_update_ms = now_ms;
+        self.last_exchange_time_ms = exchange_time_ms;
+        self.last_local_recv_ms = local_recv_ms;
+        self.last_update_ms = local_recv_ms;
+    }
+
+    pub fn compute_feed_quality(&self) -> Option<FeedQualityStats> {
+        if self.inter_arrival_samples.len() < 5 {
+            return None;
+        }
+        let mut sorted_arr = self.inter_arrival_samples.clone();
+        sorted_arr.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = sorted_arr.len();
+
+        let percentile = |pct: f64| -> f64 {
+            let idx = ((pct / 100.0) * (n as f64 - 1.0)).round() as usize;
+            sorted_arr[idx.min(n - 1)]
+        };
+
+        let p50 = percentile(50.0);
+        let p90 = percentile(90.0);
+        let p95 = percentile(95.0);
+        let p99 = percentile(99.0);
+
+        let mut abs_devs: Vec<f64> = sorted_arr.iter().map(|&x| (x - p50).abs()).collect();
+        abs_devs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mad = 1.4826 * abs_devs[abs_devs.len() / 2];
+
+        let mean_lag = if !self.transport_lag_samples.is_empty() {
+            self.transport_lag_samples.iter().sum::<f64>() / self.transport_lag_samples.len() as f64
+        } else {
+            0.0
+        };
+
+        let status = if p95 <= 1500.0 && mean_lag <= 1000.0 {
+            "GOOD".to_string()
+        } else if p95 > 2500.0 || mean_lag > 2000.0 {
+            "DEGRADED".to_string()
+        } else {
+            "ACCEPTABLE".to_string()
+        };
+
+        Some(FeedQualityStats {
+            p50_ms: p50,
+            p90_ms: p90,
+            p95_ms: p95,
+            p99_ms: p99,
+            mad_ms: mad,
+            mean_lag_ms: mean_lag,
+            sample_count: n,
+            status,
+        })
     }
 
     pub fn is_fresh_and_uncrossed(&self, now_ms: u64, max_latency_ms: u64) -> bool {
@@ -420,36 +512,110 @@ pub struct ShadowTrade {
     pub exit_reason: Option<String>,
     #[serde(default)]
     pub is_portfolio_selected: bool,
+    #[serde(default)]
+    pub lease_token: Option<String>,
 }
 
 pub const SHADOW_CLUSTER_LOCK: &str = "hl_shadow_cluster.lock";
 
-pub fn try_acquire_shadow_cluster_lease(symbol: &str) -> bool {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowClusterLease {
+    pub symbol: String,
+    pub lease_token: String,
+    pub acquired_at: i64,
+    pub expires_at: i64,
+}
+
+/// Atomically acquires the virtual shadow cluster lease using POSIX O_CREAT|O_EXCL file semantics.
+/// Returns (is_acquired, lease_token)
+pub fn try_acquire_shadow_cluster_lease(symbol: &str) -> (bool, Option<String>) {
+    let now = Utc::now().timestamp();
+    let lease_token = format!("{}_{}_{}", symbol, now, Utc::now().timestamp_subsec_nanos());
+
+    // Check if an existing lease file exists
+    if std::path::Path::new(SHADOW_CLUSTER_LOCK).exists() {
+        if let Ok(c) = fs::read_to_string(SHADOW_CLUSTER_LOCK) {
+            if let Ok(mut lease) = serde_json::from_str::<ShadowClusterLease>(&c) {
+                // If this symbol already holds the lease, refresh it
+                if lease.symbol == symbol {
+                    lease.expires_at = now + 3600;
+                    if let Ok(pretty) = serde_json::to_string_pretty(&lease) {
+                        let tmp = format!("{}.tmp_{}", SHADOW_CLUSTER_LOCK, symbol);
+                        let _ = fs::write(&tmp, pretty);
+                        let _ = fs::rename(&tmp, SHADOW_CLUSTER_LOCK);
+                    }
+                    return (true, Some(lease.lease_token));
+                }
+
+                // If held by another symbol and unexpired, verify if holder's shadow trade is still active
+                if lease.expires_at > now {
+                    let owner_active = load_shadow_trade(&lease.symbol)
+                        .map(|t| t.is_active)
+                        .unwrap_or(false);
+                    if owner_active {
+                        return (false, None);
+                    }
+                }
+            }
+        }
+        // Stale or dead holder lease -> remove stale lock file
+        let _ = fs::remove_file(SHADOW_CLUSTER_LOCK);
+    }
+
+    // Atomic creation via create_new(true) (O_CREAT | O_EXCL)
+    let new_lease = ShadowClusterLease {
+        symbol: symbol.to_string(),
+        lease_token: lease_token.clone(),
+        acquired_at: now,
+        expires_at: now + 3600,
+    };
+    let content = match serde_json::to_string_pretty(&new_lease) {
+        Ok(c) => c,
+        Err(_) => return (false, None),
+    };
+
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(SHADOW_CLUSTER_LOCK)
+    {
+        Ok(mut f) => {
+            let _ = f.write_all(content.as_bytes());
+            (true, Some(lease_token))
+        }
+        Err(_) => (false, None),
+    }
+}
+
+/// Renews the active shadow cluster lease heartbeat while a position is held.
+pub fn refresh_shadow_cluster_lease(symbol: &str, token: &str) -> bool {
     let now = Utc::now().timestamp();
     if let Ok(c) = fs::read_to_string(SHADOW_CLUSTER_LOCK) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&c) {
-            let holder = val.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
-            let expires_at = val.get("expires_at").and_then(|v| v.as_i64()).unwrap_or(0);
-            if holder == symbol {
-                return true;
-            }
-            if expires_at > now {
-                return false;
+        if let Ok(mut lease) = serde_json::from_str::<ShadowClusterLease>(&c) {
+            if lease.symbol == symbol && lease.lease_token == token {
+                lease.expires_at = now + 3600;
+                if let Ok(pretty) = serde_json::to_string_pretty(&lease) {
+                    let tmp = format!("{}.tmp_{}", SHADOW_CLUSTER_LOCK, symbol);
+                    let _ = fs::write(&tmp, pretty);
+                    let _ = fs::rename(&tmp, SHADOW_CLUSTER_LOCK);
+                    return true;
+                }
             }
         }
     }
-    let lease = serde_json::json!({
-        "symbol": symbol,
-        "expires_at": now + 3600,
-    });
-    fs::write(SHADOW_CLUSTER_LOCK, lease.to_string()).is_ok()
+    false
 }
 
-pub fn release_shadow_cluster_lease(symbol: &str) {
+/// Releases the shadow cluster lease safely verifying token ownership.
+pub fn release_shadow_cluster_lease(symbol: &str, token: Option<&str>) {
     if let Ok(c) = fs::read_to_string(SHADOW_CLUSTER_LOCK) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&c) {
-            let holder = val.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
-            if holder == symbol {
+        if let Ok(lease) = serde_json::from_str::<ShadowClusterLease>(&c) {
+            if lease.symbol == symbol {
+                if let Some(tok) = token {
+                    if lease.lease_token != tok {
+                        return; // Token mismatch: lease was already superseded
+                    }
+                }
                 let _ = fs::remove_file(SHADOW_CLUSTER_LOCK);
             }
         }
@@ -494,7 +660,7 @@ pub fn record_shadow_entry(
         Side::Long => entry_price - atr_mult * atr,
         Side::Short => entry_price + atr_mult * atr,
     };
-    let is_portfolio_selected = try_acquire_shadow_cluster_lease(symbol);
+    let (is_portfolio_selected, lease_token) = try_acquire_shadow_cluster_lease(symbol);
 
     let trade = ShadowTrade {
         symbol: symbol.to_string(),
@@ -514,6 +680,7 @@ pub fn record_shadow_entry(
         return_bps: None,
         exit_reason: None,
         is_portfolio_selected,
+        lease_token,
     };
 
     save_shadow_trade(symbol, Some(&trade));
@@ -580,7 +747,7 @@ pub fn record_shadow_exit(
     trade.exit_reason = Some(exit_reason.to_string());
 
     if trade.is_portfolio_selected {
-        release_shadow_cluster_lease(&trade.symbol);
+        release_shadow_cluster_lease(&trade.symbol, trade.lease_token.as_deref());
     }
     save_shadow_trade(&trade.symbol, None); // Clear active file
 
@@ -737,13 +904,14 @@ mod tests {
             return_bps: None,
             exit_reason: None,
             is_portfolio_selected: true,
+            lease_token: Some("test_token".to_string()),
         };
 
         // Exit at 105.0
         let pnl = record_shadow_exit(&mut trade, 105.0, "Chandelier Stop");
         // Gross = $5.0, friction = $0.11226 (maker entry + taker exit + 5 bps slippage) -> net ~ $4.8877
         assert!(pnl > 4.80 && pnl < 4.95);
-        assert_eq!(trade.is_active, false);
+        assert!(!trade.is_active);
     }
 
     #[test]
@@ -753,14 +921,14 @@ mod tests {
         let asks = vec![(101.0, 5.0), (102.0, 5.0)];
 
         let t0 = 1_000_000;
-        tracker.update(&bids, &asks, t0);
+        tracker.update(&bids, &asks, t0, t0);
         assert!(tracker.instant_obi > 0.0, "Bids outweigh asks");
         assert_eq!(tracker.ewma_1s_obi, tracker.instant_obi);
 
         // 1 second (1000ms) later, asks heavily surge
         let t1 = t0 + 1000;
         let surge_asks = vec![(101.0, 50.0), (102.0, 50.0)];
-        tracker.update(&bids, &surge_asks, t1);
+        tracker.update(&bids, &surge_asks, t1, t1);
         assert!(tracker.instant_obi < -0.50, "Instantaneous flipped heavily bearish");
         // 1s EWMA should smoothly decay towards negative, but not instantly equal instant_obi
         assert!(tracker.ewma_1s_obi > tracker.instant_obi);
@@ -768,6 +936,24 @@ mod tests {
         // Check freshness
         assert!(tracker.is_fresh_and_uncrossed(t1 + 500, 2500));
         assert!(!tracker.is_fresh_and_uncrossed(t1 + 3000, 2500), "Should expire stale books > 2500ms");
+    }
+
+    #[test]
+    fn test_feed_quality_telemetry() {
+        let mut tracker = L2ObiTracker::default();
+        let bids = vec![(100.0, 10.0)];
+        let asks = vec![(101.0, 10.0)];
+
+        for i in 1..=20 {
+            let t_exch = i * 100;
+            let t_local = t_exch + 25; // 25ms transport lag
+            tracker.update(&bids, &asks, t_exch, t_local);
+        }
+
+        let qual = tracker.compute_feed_quality().expect("Quality stats computed");
+        assert_eq!(qual.status, "GOOD");
+        assert!((qual.mean_lag_ms - 25.0).abs() < 1.0);
+        assert!((qual.p50_ms - 100.0).abs() < 5.0);
     }
 
     #[test]
