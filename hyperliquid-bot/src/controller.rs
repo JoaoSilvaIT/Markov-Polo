@@ -29,6 +29,8 @@ pub struct RegimeController {
     pub last_transition_time: String,
     pub last_reason: String,
     pub epoch: u64,
+    #[serde(default)]
+    pub breakout_seen_in_streak: bool,
 }
 
 impl Default for RegimeController {
@@ -42,6 +44,7 @@ impl Default for RegimeController {
             last_transition_time: Utc::now().to_rfc3339(),
             last_reason: "Initial system startup (Safe Cash Buffer)".to_string(),
             epoch: 1,
+            breakout_seen_in_streak: false,
         }
     }
 }
@@ -55,6 +58,7 @@ impl RegimeController {
         self.current_mode = ControllerMode::Neutral;
         self.trend_streak = 0;
         self.consolidation_streak = 0;
+        self.breakout_seen_in_streak = false;
         self.shock_cooldown_bars = 2;
         self.last_reason = if prev_cd > 0 {
             format!(
@@ -133,6 +137,7 @@ impl RegimeController {
             self.current_mode = ControllerMode::Neutral;
             self.trend_streak = 0;
             self.consolidation_streak = 0;
+            self.breakout_seen_in_streak = false;
             self.shock_cooldown_bars = 2; // 2 bars = 30-minute re-entry freeze
             self.last_reason = if prev_cd > 0 {
                 format!(
@@ -158,6 +163,7 @@ impl RegimeController {
             self.current_mode = ControllerMode::Neutral;
             self.trend_streak = 0;
             self.consolidation_streak = 0;
+            self.breakout_seen_in_streak = false;
             if self.shock_cooldown_bars > 0 {
                 self.last_reason = format!(
                     "Shock Re-Entry Cooldown Active ({} bars remaining) -> Forced Neutral",
@@ -175,6 +181,7 @@ impl RegimeController {
             self.current_mode = ControllerMode::Neutral;
             self.trend_streak = 0;
             self.consolidation_streak = 0;
+            self.breakout_seen_in_streak = false;
             self.last_reason = format!(
                 "Extreme Shock Energy Lingers (|Z15|={:.2}>=2.5 or |Z60|={:.2}>=2.5) -> Hold Neutral",
                 z_15, z_60
@@ -186,21 +193,29 @@ impl RegimeController {
         if p_trend >= 0.85 {
             self.trend_streak += 1;
             self.consolidation_streak = 0;
+            if has_donchian_breakout {
+                self.breakout_seen_in_streak = true;
+            }
         } else if p_consolidation >= 0.75 && z_15.abs() < 1.5 && z_60.abs() < 2.0 {
             // Engine A requires normalized, low volatility (|Z15| < 1.5 and |Z60| < 2.0)
             self.consolidation_streak += 1;
             self.trend_streak = 0;
+            self.breakout_seen_in_streak = false;
         } else {
             // Deadband region: uncertainty buffer
             self.trend_streak = 0;
             self.consolidation_streak = 0;
+            self.breakout_seen_in_streak = false;
         }
 
         // 4. STATE MACHINE TRANSITIONS
         match self.current_mode {
             ControllerMode::Neutral => {
-                // Neutral -> Trend requires 3-bar confirmation (45m dwell) AND Donchian breakout
-                if self.trend_streak >= 3 && has_donchian_breakout {
+                // Neutral -> Trend requires 3-bar confirmation (45m dwell) AND Donchian breakout (or sustained trend dwell >= 4 bars)
+                let valid_trend_trigger = self.trend_streak >= 3
+                    && (has_donchian_breakout || self.breakout_seen_in_streak || self.trend_streak >= 4);
+
+                if valid_trend_trigger {
                     self.current_mode = ControllerMode::Trend;
                     self.last_transition_time = Utc::now().to_rfc3339();
                     self.last_reason = format!(
@@ -331,6 +346,28 @@ mod tests {
         // Bar 3: P_T = 0.86 with breakout
         let mode3 = controller.evaluate_15m_bar(0.12, 0.86, 1.8, 1.0, true, false, false);
         assert_eq!(mode3, ControllerMode::Trend); // Bar 3: Confirmed! Transition to Trend
+        assert_eq!(controller.trend_streak, 3);
+    }
+
+    #[test]
+    fn test_breakout_seen_in_streak_triggers_trend_on_bar_3() {
+        let mut controller = RegimeController::default();
+
+        // Bar 1: P_T = 0.88 WITH initial breakout
+        let mode1 = controller.evaluate_15m_bar(0.10, 0.88, 1.0, 0.5, true, false, false);
+        assert_eq!(mode1, ControllerMode::Neutral);
+        assert_eq!(controller.trend_streak, 1);
+        assert!(controller.breakout_seen_in_streak);
+
+        // Bar 2: P_T = 0.90 WITHOUT breakout (continuation/consolidation above range)
+        let mode2 = controller.evaluate_15m_bar(0.08, 0.90, 1.5, 0.8, false, false, false);
+        assert_eq!(mode2, ControllerMode::Neutral);
+        assert_eq!(controller.trend_streak, 2);
+        assert!(controller.breakout_seen_in_streak);
+
+        // Bar 3: P_T = 0.86 WITHOUT new breakout
+        let mode3 = controller.evaluate_15m_bar(0.12, 0.86, 1.8, 1.0, false, false, false);
+        assert_eq!(mode3, ControllerMode::Trend); // Successfully transitions because breakout was seen in this streak!
         assert_eq!(controller.trend_streak, 3);
     }
 

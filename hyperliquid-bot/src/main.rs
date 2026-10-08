@@ -929,9 +929,14 @@ async fn main() {
                         current_p_t = p_t;
                         current_p_s = p_s;
 
-                        let donchian_opt = calculate_donchian(&rolling_15m_bars, donchian_period);
+                        let prior_bars = if rolling_15m_bars.len() > 1 {
+                            &rolling_15m_bars[..rolling_15m_bars.len() - 1]
+                        } else {
+                            &rolling_15m_bars[..]
+                        };
+                        let donchian_opt = calculate_donchian(prior_bars, donchian_period);
                         let has_donchian_breakout = if let Some(ref d) = donchian_opt {
-                            close_price > d.upper || close_price < d.lower
+                            close_price > d.upper || close_price < d.lower || high_price > d.upper || low_price < d.lower
                         } else {
                             false
                         };
@@ -1130,12 +1135,17 @@ async fn main() {
                             if is_cluster_blocked {
                                 println!("⏸️ [SHADOW-TREND VETO] Active cluster lease in place. Vetoing Engine B entry to prevent cross-engine conflict.");
                             } else {
-                                let donchian_opt = calculate_donchian(&rolling_15m_bars, donchian_period);
+                                let prior_bars = if finalized_15m_bar && rolling_15m_bars.len() > 1 {
+                                    &rolling_15m_bars[..rolling_15m_bars.len() - 1]
+                                } else {
+                                    &rolling_15m_bars[..]
+                                };
+                                let donchian_opt = calculate_donchian(prior_bars, donchian_period);
                                 if let Some(ref donchian) = donchian_opt {
                                     let closes_15m: Vec<f64> = rolling_15m_bars.iter().map(|b| b.close).collect();
                                     let alignment = check_trend_alignment(&closes_15m);
-                                    let is_long_breakout = close_price > donchian.upper && alignment == TrendAlignment::Bullish;
-                                    let is_short_breakout = close_price < donchian.lower && alignment == TrendAlignment::Bearish;
+                                    let is_long_breakout = (close_price > donchian.upper || high_price > donchian.upper) && alignment == TrendAlignment::Bullish;
+                                    let is_short_breakout = (close_price < donchian.lower || low_price < donchian.lower) && alignment == TrendAlignment::Bearish;
 
                                     if is_long_breakout || is_short_breakout {
                                         let side = if is_long_breakout { Side::Long } else { Side::Short };
