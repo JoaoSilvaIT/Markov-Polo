@@ -14,12 +14,14 @@ mod hyperliquid;
 mod order;
 mod ou_process;
 mod state;
+mod telemetry;
 mod trend;
 
 use crate::config::Config;
 use crate::controller::{
     load_controller_state, save_controller_state, ControllerMode,
 };
+use crate::telemetry::{save_telemetry, LiveTelemetry};
 use crate::hmm::{compute_hmm_posteriors, train_hmm_offline, GaussianHMM};
 use crate::hyperliquid::{
     cancel_order, fetch_book_ticker, fetch_sz_decimals_map, get_user_position, place_post_only_order, quantize_price,
@@ -966,6 +968,106 @@ async fn main() {
                         "💓 [HOT-PATH] {} Price: ${:.2} | Long Buy: {} | Short Sell: {} | Mode: {} | P_C: {:.0}% | P_T: {:.0}% | P_S: {:.0}% | Drift: {:.2}% | t_half: {:.1}m | Z15: {:.2} | Z60: {:.2}",
                         symbol_clone, close_price, target_buy_str, target_short_str, controller.current_mode, current_p_c * 100.0, current_p_t * 100.0, current_p_s * 100.0, total_drift_pct * 100.0, half_life_m, z_15, z_60
                     );
+
+                    // ------------------------------------------------------------------
+                    // LIVE TELEMETRY: Real-time Metrics & Proximity for Web Dashboard
+                    // ------------------------------------------------------------------
+                    let (long_buy_val, short_sell_val, exit_long_val, exit_short_val) = match thresholds_opt {
+                        Some(ref th) => (Some(th.entry_long), Some(th.entry_short), Some(th.exit_long), Some(th.exit_short)),
+                        None => (None, None, None, None),
+                    };
+
+                    let (prox_long, prox_short, overall_prox, prox_summary) = match (long_buy_val, short_sell_val) {
+                        (Some(buy_px), Some(sell_px)) => {
+                            let dist_long_pct = ((close_price - buy_px) / close_price).max(0.0) * 100.0;
+                            let p_long = if close_price <= buy_px {
+                                100.0
+                            } else {
+                                (1.0 - (dist_long_pct / 1.5).min(1.0)) * 100.0
+                            };
+
+                            let dist_short_pct = ((sell_px - close_price) / close_price).max(0.0) * 100.0;
+                            let p_short = if close_price >= sell_px {
+                                100.0
+                            } else {
+                                (1.0 - (dist_short_pct / 1.5).min(1.0)) * 100.0
+                            };
+
+                            let best_prox = p_long.max(p_short);
+                            let summary = if !is_valid_half_life {
+                                format!("Vetoed: t_half={:.1}m outside 15m-120m band", half_life_m)
+                            } else if controller.current_mode == ControllerMode::Neutral {
+                                format!("Dwell Pacing: Streak {}/3 bars", controller.consolidation_streak)
+                            } else if p_long >= p_short {
+                                format!("{:.1}% to Long Entry (${:.2} vs ${:.2})", p_long, close_price, buy_px)
+                            } else {
+                                format!("{:.1}% to Short Entry (${:.2} vs ${:.2})", p_short, close_price, sell_px)
+                            };
+
+                            (p_long, p_short, best_prox, summary)
+                        }
+                        _ => (0.0, 0.0, 0.0, "Awaiting O-U Calibration".to_string()),
+                    };
+
+                    let (pos_has, pos_side, pos_amount, pos_entry, pos_tp, pos_sl, pos_chand) = {
+                        let sl = state_clone.lock().await;
+                        if let Some(p) = sl.get(&symbol_clone) {
+                            (true, p.side.clone(), p.amount, p.entry_price, p.take_profit_price, p.stop_loss_price, p.chandelier_stop)
+                        } else {
+                            (false, "".to_string(), 0.0, 0.0, 0.0, 0.0, 0.0)
+                        }
+                    };
+
+                    let (l2_instant, l2_1s, l2_5s, l2_fresh) = {
+                        let guard = obi_tracker.read().await;
+                        (
+                            guard.instant_obi,
+                            guard.ewma_1s_obi,
+                            guard.ewma_5s_obi,
+                            guard.is_fresh_and_uncrossed(chrono::Utc::now().timestamp_millis() as u64, 2500),
+                        )
+                    };
+
+                    let telemetry_data = LiveTelemetry {
+                        symbol: symbol_clone.clone(),
+                        timestamp_ms: chrono::Utc::now().timestamp_millis() as u64,
+                        price: close_price,
+                        long_buy: long_buy_val,
+                        short_sell: short_sell_val,
+                        exit_long: exit_long_val,
+                        exit_short: exit_short_val,
+                        mode: format!("{:?}", controller.current_mode).to_uppercase(),
+                        streak_consolidation: controller.consolidation_streak,
+                        streak_trend: controller.trend_streak,
+                        mode_reason: controller.last_reason.clone(),
+                        shock_cooldown_bars: controller.shock_cooldown_bars,
+                        p_consolidation: current_p_c,
+                        p_trend: current_p_t,
+                        p_shock: current_p_s,
+                        drift_pct: total_drift_pct * 100.0,
+                        half_life_m,
+                        is_half_life_valid: is_valid_half_life,
+                        is_stationary,
+                        z_15,
+                        z_60,
+                        is_severe_shock: z_15.abs() >= 3.0 || z_60.abs() >= 3.0,
+                        obi_instant: l2_instant,
+                        obi_1s: l2_1s,
+                        obi_5s: l2_5s,
+                        l2_fresh,
+                        has_position: pos_has,
+                        position_side: pos_side,
+                        position_amount: pos_amount,
+                        position_entry_price: pos_entry,
+                        tp_price: pos_tp,
+                        sl_price: pos_sl,
+                        chandelier_stop: pos_chand,
+                        trade_proximity_long_pct: prox_long,
+                        trade_proximity_short_pct: prox_short,
+                        overall_proximity_pct: overall_prox,
+                        proximity_summary: prox_summary,
+                    };
+                    save_telemetry(&symbol_clone, &telemetry_data);
 
                     // ------------------------------------------------------------------
                     // ENGINE B SUPERVISOR: Active Shadow Trend Trailing Stop & Exits

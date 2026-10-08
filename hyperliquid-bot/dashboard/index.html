@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TradingAI • Hyperliquid Dual-Engine Terminal</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['"Plus Jakarta Sans"', 'sans-serif'],
+            mono: ['"JetBrains Mono"', 'monospace'],
+          },
+          colors: {
+            dark: {
+              900: '#070a13',
+              800: '#0e1322',
+              700: '#171f35',
+              600: '#232f4e',
+            },
+            accent: {
+              cyan: '#00f2fe',
+              emerald: '#10b981',
+              amber: '#f59e0b',
+              rose: '#f43f5e',
+              indigo: '#6366f1',
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    body {
+      background-color: #070a13;
+      color: #e2e8f0;
+      font-family: 'Plus Jakarta Sans', sans-serif;
+    }
+    .metric-track {
+      position: relative;
+      height: 10px;
+      border-radius: 9999px;
+      background: #171f35;
+      overflow: hidden;
+    }
+    .metric-needle {
+      position: absolute;
+      top: -4px;
+      width: 4px;
+      height: 18px;
+      background: #ffffff;
+      border-radius: 2px;
+      box-shadow: 0 0 10px rgba(255, 255, 255, 0.9);
+      transform: translateX(-50%);
+      transition: left 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .glass-card {
+      background: rgba(14, 19, 34, 0.75);
+      backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 255, 255, 0.07);
+    }
+  </style>
+</head>
+<body class="min-h-screen p-4 md:p-8 selection:bg-accent-cyan selection:text-black">
+
+  <!-- Header -->
+  <header class="max-w-7xl mx-auto mb-8 flex flex-col md:flex-row md:items-center md:justify-between gap-4 pb-6 border-b border-white/10">
+    <div>
+      <div class="flex items-center gap-3">
+        <div class="relative flex h-3 w-3">
+          <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-accent-emerald opacity-75"></span>
+          <span class="relative inline-flex rounded-full h-3 w-3 bg-accent-emerald"></span>
+        </div>
+        <h1 class="text-2xl md:text-3xl font-extrabold tracking-tight bg-gradient-to-r from-white via-slate-200 to-slate-400 bg-clip-text text-transparent">
+          Hyperliquid Dual-Engine Terminal
+        </h1>
+        <span class="text-xs px-2.5 py-0.5 rounded-full font-mono font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+          MAINNET CANARY
+        </span>
+      </div>
+      <p class="text-xs md:text-sm text-slate-400 mt-1">
+        Deterministic O-U Mean Reversion (Engine A) & Chandelier Trend Breakout (Engine B) • Live Telemetry
+      </p>
+    </div>
+
+    <div class="flex items-center gap-4 text-xs font-mono">
+      <div id="cluster-lease-badge" class="glass-card px-3 py-1.5 rounded-lg flex items-center gap-2">
+        <span class="text-slate-400">PORTFOLIO MUTEX:</span>
+        <span id="cluster-lease-status" class="text-emerald-400 font-bold">IDLE (0/1 OPEN)</span>
+      </div>
+      <div class="glass-card px-3 py-1.5 rounded-lg text-slate-400">
+        REFRESH: <span id="refresh-timer" class="text-cyan-400 font-bold">LIVE (2s)</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Asset Cards Grid -->
+  <main class="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-6" id="assets-container">
+    <!-- Placeholder loading cards -->
+    <div class="glass-card rounded-2xl p-6 animate-pulse">
+      <div class="h-6 bg-slate-800 rounded w-1/3 mb-4"></div>
+      <div class="h-24 bg-slate-800 rounded mb-4"></div>
+      <div class="h-40 bg-slate-800 rounded"></div>
+    </div>
+    <div class="glass-card rounded-2xl p-6 animate-pulse">
+      <div class="h-6 bg-slate-800 rounded w-1/3 mb-4"></div>
+      <div class="h-24 bg-slate-800 rounded mb-4"></div>
+      <div class="h-40 bg-slate-800 rounded"></div>
+    </div>
+    <div class="glass-card rounded-2xl p-6 animate-pulse">
+      <div class="h-6 bg-slate-800 rounded w-1/3 mb-4"></div>
+      <div class="h-24 bg-slate-800 rounded mb-4"></div>
+      <div class="h-40 bg-slate-800 rounded"></div>
+    </div>
+  </main>
+
+  <!-- Footer / Status Details -->
+  <footer class="max-w-7xl mx-auto mt-10 pt-6 border-t border-white/5 flex flex-col md:flex-row items-center justify-between text-xs text-slate-500 font-mono">
+    <div>
+      TradingAI Autonomous Architecture • Verified by Quantitative Research (R1 & R2 Certified)
+    </div>
+    <div id="last-updated" class="mt-2 md:mt-0">
+      Last Synced: --:--:--
+    </div>
+  </footer>
+
+  <script>
+    async function fetchTelemetry() {
+      try {
+        const res = await fetch('/api/telemetry?t=' + Date.now());
+        if (!res.ok) throw new Error("HTTP error " + res.status);
+        const data = await res.json();
+        renderDashboard(data);
+        document.getElementById('last-updated').textContent = "Last Synced: " + new Date().toLocaleTimeString();
+      } catch (err) {
+        console.error("Telemetry fetch error:", err);
+      }
+    }
+
+    function renderDashboard(data) {
+      // 1. Update Cluster Lease Status
+      const lease = data.cluster_lease;
+      const leaseBadge = document.getElementById('cluster-lease-status');
+      if (lease && lease.owner) {
+        leaseBadge.textContent = `LOCKED: ${lease.owner} (${lease.engine_owner || 'EngineA'})`;
+        leaseBadge.className = "text-amber-400 font-bold";
+      } else {
+        leaseBadge.textContent = "IDLE (0/1 OPEN)";
+        leaseBadge.className = "text-emerald-400 font-bold";
+      }
+
+      // 2. Render Asset Cards
+      const container = document.getElementById('assets-container');
+      const symbols = ['BTC', 'ETH', 'SOL'];
+      let html = '';
+
+      symbols.forEach(sym => {
+        const d = data.assets && data.assets[sym] ? data.assets[sym] : null;
+        if (!d) {
+          html += renderEmptyCard(sym);
+          return;
+        }
+
+        const price = d.price ? Number(d.price).toFixed(sym === 'SOL' ? 2 : sym === 'ETH' ? 2 : 2) : '0.00';
+        const buyPx = d.long_buy ? Number(d.long_buy).toFixed(2) : null;
+        const sellPx = d.short_sell ? Number(d.short_sell).toFixed(2) : null;
+
+        // Proximity calculation
+        const prox = Math.round(d.overall_proximity_pct || 0);
+        const proxLong = Math.round(d.trade_proximity_long_pct || 0);
+        const proxShort = Math.round(d.trade_proximity_short_pct || 0);
+
+        // Mode badge styling
+        let modeColor = "bg-slate-800 text-slate-300 border-slate-700";
+        if (d.mode === "CONSOLIDATION") modeColor = "bg-emerald-500/10 text-emerald-400 border-emerald-500/30";
+        if (d.mode === "TREND") modeColor = "bg-cyan-500/10 text-cyan-400 border-cyan-500/30";
+        if (d.mode === "NEUTRAL") modeColor = "bg-amber-500/10 text-amber-400 border-amber-500/30";
+
+        // Half life calculation: Range [0, 240m]. Ideal: [15, 120]
+        const thalf = Number(d.half_life_m || 0);
+        const thalfPct = Math.min(Math.max((thalf / 200) * 100, 0), 100);
+        let thalfStatus = "🟢 IDEAL (15-120m)";
+        let thalfColor = "text-emerald-400";
+        if (thalf < 15) { thalfStatus = "🟡 NOISE (<15m)"; thalfColor = "text-amber-400"; }
+        else if (thalf > 120) { thalfStatus = "🔴 VETOED (>120m)"; thalfColor = "text-rose-400"; }
+
+        // Shock Z15: Range [-4.0, +4.0]. Center: 0 -> 50%. Ideal: [-1.5, +1.5]
+        const z15 = Number(d.z_15 || 0);
+        const z15Pct = Math.min(Math.max(((z15 + 4.0) / 8.0) * 100, 0), 100);
+        let z15Status = "🟢 CALM (|Z|<1.5)";
+        let z15Color = "text-emerald-400";
+        if (Math.abs(z15) >= 3.0) { z15Status = "🔴 SEVERE SHOCK"; z15Color = "text-rose-400"; }
+        else if (Math.abs(z15) >= 1.5) { z15Status = "🟡 ELEVATED"; z15Color = "text-amber-400"; }
+
+        // Drift: Range [-3%, +3%]. Center: 0 -> 50%
+        const drift = Number(d.drift_pct || 0);
+        const driftPct = Math.min(Math.max(((drift + 3.0) / 6.0) * 100, 0), 100);
+
+        // HMM Probabilities
+        const pC = Math.round((d.p_consolidation || 0) * 100);
+        const pT = Math.round((d.p_trend || 0) * 100);
+        const pS = Math.round((d.p_shock || 0) * 100);
+
+        // Dwell Streak
+        const streakC = d.streak_consolidation || 0;
+        const dwellReady = streakC >= 3;
+
+        html += `
+          <div class="glass-card rounded-2xl p-6 transition-all duration-300 hover:border-white/20 hover:shadow-2xl hover:shadow-cyan-950/20">
+            <!-- Asset Header -->
+            <div class="flex items-start justify-between mb-4">
+              <div>
+                <div class="flex items-center gap-2">
+                  <span class="text-xl font-bold tracking-tight text-white">${sym}</span>
+                  <span class="text-xs font-mono px-2 py-0.5 rounded border ${modeColor}">
+                    ${d.mode}
+                  </span>
+                </div>
+                <div class="text-3xl font-extrabold font-mono mt-1 text-white tracking-tight">
+                  $${price}
+                </div>
+              </div>
+              <div class="text-right">
+                <span class="text-[10px] font-mono text-slate-400 block uppercase">Dwell Streak</span>
+                <div class="flex gap-1 mt-1 justify-end">
+                  <span class="h-2 w-5 rounded-full ${streakC >= 1 ? 'bg-emerald-400 shadow-sm shadow-emerald-400' : 'bg-slate-700'}"></span>
+                  <span class="h-2 w-5 rounded-full ${streakC >= 2 ? 'bg-emerald-400 shadow-sm shadow-emerald-400' : 'bg-slate-700'}"></span>
+                  <span class="h-2 w-5 rounded-full ${streakC >= 3 ? 'bg-emerald-400 shadow-sm shadow-emerald-400' : 'bg-slate-700'}"></span>
+                </div>
+                <span class="text-[10px] font-mono text-slate-400 mt-1 block">${streakC}/3 bars</span>
+              </div>
+            </div>
+
+            <!-- Trade Proximity Meter (User Requirement #1) -->
+            <div class="bg-dark-900/90 rounded-xl p-4 border border-white/5 mb-6">
+              <div class="flex items-center justify-between mb-2">
+                <span class="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                  <svg class="w-3.5 h-3.5 text-cyan-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+                  </svg>
+                  Trade Proximity
+                </span>
+                <span class="text-sm font-extrabold font-mono ${prox >= 80 ? 'text-cyan-400 animate-pulse' : prox >= 50 ? 'text-amber-400' : 'text-slate-400'}">
+                  ${prox}% CLOSE
+                </span>
+              </div>
+
+              <!-- Main Proximity Bar -->
+              <div class="w-full bg-slate-800 h-2.5 rounded-full overflow-hidden p-0.5 border border-white/5">
+                <div class="h-full rounded-full bg-gradient-to-r from-blue-500 via-cyan-400 to-emerald-400 transition-all duration-700" style="width: ${prox}%"></div>
+              </div>
+
+              <div class="text-[11px] font-mono text-slate-400 mt-2 truncate" title="${d.proximity_summary || ''}">
+                ${d.proximity_summary || 'Monitoring volatility...'}
+              </div>
+
+              <!-- Price Channel Bands -->
+              <div class="grid grid-cols-2 gap-2 mt-3 pt-3 border-t border-white/5 text-xs font-mono">
+                <div class="bg-emerald-500/5 p-2 rounded border border-emerald-500/10">
+                  <span class="text-[10px] text-emerald-400 block font-semibold">LONG BUY TARGET</span>
+                  <span class="text-white font-bold">${buyPx ? '$' + buyPx : 'N/A'}</span>
+                  <span class="text-[10px] text-slate-400 block">Prox: ${proxLong}%</span>
+                </div>
+                <div class="bg-rose-500/5 p-2 rounded border border-rose-500/10 text-right">
+                  <span class="text-[10px] text-rose-400 block font-semibold">SHORT SELL TARGET</span>
+                  <span class="text-white font-bold">${sellPx ? '$' + sellPx : 'N/A'}</span>
+                  <span class="text-[10px] text-slate-400 block">Prox: ${proxShort}%</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Quantitative Ranges with Ideal Bands (User Requirement #2) -->
+            <div class="space-y-4 text-xs font-mono">
+
+              <!-- 1. Half-Life Meter (Ideal: 15m to 120m) -->
+              <div>
+                <div class="flex justify-between text-[11px] mb-1">
+                  <span class="text-slate-400">Half-Life (t_half):</span>
+                  <span class="font-bold ${thalfColor}">${thalf.toFixed(1)}m • ${thalfStatus}</span>
+                </div>
+                <div class="relative h-2.5 bg-slate-800 rounded-full overflow-hidden border border-white/5">
+                  <!-- Shaded Ideal Zone: 15m to 120m -> 7.5% to 60% -->
+                  <div class="absolute top-0 bottom-0 bg-emerald-500/20 border-x border-emerald-500/40" style="left: 7.5%; width: 52.5%;"></div>
+                  <!-- Needle -->
+                  <div class="metric-needle" style="left: ${thalfPct}%;"></div>
+                </div>
+                <div class="flex justify-between text-[9px] text-slate-500 mt-0.5">
+                  <span>0m</span>
+                  <span class="text-emerald-400">15m [IDEAL ZONE] 120m</span>
+                  <span>200m+</span>
+                </div>
+              </div>
+
+              <!-- 2. Shock Z-Score Meter (Safe: -1.5 to +1.5) -->
+              <div>
+                <div class="flex justify-between text-[11px] mb-1">
+                  <span class="text-slate-400">Return Shock (Z15):</span>
+                  <span class="font-bold ${z15Color}">${z15.toFixed(2)}σ • ${z15Status}</span>
+                </div>
+                <div class="relative h-2.5 bg-slate-800 rounded-full overflow-hidden border border-white/5">
+                  <!-- Shaded Safe Zone: -1.5 to +1.5 -> 31.25% to 68.75% -->
+                  <div class="absolute top-0 bottom-0 bg-emerald-500/20 border-x border-emerald-500/40" style="left: 31.25%; width: 37.5%;"></div>
+                  <!-- Center zero line -->
+                  <div class="absolute top-0 bottom-0 w-px bg-white/20 left-1/2"></div>
+                  <!-- Needle -->
+                  <div class="metric-needle" style="left: ${z15Pct}%;"></div>
+                </div>
+                <div class="flex justify-between text-[9px] text-slate-500 mt-0.5">
+                  <span class="text-rose-400">-4.0σ</span>
+                  <span class="text-emerald-400">-1.5 [SAFE] +1.5</span>
+                  <span class="text-rose-400">+4.0σ</span>
+                </div>
+              </div>
+
+              <!-- 3. Macro Drift Meter (Stationary: -1.5% to +1.5%) -->
+              <div>
+                <div class="flex justify-between text-[11px] mb-1">
+                  <span class="text-slate-400">Macro Window Drift:</span>
+                  <span class="font-bold ${Math.abs(drift) <= 1.5 ? 'text-emerald-400' : 'text-amber-400'}">${drift >= 0 ? '+' : ''}${drift.toFixed(2)}%</span>
+                </div>
+                <div class="relative h-2.5 bg-slate-800 rounded-full overflow-hidden border border-white/5">
+                  <!-- Safe Stationary Zone: -1.5% to +1.5% -> 25% to 75% -->
+                  <div class="absolute top-0 bottom-0 bg-emerald-500/20 border-x border-emerald-500/40" style="left: 25%; width: 50%;"></div>
+                  <!-- Center zero line -->
+                  <div class="absolute top-0 bottom-0 w-px bg-white/20 left-1/2"></div>
+                  <!-- Needle -->
+                  <div class="metric-needle" style="left: ${driftPct}%;"></div>
+                </div>
+                <div class="flex justify-between text-[9px] text-slate-500 mt-0.5">
+                  <span>-3.0%</span>
+                  <span class="text-emerald-400">-1.5% [STATIONARY] +1.5%</span>
+                  <span>+3.0%</span>
+                </div>
+              </div>
+
+              <!-- 4. HMM Regimes Stacked Bar -->
+              <div>
+                <div class="flex justify-between text-[11px] mb-1">
+                  <span class="text-slate-400">Regime Mixture:</span>
+                  <span class="text-slate-300">C: ${pC}% | T: ${pT}% | S: ${pS}%</span>
+                </div>
+                <div class="w-full h-2.5 bg-slate-800 rounded-full overflow-hidden flex border border-white/5">
+                  <div class="bg-blue-500 transition-all duration-500" style="width: ${pC}%" title="Consolidation: ${pC}%"></div>
+                  <div class="bg-emerald-500 transition-all duration-500" style="width: ${pT}%" title="Trend: ${pT}%"></div>
+                  <div class="bg-rose-500 transition-all duration-500" style="width: ${pS}%" title="Shock: ${pS}%"></div>
+                </div>
+                <div class="flex justify-between text-[9px] text-slate-400 mt-0.5">
+                  <span class="text-blue-400">■ Consolidation</span>
+                  <span class="text-emerald-400">■ Trend</span>
+                  <span class="text-rose-400">■ Shock</span>
+                </div>
+              </div>
+
+              <!-- 5. L2 OBI Depth Bar -->
+              <div>
+                <div class="flex justify-between text-[11px] mb-1">
+                  <span class="text-slate-400">L2 Order Book Imbalance (OBI):</span>
+                  <span class="font-bold ${d.obi_instant >= 0 ? 'text-emerald-400' : 'text-rose-400'}">${(d.obi_instant || 0).toFixed(2)} (1s: ${(d.obi_1s || 0).toFixed(2)})</span>
+                </div>
+                <div class="relative h-2 bg-slate-800 rounded-full overflow-hidden border border-white/5">
+                  <div class="absolute top-0 bottom-0 w-px bg-white/20 left-1/2"></div>
+                  <div class="metric-needle" style="left: ${((d.obi_instant || 0) + 1.0) / 2.0 * 100}%;"></div>
+                </div>
+                <div class="flex justify-between text-[9px] text-slate-500 mt-0.5">
+                  <span class="text-rose-400">-1.0 (Asks Dominant)</span>
+                  <span class="text-emerald-400">+1.0 (Bids Dominant)</span>
+                </div>
+              </div>
+
+            </div>
+
+            <!-- Position Status Card -->
+            <div class="mt-5 pt-4 border-t border-white/5">
+              ${d.has_position ? `
+                <div class="bg-emerald-500/10 border border-emerald-500/20 rounded-xl p-3">
+                  <div class="flex items-center justify-between">
+                    <span class="text-xs font-bold text-emerald-400">OPEN POSITION (${d.position_side})</span>
+                    <span class="text-xs font-mono font-bold text-white">${d.position_amount} ${sym}</span>
+                  </div>
+                  <div class="flex justify-between text-[11px] font-mono text-slate-400 mt-1">
+                    <span>Entry: $${d.position_entry_price}</span>
+                    <span>TP: $${d.tp_price}</span>
+                  </div>
+                </div>
+              ` : `
+                <div class="flex items-center justify-between text-xs text-slate-500 font-mono">
+                  <span>No Open Position</span>
+                  <span class="text-emerald-400">● Scanning</span>
+                </div>
+              `}
+            </div>
+
+          </div>
+        `;
+      });
+
+      container.innerHTML = html;
+    }
+
+    function renderEmptyCard(sym) {
+      return `
+        <div class="glass-card rounded-2xl p-6 opacity-60">
+          <div class="flex items-center justify-between mb-4">
+            <span class="text-xl font-bold tracking-tight text-white">${sym}</span>
+            <span class="text-xs font-mono px-2 py-0.5 rounded border border-slate-700 bg-slate-800 text-slate-400">AWAITING SYNC</span>
+          </div>
+          <div class="h-40 flex items-center justify-center text-xs text-slate-500 font-mono">
+            Waiting for ${sym} telemetry heartbeat...
+          </div>
+        </div>
+      `;
+    }
+
+    // Initial fetch & loop every 2 seconds
+    fetchTelemetry();
+    setInterval(fetchTelemetry, 2000);
+  </script>
+</body>
+</html>

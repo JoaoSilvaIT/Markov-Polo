@@ -43,3 +43,15 @@ services:
       - HL_IS_CROSS=${HL_IS_CROSS:-true}
     volumes:
       - ./hl_bot_data:/app
+
+  hl_dashboard:
+    image: python:3.11-alpine
+    container_name: hl_dashboard
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./dashboard:/app/dashboard
+      - ./hl_bot_data:/app/data
+    working_dir: /app
+    command: python3 /app/dashboard/server.py
