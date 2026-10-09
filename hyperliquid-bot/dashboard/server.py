@@ -11,7 +11,7 @@ import os
 import glob
 import time
 
-PORT = int(os.environ.get("DASHBOARD_PORT", 8080))
+PORT = int(os.environ.get("DASHBOARD_PORT", 8088))
 
 # Potential data directories to search
 SEARCH_DIRS = [

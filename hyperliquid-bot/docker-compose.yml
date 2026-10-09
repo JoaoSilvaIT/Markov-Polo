@@ -69,7 +69,9 @@ services:
     container_name: hl_dashboard
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "${DASHBOARD_PORT:-8088}:8088"
+    environment:
+      - DASHBOARD_PORT=${DASHBOARD_PORT:-8088}
     volumes:
       - ./dashboard:/app/dashboard
       - ./hl_bot_data:/app/data

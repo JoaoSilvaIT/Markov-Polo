@@ -21,7 +21,9 @@ use crate::config::Config;
 use crate::controller::{
     load_controller_state, save_controller_state, ControllerMode,
 };
-use crate::telemetry::{save_telemetry, LiveTelemetry};
+use crate::telemetry::{
+    load_funnel_counters, save_funnel_counters, save_telemetry, LiveTelemetry,
+};
 use crate::hmm::{compute_hmm_posteriors, train_hmm_offline, GaussianHMM};
 use crate::hyperliquid::{
     cancel_order, fetch_book_ticker, fetch_sz_decimals_map, get_user_position, place_post_only_order, quantize_price,
@@ -106,7 +108,7 @@ async fn backfill_missing_1m_candles(
         }
 
         rolling_closes.push(close_f);
-        if rolling_closes.len() > 60 {
+        if rolling_closes.len() > 480 {
             rolling_closes.remove(0);
         }
 
@@ -1078,6 +1080,7 @@ async fn main() {
     let mut pending_1m: Option<CandleBar> = None;
     let mut last_processed_1m_open: u64 = initial_last_1m_open;
     let mut candle_feed_degraded: bool = false;
+    let mut funnel_counters = load_funnel_counters(&trading_symbol);
 
     loop {
         let (sender, mut receiver) = unbounded_channel();
@@ -1330,6 +1333,33 @@ async fn main() {
                     let cluster_active = has_active_cluster_position(&symbol_clone);
                     let is_cluster_blocked = cluster_active.is_some();
 
+                    funnel_counters.total_1m_ticks += 1;
+                    if candle_feed_degraded {
+                        funnel_counters.feed_quality_degraded += 1;
+                    }
+                    if is_candle_gap {
+                        funnel_counters.candle_gap_detected += 1;
+                    }
+                    if controller.shock_cooldown_bars > 0
+                        || (controller.cooldown_until_ms > 0
+                            && (chrono::Utc::now().timestamp_millis().max(0) as u64)
+                                < controller.cooldown_until_ms)
+                    {
+                        funnel_counters.shock_cooldown_active += 1;
+                    }
+                    if z_15.abs() >= 2.5 {
+                        funnel_counters.short_term_shock_veto += 1;
+                    }
+                    if z_60.abs() >= 2.5 {
+                        funnel_counters.lingering_macro_shock_veto += 1;
+                    }
+                    if is_cluster_blocked {
+                        funnel_counters.portfolio_lock_congested += 1;
+                    }
+                    if is_cb_paused {
+                        funnel_counters.circuit_breaker_paused += 1;
+                    }
+
                     // ------------------------------------------------------------------
                     // 3-MODE CONTROLLER REGIME INFERENCE (HMM Causal Filter + Hysteresis)
                     // ------------------------------------------------------------------
@@ -1424,6 +1454,8 @@ async fn main() {
                                 gate_a,
                                 gate_b
                             );
+                            println!("{}", funnel_counters.format_summary());
+                            save_funnel_counters(&symbol_clone, &funnel_counters);
                         }
                     }
 
@@ -1663,6 +1695,7 @@ async fn main() {
                                 if let Some(ref donchian) = donchian_opt {
                                     let closes_15m: Vec<f64> = rolling_15m_bars.iter().map(|b| b.close).collect();
                                     let alignment = check_trend_alignment(&closes_15m);
+                                    let has_donchian_breakout_1m = close_price > donchian.upper || close_price < donchian.lower;
                                     // Engine B Execution: Trend Regime confirmed by 15m candle close. Entry confirmed by 1m close breakout + Continuous L2 OBI hurdle (never wicks).
                                     let is_long_breakout = !candle_feed_degraded && !is_candle_gap && close_price > donchian.upper && alignment == TrendAlignment::Bullish;
                                     let is_short_breakout = !candle_feed_degraded && !is_candle_gap && close_price < donchian.lower && alignment == TrendAlignment::Bearish;
@@ -1696,6 +1729,7 @@ async fn main() {
                                             let mut portfolio_selected = false;
 
                                             if obi_favorable {
+                                                funnel_counters.engine_b_orders_placed += 1;
                                                 let trend_notional = position_size_usdc * trend_risk_fraction;
                                                 let shadow_size = trend_notional / close_price;
 
@@ -1723,6 +1757,7 @@ async fn main() {
                                                     ).await;
                                                 }
                                             } else {
+                                                funnel_counters.engine_b_obi_hurdle_veto += 1;
                                                 println!(
                                                     "⚠️ [SHADOW-TREND VETO] Multiscale OBI hurdle failed: {} (inst: {:.3}, 250ms: {:.3}, 1s: {:.3}, 5s: {:.3}).",
                                                     obi_reason, obi_inst, obi_250ms, obi_1s, obi_5s
@@ -1751,10 +1786,16 @@ async fn main() {
                                         } else {
                                             println!("⚠️ [SHADOW-TREND VETO] Missing or non-positive 20-period ATR. Entry aborted.");
                                         }
+                                    } else if has_donchian_breakout_1m {
+                                        funnel_counters.engine_b_alignment_veto += 1;
+                                    } else {
+                                        funnel_counters.engine_b_no_breakout += 1;
                                     }
                                 }
                             }
                         }
+                    } else {
+                        funnel_counters.engine_b_mode_ineligible += 1;
                     }
 
                     let mut state_lock = state_clone.lock().await;
@@ -2157,6 +2198,16 @@ async fn main() {
                                 && !is_cluster_blocked
                                 && controller.current_mode == ControllerMode::MeanReversion;
 
+                            if controller.current_mode != ControllerMode::MeanReversion {
+                                funnel_counters.engine_a_mode_ineligible += 1;
+                            } else if !consolidation_vol_ok {
+                                funnel_counters.engine_a_volatility_ineligible += 1;
+                            } else if !is_valid_half_life {
+                                funnel_counters.engine_a_half_life_ineligible += 1;
+                            } else if !is_consolidation {
+                                funnel_counters.engine_a_stationarity_ineligible += 1;
+                            }
+
                             if armed_state.is_armed && (!consolidation_vol_ok || controller.current_mode != ControllerMode::MeanReversion) {
                                 println!(
                                     "⏸️ [MEAN REVERSION VETO] Volatility breach or mode is {} (vol_ok: {}, Z15: {:.2}, Z60: {:.2}). Clearing armed state for {}.",
@@ -2167,6 +2218,7 @@ async fn main() {
                             }
 
                             if armed_state.is_armed {
+                                funnel_counters.engine_a_armed_waiting_bounce += 1;
                                 let arm_side = armed_state.side.clone();
                                 let arm_timeout_mins = (0.5 * armed_state.half_life_m).clamp(10.0, 30.0);
                                 let mut expired = false;
@@ -2230,6 +2282,7 @@ async fn main() {
                                         );
 
                                         if net_edge_bps < 25.0 {
+                                            funnel_counters.engine_a_reversal_hurdle_veto += 1;
                                             println!(
                                                 "⚠️ [LONG HURDLE VETO] Edge too narrow for {}: {:.1} bps (< 25 bps).",
                                                 symbol_clone, net_edge_bps
@@ -2237,6 +2290,7 @@ async fn main() {
                                             armed_state.is_armed = false;
                                             save_armed_signal(&arm_path_clone, &armed_state);
                                         } else {
+                                            funnel_counters.engine_a_orders_placed += 1;
                                             println!(
                                                 "🟢 [LONG REVERSAL CONFIRMED] {} reversed from dip ${:.2} to ${:.2}! Edge: {:.1} bps. Submitting Maker Buy.",
                                                 symbol_clone, armed_state.extreme_price, close_price, net_edge_bps
@@ -2261,6 +2315,7 @@ async fn main() {
                                             )
                                             .await
                                             {
+                                                funnel_counters.engine_a_orders_rejected += 1;
                                                 eprintln!("❌ [ORDER ERROR] Long maker entry failed: {}", e);
                                             }
                                         }
@@ -2297,6 +2352,7 @@ async fn main() {
                                         let net_edge_bps = (entry_limit_price / dynamic_exit_target).ln() * 10000.0;
 
                                         if net_edge_bps < 25.0 {
+                                            funnel_counters.engine_a_reversal_hurdle_veto += 1;
                                             println!(
                                                 "⚠️ [SHORT HURDLE VETO] Edge too narrow for {}: {:.1} bps (< 25 bps).",
                                                 symbol_clone, net_edge_bps
@@ -2304,6 +2360,7 @@ async fn main() {
                                             armed_state.is_armed = false;
                                             save_armed_signal(&arm_path_clone, &armed_state);
                                         } else {
+                                            funnel_counters.engine_a_orders_placed += 1;
                                             println!(
                                                 "🔴 [SHORT REVERSAL CONFIRMED] {} rejected from peak ${:.2} down to ${:.2}! Edge: {:.1} bps. Submitting Maker Short.",
                                                 symbol_clone, armed_state.extreme_price, close_price, net_edge_bps
@@ -2328,6 +2385,7 @@ async fn main() {
                                             )
                                             .await
                                             {
+                                                funnel_counters.engine_a_orders_rejected += 1;
                                                 eprintln!("❌ [ORDER ERROR] Short maker entry failed: {}", e);
                                             }
                                         }
@@ -2384,6 +2442,8 @@ async fn main() {
                                             "🟣 [SHORT ARMED] {} touched upper threshold (${:.2} >= ${:.2}). Waiting for red rejection.",
                                             symbol_clone, close_price, thresholds.entry_short
                                         );
+                                    } else {
+                                        funnel_counters.engine_a_outside_band += 1;
                                     }
                                 }
                             }
