@@ -136,7 +136,7 @@ pub fn calculate_thresholds_at_sigma(params: &OuParameters, transaction_cost: f6
 /// derived from the Bertram Optimization Model for Statistical Arbitrage.
 /// Maximizes the expected return per unit of time based on mean-reversion speed.
 pub fn calculate_optimal_thresholds(params: &OuParameters, transaction_cost: f64) -> OptimalThresholds {
-    calculate_thresholds_at_sigma(params, transaction_cost, 2.0)
+    calculate_thresholds_at_sigma(params, transaction_cost, 1.75)
 }
 
 /// Computes the robust Median Absolute Deviation (MAD) of a return series,
@@ -205,8 +205,8 @@ pub fn calculate_features(closes_history: &[f64], eval_close: f64) -> Option<Fea
             let hl = ou_params.half_life_minutes();
             let tx_cost = hist_last_price * 0.0005; // ~5 bps roundtrip on Hyperliquid Maker
             let th = calculate_optimal_thresholds(&ou_params, tx_cost);
-            let th_175 = calculate_thresholds_at_sigma(&ou_params, tx_cost, 1.75);
-            (Some(th), Some(th_175), hl)
+            let th_150 = calculate_thresholds_at_sigma(&ou_params, tx_cost, 1.50);
+            (Some(th), Some(th_150), hl)
         } else {
             (None, None, 999.0)
         };

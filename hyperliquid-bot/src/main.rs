@@ -819,7 +819,25 @@ async fn main() {
                         }
                     }
 
-                    if is_filled && pos.take_profit_price > 0.0 {
+                    if is_filled && pos.engine_type == "EngineB" && !pos.is_filled {
+                        println!(
+                            "🟢 [FAST-SENTINEL] Engine B Position Active for {} (Side: {})!",
+                            watcher_symbol, pos.side
+                        );
+                        let (side_str, entry_px, stop_px, amt) = if let Some(p) = state_lock.get_mut(&watcher_symbol) {
+                            p.is_filled = true;
+                            p.opened_at = chrono::Utc::now().to_rfc3339();
+                            (p.side.clone(), p.entry_price, p.chandelier_stop, p.amount)
+                        } else {
+                            (pos.side.clone(), pos.entry_price, pos.chandelier_stop, pos.amount)
+                        };
+                        let _ = save_state(&watcher_state_path, &state_lock);
+                        let msg = format!(
+                            "🟢 **ENGINE B BREAKOUT ENTRY FILLED (HYPERLIQUID):** {}\n**Side:** {}\n**Entry:** ${:.2}\n**Initial Stop:** ${:.2}\n**Size:** {:.5}",
+                            watcher_symbol, side_str, entry_px, stop_px, amt
+                        );
+                        crate::discord::send_alert(watcher_discord.as_deref(), &msg).await;
+                    } else if is_filled && pos.take_profit_price > 0.0 {
                         println!(
                             "🟢 [FAST-SENTINEL] Position Active for {} (Side: {})! Placing Take Profit Limit order at ${:.2}",
                             watcher_symbol, pos.side, pos.take_profit_price
@@ -1369,9 +1387,11 @@ async fn main() {
                     // ------------------------------------------------------------------
                     // 3-MODE CONTROLLER REGIME INFERENCE (HMM Causal Filter + Hysteresis)
                     // ------------------------------------------------------------------
-                    // Fast-path safety: Severe shock on ANY 1m candle unconditionally initiates/resets cooldown
+                    // Fast-path safety: Severe shock on ANY 1m candle unconditionally initiates/resets cooldown.
+                    // Evaluates immediate short-term shock (|Z15| >= 3.0) to cut risk on active flash dislocations.
+                    // Macro |Z60| is evaluated on finalized 15m candle closes to prevent 60-minute rolling step reset loops.
                     // Deduplicated strictly by completed_bar.time_open to prevent clock rolling within the same 1m candle
-                    if z_15.abs() >= 3.0 || z_60.abs() >= 3.0 {
+                    if z_15.abs() >= 3.0 {
                         if last_shock_bar_ms != completed_bar.time_open {
                             last_shock_bar_ms = completed_bar.time_open;
                             let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
@@ -1688,7 +1708,12 @@ async fn main() {
                     // ------------------------------------------------------------------
                     if controller.current_mode == ControllerMode::Trend {
                         let active_shadow = load_shadow_trade(&symbol_clone);
-                        if active_shadow.is_none() {
+                        let has_active_trade = if trend_engine_mode == "live" {
+                            state_clone.lock().await.contains_key(&symbol_clone)
+                        } else {
+                            active_shadow.is_some()
+                        };
+                        if !has_active_trade {
                             if is_cluster_blocked {
                                 println!("⏸️ [SHADOW-TREND VETO] Active cluster lease in place. Vetoing Engine B entry to prevent cross-engine conflict.");
                             } else {
@@ -1739,7 +1764,38 @@ async fn main() {
                                                 let trend_notional = position_size_usdc * trend_risk_fraction;
                                                 let shadow_size = trend_notional / close_price;
 
-                                                if trend_engine_mode == "shadow" {
+                                                if trend_engine_mode == "live" {
+                                                    let mut state_lock = state_clone.lock().await;
+                                                    if !state_lock.contains_key(&symbol_clone) && !is_cluster_blocked {
+                                                        let initial_sl = if side == Side::Long {
+                                                            close_price - chandelier_atr_mult * current_atr
+                                                        } else {
+                                                            close_price + chandelier_atr_mult * current_atr
+                                                        };
+                                                        match crate::order::place_trend_breakout_entry(
+                                                            &state_path_clone,
+                                                            &exchange_clone,
+                                                            &info_clone,
+                                                            &mut state_lock,
+                                                            &symbol_clone,
+                                                            side.clone(),
+                                                            close_price,
+                                                            initial_sl,
+                                                            current_atr,
+                                                            trend_notional,
+                                                            sz_decimals,
+                                                            discord_clone.clone(),
+                                                        ).await {
+                                                            Ok(res) => {
+                                                                println!("🚀 [ENGINE B LIVE ENTRY DISPATCHED] {} {:?}", symbol_clone, res);
+                                                                portfolio_selected = true;
+                                                            }
+                                                            Err(e) => {
+                                                                eprintln!("❌ [ENGINE B LIVE ERROR] Breakout entry failed for {}: {}", symbol_clone, e);
+                                                            }
+                                                        }
+                                                    }
+                                                } else {
                                                     let shadow_trade = record_shadow_entry(
                                                         &symbol_clone,
                                                         side.clone(),
@@ -1922,22 +1978,40 @@ async fn main() {
 
                     if has_position {
                         if let Some(pos) = state_lock.get(&symbol_clone) {
-                            if !pos.is_filled && mr_invalidated {
-                                println!(
-                                    "🛑 [RESTING ENTRY CANCELLED] Engine A invalidated (vol_ok: {}, mode: {}, Z15: {:.2}, Z60: {:.2}). Cancelling resting maker order for {}.",
-                                    consolidation_vol_ok, controller.current_mode, z_15, z_60, symbol_clone
-                                );
-                                let _ = emergency_flatten(
-                                    &state_path_clone,
-                                    &exchange_clone,
-                                    &info_clone,
-                                    user_address,
-                                    &mut state_lock,
-                                    &symbol_clone,
-                                    discord_clone.clone(),
-                                )
-                                .await;
-                                continue;
+                            if !pos.is_filled {
+                                if pos.engine_type == "EngineA" && mr_invalidated {
+                                    println!(
+                                        "🛑 [RESTING ENTRY CANCELLED] Engine A invalidated (vol_ok: {}, mode: {}, Z15: {:.2}, Z60: {:.2}). Cancelling resting maker order for {}.",
+                                        consolidation_vol_ok, controller.current_mode, z_15, z_60, symbol_clone
+                                    );
+                                    let _ = emergency_flatten(
+                                        &state_path_clone,
+                                        &exchange_clone,
+                                        &info_clone,
+                                        user_address,
+                                        &mut state_lock,
+                                        &symbol_clone,
+                                        discord_clone.clone(),
+                                    )
+                                    .await;
+                                    continue;
+                                } else if pos.engine_type == "EngineB" && (controller.current_mode != ControllerMode::Trend || is_downside_shock || is_upside_shock) {
+                                    println!(
+                                        "🛑 [RESTING ENTRY CANCELLED] Engine B invalidated (mode: {}, shock: {}). Cancelling resting maker order for {}.",
+                                        controller.current_mode, is_downside_shock || is_upside_shock, symbol_clone
+                                    );
+                                    let _ = emergency_flatten(
+                                        &state_path_clone,
+                                        &exchange_clone,
+                                        &info_clone,
+                                        user_address,
+                                        &mut state_lock,
+                                        &symbol_clone,
+                                        discord_clone.clone(),
+                                    )
+                                    .await;
+                                    continue;
+                                }
                             }
                         }
 
@@ -1975,6 +2049,7 @@ async fn main() {
                             let mut entry_ttl_expired = false;
                             let mut time_stop_triggered = false;
                             let mut hard_sl_triggered = false;
+                            let mut chandelier_stopped = false;
                             let mut giveback_triggered = false;
                             let mut elapsed_mins = 0.0;
                             let mut max_allowed_mins = 120.0;
@@ -1984,6 +2059,8 @@ async fn main() {
                             let mut reprice_qty = 0.0;
                             let mut reprice_is_buy = false;
                             let mut old_tp_order_id = String::new();
+
+                            let pos_engine_type = state_lock.get(&symbol_clone).map(|p| p.engine_type.clone()).unwrap_or_else(|| "EngineA".to_string());
 
                             if let Some(pos) = state_lock.get_mut(&symbol_clone) {
                                 if let Ok(opened_dt) =
@@ -1997,6 +2074,32 @@ async fn main() {
                                     if !pos.is_filled {
                                         if elapsed_mins >= 5.0 {
                                             entry_ttl_expired = true;
+                                        }
+                                    } else if pos.engine_type == "EngineB" {
+                                        let current_atr = calculate_atr(&rolling_15m_bars, 20).unwrap_or(pos.current_atr);
+                                        let side_enum = if pos.side == "LONG" { Side::Long } else { Side::Short };
+                                        let mut chandelier = crate::trend::ChandelierExitState {
+                                            side: side_enum,
+                                            entry_price: pos.entry_price,
+                                            extreme_favorable_price: pos.max_favorable_price,
+                                            current_stop: pos.chandelier_stop,
+                                            initial_stop: pos.stop_loss_price,
+                                            base_multiplier: chandelier_atr_mult,
+                                            active_multiplier: chandelier_atr_mult,
+                                        };
+
+                                        let new_stop = chandelier.update_with_cap(high_price, low_price, current_atr, current_p_t, Some(0.5));
+                                        pos.chandelier_stop = new_stop;
+                                        pos.stop_loss_price = new_stop;
+                                        pos.max_favorable_price = chandelier.extreme_favorable_price;
+
+                                        println!(
+                                            "🚀 [LIVE-TREND MONITOR] {} {} | Price: ${:.2} (H: ${:.2}, L: ${:.2}) | Chandelier Stop: ${:.2} | Extreme: ${:.2}",
+                                            symbol_clone, pos.side, close_price, high_price, low_price, new_stop, pos.max_favorable_price
+                                        );
+
+                                        if chandelier.is_bar_stopped_out(high_price, low_price) {
+                                            chandelier_stopped = true;
                                         }
                                     } else {
                                         // Hard Catastrophe Stop Loss check
@@ -2198,6 +2301,32 @@ async fn main() {
                                     discord_clone.clone(),
                                 )
                                 .await;
+                            } else if chandelier_stopped {
+                                let sl_px = state_lock
+                                    .get(&symbol_clone)
+                                    .map(|p| p.chandelier_stop)
+                                    .unwrap_or(0.0);
+                                println!(
+                                    "🛑 [CHANDELIER TRAILING STOP EXECUTED HL] {} stopped out by dynamic Chandelier at ${:.2} (Stop: ${:.2}). Emergency flattening!",
+                                    symbol_clone, close_price, sl_px
+                                );
+                                let ch_msg = format!(
+                                    "🛑 **CHANDELIER TRAILING STOP EXECUTED (HL):** {} stopped out at ${:.2} (Trailing Stop: ${:.2}). Emergency flattening position.",
+                                    symbol_clone, close_price, sl_px
+                                );
+                                crate::discord::send_alert(discord_clone.as_deref(), &ch_msg).await;
+                                controller.notify_trend_stopped_out();
+                                save_controller_state(&symbol_clone, &controller);
+                                let _ = emergency_flatten(
+                                    &state_path_clone,
+                                    &exchange_clone,
+                                    &info_clone,
+                                    user_address,
+                                    &mut state_lock,
+                                    &symbol_clone,
+                                    discord_clone.clone(),
+                                )
+                                .await;
                             } else if entry_ttl_expired {
                                 println!(
                                     "⏱️ [ENTRY TTL EXPIRED] Resting order for {} unfilled after {:.1}m. Flattening.",
@@ -2256,7 +2385,7 @@ async fn main() {
                                     discord_clone.clone(),
                                 )
                                 .await;
-                            } else if !is_consolidation {
+                            } else if pos_engine_type == "EngineA" && !is_consolidation {
                                 println!(
                                     "🚨 [INVALIDATION] Regime shift detected for {}. Flattening.",
                                     symbol_clone
@@ -2606,7 +2735,7 @@ async fn main() {
                                                 accepted: false,
                                                 primary_veto,
                                                 all_vetos,
-                                                threshold_sigma: 2.0,
+                                                threshold_sigma: 1.75,
                                                 signal_value: z_15,
                                                 hmm_probabilities: crate::counterfactual::HmmProbs {
                                                     consolidation: current_p_c,
@@ -2657,9 +2786,9 @@ async fn main() {
                                                     1800,
                                                     crate::counterfactual::CounterfactualDecision {
                                                         accepted: false,
-                                                        primary_veto: "RELAXED_BOUNDARY_1.75_SIGMA".to_string(),
-                                                        all_vetos: vec!["RELAXED_BOUNDARY_1.75_SIGMA".to_string()],
-                                                        threshold_sigma: 1.75,
+                                                        primary_veto: "RELAXED_BOUNDARY_1.50_SIGMA".to_string(),
+                                                        all_vetos: vec!["RELAXED_BOUNDARY_1.50_SIGMA".to_string()],
+                                                        threshold_sigma: 1.50,
                                                         signal_value: z_15,
                                                         hmm_probabilities: crate::counterfactual::HmmProbs {
                                                             consolidation: current_p_c,

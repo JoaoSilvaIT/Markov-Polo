@@ -226,6 +226,184 @@ pub async fn place_ou_maker_entry(
     Ok(json!({"status": "DISPATCHED", "order_id": oid, "side": side.to_string()}))
 }
 
+pub async fn place_trend_breakout_entry(
+    state_file_path: &str,
+    exchange: &ExchangeClient,
+    info: &InfoClient,
+    state: &mut StateMap,
+    symbol: &str,
+    side: Side,
+    breakout_price: f64,
+    initial_stop: f64,
+    current_atr: f64,
+    position_size_usdc: f64,
+    sz_decimals: u32,
+    discord_url: Option<String>,
+) -> Result<Value, String> {
+    if state.len() >= 3 {
+        return Ok(json!({"status": "REJECTED", "reason": "Max concurrent trades reached."}));
+    }
+    if state.contains_key(symbol) {
+        return Ok(json!({
+            "status": "REJECTED",
+            "reason": format!("Already hold or have open order for {}.", symbol)
+        }));
+    }
+
+    let lease_uuid = format!("{}_{}", symbol, Utc::now().timestamp_micros());
+
+    // Atomically acquire the portfolio cluster lease for EngineB
+    let (acquired, fencing_token) = try_acquire_cluster_lease_for_engine_with_uuid(
+        symbol,
+        "EngineB",
+        &lease_uuid,
+        3600,
+    );
+    if !acquired {
+        return Ok(json!({
+            "status": "REJECTED",
+            "reason": "Cluster lock currently acquired by another portfolio symbol."
+        }));
+    }
+
+    let (top_bid, top_ask) = match fetch_book_ticker(info, symbol).await {
+        Ok(quotes) => quotes,
+        Err(e) => {
+            let _ = release_cluster_lease_authenticated(symbol, Some(&lease_uuid), Some(fencing_token));
+            return Err(format!("Failed to query live book ticker: {}", e));
+        }
+    };
+
+    if top_bid <= 0.0 || top_ask <= 0.0 || top_bid >= top_ask {
+        let _ = release_cluster_lease_authenticated(symbol, Some(&lease_uuid), Some(fencing_token));
+        return Err(format!(
+            "Invalid or crossed book ticker quotes: bid={}, ask={}",
+            top_bid, top_ask
+        ));
+    }
+
+    let is_buy = side == Side::Long;
+    let raw_post_only_price = if is_buy { top_bid } else { top_ask };
+    let post_only_price = quantize_price(raw_post_only_price, sz_decimals);
+    let amount_raw = position_size_usdc / post_only_price;
+    let amount_f = round_to_decimals(amount_raw, sz_decimals);
+
+    if amount_f <= 0.0 {
+        let _ = release_cluster_lease_authenticated(symbol, Some(&lease_uuid), Some(fencing_token));
+        return Err(format!(
+            "Calculated size {:.6} is zero or below minimum size decimals {}",
+            amount_raw, sz_decimals
+        ));
+    }
+
+    let stop_loss_price = quantize_price(initial_stop, sz_decimals);
+    let cloid_uuid = uuid::Uuid::new_v4();
+    let client_order_id = format!("{}_{}", symbol, Utc::now().timestamp_millis());
+
+    let mut order_intent = OrderIntent {
+        symbol: symbol.to_string(),
+        client_order_id: client_order_id.clone(),
+        cloid_hex: Some(cloid_uuid.to_string()),
+        owner_uuid: lease_uuid.clone(),
+        fencing_token,
+        engine_type: "EngineB".to_string(),
+        side: side.clone(),
+        limit_px: post_only_price,
+        sz: amount_f,
+        sz_decimals,
+        target_tp: 0.0,
+        stop_loss: stop_loss_price,
+        half_life_minutes: 0.0,
+        position_size_usdc,
+        status: OrderIntentStatus::PendingSubmission,
+        exchange_order_id: None,
+        created_at_ms: Utc::now().timestamp_millis() as u64,
+        updated_at_ms: Utc::now().timestamp_millis() as u64,
+    };
+    save_order_intent_atomic(&order_intent)?;
+
+    if let Err(e) = assert_current_lease(symbol, &lease_uuid, fencing_token) {
+        order_intent.status = OrderIntentStatus::Aborted;
+        let _ = save_order_intent_atomic(&order_intent);
+        clear_order_intent(symbol);
+        let _ = release_cluster_lease_authenticated(symbol, Some(&lease_uuid), Some(fencing_token));
+        return Err(format!("Order boundary fencing assertion rejected: {}", e));
+    }
+
+    let oid = match place_post_only_order(
+        exchange,
+        symbol,
+        is_buy,
+        post_only_price,
+        amount_f,
+        false,
+        Some(cloid_uuid),
+    )
+    .await
+    {
+        Ok(id) => {
+            order_intent.exchange_order_id = Some(id);
+            order_intent.status = OrderIntentStatus::Submitted;
+            order_intent.updated_at_ms = Utc::now().timestamp_millis() as u64;
+            let _ = save_order_intent_atomic(&order_intent);
+            id
+        }
+        Err(e) => {
+            order_intent.status = OrderIntentStatus::Aborted;
+            let _ = save_order_intent_atomic(&order_intent);
+            clear_order_intent(symbol);
+            let _ = release_cluster_lease_authenticated(symbol, Some(&lease_uuid), Some(fencing_token));
+            return Err(e);
+        }
+    };
+
+    let new_state = PositionState {
+        symbol: symbol.to_string(),
+        side: side.to_string(),
+        order_id: oid.to_string(),
+        tp_order_id: "".to_string(),
+        entry_price: post_only_price,
+        amount: amount_f,
+        stop_loss_price,
+        take_profit_price: 0.0,
+        opened_at: Utc::now().to_rfc3339(),
+        risk_amount_usdc: position_size_usdc,
+        is_filled: false,
+        half_life_minutes: 0.0,
+        client_order_id,
+        max_progress: 0.0,
+        max_favorable_price: post_only_price,
+        effective_tp: 0.0,
+        last_reprice_time: Utc::now().timestamp_millis(),
+        reprice_count: 0,
+        candidate_lower_count: 0,
+        engine_type: "EngineB".to_string(),
+        chandelier_stop: stop_loss_price,
+        current_atr,
+        lease_fencing_token: fencing_token,
+        lease_owner_uuid: lease_uuid,
+        lifecycle: PositionLifecycle::Active,
+    };
+
+    state.insert(symbol.to_string(), new_state.clone());
+    let _ = save_state(state_file_path, state);
+
+    order_intent.status = OrderIntentStatus::Acknowledged;
+    let _ = save_order_intent_atomic(&order_intent);
+    clear_order_intent(symbol);
+
+    let side_label = if is_buy { "LONG" } else { "SHORT" };
+    let side_emoji = if is_buy { "🟢" } else { "🔴" };
+
+    let msg = format!(
+        "{} **ENGINE B {} BREAKOUT ENTRY (MAKER):** {}\n**Limit Maker {}:** ${:.2} (Breakout: ${:.2})\n**Initial Chandelier Stop:** ${:.2}\n**Size:** {:.5} (${:.2})\n**ATR:** ${:.2}",
+        side_emoji, side_label, symbol, side_label, post_only_price, breakout_price, stop_loss_price, amount_f, position_size_usdc, current_atr
+    );
+    crate::discord::send_alert(discord_url.as_deref(), &msg).await;
+
+    Ok(json!({"status": "DISPATCHED", "order_id": oid, "side": side.to_string()}))
+}
+
 pub async fn emergency_flatten(
     state_file_path: &str,
     exchange: &ExchangeClient,
