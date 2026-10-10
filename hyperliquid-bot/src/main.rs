@@ -1195,19 +1195,19 @@ async fn main() {
                 if last_processed_1m_open > 0 && completed_bar.time_open > last_processed_1m_open + 60_000 {
                     let gap_minutes = (completed_bar.time_open - last_processed_1m_open) / 60_000;
                     println!(
-                        "⚠️ [CANDLE GAP DETECTED] Missing {} candle(s) between {} and {}. Entering degraded mode and initiating REST backfill...",
+                        "⚠️ [CANDLE GAP DETECTED] Missing {} candle(s) between {} and {}. Initiating REST backfill...",
                         gap_minutes, last_processed_1m_open, completed_bar.time_open
                     );
-                    controller.force_neutral_data_quality();
-                    let mut armed_state = load_armed_signal(&arm_file_path);
-                    if armed_state.is_armed {
-                        armed_state.is_armed = false;
-                        save_armed_signal(&arm_file_path, &armed_state);
-                    }
 
-                    // Severe macro gap (>= 30m): emergency flatten any resting entry and purge windows
+                    // Severe macro gap (>= 30m): emergency disarm, flatten resting entry, and force neutral
                     if gap_minutes >= 30 {
-                        println!("🛑 [MACRO GAP >= 30m] Severe data gap detected ({} min). Cancelling resting maker orders...", gap_minutes);
+                        println!("🛑 [MACRO GAP >= 30m] Severe data gap detected ({} min). Cancelling resting maker orders and forcing Neutral...", gap_minutes);
+                        controller.force_neutral_data_quality();
+                        let mut armed_state = load_armed_signal(&arm_file_path);
+                        if armed_state.is_armed {
+                            armed_state.is_armed = false;
+                            save_armed_signal(&arm_file_path, &armed_state);
+                        }
                         let mut state_lock = active_state.lock().await;
                         if let Some(pos) = state_lock.get(&trading_symbol) {
                             if !pos.is_filled {
@@ -1240,9 +1240,15 @@ async fn main() {
                             eprintln!("❌ [BACKFILL EMPTY] Expected missing candles but received 0. Retaining candle_feed_degraded=true (fail-closed).");
                             is_candle_gap = true;
                             candle_feed_degraded = true;
+                            controller.force_neutral_data_quality();
+                            let mut armed_state = load_armed_signal(&arm_file_path);
+                            if armed_state.is_armed {
+                                armed_state.is_armed = false;
+                                save_armed_signal(&arm_file_path, &armed_state);
+                            }
                         }
                         Ok(count) => {
-                            println!("✅ [BACKFILL COMPLETE] Successfully recovered and validated {} missing 1m bars from REST.", count);
+                            println!("✅ [BACKFILL COMPLETE] Successfully recovered and validated {} missing 1m bars from REST. Continuity certified.", count);
                             is_candle_gap = false;
                             candle_feed_degraded = false;
                         }
@@ -1250,6 +1256,12 @@ async fn main() {
                             eprintln!("❌ [BACKFILL FAILED] Could not validate missing candles via REST: {}. Retaining candle_feed_degraded=true (fail-closed).", e);
                             is_candle_gap = true;
                             candle_feed_degraded = true;
+                            controller.force_neutral_data_quality();
+                            let mut armed_state = load_armed_signal(&arm_file_path);
+                            if armed_state.is_armed {
+                                armed_state.is_armed = false;
+                                save_armed_signal(&arm_file_path, &armed_state);
+                            }
                         }
                     }
                 }
