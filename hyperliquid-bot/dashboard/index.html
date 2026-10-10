@@ -100,9 +100,14 @@
     </div>
   </header>
 
-  <!-- Asset Cards Grid -->
-  <main class="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-6" id="assets-container">
+  <!-- Asset Cards Grid (4 Assets: BTC, ETH, SOL, AVAX) -->
+  <main class="max-w-7xl mx-auto grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6" id="assets-container">
     <!-- Placeholder loading cards -->
+    <div class="glass-card rounded-2xl p-6 animate-pulse">
+      <div class="h-6 bg-slate-800 rounded w-1/3 mb-4"></div>
+      <div class="h-24 bg-slate-800 rounded mb-4"></div>
+      <div class="h-40 bg-slate-800 rounded"></div>
+    </div>
     <div class="glass-card rounded-2xl p-6 animate-pulse">
       <div class="h-6 bg-slate-800 rounded w-1/3 mb-4"></div>
       <div class="h-24 bg-slate-800 rounded mb-4"></div>
@@ -286,9 +291,15 @@
           return;
         }
 
-        const price = d.price ? Number(d.price).toFixed(sym === 'SOL' ? 2 : sym === 'ETH' ? 2 : 2) : '0.00';
-        const buyPx = d.long_buy ? Number(d.long_buy).toFixed(2) : null;
-        const sellPx = d.short_sell ? Number(d.short_sell).toFixed(2) : null;
+        const price = (d.price !== undefined && d.price !== null)
+          ? Number(d.price).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+          : '0.00';
+        const buyPx = (d.long_buy !== undefined && d.long_buy !== null)
+          ? Number(d.long_buy).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+          : null;
+        const sellPx = (d.short_sell !== undefined && d.short_sell !== null)
+          ? Number(d.short_sell).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+          : null;
 
         // Proximity calculation
         const prox = Math.round(d.overall_proximity_pct || 0);
@@ -297,9 +308,16 @@
 
         // Mode badge styling
         let modeColor = "bg-slate-800 text-slate-300 border-slate-700";
-        if (d.mode === "CONSOLIDATION") modeColor = "bg-emerald-500/10 text-emerald-400 border-emerald-500/30";
-        if (d.mode === "TREND") modeColor = "bg-cyan-500/10 text-cyan-400 border-cyan-500/30";
-        if (d.mode === "NEUTRAL") modeColor = "bg-amber-500/10 text-amber-400 border-amber-500/30";
+        const modeStr = String(d.mode || "NEUTRAL").toUpperCase();
+        if (modeStr === "CONSOLIDATION" || modeStr === "MEANREVERSION") {
+          modeColor = "bg-emerald-500/10 text-emerald-400 border-emerald-500/30";
+        } else if (modeStr === "TREND") {
+          modeColor = "bg-cyan-500/10 text-cyan-400 border-cyan-500/30";
+        } else if (modeStr === "NEUTRAL") {
+          modeColor = "bg-amber-500/10 text-amber-400 border-amber-500/30";
+        } else if (modeStr === "SHOCK") {
+          modeColor = "bg-rose-500/10 text-rose-400 border-rose-500/30";
+        }
 
         // Half life calculation: Range [0, 240m]. Ideal: [15, 120]
         const thalf = Number(d.half_life_m || 0);
@@ -326,9 +344,32 @@
         const pT = Math.round((d.p_trend || 0) * 100);
         const pS = Math.round((d.p_shock || 0) * 100);
 
-        // Dwell Streak
-        const streakC = d.streak_consolidation || 0;
-        const dwellReady = streakC >= 3;
+        // Dwell Streak / Cooldown calculation
+        const streakC = Number(d.streak_consolidation || 0);
+        const streakT = Number(d.streak_trend || 0);
+        const cdBars = Number(d.shock_cooldown_bars || 0);
+
+        let streakLabel = "Consolidation";
+        let streakCurrent = streakC;
+        let streakTarget = 3;
+        let streakColor = "bg-emerald-400 shadow-sm shadow-emerald-400";
+
+        if (cdBars > 0) {
+          streakLabel = "Cooldown";
+          streakCurrent = cdBars;
+          streakTarget = 2;
+          streakColor = "bg-rose-500 shadow-sm shadow-rose-500";
+        } else if (streakT > streakC || modeStr === "TREND") {
+          streakLabel = "Trend Streak";
+          streakCurrent = streakT;
+          streakTarget = 2;
+          streakColor = "bg-cyan-400 shadow-sm shadow-cyan-400";
+        }
+
+        let pillsHtml = '';
+        for (let i = 1; i <= streakTarget; i++) {
+          pillsHtml += `<span class="h-2 w-4 rounded-full ${streakCurrent >= i ? streakColor : 'bg-slate-700'}"></span>`;
+        }
 
         html += `
           <div class="glass-card rounded-2xl p-6 transition-all duration-300 hover:border-white/20 hover:shadow-2xl hover:shadow-cyan-950/20">
@@ -346,13 +387,11 @@
                 </div>
               </div>
               <div class="text-right">
-                <span class="text-[10px] font-mono text-slate-400 block uppercase">Dwell Streak</span>
+                <span class="text-[10px] font-mono text-slate-400 block uppercase">${streakLabel}</span>
                 <div class="flex gap-1 mt-1 justify-end">
-                  <span class="h-2 w-5 rounded-full ${streakC >= 1 ? 'bg-emerald-400 shadow-sm shadow-emerald-400' : 'bg-slate-700'}"></span>
-                  <span class="h-2 w-5 rounded-full ${streakC >= 2 ? 'bg-emerald-400 shadow-sm shadow-emerald-400' : 'bg-slate-700'}"></span>
-                  <span class="h-2 w-5 rounded-full ${streakC >= 3 ? 'bg-emerald-400 shadow-sm shadow-emerald-400' : 'bg-slate-700'}"></span>
+                  ${pillsHtml}
                 </div>
-                <span class="text-[10px] font-mono text-slate-400 mt-1 block">${streakC}/3 bars</span>
+                <span class="text-[10px] font-mono text-slate-400 mt-1 block">${streakCurrent}/${streakTarget} bars</span>
               </div>
             </div>
 
@@ -546,11 +585,10 @@
 
       const elFillRatio = document.getElementById('cf-fill-ratio');
       if (elFillRatio) {
-        const strict = cf.fill_strict_through || 0;
-        const touch = cf.touch_only || 0;
-        const totalTouched = strict + touch;
-        const pct = cf.fill_ratio_pct || 0;
-        elFillRatio.textContent = `${strict} / ${totalTouched} (${pct.toFixed(0)}%)`;
+        const strict = Number(cf.fill_strict_through || cf.trade_through_count || 0);
+        const touches = Number(cf.touch_only_count || (strict + (cf.touch_only || 0)));
+        const pct = touches > 0 ? ((strict / touches) * 100) : Number(cf.fill_ratio_pct || 0);
+        elFillRatio.textContent = `${strict} / ${touches} (${pct.toFixed(0)}%)`;
       }
 
       const elNeutralCount = document.getElementById('cf-neutral-count');
@@ -566,14 +604,14 @@
         } else {
           let rows = '';
           keys.forEach(k => {
-            const item = vb[k];
-            const netBps = item.net_bps || 0;
+            const item = vb[k] || {};
+            const netBps = Number(item.net_bps || 0);
             const netBpsColor = netBps > 0 ? 'text-emerald-400' : (netBps < 0 ? 'text-rose-400' : 'text-slate-400');
             rows += `<tr>
               <td class="py-2 font-bold text-slate-300">${k}</td>
-              <td class="py-2 text-center">${item.count}</td>
-              <td class="py-2 text-emerald-400 text-center font-bold">${item.protective}</td>
-              <td class="py-2 text-amber-400 text-center font-bold">${item.strangling}</td>
+              <td class="py-2 text-center">${item.count || 0}</td>
+              <td class="py-2 text-emerald-400 text-center font-bold">${item.protective || 0}</td>
+              <td class="py-2 text-amber-400 text-center font-bold">${item.strangling || 0}</td>
               <td class="py-2 text-right font-bold ${netBpsColor}">${netBps > 0 ? '+' : ''}${netBps.toFixed(1)} bps</td>
             </tr>`;
           });
@@ -599,19 +637,21 @@
             const veto = dec.primary_veto || 'UNKNOWN';
             
             let statusBadge = '<span class="px-1.5 py-0.5 rounded text-[10px] bg-slate-800 text-slate-400">NO TOUCH</span>';
-            if (fill.trade_through_filled || fill.conservative_fill_occurred) {
+            const fillStatusStr = String(fill.fill_status || outcome.fill_status || '').toUpperCase();
+            if (fill.trade_through_filled || fillStatusStr.includes('TRADE_THROUGH')) {
               statusBadge = '<span class="px-1.5 py-0.5 rounded text-[10px] bg-cyan-500/10 text-cyan-400 border border-cyan-500/30">STRICT FILL</span>';
-            } else if (fill.touch_only || fill.touch_occurred) {
+            } else if (fill.touch_only || fillStatusStr.includes('TOUCH')) {
               statusBadge = '<span class="px-1.5 py-0.5 rounded text-[10px] bg-amber-500/10 text-amber-400 border border-amber-500/30">TOUCH ONLY</span>';
             }
 
-            const pnlBps = outcome.counterfactual_net_pnl_bps !== undefined ? outcome.counterfactual_net_pnl_bps : (outcome.hypothetical_net_pnl_bps || 0);
+            const pnlBps = Number(outcome.counterfactual_net_pnl_bps !== undefined && outcome.counterfactual_net_pnl_bps !== null ? outcome.counterfactual_net_pnl_bps : (outcome.hypothetical_net_pnl_bps || 0));
+            const vClass = String(outcome.veto_classification || '').toUpperCase();
             let outcomeHtml = '<span class="text-slate-500">PENDING</span>';
-            if (outcome.veto_classification === 'ALPHA_PROTECTIVE') {
+            if (vClass.includes('PROTECTIVE')) {
               outcomeHtml = `<span class="text-emerald-400 font-bold">PROTECTIVE (${Math.abs(pnlBps).toFixed(1)} bps saved)</span>`;
-            } else if (outcome.veto_classification === 'ALPHA_STRANGLING') {
+            } else if (vClass.includes('STRANGLING')) {
               outcomeHtml = `<span class="text-amber-400 font-bold">STRANGLING (+${pnlBps.toFixed(1)} bps missed)</span>`;
-            } else if (outcome.veto_classification === 'NEUTRAL_NOISE') {
+            } else if (vClass.includes('NEUTRAL') || vClass.includes('NOISE')) {
               outcomeHtml = `<span class="text-slate-400">NEUTRAL (${pnlBps.toFixed(1)} bps)</span>`;
             }
 
