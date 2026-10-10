@@ -66,6 +66,88 @@ def get_telemetry_data():
         except Exception:
             pass
 
+    # Load counterfactual records if present
+    cf_path = os.path.join(data_dir, "hl_counterfactual_trades.jsonl")
+    if not os.path.exists(cf_path):
+        for alt_d in SEARCH_DIRS:
+            cand = os.path.join(alt_d, "hl_counterfactual_trades.jsonl")
+            if os.path.exists(cand):
+                cf_path = cand
+                break
+
+    cf_stats = {
+        "total_evaluated": 0,
+        "total_records": 0,
+        "alpha_protective_count": 0,
+        "alpha_protective_avoided_bps": 0.0,
+        "alpha_strangling_count": 0,
+        "alpha_strangling_missed_bps": 0.0,
+        "neutral_noise_count": 0,
+        "touch_only": 0,
+        "touch_only_count": 0,
+        "fill_strict_through": 0,
+        "trade_through_count": 0,
+        "fill_ratio_pct": 0.0,
+        "veto_breakdown": {},
+        "recent_records": [],
+    }
+
+    if os.path.exists(cf_path):
+        try:
+            with open(cf_path, "r") as f:
+                lines = [line.strip() for line in f if line.strip()]
+                cf_stats["total_records"] = len(lines)
+                cf_stats["total_evaluated"] = len(lines)
+                parsed_records = []
+                for line in lines[-100:]:
+                    try:
+                        rec = json.loads(line)
+                        parsed_records.append(rec)
+                    except Exception:
+                        pass
+
+                for rec in parsed_records:
+                    outcome = rec.get("outcome", {})
+                    v_class = outcome.get("veto_classification", "")
+                    pnl = outcome.get("counterfactual_net_pnl_bps", 0.0) or 0.0
+                    fill_m = rec.get("fill_model", {})
+
+                    if fill_m.get("touch_only"):
+                        cf_stats["touch_only_count"] += 1
+                        cf_stats["touch_only"] += 1
+                    if fill_m.get("trade_through_filled"):
+                        cf_stats["trade_through_count"] += 1
+                        cf_stats["fill_strict_through"] += 1
+
+                    if v_class == "ALPHA_PROTECTIVE":
+                        cf_stats["alpha_protective_count"] += 1
+                        cf_stats["alpha_protective_avoided_bps"] += abs(pnl)
+                    elif v_class == "ALPHA_STRANGLING":
+                        cf_stats["alpha_strangling_count"] += 1
+                        cf_stats["alpha_strangling_missed_bps"] += pnl
+                    else:
+                        cf_stats["neutral_noise_count"] += 1
+
+                    veto_reason = rec.get("decision", {}).get("primary_veto", "OTHER")
+                    if veto_reason not in cf_stats["veto_breakdown"]:
+                        cf_stats["veto_breakdown"][veto_reason] = {"count": 0, "protective": 0, "strangling": 0, "net_bps": 0.0}
+                    cf_stats["veto_breakdown"][veto_reason]["count"] += 1
+                    if v_class == "ALPHA_PROTECTIVE":
+                        cf_stats["veto_breakdown"][veto_reason]["protective"] += 1
+                    elif v_class == "ALPHA_STRANGLING":
+                        cf_stats["veto_breakdown"][veto_reason]["strangling"] += 1
+                    cf_stats["veto_breakdown"][veto_reason]["net_bps"] += pnl
+
+                total_fills = cf_stats["fill_strict_through"] + cf_stats["touch_only"]
+                if total_fills > 0:
+                    cf_stats["fill_ratio_pct"] = (cf_stats["fill_strict_through"] / total_fills) * 100.0
+
+                cf_stats["recent_records"] = parsed_records[-15:][::-1]
+        except Exception:
+            pass
+
+    results["counterfactual"] = cf_stats
+
     return results
 
 class DashboardHandler(http.server.SimpleHTTPRequestHandler):

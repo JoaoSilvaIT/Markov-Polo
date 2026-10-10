@@ -120,31 +120,23 @@ pub fn estimate_ou_parameters(data: &[f64], dt: f64) -> Option<OuParameters> {
     Some(OuParameters { theta, mu, sigma })
 }
 
+pub fn calculate_thresholds_at_sigma(params: &OuParameters, transaction_cost: f64, num_sigma: f64) -> OptimalThresholds {
+    let sigma_eq = (params.sigma * params.sigma / (2.0 * params.theta)).sqrt();
+    let min_required_profit = transaction_cost * 2.5;
+    let deviation = (num_sigma * sigma_eq).max(min_required_profit);
+    OptimalThresholds {
+        entry_long: params.mu - deviation,
+        exit_long: params.mu,
+        entry_short: params.mu + deviation,
+        exit_short: params.mu,
+    }
+}
+
 /// Calculates the optimal entry and exit boundaries using a closed-form approximation 
 /// derived from the Bertram Optimization Model for Statistical Arbitrage.
 /// Maximizes the expected return per unit of time based on mean-reversion speed.
 pub fn calculate_optimal_thresholds(params: &OuParameters, transaction_cost: f64) -> OptimalThresholds {
-    // The equilibrium variance of the stationary O-U distribution is sigma^2 / (2 * theta).
-    // This gives us the standard deviation (noise band) of the process.
-    let sigma_eq = (params.sigma * params.sigma / (2.0 * params.theta)).sqrt();
-    
-    // Bertram's exact closed-form calculus requires numerical root finding for the absolute maximum, 
-    // but a highly robust analytic approximation scales the threshold based on the cost-to-noise ratio.
-    // If costs are high, the threshold widens to ensure expected profit > costs.
-    
-    // We base the entry deviation on the equilibrium standard deviation, adjusted for transaction costs.
-    // A standard optimal starting point is ~2.0 standard deviations from the mean (increased from 1.5 for higher win rate).
-    // We enforce that the minimum gross profit is at least 2.5x the transaction cost to avoid fee bleed.
-    let min_required_profit = transaction_cost * 2.5;
-    let optimal_deviation = (2.0 * sigma_eq).max(min_required_profit);
-    
-    // In strict mean-reversion, the optimal exit is exactly at the equilibrium mean (mu).
-    OptimalThresholds {
-        entry_long: params.mu - optimal_deviation,
-        exit_long: params.mu,
-        entry_short: params.mu + optimal_deviation,
-        exit_short: params.mu,
-    }
+    calculate_thresholds_at_sigma(params, transaction_cost, 2.0)
 }
 
 /// Computes the robust Median Absolute Deviation (MAD) of a return series,
@@ -185,6 +177,7 @@ pub fn calculate_net_edge_bps(entry_price: f64, exit_target: f64) -> f64 {
 #[derive(Debug, Clone)]
 pub struct FeatureSnapshot {
     pub thresholds_opt: Option<OptimalThresholds>,
+    pub thresholds_175_opt: Option<OptimalThresholds>,
     pub total_drift_pct: f64,
     #[allow(dead_code)]
     pub is_drifting: bool,
@@ -207,14 +200,15 @@ pub fn calculate_features(closes_history: &[f64], eval_close: f64) -> Option<Fea
     let hist_last_price = *closes_history.last().unwrap_or(&eval_close);
 
     // O-U Parameter Estimation with Phillips & Yu Jackknife bias correction
-    let (thresholds_opt, half_life_m) =
+    let (thresholds_opt, thresholds_175_opt, half_life_m) =
         if let Some(ou_params) = estimate_ou_parameters(closes_history, 1.0) {
             let hl = ou_params.half_life_minutes();
             let tx_cost = hist_last_price * 0.0005; // ~5 bps roundtrip on Hyperliquid Maker
             let th = calculate_optimal_thresholds(&ou_params, tx_cost);
-            (Some(th), hl)
+            let th_175 = calculate_thresholds_at_sigma(&ou_params, tx_cost, 1.75);
+            (Some(th), Some(th_175), hl)
         } else {
-            (None, 999.0)
+            (None, None, 999.0)
         };
 
     // OLS Slope drift calculation
@@ -260,6 +254,7 @@ pub fn calculate_features(closes_history: &[f64], eval_close: f64) -> Option<Fea
 
     Some(FeatureSnapshot {
         thresholds_opt,
+        thresholds_175_opt,
         total_drift_pct,
         is_drifting,
         half_life_m,

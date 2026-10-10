@@ -8,6 +8,7 @@ use tokio::sync::{mpsc::unbounded_channel, Mutex, RwLock};
 
 mod config;
 mod controller;
+pub mod counterfactual;
 mod discord;
 mod hmm;
 mod hyperliquid;
@@ -1081,6 +1082,7 @@ async fn main() {
     let mut last_processed_1m_open: u64 = initial_last_1m_open;
     let mut candle_feed_degraded: bool = false;
     let mut funnel_counters = load_funnel_counters(&trading_symbol);
+    let mut cf_tracker = crate::counterfactual::CounterfactualTracker::new(crate::counterfactual::COUNTERFACTUAL_JOURNAL);
 
     loop {
         let (sender, mut receiver) = unbounded_channel();
@@ -1241,6 +1243,9 @@ async fn main() {
                 let open_price = completed_bar.open;
                 let vol_val = completed_bar.volume;
 
+                let now_candle_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                cf_tracker.on_candle_bar(&trading_symbol, high_price, low_price, close_price, now_candle_ms);
+
                 let candle_bucket_15m = (completed_bar.time_open / (15 * 60 * 1000)) * (15 * 60 * 1000);
                 let mut finalized_15m_bar: Option<CandleBar> = None;
 
@@ -1325,6 +1330,7 @@ async fn main() {
                     let is_downside_shock = live_feat.is_downside_shock;
                     let is_upside_shock = live_feat.is_upside_shock;
                     let thresholds_opt = live_feat.thresholds_opt.clone();
+                    let thresholds_175_opt = live_feat.thresholds_175_opt.clone();
 
                     let cb_lock = cb_clone.lock().await;
                     let is_cb_paused = cb_lock.is_paused();
@@ -1762,6 +1768,53 @@ async fn main() {
                                                     "⚠️ [SHADOW-TREND VETO] Multiscale OBI hurdle failed: {} (inst: {:.3}, 250ms: {:.3}, 1s: {:.3}, 5s: {:.3}).",
                                                     obi_reason, obi_inst, obi_250ms, obi_1s, obi_5s
                                                 );
+
+                                                let (cf_tp, cf_sl) = if side == Side::Long {
+                                                    (close_price + 3.0 * current_atr, close_price - 2.0 * current_atr)
+                                                } else {
+                                                    (close_price - 3.0 * current_atr, close_price + 2.0 * current_atr)
+                                                };
+                                                let cf_opp = crate::counterfactual::ActiveOpportunity::new(
+                                                    symbol_clone.clone(),
+                                                    "EngineB_DonchianTrend".to_string(),
+                                                    if side == Side::Long { "BUY".to_string() } else { "SELL".to_string() },
+                                                    format!("{:?}", controller.current_mode).to_uppercase(),
+                                                    now_ms,
+                                                    1800,
+                                                    crate::counterfactual::CounterfactualDecision {
+                                                        accepted: false,
+                                                        primary_veto: "L2_OBI_HURDLE_FAIL".to_string(),
+                                                        all_vetos: vec!["L2_OBI_HURDLE_FAIL".to_string()],
+                                                        threshold_sigma: 0.0,
+                                                        signal_value: obi_inst,
+                                                        hmm_probabilities: crate::counterfactual::HmmProbs {
+                                                            consolidation: current_p_c,
+                                                            trend: current_p_t,
+                                                            shock: current_p_s,
+                                                        },
+                                                    },
+                                                    crate::counterfactual::MarketAtDecision {
+                                                        reference_price: close_price,
+                                                        bid: close_price,
+                                                        ask: close_price,
+                                                        spread_bps: 1.0,
+                                                        l2_age_ms: 0,
+                                                        obi: obi_1s,
+                                                        volatility_z15: z_15,
+                                                        volatility_z60: Some(z_60),
+                                                    },
+                                                    crate::counterfactual::HypotheticalOrder {
+                                                        order_type: "market".to_string(),
+                                                        limit_price: close_price,
+                                                        size: (position_size_usdc * trend_risk_fraction) / close_price,
+                                                        time_in_force: "IOC".to_string(),
+                                                        assumed_cancel_rule: "immediate".to_string(),
+                                                        queue_ahead_estimate: None,
+                                                    },
+                                                    cf_tp,
+                                                    cf_sl,
+                                                );
+                                                cf_tracker.register_opportunity(cf_opp);
                                             }
 
                                             let candidate_log = EngineBCandidateLog {
@@ -1796,6 +1849,69 @@ async fn main() {
                         }
                     } else {
                         funnel_counters.engine_b_mode_ineligible += 1;
+                        let prior_bars = if finalized_15m_bar.is_some() && rolling_15m_bars.len() > 1 {
+                            &rolling_15m_bars[..rolling_15m_bars.len() - 1]
+                        } else {
+                            &rolling_15m_bars[..]
+                        };
+                        if let Some(ref donchian) = calculate_donchian(prior_bars, donchian_period) {
+                            if close_price > donchian.upper || close_price < donchian.lower {
+                                let b_side = if close_price > donchian.upper { "BUY" } else { "SELL" };
+                                let primary_veto = if controller.shock_cooldown_bars > 0 {
+                                    "SHOCK_COOLDOWN_ACTIVE".to_string()
+                                } else {
+                                    format!("MODE_{:?}", controller.current_mode).to_uppercase()
+                                };
+                                let atr_val = calculate_atr(&rolling_15m_bars, 20).unwrap_or(close_price * 0.01).max(close_price * 0.002);
+                                let (cf_tp, cf_sl) = if b_side == "BUY" {
+                                    (close_price + 3.0 * atr_val, close_price - 2.0 * atr_val)
+                                } else {
+                                    (close_price - 3.0 * atr_val, close_price + 2.0 * atr_val)
+                                };
+                                let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                                let cf_opp = crate::counterfactual::ActiveOpportunity::new(
+                                    symbol_clone.clone(),
+                                    "EngineB_DonchianTrend".to_string(),
+                                    b_side.to_string(),
+                                    format!("{:?}", controller.current_mode).to_uppercase(),
+                                    now_ms,
+                                    1800,
+                                    crate::counterfactual::CounterfactualDecision {
+                                        accepted: false,
+                                        primary_veto: primary_veto.clone(),
+                                        all_vetos: vec![primary_veto],
+                                        threshold_sigma: 0.0,
+                                        signal_value: if b_side == "BUY" { close_price - donchian.upper } else { donchian.lower - close_price },
+                                        hmm_probabilities: crate::counterfactual::HmmProbs {
+                                            consolidation: current_p_c,
+                                            trend: current_p_t,
+                                            shock: current_p_s,
+                                        },
+                                    },
+                                    crate::counterfactual::MarketAtDecision {
+                                        reference_price: close_price,
+                                        bid: close_price,
+                                        ask: close_price,
+                                        spread_bps: 1.0,
+                                        l2_age_ms: 0,
+                                        obi: l2_1s,
+                                        volatility_z15: z_15,
+                                        volatility_z60: Some(z_60),
+                                    },
+                                    crate::counterfactual::HypotheticalOrder {
+                                        order_type: "market".to_string(),
+                                        limit_price: close_price,
+                                        size: (position_size_usdc * trend_risk_fraction) / close_price,
+                                        time_in_force: "IOC".to_string(),
+                                        assumed_cancel_rule: "immediate".to_string(),
+                                        queue_ahead_estimate: None,
+                                    },
+                                    cf_tp,
+                                    cf_sl,
+                                );
+                                cf_tracker.register_opportunity(cf_opp);
+                            }
+                        }
                     }
 
                     let mut state_lock = state_clone.lock().await;
@@ -2444,6 +2560,137 @@ async fn main() {
                                         );
                                     } else {
                                         funnel_counters.engine_a_outside_band += 1;
+                                    }
+                                }
+                            }
+
+                            // ------------------------------------------------------------------
+                            // COUNTERFACTUAL ENGINE: Track Vetoed 2.0sigma & Relaxed 1.75sigma Opportunities
+                            // ------------------------------------------------------------------
+                            if !armed_state.is_armed {
+                                if let Some(ref th20) = thresholds_opt {
+                                    let is_20_long = close_price <= th20.entry_long;
+                                    let is_20_short = close_price >= th20.entry_short;
+
+                                    if (is_20_long || is_20_short) && (!is_eligible || (is_20_long && is_downside_shock) || (is_20_short && is_upside_shock)) {
+                                        let side_str = if is_20_long { "BUY" } else { "SELL" };
+                                        let is_shock = if is_20_long { is_downside_shock } else { is_upside_shock };
+
+                                        let mut all_vetos = Vec::new();
+                                        if is_shock { all_vetos.push("SHOCK_SENTINEL".to_string()); }
+                                        if controller.shock_cooldown_bars > 0 { all_vetos.push("SHOCK_COOLDOWN_ACTIVE".to_string()); }
+                                        if controller.current_mode != ControllerMode::MeanReversion {
+                                            all_vetos.push(format!("MODE_{:?}", controller.current_mode).to_uppercase());
+                                        }
+                                        if !consolidation_vol_ok { all_vetos.push("VOLATILITY_GATE_BREACH".to_string()); }
+                                        if !is_valid_half_life { all_vetos.push("HALF_LIFE_INVALID".to_string()); }
+                                        if !is_consolidation { all_vetos.push("STATIONARITY_INVALID".to_string()); }
+                                        if is_cb_paused { all_vetos.push("CIRCUIT_BREAKER_PAUSED".to_string()); }
+                                        if is_cluster_blocked { all_vetos.push("CLUSTER_LEASE_BLOCKED".to_string()); }
+                                        if candle_feed_degraded || is_candle_gap { all_vetos.push("DATA_FEED_DEGRADED".to_string()); }
+
+                                        let primary_veto = all_vetos.first().cloned().unwrap_or_else(|| "GATED".to_string());
+                                        let limit_px = if is_20_long { th20.entry_long } else { th20.entry_short };
+                                        let tp_px = if is_20_long { th20.exit_long } else { th20.exit_short };
+                                        let sl_px = if is_20_long { limit_px * 0.99 } else { limit_px * 1.01 };
+                                        let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+
+                                        let cf_opp = crate::counterfactual::ActiveOpportunity::new(
+                                            symbol_clone.clone(),
+                                            "EngineA_MeanReversion".to_string(),
+                                            side_str.to_string(),
+                                            format!("{:?}", controller.current_mode).to_uppercase(),
+                                            now_ms,
+                                            1800,
+                                            crate::counterfactual::CounterfactualDecision {
+                                                accepted: false,
+                                                primary_veto,
+                                                all_vetos,
+                                                threshold_sigma: 2.0,
+                                                signal_value: z_15,
+                                                hmm_probabilities: crate::counterfactual::HmmProbs {
+                                                    consolidation: current_p_c,
+                                                    trend: current_p_t,
+                                                    shock: current_p_s,
+                                                },
+                                            },
+                                            crate::counterfactual::MarketAtDecision {
+                                                reference_price: close_price,
+                                                bid: close_price,
+                                                ask: close_price,
+                                                spread_bps: 1.0,
+                                                l2_age_ms: 0,
+                                                obi: l2_1s,
+                                                volatility_z15: z_15,
+                                                volatility_z60: Some(z_60),
+                                            },
+                                            crate::counterfactual::HypotheticalOrder {
+                                                order_type: "post_only_limit".to_string(),
+                                                limit_price: limit_px,
+                                                size: position_size_usdc / limit_px,
+                                                time_in_force: "GTC".to_string(),
+                                                assumed_cancel_rule: "timeout_or_reversion".to_string(),
+                                                queue_ahead_estimate: None,
+                                            },
+                                            tp_px,
+                                            sl_px,
+                                        );
+                                        cf_tracker.register_opportunity(cf_opp);
+                                    } else if !is_20_long && !is_20_short {
+                                        if let Some(ref th175) = thresholds_175_opt {
+                                            let is_175_long = close_price <= th175.entry_long;
+                                            let is_175_short = close_price >= th175.entry_short;
+
+                                            if is_175_long || is_175_short {
+                                                let side_str = if is_175_long { "BUY" } else { "SELL" };
+                                                let limit_px = if is_175_long { th175.entry_long } else { th175.entry_short };
+                                                let tp_px = if is_175_long { th175.exit_long } else { th175.exit_short };
+                                                let sl_px = if is_175_long { limit_px * 0.99 } else { limit_px * 1.01 };
+                                                let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+
+                                                let cf_opp = crate::counterfactual::ActiveOpportunity::new(
+                                                    symbol_clone.clone(),
+                                                    "EngineA_MeanReversion".to_string(),
+                                                    side_str.to_string(),
+                                                    format!("{:?}", controller.current_mode).to_uppercase(),
+                                                    now_ms,
+                                                    1800,
+                                                    crate::counterfactual::CounterfactualDecision {
+                                                        accepted: false,
+                                                        primary_veto: "RELAXED_BOUNDARY_1.75_SIGMA".to_string(),
+                                                        all_vetos: vec!["RELAXED_BOUNDARY_1.75_SIGMA".to_string()],
+                                                        threshold_sigma: 1.75,
+                                                        signal_value: z_15,
+                                                        hmm_probabilities: crate::counterfactual::HmmProbs {
+                                                            consolidation: current_p_c,
+                                                            trend: current_p_t,
+                                                            shock: current_p_s,
+                                                        },
+                                                    },
+                                                    crate::counterfactual::MarketAtDecision {
+                                                        reference_price: close_price,
+                                                        bid: close_price,
+                                                        ask: close_price,
+                                                        spread_bps: 1.0,
+                                                        l2_age_ms: 0,
+                                                        obi: l2_1s,
+                                                        volatility_z15: z_15,
+                                                        volatility_z60: Some(z_60),
+                                                    },
+                                                    crate::counterfactual::HypotheticalOrder {
+                                                        order_type: "post_only_limit".to_string(),
+                                                        limit_price: limit_px,
+                                                        size: position_size_usdc / limit_px,
+                                                        time_in_force: "GTC".to_string(),
+                                                        assumed_cancel_rule: "timeout_or_reversion".to_string(),
+                                                        queue_ahead_estimate: None,
+                                                    },
+                                                    tp_px,
+                                                    sl_px,
+                                                );
+                                                cf_tracker.register_opportunity(cf_opp);
+                                            }
+                                        }
                                     }
                                 }
                             }

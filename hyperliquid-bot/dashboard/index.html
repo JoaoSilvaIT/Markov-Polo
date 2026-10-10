@@ -120,6 +120,123 @@
     </div>
   </main>
 
+  <!-- Counterfactual Coherence & Veto Attribution Panel (R1 & R2 Certified) -->
+  <section class="max-w-7xl mx-auto mt-10" id="counterfactual-section">
+    <div class="glass-card rounded-2xl p-6 md:p-8 border border-white/10">
+      <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-6 border-b border-white/10">
+        <div>
+          <div class="flex items-center gap-2">
+            <span class="text-xl font-bold bg-gradient-to-r from-cyan-400 via-indigo-300 to-purple-400 bg-clip-text text-transparent">
+              🔬 Counterfactual Coherence & Veto Attribution
+            </span>
+            <span class="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
+              SHADOW BENCHMARK
+            </span>
+          </div>
+          <p class="text-xs text-slate-400 mt-1">
+            Empirical evaluation of rejected Maker & Breakout signals. Conservative Trade-Through fill rule (zero queue fantasy).
+          </p>
+        </div>
+        <div class="flex items-center gap-3 text-xs font-mono">
+          <span class="text-slate-400">Total Evaluated:</span>
+          <span id="cf-total-evaluated" class="font-bold text-white px-2 py-1 rounded bg-slate-800 border border-white/10">0</span>
+        </div>
+      </div>
+
+      <!-- 4 KPI Cards -->
+      <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mt-6">
+        <div class="bg-dark-900/60 p-4 rounded-xl border border-emerald-500/20">
+          <div class="flex items-center justify-between text-xs text-slate-400 mb-1">
+            <span>Alpha-Protective Vetos</span>
+            <span class="text-emerald-400 font-bold">🛡️ Capital Saved</span>
+          </div>
+          <div class="text-2xl font-black font-mono text-emerald-400" id="cf-protective-count">0</div>
+          <div class="text-[11px] font-mono text-slate-400 mt-1">
+            Avoided Losses: <span class="text-emerald-300 font-bold" id="cf-avoided-bps">+0.0 bps</span>
+          </div>
+        </div>
+
+        <div class="bg-dark-900/60 p-4 rounded-xl border border-amber-500/20">
+          <div class="flex items-center justify-between text-xs text-slate-400 mb-1">
+            <span>Alpha-Strangling Vetos</span>
+            <span class="text-amber-400 font-bold">⚠️ Missed Alpha</span>
+          </div>
+          <div class="text-2xl font-black font-mono text-amber-400" id="cf-strangling-count">0</div>
+          <div class="text-[11px] font-mono text-slate-400 mt-1">
+            Missed Profit: <span class="text-amber-300 font-bold" id="cf-missed-bps">0.0 bps</span>
+          </div>
+        </div>
+
+        <div class="bg-dark-900/60 p-4 rounded-xl border border-cyan-500/20">
+          <div class="flex items-center justify-between text-xs text-slate-400 mb-1">
+            <span>Conservative Fills</span>
+            <span class="text-cyan-400 font-bold">🎯 Strict-Through</span>
+          </div>
+          <div class="text-2xl font-black font-mono text-cyan-400" id="cf-fill-ratio">0 / 0</div>
+          <div class="text-[11px] font-mono text-slate-400 mt-1">
+            Trade-Through vs Touches
+          </div>
+        </div>
+
+        <div class="bg-dark-900/60 p-4 rounded-xl border border-slate-700">
+          <div class="flex items-center justify-between text-xs text-slate-400 mb-1">
+            <span>Neutral / Scratch</span>
+            <span class="text-slate-400 font-bold">⏱️ Timed Out</span>
+          </div>
+          <div class="text-2xl font-black font-mono text-slate-300" id="cf-neutral-count">0</div>
+          <div class="text-[11px] font-mono text-slate-500 mt-1">
+            No SL/TP breach in 30m
+          </div>
+        </div>
+      </div>
+
+      <!-- Veto Breakdown & Recent Activity Grid -->
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-6">
+        <!-- Veto Reason Attribution Table -->
+        <div class="bg-dark-900/40 p-4 rounded-xl border border-white/5">
+          <h3 class="text-xs font-bold text-slate-300 uppercase tracking-wider mb-3">Veto Attribution Scorecard</h3>
+          <div class="overflow-x-auto">
+            <table class="w-full text-[11px] font-mono text-left">
+              <thead>
+                <tr class="text-slate-400 border-b border-white/5">
+                  <th class="pb-2">VETO REASON</th>
+                  <th class="pb-2 text-center">N</th>
+                  <th class="pb-2 text-emerald-400 text-center">PROTECT</th>
+                  <th class="pb-2 text-amber-400 text-center">STRANGLE</th>
+                  <th class="pb-2 text-right">NET BPS</th>
+                </tr>
+              </thead>
+              <tbody id="cf-veto-table-body" class="divide-y divide-white/5 text-slate-300">
+                <tr><td colspan="5" class="py-4 text-center text-slate-500">No vetoed signals logged yet</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Recent Audit Stream Table -->
+        <div class="bg-dark-900/40 p-4 rounded-xl border border-white/5">
+          <h3 class="text-xs font-bold text-slate-300 uppercase tracking-wider mb-3">Recent Counterfactual Audit Stream</h3>
+          <div class="overflow-x-auto">
+            <table class="w-full text-[11px] font-mono text-left">
+              <thead>
+                <tr class="text-slate-400 border-b border-white/5">
+                  <th class="pb-2">TIME</th>
+                  <th class="pb-2">ASSET</th>
+                  <th class="pb-2">VETO</th>
+                  <th class="pb-2">STATUS</th>
+                  <th class="pb-2 text-right">OUTCOME</th>
+                </tr>
+              </thead>
+              <tbody id="cf-stream-table-body" class="divide-y divide-white/5 text-slate-300">
+                <tr><td colspan="5" class="py-4 text-center text-slate-500">Awaiting counterfactual events</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <!-- Footer / Status Details -->
   <footer class="max-w-7xl mx-auto mt-10 pt-6 border-t border-white/5 flex flex-col md:flex-row items-center justify-between text-xs text-slate-500 font-mono">
     <div>
@@ -157,7 +274,9 @@
 
       // 2. Render Asset Cards
       const container = document.getElementById('assets-container');
-      const symbols = ['BTC', 'ETH', 'SOL'];
+      const symbols = (data.assets && Object.keys(data.assets).length > 0)
+        ? Object.keys(data.assets).sort()
+        : ['BTC', 'ETH', 'SOL', 'AVAX'];
       let html = '';
 
       symbols.forEach(sym => {
@@ -401,6 +520,112 @@
       });
 
       container.innerHTML = html;
+
+      // 3. Render Counterfactual Coherence & Veto Attribution
+      const cf = data.counterfactual || {};
+      const elTotal = document.getElementById('cf-total-evaluated');
+      if (elTotal) elTotal.textContent = cf.total_evaluated || 0;
+
+      const elProtCount = document.getElementById('cf-protective-count');
+      if (elProtCount) elProtCount.textContent = cf.alpha_protective_count || 0;
+
+      const elAvoided = document.getElementById('cf-avoided-bps');
+      if (elAvoided) {
+        const bps = cf.alpha_protective_avoided_bps || 0;
+        elAvoided.textContent = `+${bps.toFixed(1)} bps`;
+      }
+
+      const elStrangleCount = document.getElementById('cf-strangling-count');
+      if (elStrangleCount) elStrangleCount.textContent = cf.alpha_strangling_count || 0;
+
+      const elMissed = document.getElementById('cf-missed-bps');
+      if (elMissed) {
+        const bps = cf.alpha_strangling_missed_bps || 0;
+        elMissed.textContent = `${bps.toFixed(1)} bps`;
+      }
+
+      const elFillRatio = document.getElementById('cf-fill-ratio');
+      if (elFillRatio) {
+        const strict = cf.fill_strict_through || 0;
+        const touch = cf.touch_only || 0;
+        const totalTouched = strict + touch;
+        const pct = cf.fill_ratio_pct || 0;
+        elFillRatio.textContent = `${strict} / ${totalTouched} (${pct.toFixed(0)}%)`;
+      }
+
+      const elNeutralCount = document.getElementById('cf-neutral-count');
+      if (elNeutralCount) elNeutralCount.textContent = cf.neutral_noise_count || 0;
+
+      // Veto Attribution Table
+      const vetoTableBody = document.getElementById('cf-veto-table-body');
+      if (vetoTableBody) {
+        const vb = cf.veto_breakdown || {};
+        const keys = Object.keys(vb);
+        if (keys.length === 0) {
+          vetoTableBody.innerHTML = '<tr><td colspan="5" class="py-4 text-center text-slate-500">No vetoed signals logged yet</td></tr>';
+        } else {
+          let rows = '';
+          keys.forEach(k => {
+            const item = vb[k];
+            const netBps = item.net_bps || 0;
+            const netBpsColor = netBps > 0 ? 'text-emerald-400' : (netBps < 0 ? 'text-rose-400' : 'text-slate-400');
+            rows += `<tr>
+              <td class="py-2 font-bold text-slate-300">${k}</td>
+              <td class="py-2 text-center">${item.count}</td>
+              <td class="py-2 text-emerald-400 text-center font-bold">${item.protective}</td>
+              <td class="py-2 text-amber-400 text-center font-bold">${item.strangling}</td>
+              <td class="py-2 text-right font-bold ${netBpsColor}">${netBps > 0 ? '+' : ''}${netBps.toFixed(1)} bps</td>
+            </tr>`;
+          });
+          vetoTableBody.innerHTML = rows;
+        }
+      }
+
+      // Recent Counterfactual Audit Stream Table
+      const streamTableBody = document.getElementById('cf-stream-table-body');
+      if (streamTableBody) {
+        const recs = cf.recent_records || [];
+        if (recs.length === 0) {
+          streamTableBody.innerHTML = '<tr><td colspan="5" class="py-4 text-center text-slate-500">Awaiting counterfactual events</td></tr>';
+        } else {
+          let rows = '';
+          recs.forEach(r => {
+            const dec = r.decision || {};
+            const outcome = r.outcome || {};
+            const fill = r.fill_model || {};
+            const timeRaw = r.ts_utc || r.timestamp;
+            const timeStr = timeRaw ? new Date(timeRaw).toLocaleTimeString() : '--:--:--';
+            const asset = r.asset || dec.symbol || '--';
+            const veto = dec.primary_veto || 'UNKNOWN';
+            
+            let statusBadge = '<span class="px-1.5 py-0.5 rounded text-[10px] bg-slate-800 text-slate-400">NO TOUCH</span>';
+            if (fill.trade_through_filled || fill.conservative_fill_occurred) {
+              statusBadge = '<span class="px-1.5 py-0.5 rounded text-[10px] bg-cyan-500/10 text-cyan-400 border border-cyan-500/30">STRICT FILL</span>';
+            } else if (fill.touch_only || fill.touch_occurred) {
+              statusBadge = '<span class="px-1.5 py-0.5 rounded text-[10px] bg-amber-500/10 text-amber-400 border border-amber-500/30">TOUCH ONLY</span>';
+            }
+
+            const pnlBps = outcome.counterfactual_net_pnl_bps !== undefined ? outcome.counterfactual_net_pnl_bps : (outcome.hypothetical_net_pnl_bps || 0);
+            let outcomeHtml = '<span class="text-slate-500">PENDING</span>';
+            if (outcome.veto_classification === 'ALPHA_PROTECTIVE') {
+              outcomeHtml = `<span class="text-emerald-400 font-bold">PROTECTIVE (${Math.abs(pnlBps).toFixed(1)} bps saved)</span>`;
+            } else if (outcome.veto_classification === 'ALPHA_STRANGLING') {
+              outcomeHtml = `<span class="text-amber-400 font-bold">STRANGLING (+${pnlBps.toFixed(1)} bps missed)</span>`;
+            } else if (outcome.veto_classification === 'NEUTRAL_NOISE') {
+              outcomeHtml = `<span class="text-slate-400">NEUTRAL (${pnlBps.toFixed(1)} bps)</span>`;
+            }
+
+            rows += `<tr>
+              <td class="py-2 text-slate-400">${timeStr}</td>
+              <td class="py-2 font-bold text-white">${asset}</td>
+              <td class="py-2 text-slate-300 font-mono text-[10px]">${veto}</td>
+              <td class="py-2">${statusBadge}</td>
+              <td class="py-2 text-right font-mono">${outcomeHtml}</td>
+            </tr>`;
+          });
+          streamTableBody.innerHTML = rows;
+        }
+      }
     }
 
     function renderEmptyCard(sym) {
