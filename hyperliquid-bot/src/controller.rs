@@ -252,21 +252,35 @@ impl RegimeController {
         // 4. STATE MACHINE TRANSITIONS (Asymmetric Multi-Tier Dwell)
         match self.current_mode {
             ControllerMode::Neutral => {
-                // Asymmetric Trend Trigger (Researcher 1 & 2):
-                // Strictly requires Donchian breakout (close-confirmed):
-                // - Strong trend (P_T >= 0.90) + Donchian breakout -> 1 bar dwell!
-                // - Moderate trend (P_T >= 0.82) + Donchian breakout -> 2 bars dwell!
-                let valid_trend_trigger = has_breakout
-                    && ((p_trend >= 0.90 && self.trend_streak >= 1) || (self.trend_streak >= 2));
+                // Asymmetric Multi-Tier Trend Trigger:
+                // - With 15m Donchian breakout (fast impulse breakout):
+                //     * Strong trend (P_T >= 0.90) -> 1 bar dwell!
+                //     * Moderate trend (P_T >= 0.82) -> 2 bars dwell!
+                // - Without 15m Donchian breakout (sustained macro momentum expansion):
+                //     * Strong trend (P_T >= 0.90) -> 2 bars dwell!
+                //     * Moderate trend (P_T >= 0.82) -> 3 bars dwell!
+                let valid_trend_trigger = if has_breakout {
+                    (p_trend >= 0.90 && self.trend_streak >= 1) || self.trend_streak >= 2
+                } else {
+                    (p_trend >= 0.90 && self.trend_streak >= 2) || self.trend_streak >= 3
+                };
 
                 if valid_trend_trigger {
                     self.current_mode = ControllerMode::Trend;
                     self.last_transition_time = Utc::now().to_rfc3339();
-                    self.last_reason = format!(
-                        "Trend confirmed: P_T={:.1}% (streak {} bars) + Donchian breakout",
-                        p_trend * 100.0,
-                        self.trend_streak
-                    );
+                    self.last_reason = if has_breakout {
+                        format!(
+                            "Trend confirmed: P_T={:.1}% (streak {} bars) + Donchian breakout",
+                            p_trend * 100.0,
+                            self.trend_streak
+                        )
+                    } else {
+                        format!(
+                            "Trend confirmed: P_T={:.1}% (streak {} bars) momentum expansion",
+                            p_trend * 100.0,
+                            self.trend_streak
+                        )
+                    };
                     self.epoch += 1;
                 }
                 // Asymmetric Consolidation Trigger (Researcher 1 & 2):
@@ -286,7 +300,11 @@ impl RegimeController {
                     );
                     self.epoch += 1;
                 } else {
-                    let required_t_dwell = if p_trend >= 0.90 && has_breakout { 1 } else { 2 };
+                    let required_t_dwell = if has_breakout {
+                        if p_trend >= 0.90 { 1 } else { 2 }
+                    } else {
+                        if p_trend >= 0.90 { 2 } else { 3 }
+                    };
                     let required_c_dwell = if p_consolidation >= 0.80 { 2 } else { 3 };
                     self.last_reason = format!(
                         "Awaiting regime confirmation (Trend streak: {}/{}, Consolidation streak: {}/{})",
@@ -481,6 +499,44 @@ mod tests {
         let mode2 = controller.evaluate_15m_bar(BASE_TIME_MS + 900_000, 0.10, 0.85, 1.2, 0.6, false, false, false);
         assert_eq!(mode2, ControllerMode::Trend);
         assert_eq!(controller.trend_streak, 2);
+    }
+
+    #[test]
+    fn test_strong_trend_without_15m_breakout_triggers_on_bar_2() {
+        let mut controller = RegimeController::default();
+
+        // Bar 1: P_T = 0.95 without 15m breakout (streak 1 -> awaits 2)
+        let mode1 = controller.evaluate_15m_bar(BASE_TIME_MS, 0.05, 0.95, 1.0, 0.5, false, false, false);
+        assert_eq!(mode1, ControllerMode::Neutral);
+        assert_eq!(controller.trend_streak, 1);
+        assert!(!controller.breakout_seen_in_streak);
+
+        // Bar 2: P_T = 0.95 without 15m breakout -> triggers on bar 2 via momentum expansion!
+        let mode2 = controller.evaluate_15m_bar(BASE_TIME_MS + 900_000, 0.05, 0.95, 1.0, 0.5, false, false, false);
+        assert_eq!(mode2, ControllerMode::Trend);
+        assert_eq!(controller.trend_streak, 2);
+        assert!(controller.last_reason.contains("momentum expansion"));
+    }
+
+    #[test]
+    fn test_moderate_trend_without_15m_breakout_triggers_on_bar_3() {
+        let mut controller = RegimeController::default();
+
+        // Bar 1: P_T = 0.85 without 15m breakout -> Neutral (1/3)
+        let mode1 = controller.evaluate_15m_bar(BASE_TIME_MS, 0.10, 0.85, 1.0, 0.5, false, false, false);
+        assert_eq!(mode1, ControllerMode::Neutral);
+        assert_eq!(controller.trend_streak, 1);
+
+        // Bar 2: P_T = 0.85 without 15m breakout -> Neutral (2/3)
+        let mode2 = controller.evaluate_15m_bar(BASE_TIME_MS + 900_000, 0.10, 0.85, 1.0, 0.5, false, false, false);
+        assert_eq!(mode2, ControllerMode::Neutral);
+        assert_eq!(controller.trend_streak, 2);
+
+        // Bar 3: P_T = 0.85 without 15m breakout -> Confirmed on bar 3 (3/3)!
+        let mode3 = controller.evaluate_15m_bar(BASE_TIME_MS + 1_800_000, 0.10, 0.85, 1.0, 0.5, false, false, false);
+        assert_eq!(mode3, ControllerMode::Trend);
+        assert_eq!(controller.trend_streak, 3);
+        assert!(controller.last_reason.contains("momentum expansion"));
     }
 
     #[test]
