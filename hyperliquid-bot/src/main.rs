@@ -1803,7 +1803,7 @@ async fn main() {
 
                                             if obi_favorable {
                                                 funnel_counters.engine_b_orders_placed += 1;
-                                                let trend_notional = position_size_usdc * trend_risk_fraction;
+                                                let trend_notional = (position_size_usdc * trend_risk_fraction).max(11.0);
                                                 let shadow_size = trend_notional / close_price;
 
                                                 if trend_engine_mode == "live" {
@@ -2990,7 +2990,7 @@ async fn main() {
                     }
 
                     // Advance rolling window with finalized 1m close
-                    if rolling_closes.len() >= 480 {
+                    if rolling_closes.len() >= 960 {
                         rolling_closes.remove(0);
                     }
                     rolling_closes.push(close_price);
