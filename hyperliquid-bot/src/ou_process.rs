@@ -13,7 +13,7 @@ impl OuParameters {
         if self.theta > 1e-6 {
             (2.0_f64.ln()) / self.theta
         } else {
-            120.0
+            999.0
         }
     }
 }
@@ -298,11 +298,19 @@ pub fn calculate_features(closes_history: &[f64], eval_close: f64, symbol: &str)
     }
     let hist_last_price = *closes_history.last().unwrap_or(&eval_close);
 
+    // Lookback-relative half-life bounds (Quant Researcher Consensus):
+    // Lower bound: max(30.0 min, 0.03 * N) to filter microstructure noise and bid-ask bounce
+    // Upper bound: 0.50 * N (e.g. 480 mins for 960 bars) to ensure mean reversion materializes within window
+    // Assets with t_half > 0.50 * N (like AVAX at ~770m) are classified as slow/uncertain unit-root and rejected.
+    let n_bars = closes_history.len() as f64;
+    let min_hl = 30.0_f64.max(0.03 * n_bars);
+    let max_hl = 0.50 * n_bars;
+
     // O-U Parameter Estimation with Phillips & Yu Jackknife bias correction (log-price space)
     let (thresholds_opt, thresholds_175_opt, half_life_m) =
         if let Some(ou_params) = estimate_ou_parameters(closes_history, 1.0) {
             let hl = ou_params.half_life_minutes();
-            let is_hl_ok = (15.0..=120.0).contains(&hl);
+            let is_hl_ok = hl >= min_hl && hl <= max_hl;
             // Tighter 7% gate: log-space estimation is more stable, so a wider mu deviation
             // reliably signals a unit-root explosion or a structural break rather than noise.
             let mu_dev = (ou_params.mu - hist_last_price).abs() / hist_last_price;
@@ -320,10 +328,7 @@ pub fn calculate_features(closes_history: &[f64], eval_close: f64, symbol: &str)
             (None, None, 999.0)
         };
 
-    // Log-price OLS slope drift detection (scale-invariant percentage drift per bar)
-    // Working in log-price space gives a drift estimate in fractional units (~0.0001 = 0.01%/bar),
-    // which is consistent across BTC ($63k), ETH ($2.5k), SOL ($150), and AVAX ($30).
-    // total_drift_pct = slope_log * n_bars represents the cumulative log-return over the window.
+    // Scale-Invariant Log-Price OLS Slope Drift Test with Student's t-statistic
     let n_drift = closes_history.len() as f64;
     let mut sum_i = 0.0_f64;
     let mut sum_lp = 0.0_f64;
@@ -339,15 +344,48 @@ pub fn calculate_features(closes_history: &[f64], eval_close: f64, symbol: &str)
         sum_ii += idx * idx;
     }
     let det = n_drift * sum_ii - sum_i * sum_i;
-    let slope_log = if det.abs() > 1e-12 {
-        (n_drift * sum_ilp - sum_i * sum_lp) / det
+    let (slope_log, intercept_log) = if det.abs() > 1e-12 {
+        let slope = (n_drift * sum_ilp - sum_i * sum_lp) / det;
+        let intercept = (sum_lp - slope * sum_i) / n_drift;
+        (slope, intercept)
+    } else {
+        (0.0, 0.0)
+    };
+
+    // Compute residual variance and t-statistic for OLS slope significance (H0: slope == 0)
+    let mut sum_sq_residuals = 0.0_f64;
+    for (i, &p) in closes_history.iter().enumerate() {
+        if p <= 0.0 { continue; }
+        let lp = p.ln();
+        let y_hat = intercept_log + slope_log * (i as f64);
+        sum_sq_residuals += (lp - y_hat).powi(2);
+    }
+    let df = (n_drift - 2.0).max(1.0);
+    let s_err_sq = sum_sq_residuals / df;
+    let ss_xx = (det / n_drift).max(1e-12);
+    let se_slope = (s_err_sq / ss_xx).sqrt();
+    let t_stat_slope = if se_slope > 1e-12 {
+        slope_log / se_slope
     } else {
         0.0
     };
-    // total_drift_pct is the total cumulative log-return drift over the full window:
-    // e.g., 0.015 means 1.5% cumulative drift. Threshold 1.5% kept the same as before.
+
+    // Cumulative log-return drift over the lookback window
     let total_drift_pct = slope_log * n_drift;
-    let is_drifting = total_drift_pct.abs() > 0.015;
+
+    // Asset-specific maximum allowable economic drift over the lookback window:
+    // BTC: 2.0%, ETH: 2.5%, SOL: 4.0%, AVAX: 5.0%, Default: 2.5%
+    let max_economic_drift = match symbol.to_uppercase().as_str() {
+        "BTC"  => 0.020,
+        "ETH"  => 0.025,
+        "SOL"  => 0.040,
+        "AVAX" => 0.050,
+        _      => 0.025,
+    };
+
+    // Series is drifting if slope is statistically significant (|t| >= 2.58, p < 0.01)
+    // AND the economic cumulative drift exceeds asset hurdle
+    let is_drifting = t_stat_slope.abs() >= 2.58 && total_drift_pct.abs() > max_economic_drift;
 
     // Standardized Downside/Upside Shock Calculation with robust MAD
     let n = closes_history.len();
@@ -391,7 +429,7 @@ pub fn calculate_features(closes_history: &[f64], eval_close: f64, symbol: &str)
     let is_upside_shock = shock_15_up || shock_60_up;
     let is_stationary = thresholds_opt.is_some();
     let is_consolidation = !is_drifting && is_stationary;
-    let is_valid_half_life = (15.0..=120.0).contains(&half_life_m);
+    let is_valid_half_life = half_life_m >= min_hl && half_life_m <= max_hl;
 
     Some(FeatureSnapshot {
         thresholds_opt,
@@ -434,7 +472,7 @@ mod tests {
             mu: 100.0,
             sigma: 1.0,
         };
-        assert_eq!(slow_params.half_life_minutes(), 120.0);
+        assert_eq!(slow_params.half_life_minutes(), 999.0);
     }
 
     #[test]

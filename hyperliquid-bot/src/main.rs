@@ -2094,7 +2094,7 @@ async fn main() {
                             let mut chandelier_stopped = false;
                             let mut giveback_triggered = false;
                             let mut elapsed_mins = 0.0;
-                            let mut max_allowed_mins = 120.0;
+                            let mut max_allowed_mins = 240.0;
 
                             let mut should_reprice = false;
                             let mut new_reprice_target = 0.0;
@@ -2154,9 +2154,9 @@ async fn main() {
                                         }
 
                                         max_allowed_mins = if pos.half_life_minutes > 0.0 {
-                                            (2.0 * pos.half_life_minutes).clamp(15.0, 360.0)
+                                            (2.0 * pos.half_life_minutes).clamp(30.0, 600.0)
                                         } else {
-                                            120.0
+                                            240.0
                                         };
                                         if elapsed_mins >= max_allowed_mins {
                                             time_stop_triggered = true;
