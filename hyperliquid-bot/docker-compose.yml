@@ -13,6 +13,8 @@ services:
       - HL_IS_CROSS=${HL_IS_CROSS:-true}
       - HL_TREND_ENGINE_MODE=${HL_TREND_ENGINE_MODE:-live}
       - HL_PORTFOLIO_SYMBOLS=${HL_PORTFOLIO_SYMBOLS:-BTC,ETH,SOL,AVAX}
+      - HL_MAX_CONCURRENT_POSITIONS=${HL_MAX_CONCURRENT_POSITIONS:-2}
+      - HL_DONCHIAN_PERIOD=${HL_DONCHIAN_PERIOD:-12}
     volumes:
       - ./hl_bot_data:/app
 
@@ -30,6 +32,8 @@ services:
       - HL_IS_CROSS=${HL_IS_CROSS:-true}
       - HL_TREND_ENGINE_MODE=${HL_TREND_ENGINE_MODE:-live}
       - HL_PORTFOLIO_SYMBOLS=${HL_PORTFOLIO_SYMBOLS:-BTC,ETH,SOL,AVAX}
+      - HL_MAX_CONCURRENT_POSITIONS=${HL_MAX_CONCURRENT_POSITIONS:-2}
+      - HL_DONCHIAN_PERIOD=${HL_DONCHIAN_PERIOD:-12}
     volumes:
       - ./hl_bot_data:/app
 
@@ -47,6 +51,8 @@ services:
       - HL_IS_CROSS=${HL_IS_CROSS:-true}
       - HL_TREND_ENGINE_MODE=${HL_TREND_ENGINE_MODE:-live}
       - HL_PORTFOLIO_SYMBOLS=${HL_PORTFOLIO_SYMBOLS:-BTC,ETH,SOL,AVAX}
+      - HL_MAX_CONCURRENT_POSITIONS=${HL_MAX_CONCURRENT_POSITIONS:-2}
+      - HL_DONCHIAN_PERIOD=${HL_DONCHIAN_PERIOD:-12}
     volumes:
       - ./hl_bot_data:/app
 
@@ -64,6 +70,8 @@ services:
       - HL_IS_CROSS=${HL_IS_CROSS:-true}
       - HL_TREND_ENGINE_MODE=${HL_TREND_ENGINE_MODE:-live}
       - HL_PORTFOLIO_SYMBOLS=${HL_PORTFOLIO_SYMBOLS:-BTC,ETH,SOL,AVAX}
+      - HL_MAX_CONCURRENT_POSITIONS=${HL_MAX_CONCURRENT_POSITIONS:-2}
+      - HL_DONCHIAN_PERIOD=${HL_DONCHIAN_PERIOD:-12}
     volumes:
       - ./hl_bot_data:/app
 
@@ -75,6 +83,7 @@ services:
       - "${DASHBOARD_PORT:-8088}:8088"
     environment:
       - DASHBOARD_PORT=${DASHBOARD_PORT:-8088}
+      - HL_MAX_CONCURRENT_POSITIONS=${HL_MAX_CONCURRENT_POSITIONS:-2}
     volumes:
       - ./dashboard:/app/dashboard
       - ./hl_bot_data:/app/data

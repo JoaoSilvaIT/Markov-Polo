@@ -494,15 +494,9 @@ async fn main() {
             );
 
             // Ensure cluster lease is held or acquired
-            let current_lease = crate::state::get_current_cluster_lease();
+            let current_lease = crate::state::get_cluster_lease_for_symbol(&trading_symbol);
             let (lease_uuid, fencing_tok) = if let Some(lease) = current_lease {
-                if lease.owner == trading_symbol {
-                    (lease.owner_uuid, lease.fencing_token)
-                } else {
-                    let uuid = format!("{}_{}", trading_symbol, chrono::Utc::now().timestamp_micros());
-                    let (_, tok) = crate::state::try_acquire_cluster_lease_for_engine_with_uuid(&trading_symbol, "EngineA", &uuid, 3600);
-                    (uuid, tok)
-                }
+                (lease.owner_uuid, lease.fencing_token)
             } else {
                 let uuid = format!("{}_{}", trading_symbol, chrono::Utc::now().timestamp_micros());
                 let (_, tok) = crate::state::try_acquire_cluster_lease_for_engine_with_uuid(&trading_symbol, "EngineA", &uuid, 3600);

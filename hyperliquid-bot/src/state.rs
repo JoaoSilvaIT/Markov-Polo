@@ -384,6 +384,14 @@ pub fn get_and_inc_cluster_counter() -> Result<u64, String> {
     Ok(next)
 }
 
+pub fn max_concurrent_cluster_positions() -> usize {
+    std::env::var("HL_MAX_CONCURRENT_POSITIONS")
+        .or_else(|_| std::env::var("MAX_CONCURRENT_POSITIONS"))
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterLease {
     pub owner: String,
@@ -397,10 +405,45 @@ pub struct ClusterLease {
     pub fencing_token: u64,
 }
 
-fn write_lease_atomic(lease: &ClusterLease) -> Result<(), String> {
-    let content = serde_json::to_string_pretty(lease)
-        .map_err(|e| format!("Failed to serialize cluster lease: {}", e))?;
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ClusterLockMap {
+    #[serde(default)]
+    pub leases: HashMap<String, ClusterLease>,
+}
+
+pub fn load_cluster_leases() -> HashMap<String, ClusterLease> {
+    if !std::path::Path::new(CLUSTER_LOCK_FILE).exists() {
+        return HashMap::new();
+    }
+    let content = match fs::read_to_string(CLUSTER_LOCK_FILE) {
+        Ok(c) => c,
+        Err(_) => return HashMap::new(),
+    };
+    if content.trim().is_empty() {
+        return HashMap::new();
+    }
+    if let Ok(map) = serde_json::from_str::<ClusterLockMap>(&content) {
+        return map.leases;
+    }
+    if let Ok(single) = serde_json::from_str::<ClusterLease>(&content) {
+        let mut map = HashMap::new();
+        map.insert(single.owner.clone(), single);
+        return map;
+    }
+    HashMap::new()
+}
+
+fn write_leases_atomic(leases: &HashMap<String, ClusterLease>) -> Result<(), String> {
     let lock_path = std::path::Path::new(CLUSTER_LOCK_FILE);
+    if leases.is_empty() {
+        let _ = fs::remove_file(lock_path);
+        return Ok(());
+    }
+    let map = ClusterLockMap {
+        leases: leases.clone(),
+    };
+    let content = serde_json::to_string_pretty(&map)
+        .map_err(|e| format!("Failed to serialize cluster leases: {}", e))?;
     let tmp_path = format!("{}.tmp.{}", CLUSTER_LOCK_FILE, std::process::id());
     {
         use std::io::Write;
@@ -425,15 +468,54 @@ fn write_lease_atomic(lease: &ClusterLease) -> Result<(), String> {
     Ok(())
 }
 
-/// Returns the active cluster lease, if any
+/// Returns an active cluster lease, if any (first unexpired)
 #[allow(dead_code)]
 pub fn get_current_cluster_lease() -> Option<ClusterLease> {
-    if std::path::Path::new(CLUSTER_LOCK_FILE).exists() {
-        if let Ok(content) = fs::read_to_string(CLUSTER_LOCK_FILE) {
-            return serde_json::from_str::<ClusterLease>(&content).ok();
+    let leases = load_cluster_leases();
+    let now = chrono::Utc::now();
+    for (_sym, lease) in leases.iter() {
+        if let Ok(exp_dt) = chrono::DateTime::parse_from_rfc3339(&lease.expires_at) {
+            if now < exp_dt.with_timezone(&chrono::Utc) {
+                return Some(lease.clone());
+            }
+        } else {
+            return Some(lease.clone());
         }
     }
     None
+}
+
+/// Returns the active cluster lease specifically for `symbol`, if any and unexpired
+pub fn get_cluster_lease_for_symbol(symbol: &str) -> Option<ClusterLease> {
+    let leases = load_cluster_leases();
+    if let Some(lease) = leases.get(symbol) {
+        let now = chrono::Utc::now();
+        if let Ok(exp_dt) = chrono::DateTime::parse_from_rfc3339(&lease.expires_at) {
+            if now < exp_dt.with_timezone(&chrono::Utc) {
+                return Some(lease.clone());
+            }
+        } else {
+            return Some(lease.clone());
+        }
+    }
+    None
+}
+
+/// Returns all currently active, unexpired cluster leases
+#[allow(dead_code)]
+pub fn get_active_cluster_leases() -> Vec<ClusterLease> {
+    let leases = load_cluster_leases();
+    let now = chrono::Utc::now();
+    leases
+        .into_values()
+        .filter(|l| {
+            if let Ok(exp_dt) = chrono::DateTime::parse_from_rfc3339(&l.expires_at) {
+                now < exp_dt.with_timezone(&chrono::Utc)
+            } else {
+                true
+            }
+        })
+        .collect()
 }
 
 /// Atomically attempts to acquire the portfolio cluster lease protected by flock guard
@@ -461,49 +543,90 @@ pub fn try_acquire_cluster_lease_for_engine_with_uuid(
     let now = chrono::Utc::now();
     let expires = now + chrono::Duration::seconds(duration_secs);
 
-    if std::path::Path::new(CLUSTER_LOCK_FILE).exists() {
-        if let Ok(content) = fs::read_to_string(CLUSTER_LOCK_FILE) {
-            if let Ok(mut lease) = serde_json::from_str::<ClusterLease>(&content) {
-                let exp_dt = chrono::DateTime::parse_from_rfc3339(&lease.expires_at)
-                    .map(|dt| dt.with_timezone(&chrono::Utc))
-                    .ok();
-                let is_unexpired = exp_dt.map(|exp| now < exp).unwrap_or(true);
+    let mut leases = load_cluster_leases();
+    let max_allowed = max_concurrent_cluster_positions();
 
-                if is_unexpired {
-                    if lease.owner == symbol {
-                        // Same symbol: only the same UUID/process is authorized to refresh!
-                        if !lease.owner_uuid.is_empty() && lease.owner_uuid == owner_uuid {
-                            lease.engine_owner = engine_owner.to_string();
-                            lease.expires_at = expires.to_rfc3339();
-                            if write_lease_atomic(&lease).is_ok() {
-                                return (true, lease.fencing_token);
-                            }
-                        } else {
-                            eprintln!(
-                                "⚠️ [CLUSTER LEASE REJECTED] Active lease for {} held by another UUID ('{}' != '{}'). Rejecting duplicate takeover.",
-                                symbol, lease.owner_uuid, owner_uuid
-                            );
-                            return (false, 0);
-                        }
-                    }
+    // 1. Check if lease for THIS symbol already exists
+    if let Some(mut existing_lease) = leases.remove(symbol) {
+        let exp_dt = chrono::DateTime::parse_from_rfc3339(&existing_lease.expires_at)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .ok();
+        let is_unexpired = exp_dt.map(|exp| now < exp).unwrap_or(true);
 
-                    // Different symbol and active: verify if owner has open position
-                    let owner_state_file = format!("hl_hmm_state_{}.json", lease.owner);
-                    let owner_has_pos = load_state(&owner_state_file)
-                        .ok()
-                        .and_then(|s| s.get(&lease.owner).cloned())
-                        .map(|p| p.is_occupied())
-                        .unwrap_or(false);
+        if is_unexpired {
+            // Same symbol: only same UUID/process is authorized to refresh/reacquire!
+            if !existing_lease.owner_uuid.is_empty() && existing_lease.owner_uuid == owner_uuid {
+                existing_lease.engine_owner = engine_owner.to_string();
+                existing_lease.expires_at = expires.to_rfc3339();
+                let token = existing_lease.fencing_token;
+                leases.insert(symbol.to_string(), existing_lease);
+                if write_leases_atomic(&leases).is_ok() {
+                    return (true, token);
+                } else {
+                    return (false, 0);
+                }
+            } else {
+                eprintln!(
+                    "⚠️ [CLUSTER LEASE REJECTED] Active lease for {} held by another UUID ('{}' != '{}'). Rejecting duplicate takeover.",
+                    symbol, existing_lease.owner_uuid, owner_uuid
+                );
+                // Put it back
+                leases.insert(symbol.to_string(), existing_lease);
+                let _ = write_leases_atomic(&leases);
+                return (false, 0);
+            }
+        }
+        // If expired, drop it and proceed to acquire brand-new epoch below
+    }
 
-                    if owner_has_pos || is_unexpired {
-                        return (false, 0);
+    // 2. Clean up any expired leases for other symbols from map
+    leases.retain(|other_sym, lease| {
+        let is_unexp = chrono::DateTime::parse_from_rfc3339(&lease.expires_at)
+            .map(|dt| now < dt.with_timezone(&chrono::Utc))
+            .unwrap_or(true);
+        if !is_unexp {
+            let state_file = format!("hl_hmm_state_{}.json", other_sym);
+            let has_pos = load_state(&state_file)
+                .ok()
+                .and_then(|s| s.get(other_sym).cloned())
+                .map(|p| p.is_occupied())
+                .unwrap_or(false);
+            has_pos
+        } else {
+            true
+        }
+    });
+
+    // 3. Count total active positions / leases across OTHER symbols
+    let mut other_active_symbols = std::collections::HashSet::new();
+    for other_lease in leases.values() {
+        if other_lease.owner != symbol {
+            other_active_symbols.insert(other_lease.owner.clone());
+        }
+    }
+    for other_sym in configured_portfolio_symbols() {
+        if other_sym != symbol && !other_active_symbols.contains(&other_sym) {
+            let state_file = format!("hl_hmm_state_{}.json", other_sym);
+            if let Ok(state) = load_state(&state_file) {
+                if let Some(pos) = state.get(&other_sym) {
+                    if pos.is_occupied() {
+                        other_active_symbols.insert(other_sym);
                     }
                 }
             }
         }
     }
 
-    // Acquire brand-new lease epoch with incremented monotonic fencing token
+    if other_active_symbols.len() >= max_allowed {
+        eprintln!(
+            "⏸️ [CLUSTER CONGESTION] Symbol {} blocked. Active portfolio symbols: {:?} (max allowed: {}).",
+            symbol, other_active_symbols, max_allowed
+        );
+        let _ = write_leases_atomic(&leases);
+        return (false, 0);
+    }
+
+    // 4. Acquire brand-new lease epoch with incremented monotonic fencing token
     let new_token = match get_and_inc_cluster_counter() {
         Ok(t) => t,
         Err(e) => {
@@ -512,7 +635,7 @@ pub fn try_acquire_cluster_lease_for_engine_with_uuid(
         }
     };
 
-    let lease = ClusterLease {
+    let new_lease = ClusterLease {
         owner: symbol.to_string(),
         engine_owner: engine_owner.to_string(),
         owner_uuid: owner_uuid.to_string(),
@@ -521,7 +644,9 @@ pub fn try_acquire_cluster_lease_for_engine_with_uuid(
         fencing_token: new_token,
     };
 
-    if write_lease_atomic(&lease).is_ok() {
+    leases.insert(symbol.to_string(), new_lease);
+
+    if write_leases_atomic(&leases).is_ok() {
         (true, new_token)
     } else {
         (false, 0)
@@ -546,27 +671,21 @@ pub fn refresh_cluster_lease_authenticated(
     };
     let now = chrono::Utc::now();
     let expires = now + chrono::Duration::seconds(duration_secs);
-    if std::path::Path::new(CLUSTER_LOCK_FILE).exists() {
-        if let Ok(content) = fs::read_to_string(CLUSTER_LOCK_FILE) {
-            if let Ok(mut lease) = serde_json::from_str::<ClusterLease>(&content) {
-                if lease.owner != symbol {
-                    return false;
-                }
-                if let Some(expected_uuid) = owner_uuid {
-                    if !lease.owner_uuid.is_empty() && lease.owner_uuid != expected_uuid {
-                        return false;
-                    }
-                }
-                if let Some(expected_token) = fencing_token {
-                    if lease.fencing_token != expected_token {
-                        return false;
-                    }
-                }
-                // PRESERVE fencing_token! Heartbeat extends expiry only without changing epoch.
-                lease.expires_at = expires.to_rfc3339();
-                return write_lease_atomic(&lease).is_ok();
+    let mut leases = load_cluster_leases();
+    if let Some(lease) = leases.get_mut(symbol) {
+        if let Some(expected_uuid) = owner_uuid {
+            if !lease.owner_uuid.is_empty() && lease.owner_uuid != expected_uuid {
+                return false;
             }
         }
+        if let Some(expected_token) = fencing_token {
+            if lease.fencing_token != expected_token {
+                return false;
+            }
+        }
+        // PRESERVE fencing_token! Heartbeat extends expiry only without changing epoch.
+        lease.expires_at = expires.to_rfc3339();
+        return write_leases_atomic(&leases).is_ok();
     }
     false
 }
@@ -586,25 +705,20 @@ pub fn release_cluster_lease_authenticated(
         Ok(g) => g,
         Err(_) => return false,
     };
-    if std::path::Path::new(CLUSTER_LOCK_FILE).exists() {
-        if let Ok(content) = fs::read_to_string(CLUSTER_LOCK_FILE) {
-            if let Ok(lease) = serde_json::from_str::<ClusterLease>(&content) {
-                if lease.owner == symbol {
-                    if let Some(expected_uuid) = owner_uuid {
-                        if !lease.owner_uuid.is_empty() && lease.owner_uuid != expected_uuid {
-                            return false;
-                        }
-                    }
-                    if let Some(expected_token) = fencing_token {
-                        if lease.fencing_token != expected_token {
-                            return false;
-                        }
-                    }
-                    let _ = fs::remove_file(CLUSTER_LOCK_FILE);
-                    return true;
-                }
+    let mut leases = load_cluster_leases();
+    if let Some(lease) = leases.get(symbol) {
+        if let Some(expected_uuid) = owner_uuid {
+            if !lease.owner_uuid.is_empty() && lease.owner_uuid != expected_uuid {
+                return false;
             }
         }
+        if let Some(expected_token) = fencing_token {
+            if lease.fencing_token != expected_token {
+                return false;
+            }
+        }
+        leases.remove(symbol);
+        return write_leases_atomic(&leases).is_ok();
     }
     false
 }
@@ -621,23 +735,18 @@ pub fn assert_current_lease(
         Err(e) => return Err(format!("Failed to acquire cluster flock guard for lease assertion: {}", e)),
     };
 
-    if let Some(lease) = get_current_cluster_lease() {
-        if lease.owner != symbol {
-            return Err(format!(
-                "Lease owned by different symbol '{}' (expected '{}')",
-                lease.owner, symbol
-            ));
-        }
+    let leases = load_cluster_leases();
+    if let Some(lease) = leases.get(symbol) {
         if !expected_owner_uuid.is_empty() && lease.owner_uuid != expected_owner_uuid {
             return Err(format!(
-                "Lease owner UUID mismatch: '{}' (expected '{}')",
-                lease.owner_uuid, expected_owner_uuid
+                "Lease owner UUID mismatch for {}: '{}' (expected '{}')",
+                symbol, lease.owner_uuid, expected_owner_uuid
             ));
         }
         if expected_fencing_token > 0 && lease.fencing_token != expected_fencing_token {
             return Err(format!(
-                "Lease fencing token mismatch: epoch {} superseded by {}",
-                expected_fencing_token, lease.fencing_token
+                "Lease fencing token mismatch for {}: epoch {} superseded by {}",
+                symbol, expected_fencing_token, lease.fencing_token
             ));
         }
         let now = chrono::Utc::now();
@@ -645,14 +754,14 @@ pub fn assert_current_lease(
             let exp_utc = exp_dt.with_timezone(&chrono::Utc);
             if now >= exp_utc {
                 return Err(format!(
-                    "Lease expired at {} (current time {})",
-                    lease.expires_at, now
+                    "Lease for {} expired at {} (current time {})",
+                    symbol, lease.expires_at, now
                 ));
             }
         }
         Ok(())
     } else {
-        Err("No active cluster lease found on disk".to_string())
+        Err(format!("No active cluster lease found on disk for {}", symbol))
     }
 }
 
@@ -681,27 +790,25 @@ pub fn configured_portfolio_symbols() -> Vec<String> {
 /// Checks if any other symbol in the portfolio cluster currently has an active open position or active atomic lease
 pub fn has_active_cluster_position(current_symbol: &str) -> Option<String> {
     let now = chrono::Utc::now();
-    // 1. Check atomic lease lock
-    if std::path::Path::new(CLUSTER_LOCK_FILE).exists() {
-        if let Ok(content) = fs::read_to_string(CLUSTER_LOCK_FILE) {
-            if let Ok(lease) = serde_json::from_str::<ClusterLease>(&content) {
-                if lease.owner != current_symbol {
-                    let owner_state_file = format!("hl_hmm_state_{}.json", lease.owner);
-                    let owner_has_pos = load_state(&owner_state_file)
-                        .ok()
-                        .and_then(|s| s.get(&lease.owner).cloned())
-                        .map(|p| p.is_occupied())
-                        .unwrap_or(false);
+    let max_allowed = max_concurrent_cluster_positions();
+    let mut other_active_symbols = std::collections::HashSet::new();
 
-                    if owner_has_pos {
-                        return Some(lease.owner);
-                    }
+    // 1. Check atomic lease locks
+    let leases = load_cluster_leases();
+    for (owner_sym, lease) in &leases {
+        if owner_sym != current_symbol {
+            let owner_state_file = format!("hl_hmm_state_{}.json", owner_sym);
+            let owner_has_pos = load_state(&owner_state_file)
+                .ok()
+                .and_then(|s| s.get(owner_sym).cloned())
+                .map(|p| p.is_occupied())
+                .unwrap_or(false);
 
-                    if let Ok(exp_dt) = chrono::DateTime::parse_from_rfc3339(&lease.expires_at) {
-                        if now < exp_dt.with_timezone(&chrono::Utc) {
-                            return Some(lease.owner);
-                        }
-                    }
+            if owner_has_pos {
+                other_active_symbols.insert(owner_sym.clone());
+            } else if let Ok(exp_dt) = chrono::DateTime::parse_from_rfc3339(&lease.expires_at) {
+                if now < exp_dt.with_timezone(&chrono::Utc) {
+                    other_active_symbols.insert(owner_sym.clone());
                 }
             }
         }
@@ -710,14 +817,14 @@ pub fn has_active_cluster_position(current_symbol: &str) -> Option<String> {
     // 2. Check position state files across all portfolio symbols
     let all_symbols = configured_portfolio_symbols();
     for sym in &all_symbols {
-        if sym == current_symbol {
+        if sym == current_symbol || other_active_symbols.contains(sym) {
             continue;
         }
         let state_file = format!("hl_hmm_state_{}.json", sym);
         if let Ok(state) = load_state(&state_file) {
             if let Some(pos) = state.get(sym) {
                 if pos.is_occupied() {
-                    return Some(sym.to_string());
+                    other_active_symbols.insert(sym.clone());
                 }
             }
         }
@@ -731,11 +838,11 @@ pub fn has_active_cluster_position(current_symbol: &str) -> Option<String> {
                 let symbol_part = file_name
                     .trim_start_matches("hl_hmm_state_")
                     .trim_end_matches(".json");
-                if symbol_part != current_symbol && !all_symbols.iter().any(|s| s == symbol_part) {
+                if symbol_part != current_symbol && !other_active_symbols.contains(symbol_part) {
                     if let Ok(state) = load_state(&file_name) {
                         if let Some(pos) = state.get(symbol_part) {
                             if pos.is_occupied() {
-                                return Some(symbol_part.to_string());
+                                other_active_symbols.insert(symbol_part.to_string());
                             }
                         }
                     }
@@ -744,7 +851,13 @@ pub fn has_active_cluster_position(current_symbol: &str) -> Option<String> {
         }
     }
 
-    None
+    if other_active_symbols.len() >= max_allowed {
+        let mut sorted: Vec<String> = other_active_symbols.into_iter().collect();
+        sorted.sort();
+        Some(sorted.join(","))
+    } else {
+        None
+    }
 }
 
 #[allow(dead_code)]
@@ -1091,6 +1204,64 @@ mod tests {
         // Assertion after release fails (lease missing)
         assert!(assert_current_lease("BTC", "uuid_owner_1", tok).is_err());
 
+        let _ = fs::remove_file(CLUSTER_LOCK_FILE);
+        let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
+        let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
+    }
+
+    #[test]
+    fn test_multi_cluster_concurrency_two_positions() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let _ = fs::remove_file(CLUSTER_LOCK_FILE);
+        let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
+        let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
+
+        // Temporarily configure 2 concurrent positions
+        std::env::set_var("HL_MAX_CONCURRENT_POSITIONS", "2");
+
+        // First position: BTC acquires lease
+        let (acq_btc, tok_btc) = try_acquire_cluster_lease_for_engine_with_uuid("BTC", "EngineA", "uuid_btc", 60);
+        assert!(acq_btc);
+        assert_eq!(tok_btc, 1);
+
+        // Second position: ETH acquires lease concurrently (since max is 2)
+        let (acq_eth, tok_eth) = try_acquire_cluster_lease_for_engine_with_uuid("ETH", "EngineB", "uuid_eth", 60);
+        assert!(acq_eth);
+        assert_eq!(tok_eth, 2);
+
+        // Neither BTC nor ETH is blocked by has_active_cluster_position
+        assert!(has_active_cluster_position("BTC").is_none());
+        assert!(has_active_cluster_position("ETH").is_none());
+
+        // Third position: SOL tries to acquire, but portfolio is at capacity (2/2) -> REJECTED
+        let (acq_sol, tok_sol) = try_acquire_cluster_lease_for_engine_with_uuid("SOL", "EngineA", "uuid_sol", 60);
+        assert!(!acq_sol);
+        assert_eq!(tok_sol, 0);
+        let blocked = has_active_cluster_position("SOL");
+        assert!(blocked.is_some());
+        let blocked_str = blocked.unwrap();
+        assert!(blocked_str.contains("BTC") && blocked_str.contains("ETH"));
+
+        // Both BTC and ETH hold valid leases simultaneously
+        assert!(assert_current_lease("BTC", "uuid_btc", tok_btc).is_ok());
+        assert!(assert_current_lease("ETH", "uuid_eth", tok_eth).is_ok());
+
+        // Release BTC
+        assert!(release_cluster_lease_authenticated("BTC", Some("uuid_btc"), Some(tok_btc)));
+        assert!(assert_current_lease("BTC", "uuid_btc", tok_btc).is_err());
+        assert!(assert_current_lease("ETH", "uuid_eth", tok_eth).is_ok());
+
+        // Now capacity is 1/2: SOL can now acquire lease!
+        let (acq_sol2, tok_sol2) = try_acquire_cluster_lease_for_engine_with_uuid("SOL", "EngineA", "uuid_sol", 60);
+        assert!(acq_sol2);
+        assert_eq!(tok_sol2, 3);
+        assert!(assert_current_lease("SOL", "uuid_sol", tok_sol2).is_ok());
+
+        // Cleanup
+        assert!(release_cluster_lease_authenticated("ETH", Some("uuid_eth"), Some(tok_eth)));
+        assert!(release_cluster_lease_authenticated("SOL", Some("uuid_sol"), Some(tok_sol2)));
+
+        std::env::remove_var("HL_MAX_CONCURRENT_POSITIONS");
         let _ = fs::remove_file(CLUSTER_LOCK_FILE);
         let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
         let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
