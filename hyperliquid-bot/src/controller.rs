@@ -228,8 +228,14 @@ impl RegimeController {
 
         // 3. UPDATE STREAK COUNTERS (Asymmetric Dwell + Leaky Accumulator)
         let has_breakout = has_donchian_breakout || self.breakout_seen_in_streak;
+        let p_shock = (1.0 - p_consolidation - p_trend).max(0.0);
 
-        if p_trend >= 0.82 && !extreme_short_term_shock {
+        if p_shock >= 0.50 {
+            // HMM Shock Regime: immediate hard reset of all regime streaks (no leaky decay during shock)
+            self.trend_streak = 0;
+            self.consolidation_streak = 0;
+            self.breakout_seen_in_streak = false;
+        } else if p_trend >= 0.82 && !extreme_short_term_shock {
             self.trend_streak += 1;
             self.consolidation_streak = 0; // Opposite regime actively contradicts
             if has_donchian_breakout {
@@ -260,9 +266,9 @@ impl RegimeController {
                 //     * Strong trend (P_T >= 0.90) -> 2 bars dwell!
                 //     * Moderate trend (P_T >= 0.82) -> 3 bars dwell!
                 let valid_trend_trigger = if has_breakout {
-                    (p_trend >= 0.90 && self.trend_streak >= 1) || self.trend_streak >= 2
+                    (p_trend >= 0.90 && self.trend_streak >= 1) || (p_trend >= 0.82 && self.trend_streak >= 2)
                 } else {
-                    (p_trend >= 0.90 && self.trend_streak >= 2) || self.trend_streak >= 3
+                    (p_trend >= 0.90 && self.trend_streak >= 2) || (p_trend >= 0.82 && self.trend_streak >= 3)
                 };
 
                 if valid_trend_trigger {
@@ -286,7 +292,8 @@ impl RegimeController {
                 // Asymmetric Consolidation Trigger (Researcher 1 & 2):
                 // - Strong consolidation (P_C >= 0.80) -> 2 bars dwell!
                 // - Moderate consolidation (P_C >= 0.72) -> 3 bars dwell!
-                else if ((p_consolidation >= 0.80 && self.consolidation_streak >= 2) || self.consolidation_streak >= 3)
+                else if ((p_consolidation >= 0.80 && self.consolidation_streak >= 2)
+                    || (p_consolidation >= 0.72 && self.consolidation_streak >= 3))
                     && is_ou_stationary
                     && is_half_life_valid
                     && !is_severe_shock
@@ -537,6 +544,21 @@ mod tests {
         assert_eq!(mode3, ControllerMode::Trend);
         assert_eq!(controller.trend_streak, 3);
         assert!(controller.last_reason.contains("momentum expansion"));
+    }
+
+    #[test]
+    fn test_hmm_shock_regime_resets_streaks() {
+        let mut controller = RegimeController::default();
+
+        // 2 bars of strong trend
+        controller.evaluate_15m_bar(BASE_TIME_MS, 0.05, 0.95, 1.0, 0.5, true, false, false);
+        controller.evaluate_15m_bar(BASE_TIME_MS + 900_000, 0.05, 0.95, 1.0, 0.5, true, false, false);
+        assert_eq!(controller.trend_streak, 2);
+
+        // Bar 3: HMM detects severe regime shock (P_Shock = 1.0, P_T = 0, P_C = 0)
+        let mode = controller.evaluate_15m_bar(BASE_TIME_MS + 1_800_000, 0.0, 0.0, 1.0, 0.5, false, false, false);
+        assert_eq!(mode, ControllerMode::Neutral);
+        assert_eq!(controller.trend_streak, 0); // Must be zero, NOT decremented!
     }
 
     #[test]
