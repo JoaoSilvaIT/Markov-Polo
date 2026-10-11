@@ -1044,9 +1044,24 @@ async fn main() {
     );
     let mut controller = load_controller_state(&trading_symbol);
     let mut current_15m_bar: Option<CandleBar> = initial_15m_bar;
-    let mut current_p_c = 0.60;
-    let mut current_p_t = 0.25;
-    let mut current_p_s = 0.15;
+
+    // Initialize regime posteriors immediately from pre-filled 15m bars to eliminate startup blind-lag
+    let (init_p_c, init_p_t, init_p_s) = if rolling_15m_bars.len() >= 15 {
+        let hmm_lock = hmm_model.read().await;
+        let closes_15m: Vec<f64> = rolling_15m_bars.iter().map(|b| b.close).collect();
+        let res = compute_hmm_posteriors(&*hmm_lock, &closes_15m);
+        drop(hmm_lock);
+        res.unwrap_or((0.60, 0.25, 0.15))
+    } else {
+        (0.60, 0.25, 0.15)
+    };
+    let mut current_p_c = init_p_c;
+    let mut current_p_t = init_p_t;
+    let mut current_p_s = init_p_s;
+    println!(
+        "🧭 [STARTUP REGIME INITIALIZED] Symbol: {} | P_C: {:.1}% | P_T: {:.1}% | P_S: {:.1}% (from {} historical 15m bars)",
+        trading_symbol, current_p_c * 100.0, current_p_t * 100.0, current_p_s * 100.0, rolling_15m_bars.len()
+    );
     let mut last_shock_bar_ms: u64 = 0;
 
     let obi_tracker = Arc::new(RwLock::new(L2ObiTracker::default()));
