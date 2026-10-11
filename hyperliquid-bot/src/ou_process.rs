@@ -173,6 +173,67 @@ pub fn calculate_net_edge_bps(entry_price: f64, exit_target: f64) -> f64 {
     }
 }
 
+/// Calculates the Rogers-Satchell realized volatility over a series of OHLC price bars.
+/// Rogers-Satchell is non-zero drift independent and ~8x more efficient than standard close-to-close.
+#[allow(dead_code)]
+pub fn calculate_rogers_satchell_sigma(opens: &[f64], highs: &[f64], lows: &[f64], closes: &[f64]) -> f64 {
+    let n = opens.len().min(highs.len()).min(lows.len()).min(closes.len());
+    if n < 2 {
+        return 0.0;
+    }
+    let mut sum_rs = 0.0;
+    let mut valid_count = 0;
+    for i in 0..n {
+        let o = opens[i];
+        let h = highs[i];
+        let l = lows[i];
+        let c = closes[i];
+        if o <= 0.0 || h <= 0.0 || l <= 0.0 || c <= 0.0 || h < l {
+            continue;
+        }
+        let u = (h / c).ln();
+        let d = (l / c).ln();
+        let u_o = (h / o).ln();
+        let d_o = (l / o).ln();
+        sum_rs += u * u_o + d * d_o;
+        valid_count += 1;
+    }
+    if valid_count < 2 {
+        return 0.0;
+    }
+    (sum_rs / valid_count as f64).max(0.0).sqrt()
+}
+
+/// Calculates the Garman-Klass realized volatility over a series of OHLC price bars.
+/// ~7.4x more efficient than close-to-close volatility in continuous markets.
+#[allow(dead_code)]
+pub fn calculate_garman_klass_sigma(opens: &[f64], highs: &[f64], lows: &[f64], closes: &[f64]) -> f64 {
+    let n = opens.len().min(highs.len()).min(lows.len()).min(closes.len());
+    if n < 2 {
+        return 0.0;
+    }
+    let ln2_term = 2.0 * 2.0_f64.ln() - 1.0;
+    let mut sum_gk = 0.0;
+    let mut valid_count = 0;
+    for i in 0..n {
+        let o = opens[i];
+        let h = highs[i];
+        let l = lows[i];
+        let c = closes[i];
+        if o <= 0.0 || h <= 0.0 || l <= 0.0 || c <= 0.0 || h < l {
+            continue;
+        }
+        let hl = (h / l).ln();
+        let co = (c / o).ln();
+        sum_gk += 0.5 * hl * hl - ln2_term * co * co;
+        valid_count += 1;
+    }
+    if valid_count < 2 {
+        return 0.0;
+    }
+    (sum_gk / valid_count as f64).max(0.0).sqrt()
+}
+
 /// Feature snapshot capturing O-U, drift, and standardized Z-scores at a specific time cutoff.
 #[derive(Debug, Clone)]
 pub struct FeatureSnapshot {
@@ -348,5 +409,48 @@ mod tests {
         assert!(feat.half_life_m > 0.0);
         assert!(feat.z_15.is_finite());
         assert!(feat.z_60.is_finite());
+    }
+
+    #[test]
+    fn test_rogers_satchell_and_garman_klass() {
+        let opens = vec![100.0, 101.0, 100.5, 99.8, 100.2];
+        let highs = vec![101.5, 102.0, 101.2, 100.6, 101.0];
+        let lows = vec![99.5, 100.2, 99.7, 99.1, 99.9];
+        let closes = vec![101.0, 100.5, 99.8, 100.2, 100.8];
+
+        let rs = calculate_rogers_satchell_sigma(&opens, &highs, &lows, &closes);
+        let gk = calculate_garman_klass_sigma(&opens, &highs, &lows, &closes);
+
+        assert!(rs > 0.0 && rs.is_finite());
+        assert!(gk > 0.0 && gk.is_finite());
+        assert!((rs - gk).abs() < 0.02);
+    }
+
+    #[test]
+    fn test_conditional_ladder_thresholds_relationship() {
+        let params = OuParameters {
+            theta: 0.03,
+            mu: 100.0,
+            sigma: 1.5,
+        };
+        let tx_cost = 0.05;
+        let th_175 = calculate_optimal_thresholds(&params, tx_cost);
+        let th_150 = calculate_thresholds_at_sigma(&params, tx_cost, 1.50);
+
+        // For Long: 1.50σ entry is closer to the mean than 1.75σ (i.e. th_150.entry_long > th_175.entry_long)
+        assert!(th_150.entry_long > th_175.entry_long);
+        // Both are below the mean
+        assert!(th_150.entry_long < params.mu);
+        assert!(th_175.entry_long < params.mu);
+
+        // For Short: 1.50σ entry is closer to the mean than 1.75σ (i.e. th_150.entry_short < th_175.entry_short)
+        assert!(th_150.entry_short < th_175.entry_short);
+        // Both are above the mean
+        assert!(th_150.entry_short > params.mu);
+        assert!(th_175.entry_short > params.mu);
+
+        // Both target the same mean reversion exit target
+        assert_eq!(th_150.exit_long, params.mu);
+        assert_eq!(th_175.exit_long, params.mu);
     }
 }

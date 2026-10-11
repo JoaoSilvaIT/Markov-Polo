@@ -1034,6 +1034,14 @@ async fn main() {
     let trend_risk_fraction = config.trend_risk_fraction;
     let donchian_period = config.donchian_period;
     let chandelier_atr_mult = config.chandelier_atr_mult;
+    println!(
+        "⚙️ [STARTUP CONFIG] Symbol: {} | Engine A: LIVE (Maker Post-Only) | Engine B (Trend): {} | Leverage: {}x | Base Size: ${:.2} (Risk Fraction: {:.2})",
+        trading_symbol,
+        trend_engine_mode.to_uppercase(),
+        config.hl_leverage,
+        position_size_usdc,
+        trend_risk_fraction
+    );
     let mut controller = load_controller_state(&trading_symbol);
     let mut current_15m_bar: Option<CandleBar> = initial_15m_bar;
     let mut current_p_c = 0.60;
@@ -2509,6 +2517,17 @@ async fn main() {
                                     // Update lowest dip price
                                     if close_price < armed_state.extreme_price {
                                         armed_state.extreme_price = close_price;
+                                        if armed_state.tier == "TIER_2_CONDITIONAL" {
+                                            if let Some(ref th) = thresholds_opt {
+                                                if close_price <= th.entry_long {
+                                                    armed_state.tier = "TIER_1_NORMAL".to_string();
+                                                    println!(
+                                                        "⏫ [TIER UPGRADED] {} reached Tier 1 hurdle (${:.2} <= ${:.2}). Upgraded to TIER_1_NORMAL (full size).",
+                                                        symbol_clone, close_price, th.entry_long
+                                                    );
+                                                }
+                                            }
+                                        }
                                         save_armed_signal(&arm_path_clone, &armed_state);
                                     }
 
@@ -2532,48 +2551,69 @@ async fn main() {
                                     let still_below_exit = close_price < dynamic_exit_target;
 
                                     if is_green_bounce && bounced_off_low && still_below_exit {
-                                        let entry_limit_price = f64::min(close_price, dynamic_entry_cap);
-                                        let net_edge_bps = calculate_net_edge_bps(
-                                            entry_limit_price,
-                                            dynamic_exit_target,
-                                        );
-
-                                        if net_edge_bps < 25.0 {
-                                            funnel_counters.engine_a_reversal_hurdle_veto += 1;
-                                            println!(
-                                                "⚠️ [LONG HURDLE VETO] Edge too narrow for {}: {:.1} bps (< 25 bps).",
-                                                symbol_clone, net_edge_bps
-                                            );
-                                            armed_state.is_armed = false;
-                                            save_armed_signal(&arm_path_clone, &armed_state);
+                                        let is_tier2 = armed_state.tier == "TIER_2_CONDITIONAL";
+                                        let obi_confirmed = if is_tier2 {
+                                            // Tier 2 requires order book not being flooded by sell volume
+                                            l2_instant >= -0.20 && l2_1s >= -0.20
                                         } else {
-                                            funnel_counters.engine_a_orders_placed += 1;
-                                            println!(
-                                                "🟢 [LONG REVERSAL CONFIRMED] {} reversed from dip ${:.2} to ${:.2}! Edge: {:.1} bps. Submitting Maker Buy.",
-                                                symbol_clone, armed_state.extreme_price, close_price, net_edge_bps
-                                            );
-                                            let frozen_hl = armed_state.half_life_m;
-                                            armed_state.is_armed = false;
-                                            save_armed_signal(&arm_path_clone, &armed_state);
+                                            true
+                                        };
 
-                                            if let Err(e) = place_ou_maker_entry(
-                                                &state_path_clone,
-                                                &exchange_clone,
-                                                &info_clone,
-                                                &mut state_lock,
-                                                &symbol_clone,
-                                                Side::Long,
+                                        if !obi_confirmed {
+                                            println!(
+                                                "⚠️ [TIER 2 OBI VETO] {} Long reversal bounce vetoed: sell pressure in order book (instant: {:.2}, 1s: {:.2} < -0.20). Waiting.",
+                                                symbol_clone, l2_instant, l2_1s
+                                            );
+                                        } else {
+                                            let entry_limit_price = f64::min(close_price, dynamic_entry_cap);
+                                            let net_edge_bps = calculate_net_edge_bps(
                                                 entry_limit_price,
                                                 dynamic_exit_target,
-                                                frozen_hl,
-                                                position_size_usdc,
-                                                sz_decimals,
-                                                discord_clone.clone(),
-                                            )
-                                            .await
-                                            {
-                                                funnel_counters.engine_a_orders_rejected += 1;
-                                                eprintln!("❌ [ORDER ERROR] Long maker entry failed: {}", e);
+                                            );
+
+                                            if net_edge_bps < 25.0 {
+                                                funnel_counters.engine_a_reversal_hurdle_veto += 1;
+                                                println!(
+                                                    "⚠️ [LONG HURDLE VETO] Edge too narrow for {}: {:.1} bps (< 25 bps).",
+                                                    symbol_clone, net_edge_bps
+                                                );
+                                                armed_state.is_armed = false;
+                                                save_armed_signal(&arm_path_clone, &armed_state);
+                                            } else {
+                                                let trade_size_usdc = if is_tier2 {
+                                                    (position_size_usdc * 0.5).max(12.0)
+                                                } else {
+                                                    position_size_usdc
+                                                };
+
+                                                funnel_counters.engine_a_orders_placed += 1;
+                                                println!(
+                                                    "🟢 [LONG REVERSAL CONFIRMED] {} reversed from dip ${:.2} to ${:.2}! Edge: {:.1} bps. Tier: {} (${:.2}). Submitting Maker Buy.",
+                                                    symbol_clone, armed_state.extreme_price, close_price, net_edge_bps, armed_state.tier, trade_size_usdc
+                                                );
+                                                let frozen_hl = armed_state.half_life_m;
+                                                armed_state.is_armed = false;
+                                                save_armed_signal(&arm_path_clone, &armed_state);
+
+                                                if let Err(e) = place_ou_maker_entry(
+                                                    &state_path_clone,
+                                                    &exchange_clone,
+                                                    &info_clone,
+                                                    &mut state_lock,
+                                                    &symbol_clone,
+                                                    Side::Long,
+                                                    entry_limit_price,
+                                                    dynamic_exit_target,
+                                                    frozen_hl,
+                                                    trade_size_usdc,
+                                                    sz_decimals,
+                                                    discord_clone.clone(),
+                                                )
+                                                .await
+                                                {
+                                                    funnel_counters.engine_a_orders_rejected += 1;
+                                                    eprintln!("❌ [ORDER ERROR] Long maker entry failed: {}", e);
+                                                }
                                             }
                                         }
                                     }
@@ -2581,6 +2621,17 @@ async fn main() {
                                     // Update highest peak price
                                     if close_price > armed_state.extreme_price {
                                         armed_state.extreme_price = close_price;
+                                        if armed_state.tier == "TIER_2_CONDITIONAL" {
+                                            if let Some(ref th) = thresholds_opt {
+                                                if close_price >= th.entry_short {
+                                                    armed_state.tier = "TIER_1_NORMAL".to_string();
+                                                    println!(
+                                                        "⏫ [TIER UPGRADED] {} reached Tier 1 hurdle (${:.2} >= ${:.2}). Upgraded to TIER_1_NORMAL (full size).",
+                                                        symbol_clone, close_price, th.entry_short
+                                                    );
+                                                }
+                                            }
+                                        }
                                         save_armed_signal(&arm_path_clone, &armed_state);
                                     }
 
@@ -2604,53 +2655,74 @@ async fn main() {
                                     let still_above_exit = close_price > dynamic_exit_target;
 
                                     if is_red_rejection && rejected_off_high && still_above_exit {
-                                        let entry_limit_price = f64::max(close_price, dynamic_entry_floor);
-                                        // For Short: edge is entry_limit_price down to dynamic_exit_target
-                                        let net_edge_bps = (entry_limit_price / dynamic_exit_target).ln() * 10000.0;
-
-                                        if net_edge_bps < 25.0 {
-                                            funnel_counters.engine_a_reversal_hurdle_veto += 1;
-                                            println!(
-                                                "⚠️ [SHORT HURDLE VETO] Edge too narrow for {}: {:.1} bps (< 25 bps).",
-                                                symbol_clone, net_edge_bps
-                                            );
-                                            armed_state.is_armed = false;
-                                            save_armed_signal(&arm_path_clone, &armed_state);
+                                        let is_tier2 = armed_state.tier == "TIER_2_CONDITIONAL";
+                                        let obi_confirmed = if is_tier2 {
+                                            // Tier 2 requires order book not being flooded by buy volume
+                                            l2_instant <= 0.20 && l2_1s <= 0.20
                                         } else {
-                                            funnel_counters.engine_a_orders_placed += 1;
-                                            println!(
-                                                "🔴 [SHORT REVERSAL CONFIRMED] {} rejected from peak ${:.2} down to ${:.2}! Edge: {:.1} bps. Submitting Maker Short.",
-                                                symbol_clone, armed_state.extreme_price, close_price, net_edge_bps
-                                            );
-                                            let frozen_hl = armed_state.half_life_m;
-                                            armed_state.is_armed = false;
-                                            save_armed_signal(&arm_path_clone, &armed_state);
+                                            true
+                                        };
 
-                                            if let Err(e) = place_ou_maker_entry(
-                                                &state_path_clone,
-                                                &exchange_clone,
-                                                &info_clone,
-                                                &mut state_lock,
-                                                &symbol_clone,
-                                                Side::Short,
-                                                entry_limit_price,
-                                                dynamic_exit_target,
-                                                frozen_hl,
-                                                position_size_usdc,
-                                                sz_decimals,
-                                                discord_clone.clone(),
-                                            )
-                                            .await
-                                            {
-                                                funnel_counters.engine_a_orders_rejected += 1;
-                                                eprintln!("❌ [ORDER ERROR] Short maker entry failed: {}", e);
+                                        if !obi_confirmed {
+                                            println!(
+                                                "⚠️ [TIER 2 OBI VETO] {} Short rejection bounce vetoed: buy pressure in order book (instant: {:.2}, 1s: {:.2} > 0.20). Waiting.",
+                                                symbol_clone, l2_instant, l2_1s
+                                            );
+                                        } else {
+                                            let entry_limit_price = f64::max(close_price, dynamic_entry_floor);
+                                            // For Short: edge is entry_limit_price down to dynamic_exit_target
+                                            let net_edge_bps = (entry_limit_price / dynamic_exit_target).ln() * 10000.0;
+
+                                            if net_edge_bps < 25.0 {
+                                                funnel_counters.engine_a_reversal_hurdle_veto += 1;
+                                                println!(
+                                                    "⚠️ [SHORT HURDLE VETO] Edge too narrow for {}: {:.1} bps (< 25 bps).",
+                                                    symbol_clone, net_edge_bps
+                                                );
+                                                armed_state.is_armed = false;
+                                                save_armed_signal(&arm_path_clone, &armed_state);
+                                            } else {
+                                                let trade_size_usdc = if is_tier2 {
+                                                    (position_size_usdc * 0.5).max(12.0)
+                                                } else {
+                                                    position_size_usdc
+                                                };
+
+                                                funnel_counters.engine_a_orders_placed += 1;
+                                                println!(
+                                                    "🔴 [SHORT REVERSAL CONFIRMED] {} rejected from peak ${:.2} down to ${:.2}! Edge: {:.1} bps. Tier: {} (${:.2}). Submitting Maker Short.",
+                                                    symbol_clone, armed_state.extreme_price, close_price, net_edge_bps, armed_state.tier, trade_size_usdc
+                                                );
+                                                let frozen_hl = armed_state.half_life_m;
+                                                armed_state.is_armed = false;
+                                                save_armed_signal(&arm_path_clone, &armed_state);
+
+                                                if let Err(e) = place_ou_maker_entry(
+                                                    &state_path_clone,
+                                                    &exchange_clone,
+                                                    &info_clone,
+                                                    &mut state_lock,
+                                                    &symbol_clone,
+                                                    Side::Short,
+                                                    entry_limit_price,
+                                                    dynamic_exit_target,
+                                                    frozen_hl,
+                                                    trade_size_usdc,
+                                                    sz_decimals,
+                                                    discord_clone.clone(),
+                                                )
+                                                .await
+                                                {
+                                                    funnel_counters.engine_a_orders_rejected += 1;
+                                                    eprintln!("❌ [ORDER ERROR] Short maker entry failed: {}", e);
+                                                }
                                             }
                                         }
                                     }
                                 }
                             } else if is_eligible {
                                 if let Some(ref thresholds) = thresholds_opt {
-                                    // Check Long Arm: price dipped below lower boundary
+                                    // Check Long Arm: price dipped below 1.75σ boundary
                                     if close_price <= thresholds.entry_long && !is_downside_shock {
                                         let baseline_arm = rolling_closes.iter().sum::<f64>()
                                             / rolling_closes.len() as f64;
@@ -2661,6 +2733,7 @@ async fn main() {
 
                                         armed_state.is_armed = true;
                                         armed_state.side = "LONG".to_string();
+                                        armed_state.tier = "TIER_1_NORMAL".to_string();
                                         armed_state.armed_at = Some(chrono::Utc::now().to_rfc3339());
                                         armed_state.entry_threshold = thresholds.entry_long;
                                         armed_state.exit_threshold = thresholds.exit_long;
@@ -2671,11 +2744,11 @@ async fn main() {
                                         save_armed_signal(&arm_path_clone, &armed_state);
 
                                         println!(
-                                            "🟡 [LONG ARMED] {} touched lower threshold (${:.2} <= ${:.2}). Waiting for green bounce.",
+                                            "🟡 [LONG ARMED - TIER 1 (1.75σ)] {} touched lower threshold (${:.2} <= ${:.2}). Waiting for green bounce.",
                                             symbol_clone, close_price, thresholds.entry_long
                                         );
                                     }
-                                    // Check Short Arm: price spiked above upper boundary
+                                    // Check Short Arm: price spiked above 1.75σ boundary
                                     else if close_price >= thresholds.entry_short && !is_upside_shock {
                                         let baseline_arm = rolling_closes.iter().sum::<f64>()
                                             / rolling_closes.len() as f64;
@@ -2686,6 +2759,7 @@ async fn main() {
 
                                         armed_state.is_armed = true;
                                         armed_state.side = "SHORT".to_string();
+                                        armed_state.tier = "TIER_1_NORMAL".to_string();
                                         armed_state.armed_at = Some(chrono::Utc::now().to_rfc3339());
                                         armed_state.entry_threshold = thresholds.entry_short;
                                         armed_state.exit_threshold = thresholds.exit_short;
@@ -2696,9 +2770,63 @@ async fn main() {
                                         save_armed_signal(&arm_path_clone, &armed_state);
 
                                         println!(
-                                            "🟣 [SHORT ARMED] {} touched upper threshold (${:.2} >= ${:.2}). Waiting for red rejection.",
+                                            "🟣 [SHORT ARMED - TIER 1 (1.75σ)] {} touched upper threshold (${:.2} >= ${:.2}). Waiting for red rejection.",
                                             symbol_clone, close_price, thresholds.entry_short
                                         );
+                                    }
+                                    // Check Conditional Tier 2: 1.50σ boundary
+                                    else if let Some(ref th150) = thresholds_175_opt {
+                                        if close_price <= th150.entry_long && !is_downside_shock {
+                                            let baseline_arm = rolling_closes.iter().sum::<f64>()
+                                                / rolling_closes.len() as f64;
+                                            let unitless_entry_dev =
+                                                (th150.entry_long / baseline_arm).ln();
+                                            let unitless_exit_dev =
+                                                (th150.exit_long / baseline_arm).ln();
+
+                                            armed_state.is_armed = true;
+                                            armed_state.side = "LONG".to_string();
+                                            armed_state.tier = "TIER_2_CONDITIONAL".to_string();
+                                            armed_state.armed_at = Some(chrono::Utc::now().to_rfc3339());
+                                            armed_state.entry_threshold = th150.entry_long;
+                                            armed_state.exit_threshold = th150.exit_long;
+                                            armed_state.unitless_entry_dev = unitless_entry_dev;
+                                            armed_state.unitless_exit_dev = unitless_exit_dev;
+                                            armed_state.half_life_m = half_life_m;
+                                            armed_state.extreme_price = close_price;
+                                            save_armed_signal(&arm_path_clone, &armed_state);
+
+                                            println!(
+                                                "🟡 [LONG ARMED - TIER 2 CONDITIONAL (1.50σ)] {} touched conditional threshold (${:.2} <= ${:.2}). Half-size with L2 OBI guard.",
+                                                symbol_clone, close_price, th150.entry_long
+                                            );
+                                        } else if close_price >= th150.entry_short && !is_upside_shock {
+                                            let baseline_arm = rolling_closes.iter().sum::<f64>()
+                                                / rolling_closes.len() as f64;
+                                            let unitless_entry_dev =
+                                                (th150.entry_short / baseline_arm).ln();
+                                            let unitless_exit_dev =
+                                                (th150.exit_short / baseline_arm).ln();
+
+                                            armed_state.is_armed = true;
+                                            armed_state.side = "SHORT".to_string();
+                                            armed_state.tier = "TIER_2_CONDITIONAL".to_string();
+                                            armed_state.armed_at = Some(chrono::Utc::now().to_rfc3339());
+                                            armed_state.entry_threshold = th150.entry_short;
+                                            armed_state.exit_threshold = th150.exit_short;
+                                            armed_state.unitless_entry_dev = unitless_entry_dev;
+                                            armed_state.unitless_exit_dev = unitless_exit_dev;
+                                            armed_state.half_life_m = half_life_m;
+                                            armed_state.extreme_price = close_price;
+                                            save_armed_signal(&arm_path_clone, &armed_state);
+
+                                            println!(
+                                                "🟣 [SHORT ARMED - TIER 2 CONDITIONAL (1.50σ)] {} touched conditional threshold (${:.2} >= ${:.2}). Half-size with L2 OBI guard.",
+                                                symbol_clone, close_price, th150.entry_short
+                                            );
+                                        } else {
+                                            funnel_counters.engine_a_outside_band += 1;
+                                        }
                                     } else {
                                         funnel_counters.engine_a_outside_band += 1;
                                     }

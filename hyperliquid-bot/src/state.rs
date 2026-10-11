@@ -218,6 +218,10 @@ fn default_side() -> String {
     "LONG".to_string()
 }
 
+fn default_tier() -> String {
+    "TIER_1_NORMAL".to_string()
+}
+
 pub type StateMap = HashMap<String, PositionState>;
 
 pub fn load_state(file_path: &str) -> Result<StateMap, Box<dyn std::error::Error>> {
@@ -310,6 +314,8 @@ pub struct ArmedSignal {
     #[serde(default)]
     pub half_life_m: f64,
     pub extreme_price: f64, // Lowest price for LONG, Highest price for SHORT
+    #[serde(default = "default_tier")]
+    pub tier: String, // "TIER_1_NORMAL" (1.75σ) or "TIER_2_CONDITIONAL" (1.50σ)
 }
 
 pub fn load_armed_signal(file_path: &str) -> ArmedSignal {

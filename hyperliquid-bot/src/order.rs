@@ -90,12 +90,16 @@ pub async fn place_ou_maker_entry(
         ));
     }
 
-    // Epsilon Shave: front-run the mean by 5 bps (min 2 ticks) to avoid Schelling point liquidity walls
-    let epsilon_shave = (target_mu * 0.0005).max(0.02);
+    // Epsilon Shave + Avellaneda-Stoikov Inventory Skew:
+    // Front-run the mean by 5 bps (min 2 ticks) plus AS inventory skew (~4 bps)
+    // to aggressively exit inventory, accelerate fill probability, and free cluster lock faster.
+    let base_shave = (target_mu * 0.0005).max(0.02);
+    let as_inventory_skew = (target_mu * 0.0004).max(0.015);
+    let total_shave = base_shave + as_inventory_skew;
     let target_tp = if is_buy {
-        target_mu - epsilon_shave
+        target_mu - total_shave
     } else {
-        target_mu + epsilon_shave
+        target_mu + total_shave
     };
     let target_tp_quantized = quantize_price(target_tp, sz_decimals);
 

@@ -54,9 +54,13 @@ impl Config {
             .unwrap_or_else(|_| format!("hl_hmm_weights_{}.json", symbol));
         let state_path = format!("hl_hmm_state_{}.json", symbol);
 
-        let trend_mode = env::var("HL_TREND_ENGINE_MODE")
-            .unwrap_or_else(|_| "shadow".to_string())
+        let raw_trend_mode = env::var("HL_TREND_ENGINE_MODE")
+            .or_else(|_| env::var("TREND_ENGINE_MODE"))
+            .or_else(|_| env::var("HL_TREND_MODE"))
+            .unwrap_or_else(|_| "live".to_string())
             .to_lowercase();
+        let is_live_trend = matches!(raw_trend_mode.trim(), "live" | "libe" | "true" | "1" | "prod");
+        let trend_mode = if is_live_trend { "live".to_string() } else { "shadow".to_string() };
         let trend_risk = env::var("HL_TREND_RISK_FRACTION")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())

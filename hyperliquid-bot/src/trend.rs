@@ -544,6 +544,18 @@ impl L2ObiTracker {
         latency <= max_latency_ms && self.best_ask > self.best_bid && self.best_bid > 0.0
     }
 
+    /// Computes the Stoikov Micro-Price conditional on current order book depth and imbalance:
+    /// P_micro = S_mid + I * (spread / 2)
+    #[allow(dead_code)]
+    pub fn compute_micro_price(&self) -> f64 {
+        if self.best_bid <= 0.0 || self.best_ask <= 0.0 || self.best_bid >= self.best_ask {
+            return 0.0;
+        }
+        let mid = (self.best_bid + self.best_ask) / 2.0;
+        let spread = self.best_ask - self.best_bid;
+        mid + self.instant_obi * (spread / 2.0)
+    }
+
     pub fn satisfies_entry_hurdle(&self, side: &Side, now_ms: u64) -> (bool, &'static str) {
         if !self.is_fresh_and_uncrossed(now_ms, 7500) {
             return (false, "L2 Book Stale or Crossed");

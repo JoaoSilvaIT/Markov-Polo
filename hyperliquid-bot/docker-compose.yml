@@ -11,6 +11,7 @@ services:
       - HL_TRADING_SYMBOL=BTC
       - HL_LEVERAGE=${HL_LEVERAGE:-3}
       - HL_IS_CROSS=${HL_IS_CROSS:-true}
+      - HL_TREND_ENGINE_MODE=${HL_TREND_ENGINE_MODE:-live}
       - HL_PORTFOLIO_SYMBOLS=${HL_PORTFOLIO_SYMBOLS:-BTC,ETH,SOL,AVAX}
     volumes:
       - ./hl_bot_data:/app
@@ -27,6 +28,7 @@ services:
       - HL_TRADING_SYMBOL=ETH
       - HL_LEVERAGE=${HL_LEVERAGE:-3}
       - HL_IS_CROSS=${HL_IS_CROSS:-true}
+      - HL_TREND_ENGINE_MODE=${HL_TREND_ENGINE_MODE:-live}
       - HL_PORTFOLIO_SYMBOLS=${HL_PORTFOLIO_SYMBOLS:-BTC,ETH,SOL,AVAX}
     volumes:
       - ./hl_bot_data:/app
@@ -43,6 +45,7 @@ services:
       - HL_TRADING_SYMBOL=SOL
       - HL_LEVERAGE=${HL_LEVERAGE:-3}
       - HL_IS_CROSS=${HL_IS_CROSS:-true}
+      - HL_TREND_ENGINE_MODE=${HL_TREND_ENGINE_MODE:-live}
       - HL_PORTFOLIO_SYMBOLS=${HL_PORTFOLIO_SYMBOLS:-BTC,ETH,SOL,AVAX}
     volumes:
       - ./hl_bot_data:/app
@@ -59,7 +62,7 @@ services:
       - HL_TRADING_SYMBOL=AVAX
       - HL_LEVERAGE=${HL_LEVERAGE:-3}
       - HL_IS_CROSS=${HL_IS_CROSS:-true}
-      - HL_TREND_ENGINE_MODE=shadow
+      - HL_TREND_ENGINE_MODE=${HL_TREND_ENGINE_MODE:-live}
       - HL_PORTFOLIO_SYMBOLS=${HL_PORTFOLIO_SYMBOLS:-BTC,ETH,SOL,AVAX}
     volumes:
       - ./hl_bot_data:/app
