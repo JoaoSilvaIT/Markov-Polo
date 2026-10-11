@@ -268,10 +268,18 @@ pub fn calculate_features(closes_history: &[f64], eval_close: f64) -> Option<Fea
     let (thresholds_opt, thresholds_175_opt, half_life_m) =
         if let Some(ou_params) = estimate_ou_parameters(closes_history, 1.0) {
             let hl = ou_params.half_life_minutes();
-            let tx_cost = hist_last_price * 0.0005; // ~5 bps roundtrip on Hyperliquid Maker
-            let th = calculate_optimal_thresholds(&ou_params, tx_cost);
-            let th_150 = calculate_thresholds_at_sigma(&ou_params, tx_cost, 1.50);
-            (Some(th), Some(th_150), hl)
+            let is_hl_ok = (15.0..=120.0).contains(&hl);
+            let mu_dev = (ou_params.mu - hist_last_price).abs() / hist_last_price;
+            let is_mu_ok = mu_dev <= 0.10; // mu must be within 10% of market price (reject unit-root explosion)
+
+            if is_hl_ok && is_mu_ok {
+                let tx_cost = hist_last_price * 0.0005; // ~5 bps roundtrip on Hyperliquid Maker
+                let th = calculate_optimal_thresholds(&ou_params, tx_cost);
+                let th_150 = calculate_thresholds_at_sigma(&ou_params, tx_cost, 1.50);
+                (Some(th), Some(th_150), hl)
+            } else {
+                (None, None, hl)
+            }
         } else {
             (None, None, 999.0)
         };
