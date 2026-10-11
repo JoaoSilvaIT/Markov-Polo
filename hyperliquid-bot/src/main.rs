@@ -1407,19 +1407,18 @@ async fn main() {
                     // ------------------------------------------------------------------
                     // 3-MODE CONTROLLER REGIME INFERENCE (HMM Causal Filter + Hysteresis)
                     // ------------------------------------------------------------------
-                    // Fast-path safety: Severe shock on ANY 1m candle unconditionally initiates/resets cooldown.
-                    // Evaluates immediate short-term shock (|Z15| >= 3.0) to cut risk on active flash dislocations.
-                    // Macro |Z60| is evaluated on finalized 15m candle closes to prevent 60-minute rolling step reset loops.
+                    // Fast-path safety: Severe shock on ANY 1m candle unconditionally initiates/preserves cooldown.
+                    // Evaluates immediate short-term shock (|Z15| >= 3.0 with |ret_15| >= 0.75% or |ret_60| >= 1.50%) to cut risk on active flash dislocations.
                     // Deduplicated strictly by completed_bar.time_open to prevent clock rolling within the same 1m candle
-                    if z_15.abs() >= 3.0 {
+                    if live_feat.is_downside_shock || live_feat.is_upside_shock {
                         if last_shock_bar_ms != completed_bar.time_open {
                             last_shock_bar_ms = completed_bar.time_open;
                             let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
                             controller.force_shock_cooldown(z_15, z_60, now_ms);
                             save_controller_state(&symbol_clone, &controller);
                             println!(
-                                "🚨 [CONTROLLER SHOCK VETO] Severe shock on 1m bar {} (Z15: {:.2}, Z60: {:.2}) -> Neutral cooldown initialized/reset (2 bars & 30m)",
-                                completed_bar.time_open, z_15, z_60
+                                "🚨 [CONTROLLER SHOCK VETO] Severe shock on 1m bar {} (Z15: {:.2}, Z60: {:.2}) -> {}",
+                                completed_bar.time_open, z_15, z_60, controller.last_reason
                             );
                         }
                     }
@@ -1463,6 +1462,7 @@ async fn main() {
 
                         // Features evaluated strictly at the cutoff of the finalized 15m candle
                         let d_feat = decision_features.as_ref().unwrap_or(&live_feat);
+                        let is_severe_shock_15m = d_feat.is_downside_shock || d_feat.is_upside_shock;
                         let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
                         let prev_mode = controller.current_mode;
                         if let Some(new_mode) = controller.evaluate_15m_bar_idempotent(
@@ -1475,6 +1475,7 @@ async fn main() {
                             has_donchian_breakout,
                             d_feat.is_stationary,
                             d_feat.is_valid_half_life,
+                            is_severe_shock_15m,
                         ) {
                             save_controller_state(&symbol_clone, &controller);
 
@@ -1993,7 +1994,7 @@ async fn main() {
                     let mut state_lock = state_clone.lock().await;
                     let has_position = state_lock.contains_key(&symbol_clone);
 
-                    let consolidation_vol_ok = z_15.abs() < 1.5 && z_60.abs() < 2.5;
+                    let consolidation_vol_ok = z_15.abs() < 2.2 && z_60.abs() < 2.5;
                     let mr_invalidated = !consolidation_vol_ok || controller.current_mode != ControllerMode::MeanReversion;
 
                     if has_position {
@@ -2453,7 +2454,7 @@ async fn main() {
                             // BI-DIRECTIONAL REVERSAL-CONFIRMED ENTRY PROTOCOL (Long & Short)
                             // ------------------------------------------------------------------
                             let mut armed_state = load_armed_signal(&arm_path_clone);
-                            let consolidation_vol_ok = z_15.abs() < 1.5 && z_60.abs() < 2.5;
+                            let consolidation_vol_ok = z_15.abs() < 2.2 && z_60.abs() < 2.5;
                             let is_eligible = !candle_feed_degraded
                                 && !is_candle_gap
                                 && is_consolidation

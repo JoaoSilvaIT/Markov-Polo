@@ -245,6 +245,10 @@ pub struct FeatureSnapshot {
     pub half_life_m: f64,
     pub z_15: f64,
     pub z_60: f64,
+    #[allow(dead_code)]
+    pub ret_15: f64,
+    #[allow(dead_code)]
+    pub ret_60: f64,
     pub is_downside_shock: bool,
     pub is_upside_shock: bool,
     pub hist_last_price: f64,
@@ -294,6 +298,8 @@ pub fn calculate_features(closes_history: &[f64], eval_close: f64) -> Option<Fea
     let n = closes_history.len();
     let mut z_15 = 0.0;
     let mut z_60 = 0.0;
+    let mut ret_15 = 0.0;
+    let mut ret_60 = 0.0;
     if n >= 65 {
         let mut returns_1m = Vec::with_capacity(n - 1);
         for i in 1..n {
@@ -301,14 +307,25 @@ pub fn calculate_features(closes_history: &[f64], eval_close: f64) -> Option<Fea
         }
         let sigma_mad = calculate_mad_sigma(&returns_1m);
 
-        let ret_15 = (eval_close / closes_history[n - 15]).ln();
+        ret_15 = (eval_close / closes_history[n - 15]).ln();
         z_15 = ret_15 / (sigma_mad * (15.0_f64).sqrt());
 
-        let ret_60 = (eval_close / closes_history[n - 60]).ln();
+        ret_60 = (eval_close / closes_history[n - 60]).ln();
         z_60 = ret_60 / (sigma_mad * (60.0_f64).sqrt());
     }
-    let is_downside_shock = z_15 < -3.0 || z_60 < -3.0;
-    let is_upside_shock = z_15 > 3.0 || z_60 > 3.0;
+
+    // Physical return hurdle for severe shocks:
+    // Requires statistical deviation (|Z| >= 3.0) AND physical price displacement:
+    // - 15m shock: |ret_15| >= 0.75% (75 bps = 0.0075) AND |z_15| >= 3.0
+    // - 60m shock: |ret_60| >= 1.50% (150 bps = 0.0150) AND |z_60| >= 3.0
+    // Prevents low-volatility quiet market compression (e.g. 28 bps Sunday fluctuation) from triggering false shock vetos.
+    let shock_15_down = ret_15 <= -0.0075 && z_15 <= -3.0;
+    let shock_15_up = ret_15 >= 0.0075 && z_15 >= 3.0;
+    let shock_60_down = ret_60 <= -0.0150 && z_60 <= -3.0;
+    let shock_60_up = ret_60 >= 0.0150 && z_60 >= 3.0;
+
+    let is_downside_shock = shock_15_down || shock_60_down;
+    let is_upside_shock = shock_15_up || shock_60_up;
     let is_stationary = thresholds_opt.is_some();
     let is_consolidation = !is_drifting && is_stationary;
     let is_valid_half_life = (15.0..=120.0).contains(&half_life_m);
@@ -321,6 +338,8 @@ pub fn calculate_features(closes_history: &[f64], eval_close: f64) -> Option<Fea
         half_life_m,
         z_15,
         z_60,
+        ret_15,
+        ret_60,
         is_downside_shock,
         is_upside_shock,
         hist_last_price,
@@ -453,4 +472,39 @@ mod tests {
         assert_eq!(th_150.exit_long, params.mu);
         assert_eq!(th_175.exit_long, params.mu);
     }
+
+    #[test]
+    fn test_shock_physical_return_hurdle() {
+        // Build a baseline of flat/quiet prices (100.0)
+        let mut history = vec![100.0; 120];
+        // Inject tiny tick noise (0.001) to produce a tiny MAD sigma
+        for i in 0..120 {
+            if i % 2 == 0 {
+                history[i] = 100.01;
+            } else {
+                history[i] = 99.99;
+            }
+        }
+
+        // Scenario 1: A 28 bps move (100.0 -> 100.28).
+        // Statistical Z will be large (> 3.0) due to tiny sigma_mad, but |ret_15| is only 0.28% < 0.75%.
+        // Must NOT trigger is_upside_shock!
+        let feat_quiet = calculate_features(&history, 100.28).expect("features");
+        assert!(feat_quiet.z_15 > 3.0);
+        assert!(!feat_quiet.is_upside_shock, "28 bps move must not trigger shock veto despite high Z!");
+
+        // Scenario 2: A genuine 150 bps flash pump (100.0 -> 101.50).
+        // Statistical Z > 3.0 AND |ret_15| = 1.5% >= 0.75%.
+        // Must trigger is_upside_shock!
+        let feat_real_shock = calculate_features(&history, 101.50).expect("features");
+        assert!(feat_real_shock.z_15 > 3.0);
+        assert!(feat_real_shock.is_upside_shock, "150 bps flash move must trigger shock veto!");
+
+        // Scenario 3: A genuine -200 bps flash dump (100.0 -> 98.00).
+        // Must trigger is_downside_shock!
+        let feat_dump = calculate_features(&history, 98.00).expect("features");
+        assert!(feat_dump.z_15 < -3.0);
+        assert!(feat_dump.is_downside_shock, "-200 bps flash crash must trigger downside shock!");
+    }
 }
+
