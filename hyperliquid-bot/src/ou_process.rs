@@ -82,22 +82,42 @@ fn estimate_ar1_raw(data: &[f64]) -> Option<(f64, f64, f64)> {
 /// Estimates the Ornstein-Uhlenbeck parameters using Ordinary Least Squares (OLS)
 /// applied to an exact Autoregressive AR(1) discretization with Phillips & Yu (2005)
 /// Jackknife bias reduction to eliminate the Hurwicz upward bias on theta.
-/// 
-/// `data`: The rolling window of price data (e.g., 480 1-minute close prices).
+///
+/// Operates in **log-price space** (Y_t = ln(S_t)) for three key advantages:
+///   1. Log-returns are more homoscedastic than price-level increments (better AR(1) fit).
+///   2. sigma_eps is scale-invariant (fractional, ~0.1–0.5% per 1m bar), making
+///      sigma_eq a consistent percentage-of-price deviation across all assets and price levels.
+///   3. mu = exp(log_mu) respects price positivity and handles asymmetric up/down moves.
+///
+/// Returns mu/sigma in **price space** for full backward compatibility with all callers.
+/// Specifically, sigma_price = mu × sigma_log, so sigma_eq = sigma_price/sqrt(2θ) remains
+/// the correct equilibrium standard deviation in price units.
+///
+/// `data`: The rolling window of price data (e.g., 960 1-minute close prices).
 /// `dt`: The discrete time step (e.g., 1.0 for 1-minute bars).
 pub fn estimate_ou_parameters(data: &[f64], dt: f64) -> Option<OuParameters> {
-    let (a, b, sigma_eps) = estimate_ar1_raw(data)?;
-    
-    let theta_full = -b.ln() / dt;
-    
-    // Apply Phillips & Yu (2005) 2-split Jackknife bias correction:
+    // Validate input: all prices must be positive and finite
+    if data.iter().any(|&p| !p.is_finite() || p <= 0.0) {
+        return None;
+    }
+
+    // Work in log-price space: Y_t = ln(S_t)
+    // Log-prices have more homoscedastic increments than raw levels, giving
+    // better-conditioned AR(1) estimates across different price magnitudes.
+    let log_data: Vec<f64> = data.iter().map(|&p| p.ln()).collect();
+
+    let (a_log, b_log, sigma_eps_log) = estimate_ar1_raw(&log_data)?;
+
+    let theta_full = -b_log.ln() / dt;
+
+    // Apply Phillips & Yu (2005) 2-split Jackknife bias correction on log-price AR(1):
     // theta_jack = 2 * theta_full - 0.5 * (theta_1 + theta_2)
     // This removes the O(1/T) Hurwicz bias that artificially inflates mean-reversion speed.
-    let mid = data.len() / 2;
+    let mid = log_data.len() / 2;
     let theta = if mid >= 4 {
-        let part1 = estimate_ar1_raw(&data[..mid]);
-        let part2 = estimate_ar1_raw(&data[mid..]);
-        
+        let part1 = estimate_ar1_raw(&log_data[..mid]);
+        let part2 = estimate_ar1_raw(&log_data[mid..]);
+
         if let (Some((_, b1, _)), Some((_, b2, _))) = (part1, part2) {
             let theta1 = -b1.ln() / dt;
             let theta2 = -b2.ln() / dt;
@@ -113,12 +133,26 @@ pub fn estimate_ou_parameters(data: &[f64], dt: f64) -> Option<OuParameters> {
     } else {
         theta_full
     };
-    
-    let mu = a / (1.0 - b);
-    let sigma = sigma_eps * ((2.0 * theta) / (1.0 - b * b)).sqrt();
-    
+
+    // mu in log-space → convert to price space.
+    // mu_log = a / (1 - b) is the long-run log-price mean; exp() gives the price-space equilibrium.
+    let mu_log = a_log / (1.0 - b_log);
+    let mu = mu_log.exp();
+    if !mu.is_finite() || mu <= 0.0 {
+        return None;
+    }
+
+    // sigma_log is the OU diffusion coefficient in log-return units (e.g., 0.002 = 0.2%/bar).
+    // Convert to price space: sigma_price ≈ mu × sigma_log (first-order Taylor, valid for small σ).
+    // This preserves the interface: sigma_eq = sigma_price / sqrt(2θ) gives the correct
+    // equilibrium ±1σ price band. For thresholds: entry = mu - 1.75×sigma_eq in price space,
+    // which equals mu × (1 - 1.75×sigma_log/sqrt(2θ)) — multiplicatively consistent.
+    let sigma_log = sigma_eps_log * ((2.0 * theta) / (1.0 - b_log * b_log)).sqrt();
+    let sigma = mu * sigma_log;
+
     Some(OuParameters { theta, mu, sigma })
 }
+
 
 pub fn calculate_thresholds_at_sigma(params: &OuParameters, transaction_cost: f64, num_sigma: f64) -> OptimalThresholds {
     let sigma_eq = (params.sigma * params.sigma / (2.0 * params.theta)).sqrt();
@@ -258,19 +292,21 @@ pub struct FeatureSnapshot {
 }
 
 /// Evaluates stochastic O-U, drift, and Z-score features at an exact time cutoff.
-pub fn calculate_features(closes_history: &[f64], eval_close: f64) -> Option<FeatureSnapshot> {
+pub fn calculate_features(closes_history: &[f64], eval_close: f64, symbol: &str) -> Option<FeatureSnapshot> {
     if closes_history.len() < 100 || eval_close <= 0.0 {
         return None;
     }
     let hist_last_price = *closes_history.last().unwrap_or(&eval_close);
 
-    // O-U Parameter Estimation with Phillips & Yu Jackknife bias correction
+    // O-U Parameter Estimation with Phillips & Yu Jackknife bias correction (log-price space)
     let (thresholds_opt, thresholds_175_opt, half_life_m) =
         if let Some(ou_params) = estimate_ou_parameters(closes_history, 1.0) {
             let hl = ou_params.half_life_minutes();
             let is_hl_ok = (15.0..=120.0).contains(&hl);
+            // Tighter 7% gate: log-space estimation is more stable, so a wider mu deviation
+            // reliably signals a unit-root explosion or a structural break rather than noise.
             let mu_dev = (ou_params.mu - hist_last_price).abs() / hist_last_price;
-            let is_mu_ok = mu_dev <= 0.10; // mu must be within 10% of market price (reject unit-root explosion)
+            let is_mu_ok = mu_dev <= 0.07;
 
             if is_hl_ok && is_mu_ok {
                 let tx_cost = hist_last_price * 0.0005; // ~5 bps roundtrip on Hyperliquid Maker
@@ -284,22 +320,33 @@ pub fn calculate_features(closes_history: &[f64], eval_close: f64) -> Option<Fea
             (None, None, 999.0)
         };
 
-    // OLS Slope drift calculation
+    // Log-price OLS slope drift detection (scale-invariant percentage drift per bar)
+    // Working in log-price space gives a drift estimate in fractional units (~0.0001 = 0.01%/bar),
+    // which is consistent across BTC ($63k), ETH ($2.5k), SOL ($150), and AVAX ($30).
+    // total_drift_pct = slope_log * n_bars represents the cumulative log-return over the window.
     let n_drift = closes_history.len() as f64;
-    let mut sum_i = 0.0;
-    let mut sum_p = 0.0;
-    let mut sum_ip = 0.0;
-    let mut sum_ii = 0.0;
+    let mut sum_i = 0.0_f64;
+    let mut sum_lp = 0.0_f64;
+    let mut sum_ilp = 0.0_f64;
+    let mut sum_ii = 0.0_f64;
     for (i, &p) in closes_history.iter().enumerate() {
+        if p <= 0.0 { continue; }
+        let lp = p.ln();
         let idx = i as f64;
         sum_i += idx;
-        sum_p += p;
-        sum_ip += idx * p;
+        sum_lp += lp;
+        sum_ilp += idx * lp;
         sum_ii += idx * idx;
     }
-    let slope = (n_drift * sum_ip - sum_i * sum_p)
-        / (n_drift * sum_ii - sum_i * sum_i);
-    let total_drift_pct = (slope * n_drift) / hist_last_price;
+    let det = n_drift * sum_ii - sum_i * sum_i;
+    let slope_log = if det.abs() > 1e-12 {
+        (n_drift * sum_ilp - sum_i * sum_lp) / det
+    } else {
+        0.0
+    };
+    // total_drift_pct is the total cumulative log-return drift over the full window:
+    // e.g., 0.015 means 1.5% cumulative drift. Threshold 1.5% kept the same as before.
+    let total_drift_pct = slope_log * n_drift;
     let is_drifting = total_drift_pct.abs() > 0.015;
 
     // Standardized Downside/Upside Shock Calculation with robust MAD
@@ -322,15 +369,23 @@ pub fn calculate_features(closes_history: &[f64], eval_close: f64) -> Option<Fea
         z_60 = ret_60 / (sigma_mad * (60.0_f64).sqrt());
     }
 
-    // Physical return hurdle for severe shocks:
-    // Requires statistical deviation (|Z| >= 3.0) AND physical price displacement:
-    // - 15m shock: |ret_15| >= 0.75% (75 bps = 0.0075) AND |z_15| >= 3.0
-    // - 60m shock: |ret_60| >= 1.50% (150 bps = 0.0150) AND |z_60| >= 3.0
-    // Prevents low-volatility quiet market compression (e.g. 28 bps Sunday fluctuation) from triggering false shock vetos.
-    let shock_15_down = ret_15 <= -0.0075 && z_15 <= -3.0;
-    let shock_15_up = ret_15 >= 0.0075 && z_15 >= 3.0;
-    let shock_60_down = ret_60 <= -0.0150 && z_60 <= -3.0;
-    let shock_60_up = ret_60 >= 0.0150 && z_60 >= 3.0;
+    // Asset-specific physical return hurdles for the shock veto.
+    // Rationale: a 0.75% 15m move is a mild fluctuation on SOL or AVAX but a meaningful shock
+    // on BTC. Using asset-specific thresholds prevents over-vetoing on volatile small-caps
+    // while maintaining protective sensitivity on large-caps.
+    // Each threshold pair: (shock_15m_pct, shock_60m_pct).
+    let (hurdle_15, hurdle_60) = match symbol.to_uppercase().as_str() {
+        "BTC"  => (0.0075, 0.0150), // BTC: 0.75% / 1.50% (baseline)
+        "ETH"  => (0.0100, 0.0200), // ETH: 1.00% / 2.00% (slightly more volatile)
+        "SOL"  => (0.0150, 0.0300), // SOL: 1.50% / 3.00% (significantly more volatile)
+        "AVAX" => (0.0200, 0.0400), // AVAX: 2.00% / 4.00% (most volatile in portfolio)
+        _      => (0.0100, 0.0200), // Default: ETH-equivalent for unknown assets
+    };
+
+    let shock_15_down = ret_15 <= -hurdle_15 && z_15 <= -3.0;
+    let shock_15_up   = ret_15 >=  hurdle_15 && z_15 >=  3.0;
+    let shock_60_down = ret_60 <= -hurdle_60 && z_60 <= -3.0;
+    let shock_60_up   = ret_60 >=  hurdle_60 && z_60 >=  3.0;
 
     let is_downside_shock = shock_15_down || shock_60_down;
     let is_upside_shock = shock_15_up || shock_60_up;
@@ -356,6 +411,7 @@ pub fn calculate_features(closes_history: &[f64], eval_close: f64) -> Option<Fea
         is_valid_half_life,
     })
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -432,7 +488,7 @@ mod tests {
         for i in 0..120 {
             history.push(100.0 + (i as f64 * 0.01).sin() * 2.0);
         }
-        let feat = calculate_features(&history, 100.5).expect("Features calculated");
+        let feat = calculate_features(&history, 100.5, "BTC").expect("Features calculated");
         assert!(feat.half_life_m > 0.0);
         assert!(feat.z_15.is_finite());
         assert!(feat.z_60.is_finite());
@@ -497,20 +553,20 @@ mod tests {
         // Scenario 1: A 28 bps move (100.0 -> 100.28).
         // Statistical Z will be large (> 3.0) due to tiny sigma_mad, but |ret_15| is only 0.28% < 0.75%.
         // Must NOT trigger is_upside_shock!
-        let feat_quiet = calculate_features(&history, 100.28).expect("features");
+        let feat_quiet = calculate_features(&history, 100.28, "BTC").expect("features");
         assert!(feat_quiet.z_15 > 3.0);
         assert!(!feat_quiet.is_upside_shock, "28 bps move must not trigger shock veto despite high Z!");
 
         // Scenario 2: A genuine 150 bps flash pump (100.0 -> 101.50).
         // Statistical Z > 3.0 AND |ret_15| = 1.5% >= 0.75%.
         // Must trigger is_upside_shock!
-        let feat_real_shock = calculate_features(&history, 101.50).expect("features");
+        let feat_real_shock = calculate_features(&history, 101.50, "BTC").expect("features");
         assert!(feat_real_shock.z_15 > 3.0);
         assert!(feat_real_shock.is_upside_shock, "150 bps flash move must trigger shock veto!");
 
         // Scenario 3: A genuine -200 bps flash dump (100.0 -> 98.00).
         // Must trigger is_downside_shock!
-        let feat_dump = calculate_features(&history, 98.00).expect("features");
+        let feat_dump = calculate_features(&history, 98.00, "BTC").expect("features");
         assert!(feat_dump.z_15 < -3.0);
         assert!(feat_dump.is_downside_shock, "-200 bps flash crash must trigger downside shock!");
     }

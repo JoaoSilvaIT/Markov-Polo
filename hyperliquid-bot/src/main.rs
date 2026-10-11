@@ -109,7 +109,7 @@ async fn backfill_missing_1m_candles(
         }
 
         rolling_closes.push(close_f);
-        if rolling_closes.len() > 480 {
+        if rolling_closes.len() > 960 {
             rolling_closes.remove(0);
         }
 
@@ -300,15 +300,15 @@ async fn main() {
     });
 
     // ------------------------------------------------------------------------
-    // INGESTION: Pre-fill 480 1m historical candles via REST
+    // INGESTION: Pre-fill 960 1m historical candles via REST
     // ------------------------------------------------------------------------
-    let mut rolling_closes: Vec<f64> = Vec::with_capacity(480);
+    let mut rolling_closes: Vec<f64> = Vec::with_capacity(960);
     println!(
-        "⏳ [INGESTION] Pre-filling 480-minute rolling window for {} via Hyperliquid REST...",
+        "⏳ [INGESTION] Pre-filling 960-minute rolling window for {} via Hyperliquid REST...",
         trading_symbol
     );
     let now_ms = chrono::Utc::now().timestamp_millis() as u64;
-    let window_start_ms = now_ms.saturating_sub(480 * 60 * 1000);
+    let window_start_ms = now_ms.saturating_sub(960 * 60 * 1000);
     let cur_bucket_15m = (now_ms / (15 * 60 * 1000)) * (15 * 60 * 1000);
     let mut initial_15m_bar: Option<CandleBar> = None;
     let mut initial_last_1m_open: u64 = 0;
@@ -1352,13 +1352,14 @@ async fn main() {
                 let finalized_15m_clone = finalized_15m_bar.clone();
 
                 let (live_features, decision_features) = if closes_clone.len() >= 100 {
+                    let symbol_for_feat = symbol_clone.clone();
                     tokio::task::spawn_blocking(move || {
-                        let live_feat = calculate_features(&closes_clone, current_close);
+                        let live_feat = calculate_features(&closes_clone, current_close, &symbol_for_feat);
                         let decision_feat = if let Some(ref closed_15m) = finalized_15m_clone {
                             if closes_clone.len() > 1 {
-                                calculate_features(&closes_clone[..closes_clone.len() - 1], closed_15m.close)
+                                calculate_features(&closes_clone[..closes_clone.len() - 1], closed_15m.close, &symbol_for_feat)
                             } else {
-                                calculate_features(&closes_clone, closed_15m.close)
+                                calculate_features(&closes_clone, closed_15m.close, &symbol_for_feat)
                             }
                         } else {
                             None
