@@ -574,16 +574,17 @@ impl L2ObiTracker {
 
         match side {
             Side::Long => {
-                // Multiscale hurdle: instant >= +0.15, 1s >= +0.10, and persistent 5s > 0.0
-                if self.instant_obi >= 0.15 && self.ewma_1s_obi >= 0.10 && self.ewma_5s_obi > 0.0 {
+                // Multiscale hurdle: ensure bid depth is not overwhelmed by adverse sell walls.
+                // Tolerates minor taker sweep asymmetry (down to -0.08 instant, -0.06 1s, -0.04 5s) while rejecting toxic sell imbalance.
+                if self.instant_obi >= -0.08 && self.ewma_1s_obi >= -0.06 && self.ewma_5s_obi >= -0.04 {
                     (true, "Bullish Multiscale Depth Alignment")
                 } else {
                     (false, "Insufficient Bid Depth / Fleeting Ask Asymmetry")
                 }
             }
             Side::Short => {
-                // Multiscale hurdle: instant <= -0.15, 1s <= -0.10, and persistent 5s < 0.0
-                if self.instant_obi <= -0.15 && self.ewma_1s_obi <= -0.10 && self.ewma_5s_obi < 0.0 {
+                // Multiscale hurdle: ensure ask depth is not overwhelmed by adverse buy walls.
+                if self.instant_obi <= 0.08 && self.ewma_1s_obi <= 0.06 && self.ewma_5s_obi <= 0.04 {
                     (true, "Bearish Multiscale Depth Alignment")
                 } else {
                     (false, "Insufficient Ask Depth / Fleeting Bid Asymmetry")
@@ -1358,6 +1359,33 @@ mod tests {
         let (ok3, reason3) = tracker.satisfies_entry_hurdle(&Side::Long, t0 + 16300);
         assert!(ok3);
         assert_eq!(reason3, "Bullish Multiscale Depth Alignment");
+    }
+
+    #[test]
+    fn test_taker_sweep_obi_asymmetry_satisfies_hurdle() {
+        let mut tracker = L2ObiTracker::default();
+        let t0 = 100_000;
+        tracker.updates_since_reconnect = 10;
+        tracker.reconnect_time_ms = t0 - 60_000;
+        tracker.last_update_ms = t0;
+        tracker.best_bid = 2500.0;
+        tracker.best_ask = 2500.1;
+
+        // Simulate ETH taker sweep condition that hit Take Profit (+30.8 bps)
+        // inst: -0.052, 1s: -0.044, 5s: -0.024
+        tracker.instant_obi = -0.052;
+        tracker.ewma_1s_obi = -0.044;
+        tracker.ewma_5s_obi = -0.024;
+
+        let (ok, reason) = tracker.satisfies_entry_hurdle(&Side::Long, t0 + 100);
+        assert!(ok, "Taker sweep asymmetry must not strangle valid breakout entry");
+        assert_eq!(reason, "Bullish Multiscale Depth Alignment");
+
+        // Toxic sell wall dumping (-0.25) must be vetoed!
+        tracker.instant_obi = -0.25;
+        let (toxic_ok, toxic_reason) = tracker.satisfies_entry_hurdle(&Side::Long, t0 + 100);
+        assert!(!toxic_ok);
+        assert!(toxic_reason.contains("Insufficient Bid Depth"));
     }
 
     static TEST_SHADOW_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());

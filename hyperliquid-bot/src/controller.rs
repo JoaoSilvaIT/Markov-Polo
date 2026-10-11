@@ -183,30 +183,50 @@ impl RegimeController {
         // 1. SEVERE SHOCK OVERRIDE (100% Cash Protection):
         if is_severe_shock {
             let was_different = self.current_mode != ControllerMode::Neutral;
-            let prev_cd = self.shock_cooldown_bars;
             let prev_time_active = self.cooldown_until_ms > now_ms;
             let current_shock_z = z_15.abs().max(z_60.abs());
             self.current_mode = ControllerMode::Neutral;
             self.trend_streak = 0;
             self.consolidation_streak = 0;
             self.breakout_seen_in_streak = false;
-            self.shock_cooldown_bars = 2; // 2 bars = minimum
-            self.cooldown_until_ms = now_ms + 30 * 60 * 1000; // 30-min real wall-clock minimum
-            self.peak_shock_z = current_shock_z;
-            self.last_reason = if prev_cd > 0 || prev_time_active {
-                format!(
-                    "Secondary Severe Shock in Cooldown (|Z15|={:.2}, |Z60|={:.2}) -> Cooldown Clock Restarted (2 bars & 30m)",
-                    z_15, z_60
-                )
-            } else {
-                format!(
+
+            if !prev_time_active {
+                // Fresh shock initiation: start 30m countdown clock
+                self.cooldown_until_ms = now_ms + 30 * 60 * 1000;
+                self.peak_shock_z = current_shock_z;
+                self.shock_cooldown_bars = 2; // 2 bars = minimum
+                self.last_reason = format!(
                     "Severe Volatility Shock Veto (|Z15|={:.2}, |Z60|={:.2}) -> Safe Neutral Cash Buffer (Cooldown 2 bars & 30m)",
                     z_15, z_60
-                )
-            };
-            if was_different || prev_cd > 0 || prev_time_active {
+                );
                 self.last_transition_time = Utc::now().to_rfc3339();
                 self.epoch += 1;
+            } else if current_shock_z >= self.peak_shock_z + 1.5 {
+                // Severe secondary shock escalation: restart clock
+                self.cooldown_until_ms = now_ms + 30 * 60 * 1000;
+                self.peak_shock_z = current_shock_z;
+                self.shock_cooldown_bars = 2;
+                self.last_reason = format!(
+                    "Secondary Severe Shock in Cooldown (|Z15|={:.2}, |Z60|={:.2} vs peak {:.2}) -> Cooldown Clock Restarted (2 bars & 30m)",
+                    z_15, z_60, self.peak_shock_z
+                );
+                self.last_transition_time = Utc::now().to_rfc3339();
+                self.epoch += 1;
+            } else {
+                // Ongoing shock cooldown active - preserve wall-clock countdown!
+                self.peak_shock_z = self.peak_shock_z.max(current_shock_z);
+                if self.shock_cooldown_bars > 0 {
+                    self.shock_cooldown_bars -= 1;
+                }
+                let rem_mins = ((self.cooldown_until_ms.saturating_sub(now_ms)) as f64 / 60_000.0).ceil() as u64;
+                self.last_reason = format!(
+                    "Ongoing Shock Cooldown Active (|Z15|={:.2}, |Z60|={:.2}) -> Remaining: ~{}m (Clock preserved)",
+                    z_15, z_60, rem_mins
+                );
+                if was_different {
+                    self.last_transition_time = Utc::now().to_rfc3339();
+                    self.epoch += 1;
+                }
             }
             return self.current_mode;
         }
@@ -233,10 +253,13 @@ impl RegimeController {
             return self.current_mode;
         }
 
-        // 2b. LINGERING MACRO SHOCK GATES (Multi-hour macro liquidation dislocation)
-        let extreme_macro_shock = z_60.abs() >= 2.5;
+        // 2b. LINGERING MACRO SHOCK GATES (Multi-hour macro liquidation crash)
+        // Multi-hour downside dislocation (Z60 <= -2.5) forces Neutral to prevent knife-catching.
+        // For consolidation, ANY high macro volatility (|Z60| >= 2.5) prevents mean reversion.
+        let extreme_downside_macro_crash = z_60 <= -2.5;
+        let extreme_macro_volatility = z_60.abs() >= 2.5;
 
-        if extreme_macro_shock {
+        if extreme_downside_macro_crash {
             self.current_mode = ControllerMode::Neutral;
             self.trend_streak = self.trend_streak.saturating_sub(1);
             self.consolidation_streak = self.consolidation_streak.saturating_sub(1);
@@ -244,7 +267,7 @@ impl RegimeController {
                 self.breakout_seen_in_streak = false;
             }
             self.last_reason = format!(
-                "Extreme Macro Volatility Shock (|Z60|={:.2}>=2.5) -> Hold Neutral",
+                "Extreme Macro Downside Crash (Z60={:.2}<=-2.5) -> Hold Neutral",
                 z_60
             );
             return self.current_mode;
@@ -259,14 +282,14 @@ impl RegimeController {
             self.trend_streak = 0;
             self.consolidation_streak = 0;
             self.breakout_seen_in_streak = false;
-        } else if p_trend >= 0.82 && !extreme_macro_shock {
-            // Engine B accumulates momentum breakouts
+        } else if p_trend >= 0.82 && !extreme_downside_macro_crash {
+            // Engine B accumulates momentum breakouts (not blocked by positive Z60!)
             self.trend_streak += 1;
             self.consolidation_streak = 0; // Opposite regime actively contradicts
             if has_donchian_breakout {
                 self.breakout_seen_in_streak = true;
             }
-        } else if p_consolidation >= 0.72 && z_15.abs() < 2.2 && !extreme_macro_shock {
+        } else if p_consolidation >= 0.72 && z_15.abs() < 2.2 && !extreme_macro_volatility {
             // Engine A requires normalized, low volatility (|Z15| < 2.2 and |Z60| < 2.5)
             self.consolidation_streak += 1;
             self.trend_streak = 0; // Opposite regime actively contradicts
@@ -437,8 +460,8 @@ impl RegimeController {
                 0
             };
             format!("BLOCKED(Cooldown {}b, ~{}m)", self.shock_cooldown_bars, rem_mins)
-        } else if z_60.abs() >= 2.5 {
-            format!("BLOCKED(Z60={:.2}>=2.5)", z_60)
+        } else if z_60 <= -2.5 {
+            format!("BLOCKED(Z60={:.2}<=-2.5)", z_60)
         } else if p_trend < 0.82 {
             format!("BLOCKED(P_T={:.1}% < 82%)", p_trend * 100.0)
         } else if !has_breakout {
@@ -836,8 +859,8 @@ mod tests {
         assert_eq!(mode2, ControllerMode::Neutral);
         assert_eq!(controller.shock_cooldown_bars, 1);
 
-        // 3. Secondary shock hits during cooldown! Clock must restart to full 2 bars and 30m
-        let mode3 = controller.evaluate_15m_bar(shock_time + 20 * 60 * 1000, 0.05, 0.95, -3.8, -2.0, true, false, false, true);
+        // 3. Secondary shock escalation hits during cooldown (Z = -5.0 >= peak 3.4 + 1.5)! Clock must restart to full 2 bars and 30m
+        let mode3 = controller.evaluate_15m_bar(shock_time + 20 * 60 * 1000, 0.05, 0.95, -5.0, -2.0, true, false, false, true);
         assert_eq!(mode3, ControllerMode::Neutral);
         assert_eq!(controller.shock_cooldown_bars, 2);
         assert_eq!(controller.cooldown_until_ms, shock_time + 20 * 60 * 1000 + 30 * 60 * 1000);
@@ -883,5 +906,44 @@ mod tests {
         assert_eq!(mode, ControllerMode::Trend);
         assert_eq!(controller.trend_streak, 1);
         assert!(controller.last_reason.contains("Trend confirmed"));
+    }
+
+    #[test]
+    fn test_15m_shock_cooldown_preserves_countdown() {
+        let mut controller = RegimeController::default();
+        let shock_start = BASE_TIME_MS;
+
+        // Severe shock hits at t=0
+        controller.evaluate_15m_bar(shock_start, 0.05, 0.90, -3.5, -2.0, false, false, false, true);
+        assert_eq!(controller.current_mode, ControllerMode::Neutral);
+        assert_eq!(controller.cooldown_until_ms, shock_start + 30 * 60 * 1000);
+        assert_eq!(controller.shock_cooldown_bars, 2);
+
+        // At t = 15m (first 15m candle close): ongoing shock (Z15: -3.2, Z60: -2.0)
+        // Must PRESERVE original cooldown_until_ms (still ending at shock_start + 30m)
+        controller.evaluate_15m_bar(shock_start + 15 * 60 * 1000, 0.05, 0.90, -3.2, -2.0, false, false, false, true);
+        assert_eq!(controller.cooldown_until_ms, shock_start + 30 * 60 * 1000);
+        assert_eq!(controller.shock_cooldown_bars, 1);
+        assert!(controller.last_reason.contains("Clock preserved"));
+
+        // At t = 30m: cooldown has expired
+        assert!(shock_start + 30 * 60 * 1000 >= controller.cooldown_until_ms);
+    }
+
+    #[test]
+    fn test_positive_z60_momentum_does_not_block_trend_regime() {
+        let mut controller = RegimeController::default();
+
+        // Strong upward bull rally: P_T = 0.92, Donchian breakout = true, Z15 = +3.0, Z60 = +3.5 (sustained rally)
+        // Must NOT be blocked by positive Z60!
+        let mode = controller.evaluate_15m_bar(BASE_TIME_MS, 0.05, 0.92, 3.0, 3.5, true, false, false, false);
+        assert_eq!(mode, ControllerMode::Trend);
+        assert_eq!(controller.trend_streak, 1);
+        assert!(controller.last_reason.contains("Trend confirmed"));
+
+        // Gates inspection: Engine B must be ELIGIBLE (not BLOCKED by Z60 >= 2.5)
+        let (gate_a, gate_b) = controller.inspect_gates(0.05, 0.92, 3.0, 3.5, true, false, false, BASE_TIME_MS);
+        assert!(gate_a.contains("BLOCKED(Vol")); // Engine A properly protected!
+        assert_eq!(gate_b, "ELIGIBLE"); // Engine B is ready!
     }
 }

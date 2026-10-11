@@ -1407,10 +1407,13 @@ async fn main() {
                     // ------------------------------------------------------------------
                     // 3-MODE CONTROLLER REGIME INFERENCE (HMM Causal Filter + Hysteresis)
                     // ------------------------------------------------------------------
-                    // Fast-path safety: Severe shock on ANY 1m candle unconditionally initiates/preserves cooldown.
-                    // Evaluates immediate short-term shock (|Z15| >= 3.0 with |ret_15| >= 0.75% or |ret_60| >= 1.50%) to cut risk on active flash dislocations.
-                    // Deduplicated strictly by completed_bar.time_open to prevent clock rolling within the same 1m candle
-                    if live_feat.is_downside_shock || live_feat.is_upside_shock {
+                    // Fast-path safety: Downside flash crashes unconditionally initiate/preserve Neutral cooldown to protect against liquidation cascades.
+                    // Upside impulses only force Neutral if NOT in confirmed trend regime (current_p_t < 0.82 || current_p_s >= 0.50).
+                    // In a confirmed trend, an upside expansion is the breakout signal for Engine B!
+                    let is_controller_shock_1m = live_feat.is_downside_shock
+                        || (live_feat.is_upside_shock && (current_p_t < 0.82 || current_p_s >= 0.50));
+
+                    if is_controller_shock_1m {
                         if last_shock_bar_ms != completed_bar.time_open {
                             last_shock_bar_ms = completed_bar.time_open;
                             let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
@@ -1460,9 +1463,11 @@ async fn main() {
                             false
                         };
 
-                        // Features evaluated strictly at the cutoff of the finalized 15m candle
+                        // Features evaluated strictly at the cutoff of the finalized 15m candle.
+                        // Upside impulses only veto into Neutral if NOT in confirmed trend regime.
                         let d_feat = decision_features.as_ref().unwrap_or(&live_feat);
-                        let is_severe_shock_15m = d_feat.is_downside_shock || d_feat.is_upside_shock;
+                        let is_severe_shock_15m = d_feat.is_downside_shock
+                            || (d_feat.is_upside_shock && (p_t < 0.82 || p_s >= 0.50));
                         let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
                         let prev_mode = controller.current_mode;
                         if let Some(new_mode) = controller.evaluate_15m_bar_idempotent(
@@ -2016,10 +2021,10 @@ async fn main() {
                                     )
                                     .await;
                                     continue;
-                                } else if pos.engine_type == "EngineB" && (controller.current_mode != ControllerMode::Trend || is_downside_shock || is_upside_shock) {
+                                } else if pos.engine_type == "EngineB" && (controller.current_mode != ControllerMode::Trend || is_downside_shock) {
                                     println!(
-                                        "🛑 [RESTING ENTRY CANCELLED] Engine B invalidated (mode: {}, shock: {}). Cancelling resting maker order for {}.",
-                                        controller.current_mode, is_downside_shock || is_upside_shock, symbol_clone
+                                        "🛑 [RESTING ENTRY CANCELLED] Engine B invalidated (mode: {}, downside shock: {}). Cancelling resting maker order for {}.",
+                                        controller.current_mode, is_downside_shock, symbol_clone
                                     );
                                     let _ = emergency_flatten(
                                         &state_path_clone,
@@ -2391,10 +2396,11 @@ async fn main() {
                                     discord_clone.clone(),
                                 )
                                 .await;
-                            } else if is_downside_shock || is_upside_shock {
+                            } else if (pos_engine_type == "EngineA" && (is_downside_shock || is_upside_shock))
+                                || (pos_engine_type == "EngineB" && is_downside_shock) {
                                 println!(
-                                    "🚨 [SHOCK VETO ON POSITION] Severe shock on {} (Z15: {:.2}, Z60: {:.2})! Flattening.",
-                                    symbol_clone, z_15, z_60
+                                    "🚨 [SHOCK VETO ON POSITION] Severe adverse shock on {} (Z15: {:.2}, Z60: {:.2}, Engine: {})! Flattening.",
+                                    symbol_clone, z_15, z_60, pos_engine_type
                                 );
                                 let _ = emergency_flatten(
                                     &state_path_clone,
