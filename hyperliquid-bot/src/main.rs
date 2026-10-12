@@ -1418,10 +1418,10 @@ async fn main() {
                     // 3-MODE CONTROLLER REGIME INFERENCE (HMM Causal Filter + Hysteresis)
                     // ------------------------------------------------------------------
                     // Fast-path safety: Downside flash crashes unconditionally initiate/preserve Neutral cooldown to protect against liquidation cascades.
-                    // Upside impulses only force Neutral if NOT in confirmed trend regime (current_p_t < 0.82 || current_p_s >= 0.50).
-                    // In a confirmed trend, an upside expansion is the breakout signal for Engine B!
+                    // Upside impulses only force Neutral if HMM detects a severe macro shock regime (current_p_s >= 0.50) or extreme macro volatility (|Z15| >= 3.5).
+                    // Normal intraday upside bounces do not force a cash lockout, and individual Short entries already independently check !is_upside_shock.
                     let is_controller_shock_1m = live_feat.is_downside_shock
-                        || (live_feat.is_upside_shock && (current_p_t < 0.82 || current_p_s >= 0.50));
+                        || (live_feat.is_upside_shock && (current_p_s >= 0.50 || z_15.abs() >= 3.5));
 
                     if is_controller_shock_1m {
                         if last_shock_bar_ms != completed_bar.time_open {
@@ -2532,15 +2532,16 @@ async fn main() {
                                     save_armed_signal(&arm_path_clone, &armed_state);
                                 } else if arm_side == "LONG" {
                                     // Update lowest dip price
-                                    if close_price < armed_state.extreme_price {
-                                        armed_state.extreme_price = close_price;
+                                    let current_extreme = f64::min(close_price, low_price);
+                                    if current_extreme < armed_state.extreme_price {
+                                        armed_state.extreme_price = current_extreme;
                                         if armed_state.tier == "TIER_2_CONDITIONAL" {
                                             if let Some(ref th) = thresholds_opt {
-                                                if close_price <= th.entry_long {
+                                                if current_extreme <= th.entry_long {
                                                     armed_state.tier = "TIER_1_NORMAL".to_string();
                                                     println!(
                                                         "⏫ [TIER UPGRADED] {} reached Tier 1 hurdle (${:.2} <= ${:.2}). Upgraded to TIER_1_NORMAL (full size).",
-                                                        symbol_clone, close_price, th.entry_long
+                                                        symbol_clone, current_extreme, th.entry_long
                                                     );
                                                 }
                                             }
@@ -2582,16 +2583,16 @@ async fn main() {
                                                 symbol_clone, l2_instant, l2_1s
                                             );
                                         } else {
-                                            let entry_limit_price = f64::min(close_price, dynamic_entry_cap);
+                                            let entry_limit_price = close_price;
                                             let net_edge_bps = calculate_net_edge_bps(
                                                 entry_limit_price,
                                                 dynamic_exit_target,
                                             );
 
-                                            if net_edge_bps < 25.0 {
+                                            if net_edge_bps < 20.0 {
                                                 funnel_counters.engine_a_reversal_hurdle_veto += 1;
                                                 println!(
-                                                    "⚠️ [LONG HURDLE VETO] Edge too narrow for {}: {:.1} bps (< 25 bps).",
+                                                    "⚠️ [LONG HURDLE VETO] Edge too narrow for {}: {:.1} bps (< 20 bps).",
                                                     symbol_clone, net_edge_bps
                                                 );
                                                 armed_state.is_armed = false;
@@ -2636,15 +2637,16 @@ async fn main() {
                                     }
                                 } else if arm_side == "SHORT" {
                                     // Update highest peak price
-                                    if close_price > armed_state.extreme_price {
-                                        armed_state.extreme_price = close_price;
+                                    let current_extreme = f64::max(close_price, high_price);
+                                    if current_extreme > armed_state.extreme_price {
+                                        armed_state.extreme_price = current_extreme;
                                         if armed_state.tier == "TIER_2_CONDITIONAL" {
                                             if let Some(ref th) = thresholds_opt {
-                                                if close_price >= th.entry_short {
+                                                if current_extreme >= th.entry_short {
                                                     armed_state.tier = "TIER_1_NORMAL".to_string();
                                                     println!(
                                                         "⏫ [TIER UPGRADED] {} reached Tier 1 hurdle (${:.2} >= ${:.2}). Upgraded to TIER_1_NORMAL (full size).",
-                                                        symbol_clone, close_price, th.entry_short
+                                                        symbol_clone, current_extreme, th.entry_short
                                                     );
                                                 }
                                             }
@@ -2686,14 +2688,14 @@ async fn main() {
                                                 symbol_clone, l2_instant, l2_1s
                                             );
                                         } else {
-                                            let entry_limit_price = f64::max(close_price, dynamic_entry_floor);
+                                            let entry_limit_price = close_price;
                                             // For Short: edge is entry_limit_price down to dynamic_exit_target
                                             let net_edge_bps = (entry_limit_price / dynamic_exit_target).ln() * 10000.0;
 
-                                            if net_edge_bps < 25.0 {
+                                            if net_edge_bps < 20.0 {
                                                 funnel_counters.engine_a_reversal_hurdle_veto += 1;
                                                 println!(
-                                                    "⚠️ [SHORT HURDLE VETO] Edge too narrow for {}: {:.1} bps (< 25 bps).",
+                                                    "⚠️ [SHORT HURDLE VETO] Edge too narrow for {}: {:.1} bps (< 20 bps).",
                                                     symbol_clone, net_edge_bps
                                                 );
                                                 armed_state.is_armed = false;
@@ -2739,8 +2741,8 @@ async fn main() {
                                 }
                             } else if is_eligible {
                                 if let Some(ref thresholds) = thresholds_opt {
-                                    // Check Long Arm: price dipped below 1.75σ boundary
-                                    if close_price <= thresholds.entry_long && !is_downside_shock {
+                                    // Check Long Arm: price dipped below Tier 1 (1.50σ) boundary
+                                    if (close_price <= thresholds.entry_long || low_price <= thresholds.entry_long) && !is_downside_shock {
                                         let baseline_arm = rolling_closes.iter().sum::<f64>()
                                             / rolling_closes.len() as f64;
                                         let unitless_entry_dev =
@@ -2757,16 +2759,16 @@ async fn main() {
                                         armed_state.unitless_entry_dev = unitless_entry_dev;
                                         armed_state.unitless_exit_dev = unitless_exit_dev;
                                         armed_state.half_life_m = half_life_m;
-                                        armed_state.extreme_price = close_price;
+                                        armed_state.extreme_price = f64::min(close_price, low_price);
                                         save_armed_signal(&arm_path_clone, &armed_state);
 
                                         println!(
-                                            "🟡 [LONG ARMED - TIER 1 (1.75σ)] {} touched lower threshold (${:.2} <= ${:.2}). Waiting for green bounce.",
-                                            symbol_clone, close_price, thresholds.entry_long
+                                            "🟡 [LONG ARMED - TIER 1 (1.50σ)] {} touched lower threshold (${:.2} <= ${:.2}, low: ${:.2}). Waiting for green bounce.",
+                                            symbol_clone, close_price, thresholds.entry_long, low_price
                                         );
                                     }
-                                    // Check Short Arm: price spiked above 1.75σ boundary
-                                    else if close_price >= thresholds.entry_short && !is_upside_shock {
+                                    // Check Short Arm: price spiked above Tier 1 (1.50σ) boundary
+                                    else if (close_price >= thresholds.entry_short || high_price >= thresholds.entry_short) && !is_upside_shock {
                                         let baseline_arm = rolling_closes.iter().sum::<f64>()
                                             / rolling_closes.len() as f64;
                                         let unitless_entry_dev =
@@ -2783,63 +2785,63 @@ async fn main() {
                                         armed_state.unitless_entry_dev = unitless_entry_dev;
                                         armed_state.unitless_exit_dev = unitless_exit_dev;
                                         armed_state.half_life_m = half_life_m;
-                                        armed_state.extreme_price = close_price;
+                                        armed_state.extreme_price = f64::max(close_price, high_price);
                                         save_armed_signal(&arm_path_clone, &armed_state);
 
                                         println!(
-                                            "🟣 [SHORT ARMED - TIER 1 (1.75σ)] {} touched upper threshold (${:.2} >= ${:.2}). Waiting for red rejection.",
-                                            symbol_clone, close_price, thresholds.entry_short
+                                            "🟣 [SHORT ARMED - TIER 1 (1.50σ)] {} touched upper threshold (${:.2} >= ${:.2}, high: ${:.2}). Waiting for red rejection.",
+                                            symbol_clone, close_price, thresholds.entry_short, high_price
                                         );
                                     }
-                                    // Check Conditional Tier 2: 1.50σ boundary
-                                    else if let Some(ref th150) = thresholds_175_opt {
-                                        if close_price <= th150.entry_long && !is_downside_shock {
+                                    // Check Conditional Tier 2: 1.25σ boundary
+                                    else if let Some(ref th125) = thresholds_175_opt {
+                                        if (close_price <= th125.entry_long || low_price <= th125.entry_long) && !is_downside_shock {
                                             let baseline_arm = rolling_closes.iter().sum::<f64>()
                                                 / rolling_closes.len() as f64;
                                             let unitless_entry_dev =
-                                                (th150.entry_long / baseline_arm).ln();
+                                                (th125.entry_long / baseline_arm).ln();
                                             let unitless_exit_dev =
-                                                (th150.exit_long / baseline_arm).ln();
+                                                (th125.exit_long / baseline_arm).ln();
 
                                             armed_state.is_armed = true;
                                             armed_state.side = "LONG".to_string();
                                             armed_state.tier = "TIER_2_CONDITIONAL".to_string();
                                             armed_state.armed_at = Some(chrono::Utc::now().to_rfc3339());
-                                            armed_state.entry_threshold = th150.entry_long;
-                                            armed_state.exit_threshold = th150.exit_long;
+                                            armed_state.entry_threshold = th125.entry_long;
+                                            armed_state.exit_threshold = th125.exit_long;
                                             armed_state.unitless_entry_dev = unitless_entry_dev;
                                             armed_state.unitless_exit_dev = unitless_exit_dev;
                                             armed_state.half_life_m = half_life_m;
-                                            armed_state.extreme_price = close_price;
+                                            armed_state.extreme_price = f64::min(close_price, low_price);
                                             save_armed_signal(&arm_path_clone, &armed_state);
 
                                             println!(
-                                                "🟡 [LONG ARMED - TIER 2 CONDITIONAL (1.50σ)] {} touched conditional threshold (${:.2} <= ${:.2}). Half-size with L2 OBI guard.",
-                                                symbol_clone, close_price, th150.entry_long
+                                                "🟡 [LONG ARMED - TIER 2 CONDITIONAL (1.25σ)] {} touched conditional threshold (${:.2} <= ${:.2}, low: ${:.2}). Half-size with L2 OBI guard.",
+                                                symbol_clone, close_price, th125.entry_long, low_price
                                             );
-                                        } else if close_price >= th150.entry_short && !is_upside_shock {
+                                        } else if (close_price >= th125.entry_short || high_price >= th125.entry_short) && !is_upside_shock {
                                             let baseline_arm = rolling_closes.iter().sum::<f64>()
                                                 / rolling_closes.len() as f64;
                                             let unitless_entry_dev =
-                                                (th150.entry_short / baseline_arm).ln();
+                                                (th125.entry_short / baseline_arm).ln();
                                             let unitless_exit_dev =
-                                                (th150.exit_short / baseline_arm).ln();
+                                                (th125.exit_short / baseline_arm).ln();
 
                                             armed_state.is_armed = true;
                                             armed_state.side = "SHORT".to_string();
                                             armed_state.tier = "TIER_2_CONDITIONAL".to_string();
                                             armed_state.armed_at = Some(chrono::Utc::now().to_rfc3339());
-                                            armed_state.entry_threshold = th150.entry_short;
-                                            armed_state.exit_threshold = th150.exit_short;
+                                            armed_state.entry_threshold = th125.entry_short;
+                                            armed_state.exit_threshold = th125.exit_short;
                                             armed_state.unitless_entry_dev = unitless_entry_dev;
                                             armed_state.unitless_exit_dev = unitless_exit_dev;
                                             armed_state.half_life_m = half_life_m;
-                                            armed_state.extreme_price = close_price;
+                                            armed_state.extreme_price = f64::max(close_price, high_price);
                                             save_armed_signal(&arm_path_clone, &armed_state);
 
                                             println!(
-                                                "🟣 [SHORT ARMED - TIER 2 CONDITIONAL (1.50σ)] {} touched conditional threshold (${:.2} >= ${:.2}). Half-size with L2 OBI guard.",
-                                                symbol_clone, close_price, th150.entry_short
+                                                "🟣 [SHORT ARMED - TIER 2 CONDITIONAL (1.25σ)] {} touched conditional threshold (${:.2} >= ${:.2}, high: ${:.2}). Half-size with L2 OBI guard.",
+                                                symbol_clone, close_price, th125.entry_short, high_price
                                             );
                                         } else {
                                             funnel_counters.engine_a_outside_band += 1;
@@ -2851,7 +2853,7 @@ async fn main() {
                             }
 
                             // ------------------------------------------------------------------
-                            // COUNTERFACTUAL ENGINE: Track Vetoed 2.0sigma & Relaxed 1.75sigma Opportunities
+                            // COUNTERFACTUAL ENGINE: Track Vetoed 1.50sigma & Relaxed 1.25sigma Opportunities
                             // ------------------------------------------------------------------
                             if !armed_state.is_armed {
                                 if let Some(ref th20) = thresholds_opt {
@@ -2892,7 +2894,7 @@ async fn main() {
                                                 accepted: false,
                                                 primary_veto,
                                                 all_vetos,
-                                                threshold_sigma: 1.75,
+                                                threshold_sigma: 1.50,
                                                 signal_value: z_15,
                                                 hmm_probabilities: crate::counterfactual::HmmProbs {
                                                     consolidation: current_p_c,
@@ -2943,9 +2945,9 @@ async fn main() {
                                                     1800,
                                                     crate::counterfactual::CounterfactualDecision {
                                                         accepted: false,
-                                                        primary_veto: "RELAXED_BOUNDARY_1.50_SIGMA".to_string(),
-                                                        all_vetos: vec!["RELAXED_BOUNDARY_1.50_SIGMA".to_string()],
-                                                        threshold_sigma: 1.50,
+                                                        primary_veto: "RELAXED_BOUNDARY_1.25_SIGMA".to_string(),
+                                                        all_vetos: vec!["RELAXED_BOUNDARY_1.25_SIGMA".to_string()],
+                                                        threshold_sigma: 1.25,
                                                         signal_value: z_15,
                                                         hmm_probabilities: crate::counterfactual::HmmProbs {
                                                             consolidation: current_p_c,

@@ -170,7 +170,7 @@ pub fn calculate_thresholds_at_sigma(params: &OuParameters, transaction_cost: f6
 /// derived from the Bertram Optimization Model for Statistical Arbitrage.
 /// Maximizes the expected return per unit of time based on mean-reversion speed.
 pub fn calculate_optimal_thresholds(params: &OuParameters, transaction_cost: f64) -> OptimalThresholds {
-    calculate_thresholds_at_sigma(params, transaction_cost, 1.75)
+    calculate_thresholds_at_sigma(params, transaction_cost, 1.50)
 }
 
 /// Computes the robust Median Absolute Deviation (MAD) of a return series,
@@ -319,8 +319,8 @@ pub fn calculate_features(closes_history: &[f64], eval_close: f64, symbol: &str)
             if is_hl_ok && is_mu_ok {
                 let tx_cost = hist_last_price * 0.0005; // ~5 bps roundtrip on Hyperliquid Maker
                 let th = calculate_optimal_thresholds(&ou_params, tx_cost);
-                let th_150 = calculate_thresholds_at_sigma(&ou_params, tx_cost, 1.50);
-                (Some(th), Some(th_150), hl)
+                let th_125 = calculate_thresholds_at_sigma(&ou_params, tx_cost, 1.25);
+                (Some(th), Some(th_125), hl)
             } else {
                 (None, None, hl)
             }
@@ -555,24 +555,24 @@ mod tests {
             sigma: 1.5,
         };
         let tx_cost = 0.05;
-        let th_175 = calculate_optimal_thresholds(&params, tx_cost);
-        let th_150 = calculate_thresholds_at_sigma(&params, tx_cost, 1.50);
+        let th_150 = calculate_optimal_thresholds(&params, tx_cost);
+        let th_125 = calculate_thresholds_at_sigma(&params, tx_cost, 1.25);
 
-        // For Long: 1.50σ entry is closer to the mean than 1.75σ (i.e. th_150.entry_long > th_175.entry_long)
-        assert!(th_150.entry_long > th_175.entry_long);
+        // For Long: 1.25σ entry is closer to the mean than 1.50σ (i.e. th_125.entry_long > th_150.entry_long)
+        assert!(th_125.entry_long > th_150.entry_long);
         // Both are below the mean
+        assert!(th_125.entry_long < params.mu);
         assert!(th_150.entry_long < params.mu);
-        assert!(th_175.entry_long < params.mu);
 
-        // For Short: 1.50σ entry is closer to the mean than 1.75σ (i.e. th_150.entry_short < th_175.entry_short)
-        assert!(th_150.entry_short < th_175.entry_short);
+        // For Short: 1.25σ entry is closer to the mean than 1.50σ (i.e. th_125.entry_short < th_150.entry_short)
+        assert!(th_125.entry_short < th_150.entry_short);
         // Both are above the mean
+        assert!(th_125.entry_short > params.mu);
         assert!(th_150.entry_short > params.mu);
-        assert!(th_175.entry_short > params.mu);
 
         // Both target the same mean reversion exit target
+        assert_eq!(th_125.exit_long, params.mu);
         assert_eq!(th_150.exit_long, params.mu);
-        assert_eq!(th_175.exit_long, params.mu);
     }
 
     #[test]

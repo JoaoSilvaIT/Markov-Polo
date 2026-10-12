@@ -575,8 +575,8 @@ impl L2ObiTracker {
         match side {
             Side::Long => {
                 // Multiscale hurdle: ensure bid depth is not overwhelmed by adverse sell walls.
-                // Tolerates minor taker sweep asymmetry (down to -0.08 instant, -0.06 1s, -0.04 5s) while rejecting toxic sell imbalance.
-                if self.instant_obi >= -0.08 && self.ewma_1s_obi >= -0.06 && self.ewma_5s_obi >= -0.04 {
+                // Tolerates natural taker absorption during breakout momentum (down to -0.18 instant, -0.15 1s, -0.12 5s) while rejecting toxic sell imbalance.
+                if self.instant_obi >= -0.18 && self.ewma_1s_obi >= -0.15 && self.ewma_5s_obi >= -0.12 {
                     (true, "Bullish Multiscale Depth Alignment")
                 } else {
                     (false, "Insufficient Bid Depth / Fleeting Ask Asymmetry")
@@ -584,7 +584,7 @@ impl L2ObiTracker {
             }
             Side::Short => {
                 // Multiscale hurdle: ensure ask depth is not overwhelmed by adverse buy walls.
-                if self.instant_obi <= 0.08 && self.ewma_1s_obi <= 0.06 && self.ewma_5s_obi <= 0.04 {
+                if self.instant_obi <= 0.18 && self.ewma_1s_obi <= 0.15 && self.ewma_5s_obi <= 0.12 {
                     (true, "Bearish Multiscale Depth Alignment")
                 } else {
                     (false, "Insufficient Ask Depth / Fleeting Bid Asymmetry")
