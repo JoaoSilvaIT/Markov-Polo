@@ -539,17 +539,43 @@
           sellDistBps = (((d.short_sell - d.price) / d.price) * 10000).toFixed(1);
         }
 
-        // Mode Badge
+        // Engine B: 3h Donchian Breakout Levels
+        const donchianUpper = d.donchian_upper ? Number(d.donchian_upper).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : null;
+        const donchianLower = d.donchian_lower ? Number(d.donchian_lower).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : null;
+        const donchianStatus = d.donchian_status || 'COILING';
+        const distUpperPct = d.donchian_dist_upper_pct !== undefined ? Number(d.donchian_dist_upper_pct).toFixed(2) : '--';
+        const distLowerPct = d.donchian_dist_lower_pct !== undefined ? Number(d.donchian_dist_lower_pct).toFixed(2) : '--';
+        const align = d.trend_alignment || 'NEUTRAL';
+
+        // Mode & Engine Differentiation
         const mode = String(d.mode || 'NEUTRAL').toUpperCase();
+        const isTrend = (mode === 'TREND');
+        const isConsolidation = (mode === 'CONSOLIDATION' || mode === 'MEANREVERSION' || mode === 'MEAN_REVERSION');
+        const isNeutral = !isTrend && !isConsolidation;
+
         let modeColor = 'bg-slate-800 text-slate-300 border-slate-700';
-        if (mode === 'CONSOLIDATION' || mode === 'MEANREVERSION') {
+        if (isConsolidation) {
           modeColor = 'bg-emerald-500/15 text-emerald-400 border-emerald-500/40';
-        } else if (mode === 'TREND') {
+        } else if (isTrend) {
           modeColor = 'bg-cyan-500/15 text-cyan-400 border-cyan-500/40';
         } else if (mode === 'NEUTRAL') {
           modeColor = 'bg-amber-500/15 text-amber-400 border-amber-500/40';
         } else if (mode === 'SHOCK') {
           modeColor = 'bg-rose-500/15 text-rose-400 border-rose-500/40';
+        }
+
+        // Donchian Status Badge
+        let donchianBadgeClass = 'bg-slate-800 text-slate-400 border border-slate-700';
+        let donchianBadgeText = 'COILING';
+        if (donchianStatus === 'BREAKOUT_HIGH') {
+          donchianBadgeClass = 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 font-bold';
+          donchianBadgeText = 'BREAKOUT HIGH';
+        } else if (donchianStatus === 'BREAKOUT_LOW') {
+          donchianBadgeClass = 'bg-rose-500/20 text-rose-400 border border-rose-500/40 font-bold';
+          donchianBadgeText = 'BREAKOUT LOW';
+        } else if (isTrend) {
+          donchianBadgeClass = 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/30';
+          donchianBadgeText = 'COILING IN RANGE';
         }
 
         // Half-Life Quantitative Bounds Check (Relative bounds: [30m, 480m] for N=960)
@@ -624,26 +650,68 @@
             </div>
           </div>
 
-          <!-- Trade Execution Targets (Long Buy / Short Sell) -->
+          <!-- Trade Execution Targets (Dual Engine: Donchian & Mean Reversion) -->
           <div class="bg-term-surface rounded p-2.5 border border-term-border space-y-2">
             <div class="flex items-center justify-between text-xs">
-              <span class="text-term-muted text-[11px]">PROXIMITY</span>
+              <span class="text-term-muted text-[11px] flex items-center gap-1.5">
+                <span class="w-1.5 h-1.5 rounded-full ${isTrend ? 'bg-cyan-400 animate-pulse' : (isConsolidation ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400')}"></span>
+                <span class="font-bold text-white">${isTrend ? 'ENGINE B PROXIMITY' : (isConsolidation ? 'ENGINE A PROXIMITY' : 'TRADE PROXIMITY')}</span>
+              </span>
               <span class="${proxColor}">${prox}%</span>
             </div>
             <div class="w-full bg-term-border h-1.5 rounded-full overflow-hidden">
-              <div class="h-full bg-cyan-400 transition-all duration-500" style="width: ${prox}%"></div>
+              <div class="h-full ${isTrend ? 'bg-cyan-400' : (isConsolidation ? 'bg-emerald-400' : 'bg-amber-400')} transition-all duration-500" style="width: ${prox}%"></div>
+            </div>
+            <div class="text-[10px] text-term-muted truncate">
+              ${d.proximity_summary || (isTrend ? 'Awaiting 3h Donchian breakout' : 'Awaiting O-U band touch')}
             </div>
 
-            <div class="grid grid-cols-2 gap-2 pt-1 text-[11px]">
-              <div class="bg-emerald-500/5 p-1.5 rounded border border-emerald-500/15">
-                <span class="text-[9px] text-emerald-400 block font-bold uppercase">LONG BUY TARGET</span>
-                <span class="text-white font-bold block">${buyPx ? '$' + buyPx : 'N/A'}</span>
-                <span class="text-[9px] text-term-muted">${buyDistBps !== '--' ? buyDistBps + ' bps' : ''}</span>
+            <!-- Dual-Engine Execution Boxes -->
+            <div class="space-y-1.5 pt-1">
+              <!-- Engine B: Trend Momentum Breakout -->
+              <div class="p-2 rounded border transition-all ${isTrend ? 'bg-cyan-500/10 border-cyan-500/40' : 'bg-term-card/40 border-term-border/40 opacity-60'}">
+                <div class="flex items-center justify-between text-[10px] mb-1">
+                  <span class="font-bold ${isTrend ? 'text-cyan-400' : 'text-term-muted'} flex items-center gap-1">
+                    <span class="w-1.5 h-1.5 rounded-full ${isTrend ? 'bg-cyan-400' : 'bg-slate-600'}"></span>
+                    ENGINE B • 3H DONCHIAN
+                  </span>
+                  <span class="text-[9px] px-1.5 py-0.2 rounded font-semibold ${donchianBadgeClass}">${donchianBadgeText}</span>
+                </div>
+                <div class="grid grid-cols-2 gap-2 text-[11px]">
+                  <div>
+                    <span class="text-[9px] text-cyan-400/90 block font-semibold uppercase">LONG BREAKOUT</span>
+                    <span class="text-white font-bold block">${donchianUpper ? '$' + donchianUpper : 'N/A'}</span>
+                    <span class="text-[9px] text-term-muted">${distUpperPct !== '--' ? (Number(distUpperPct) <= 0 ? 'TRIGGERED' : '+' + distUpperPct + '% away') : ''}</span>
+                  </div>
+                  <div class="text-right">
+                    <span class="text-[9px] text-rose-400/90 block font-semibold uppercase">SHORT BREAKOUT</span>
+                    <span class="text-white font-bold block">${donchianLower ? '$' + donchianLower : 'N/A'}</span>
+                    <span class="text-[9px] text-term-muted">${distLowerPct !== '--' ? (Number(distLowerPct) <= 0 ? 'TRIGGERED' : '-' + distLowerPct + '% away') : ''}</span>
+                  </div>
+                </div>
               </div>
-              <div class="bg-rose-500/5 p-1.5 rounded border border-rose-500/15 text-right">
-                <span class="text-[9px] text-rose-400 block font-bold uppercase">SHORT SELL TARGET</span>
-                <span class="text-white font-bold block">${sellPx ? '$' + sellPx : 'N/A'}</span>
-                <span class="text-[9px] text-term-muted">${sellDistBps !== '--' ? sellDistBps + ' bps' : ''}</span>
+
+              <!-- Engine A: Mean Reversion Bands -->
+              <div class="p-2 rounded border transition-all ${isConsolidation ? 'bg-emerald-500/10 border-emerald-500/40' : 'bg-term-card/40 border-term-border/40 opacity-60'}">
+                <div class="flex items-center justify-between text-[10px] mb-1">
+                  <span class="font-bold ${isConsolidation ? 'text-emerald-400' : 'text-term-muted'} flex items-center gap-1">
+                    <span class="w-1.5 h-1.5 rounded-full ${isConsolidation ? 'bg-emerald-400' : 'bg-slate-600'}"></span>
+                    ENGINE A • MEAN REVERSION
+                  </span>
+                  <span class="text-[9px] px-1.5 py-0.2 rounded font-semibold ${isConsolidation ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-slate-800 text-slate-400'}">${isConsolidation ? 'ARMED' : 'INACTIVE'}</span>
+                </div>
+                <div class="grid grid-cols-2 gap-2 text-[11px]">
+                  <div>
+                    <span class="text-[9px] text-emerald-400/90 block font-semibold uppercase">LONG DIP BUY</span>
+                    <span class="text-white font-bold block">${buyPx ? '$' + buyPx : 'N/A'}</span>
+                    <span class="text-[9px] text-term-muted">${buyDistBps !== '--' ? buyDistBps + ' bps' : ''}</span>
+                  </div>
+                  <div class="text-right">
+                    <span class="text-[9px] text-rose-400/90 block font-semibold uppercase">SHORT FADE SELL</span>
+                    <span class="text-white font-bold block">${sellPx ? '$' + sellPx : 'N/A'}</span>
+                    <span class="text-[9px] text-term-muted">${sellDistBps !== '--' ? sellDistBps + ' bps' : ''}</span>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -689,8 +757,16 @@
                 <span class="text-slate-300 font-semibold">${drift.toFixed(2)}%</span>
               </div>
               <div class="flex justify-between">
-                <span>Status:</span>
-                <span class="text-emerald-400 font-semibold">HOT-PATH OK</span>
+                <span>EMA Align:</span>
+                <span class="${align === 'BULLISH' ? 'text-emerald-400 font-semibold' : (align === 'BEARISH' ? 'text-rose-400 font-semibold' : 'text-slate-300')}">${align}</span>
+              </div>
+              <div class="flex justify-between">
+                <span>Active Engine:</span>
+                <span class="${isTrend ? 'text-cyan-400 font-bold' : (isConsolidation ? 'text-emerald-400 font-bold' : 'text-amber-400 font-semibold')}">${isTrend ? 'ENGINE B' : (isConsolidation ? 'ENGINE A' : 'NEUTRAL')}</span>
+              </div>
+              <div class="flex justify-between">
+                <span>Feed Status:</span>
+                <span class="${d.l2_fresh ? 'text-emerald-400' : 'text-amber-400'} font-semibold">${d.l2_fresh ? 'L2 FRESH' : 'L2 STALE'}</span>
               </div>
             </div>
           </div>

@@ -40,6 +40,24 @@ pub struct LiveTelemetry {
     pub trade_proximity_short_pct: f64,
     pub overall_proximity_pct: f64,
     pub proximity_summary: String,
+
+    // Engine B (Trend Momentum) Breakout Channel & Proximity
+    #[serde(default)]
+    pub donchian_upper: Option<f64>,
+    #[serde(default)]
+    pub donchian_lower: Option<f64>,
+    #[serde(default)]
+    pub donchian_middle: Option<f64>,
+    #[serde(default)]
+    pub donchian_status: String,
+    #[serde(default)]
+    pub donchian_dist_upper_pct: f64,
+    #[serde(default)]
+    pub donchian_dist_lower_pct: f64,
+    #[serde(default)]
+    pub trend_alignment: String,
+    #[serde(default)]
+    pub active_engine: String,
 }
 
 pub fn save_telemetry(symbol: &str, telemetry: &LiveTelemetry) {
@@ -157,5 +175,56 @@ mod tests {
         assert_eq!(loaded.total_1m_ticks, 100);
         assert_eq!(loaded.engine_a_outside_band, 75);
         let _ = fs::remove_file(funnel_counters_path(test_symbol));
+    }
+
+    #[test]
+    fn test_live_telemetry_backward_compatibility() {
+        // Minimal JSON without the new Donchian fields
+        let legacy_json = r#"{
+            "symbol": "ETH",
+            "timestamp_ms": 1700000000000,
+            "price": 2500.0,
+            "long_buy": 2480.0,
+            "short_sell": 2520.0,
+            "exit_long": null,
+            "exit_short": null,
+            "mode": "TREND",
+            "streak_consolidation": 0,
+            "streak_trend": 2,
+            "mode_reason": "Streak",
+            "shock_cooldown_bars": 0,
+            "p_consolidation": 0.05,
+            "p_trend": 0.90,
+            "p_shock": 0.05,
+            "drift_pct": 0.5,
+            "half_life_m": 60.0,
+            "is_half_life_valid": true,
+            "is_stationary": true,
+            "z_15": 0.5,
+            "z_60": -0.5,
+            "is_severe_shock": false,
+            "obi_instant": 0.1,
+            "obi_1s": 0.1,
+            "obi_5s": 0.1,
+            "l2_fresh": true,
+            "has_position": false,
+            "position_side": "",
+            "position_amount": 0.0,
+            "position_entry_price": 0.0,
+            "tp_price": 0.0,
+            "sl_price": 0.0,
+            "chandelier_stop": 0.0,
+            "trade_proximity_long_pct": 50.0,
+            "trade_proximity_short_pct": 50.0,
+            "overall_proximity_pct": 50.0,
+            "proximity_summary": "Testing"
+        }"#;
+
+        let telem: LiveTelemetry = serde_json::from_str(legacy_json).expect("Deserialization must succeed with defaults");
+        assert_eq!(telem.symbol, "ETH");
+        assert_eq!(telem.donchian_upper, None);
+        assert_eq!(telem.donchian_status, "");
+        assert_eq!(telem.donchian_dist_upper_pct, 0.0);
+        assert_eq!(telem.active_engine, "");
     }
 }

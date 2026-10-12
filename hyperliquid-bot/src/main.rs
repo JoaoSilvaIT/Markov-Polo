@@ -1521,12 +1521,58 @@ async fn main() {
                         }
                     }
 
-                    let (target_buy_str, target_short_str) = match thresholds_opt {
-                        Some(ref th) => (
-                            format!("${:.2}", th.entry_long),
-                            format!("${:.2}", th.entry_short),
-                        ),
-                        None => ("N/A".to_string(), "N/A".to_string()),
+                    let donchian_prior_bars = if finalized_15m_bar.is_some() && rolling_15m_bars.len() > 1 {
+                        &rolling_15m_bars[..rolling_15m_bars.len() - 1]
+                    } else {
+                        &rolling_15m_bars[..]
+                    };
+                    let donchian_channel_opt = calculate_donchian(donchian_prior_bars, donchian_period);
+
+                    let closes_15m_curr: Vec<f64> = rolling_15m_bars.iter().map(|b| b.close).collect();
+                    let alignment_curr = check_trend_alignment(&closes_15m_curr);
+                    let align_str = match alignment_curr {
+                        TrendAlignment::Bullish => "BULLISH",
+                        TrendAlignment::Bearish => "BEARISH",
+                        TrendAlignment::Neutral => "NEUTRAL",
+                    };
+
+                    let (donchian_upper_val, donchian_lower_val, donchian_mid_val, dist_up_pct, dist_low_pct, donchian_status) = match donchian_channel_opt {
+                        Some(ref d) => {
+                            let up_dist = ((d.upper - close_price) / close_price) * 100.0;
+                            let low_dist = ((close_price - d.lower) / close_price) * 100.0;
+                            let status = if close_price > d.upper {
+                                "BREAKOUT_HIGH"
+                            } else if close_price < d.lower {
+                                "BREAKOUT_LOW"
+                            } else {
+                                "COILING"
+                            };
+                            (Some(d.upper), Some(d.lower), Some(d.middle), up_dist, low_dist, status.to_string())
+                        }
+                        None => (None, None, None, 0.0, 0.0, "AWAITING_DATA".to_string()),
+                    };
+
+                    let active_engine = match controller.current_mode {
+                        ControllerMode::MeanReversion => "ENGINE_A".to_string(),
+                        ControllerMode::Trend => "ENGINE_B".to_string(),
+                        _ => "NEUTRAL".to_string(),
+                    };
+
+                    let (target_buy_str, target_short_str) = match controller.current_mode {
+                        ControllerMode::Trend => match donchian_channel_opt {
+                            Some(ref d) => (
+                                format!(">${:.2} (BO-Up)", d.upper),
+                                format!("<${:.2} (BO-Dn)", d.lower),
+                            ),
+                            None => ("N/A".to_string(), "N/A".to_string()),
+                        },
+                        _ => match thresholds_opt {
+                            Some(ref th) => (
+                                format!("${:.2}", th.entry_long),
+                                format!("${:.2}", th.entry_short),
+                            ),
+                            None => ("N/A".to_string(), "N/A".to_string()),
+                        },
                     };
 
                     println!(
@@ -1584,20 +1630,44 @@ async fn main() {
                                 (1.0 - (dist_short_pct / 1.5).min(1.0)) * 100.0
                             };
 
-                            let best_prox = p_long.max(p_short);
-                            let summary = if !is_valid_half_life {
-                                format!("Vetoed: t_half={:.1}m outside 15m-120m band", half_life_m)
-                            } else if controller.current_mode == ControllerMode::Neutral {
-                                format!("Dwell Pacing: Streak {}/3 bars", controller.consolidation_streak)
-                            } else if p_long >= p_short {
-                                format!("{:.1}% to Long Entry (${:.2} vs ${:.2})", p_long, close_price, buy_px)
+                            let mr_prox = p_long.max(p_short);
+                            let trend_prox = if let Some(ref d) = donchian_channel_opt {
+                                if close_price >= d.upper || close_price <= d.lower {
+                                    100.0
+                                } else {
+                                    let min_dist = dist_up_pct.min(dist_low_pct).max(0.0);
+                                    (1.0 - (min_dist / 1.5).min(1.0)) * 100.0
+                                }
                             } else {
-                                format!("{:.1}% to Short Entry (${:.2} vs ${:.2})", p_short, close_price, sell_px)
+                                0.0
                             };
 
-                            (p_long, p_short, best_prox, summary)
+                            let (active_prox, summary) = if controller.current_mode == ControllerMode::Trend {
+                                let sum = if let Some(ref d) = donchian_channel_opt {
+                                    if close_price > d.upper {
+                                        format!("Engine B: BREAKOUT HIGH above ${:.2} (Align: {})", d.upper, align_str)
+                                    } else if close_price < d.lower {
+                                        format!("Engine B: BREAKOUT LOW below ${:.2} (Align: {})", d.lower, align_str)
+                                    } else {
+                                        format!("Engine B: Coiling in Range [${:.2} - ${:.2}] (Nearest: {:.2}%)", d.lower, d.upper, dist_up_pct.min(dist_low_pct).max(0.0))
+                                    }
+                                } else {
+                                    "Engine B: Awaiting Donchian Channel".to_string()
+                                };
+                                (trend_prox, sum)
+                            } else if !is_valid_half_life {
+                                (mr_prox, format!("Vetoed: t_half={:.1}m outside 15m-120m band", half_life_m))
+                            } else if controller.current_mode == ControllerMode::Neutral {
+                                (mr_prox, format!("Dwell Pacing: Streak C={}/2, T={}/2 bars", controller.consolidation_streak, controller.trend_streak))
+                            } else if p_long >= p_short {
+                                (mr_prox, format!("{:.1}% to Long Entry (${:.2} vs ${:.2})", p_long, close_price, buy_px))
+                            } else {
+                                (mr_prox, format!("{:.1}% to Short Entry (${:.2} vs ${:.2})", p_short, close_price, sell_px))
+                            };
+
+                            (p_long, p_short, active_prox, summary)
                         }
-                        _ => (0.0, 0.0, 0.0, "Awaiting O-U Calibration".to_string()),
+                        _ => (0.0, 0.0, 0.0, "Awaiting Calibration".to_string()),
                     };
 
                     let (pos_has, pos_side, pos_amount, pos_entry, pos_tp, pos_sl, pos_chand) = {
@@ -1657,6 +1727,14 @@ async fn main() {
                         trade_proximity_short_pct: prox_short,
                         overall_proximity_pct: overall_prox,
                         proximity_summary: prox_summary,
+                        donchian_upper: donchian_upper_val,
+                        donchian_lower: donchian_lower_val,
+                        donchian_middle: donchian_mid_val,
+                        donchian_status,
+                        donchian_dist_upper_pct: dist_up_pct,
+                        donchian_dist_lower_pct: dist_low_pct,
+                        trend_alignment: align_str.to_string(),
+                        active_engine,
                     };
                     save_telemetry(&symbol_clone, &telemetry_data);
 
