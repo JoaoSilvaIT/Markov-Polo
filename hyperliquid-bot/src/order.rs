@@ -485,7 +485,7 @@ pub async fn emergency_flatten(
         );
         crate::discord::send_alert(discord_url.as_deref(), &msg).await;
 
-        if let Err(e) = close_market_position(exchange, symbol, 0.02).await {
+        if let Err(e) = close_market_position(exchange, info, symbol, szi, 0.02).await {
             eprintln!("❌ [EMERGENCY FLATTEN FAILED] Close failed for {}: {}", symbol, e);
             let err_msg = format!("❌ **EMERGENCY FLATTEN FAILED:** Close failed for {}: {}", symbol, e);
             crate::discord::send_alert(discord_url.as_deref(), &err_msg).await;

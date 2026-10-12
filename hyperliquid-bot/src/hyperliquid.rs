@@ -1,7 +1,7 @@
 use ethers::types::H160;
 use hyperliquid_rust_sdk::{
     ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest, ExchangeClient,
-    ExchangeDataStatus, ExchangeResponseStatus, InfoClient, MarketCloseParams,
+    ExchangeDataStatus, ExchangeResponseStatus, InfoClient,
 };
 use std::collections::HashMap;
 
@@ -144,24 +144,68 @@ pub async fn cancel_order(exchange: &ExchangeClient, coin: &str, oid: u64) -> Re
 /// Closes open position at market with slippage protection
 pub async fn close_market_position(
     exchange: &ExchangeClient,
+    info: &InfoClient,
     coin: &str,
+    szi: f64,
     slippage: f64,
 ) -> Result<(), String> {
-    let params = MarketCloseParams {
-        asset: coin,
-        sz: None,
-        px: None,
-        slippage: Some(slippage),
-        cloid: None,
-        wallet: None,
+    let eps = 1e-5;
+    if szi.abs() <= eps {
+        return Ok(());
+    }
+
+    let sz_decimals_map = fetch_sz_decimals_map(info).await;
+    let sz_decimals = sz_decimals_map.get(coin).copied().unwrap_or(2);
+    let is_buy = szi < 0.0; // If szi < 0 (Short), buy to close. If szi > 0 (Long), sell to close.
+    let sz = round_to_decimals(szi.abs(), sz_decimals);
+    if sz <= 0.0 {
+        return Ok(());
+    }
+
+    let (top_bid, top_ask) = fetch_book_ticker(info, coin).await?;
+    let raw_px = if is_buy {
+        top_ask * (1.0 + slippage)
+    } else {
+        top_bid * (1.0 - slippage)
     };
+    let limit_px = quantize_price(raw_px, sz_decimals);
+
+    let order_req = ClientOrderRequest {
+        asset: coin.to_string(),
+        is_buy,
+        reduce_only: true,
+        limit_px,
+        sz,
+        cloid: Some(uuid::Uuid::new_v4()),
+        order_type: ClientOrder::Limit(ClientLimit {
+            tif: "Ioc".to_string(),
+        }),
+    };
+
     let res = exchange
-        .market_close(params)
+        .order(order_req, None)
         .await
-        .map_err(|e| format!("Market close failed: {}", e))?;
+        .map_err(|e| format!("Market close submission failed: {}", e))?;
 
     match res {
-        ExchangeResponseStatus::Ok(_) => Ok(()),
+        ExchangeResponseStatus::Ok(resp) => {
+            if let Some(data) = resp.data {
+                if let Some(first) = data.statuses.first() {
+                    match first {
+                        ExchangeDataStatus::Filled(_) => Ok(()),
+                        ExchangeDataStatus::Resting(_) => Ok(()),
+                        ExchangeDataStatus::Error(msg) => {
+                            Err(format!("Exchange rejected market close order: {}", msg))
+                        }
+                        other => Err(format!("Unexpected order status: {:?}", other)),
+                    }
+                } else {
+                    Ok(())
+                }
+            } else {
+                Ok(())
+            }
+        }
         ExchangeResponseStatus::Err(e) => Err(format!("Market close exchange error: {}", e)),
     }
 }
