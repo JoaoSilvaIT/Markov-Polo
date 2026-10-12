@@ -30,7 +30,7 @@ use crate::hyperliquid::{
     cancel_order, fetch_book_ticker, fetch_sz_decimals_map, get_user_position, place_post_only_order, quantize_price,
 };
 use crate::order::{emergency_flatten, place_ou_maker_entry};
-use crate::ou_process::{calculate_features, calculate_net_edge_bps};
+use crate::ou_process::{calculate_directional_edge_bps, calculate_features, calculate_net_edge_bps};
 use crate::state::{
     has_active_cluster_position, load_armed_signal, load_circuit_breaker, load_state,
     save_armed_signal, save_circuit_breaker, save_state, Side, StateMap,
@@ -148,6 +148,48 @@ async fn backfill_missing_1m_candles(
         backfilled_count += 1;
     }
     Ok(backfilled_count)
+}
+
+pub async fn execute_emergency_flatten_with_retry(
+    state_file_path: &str,
+    exchange: &ExchangeClient,
+    info: &InfoClient,
+    wallet_address: H160,
+    state: &mut StateMap,
+    symbol: &str,
+    discord_url: Option<String>,
+) -> Result<(), String> {
+    let mut last_err = String::new();
+    for attempt in 1..=3 {
+        match emergency_flatten(
+            state_file_path,
+            exchange,
+            info,
+            wallet_address,
+            state,
+            symbol,
+            discord_url.clone(),
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = e;
+                eprintln!(
+                    "⚠️ [EMERGENCY FLATTEN RETRY] Attempt {}/3 failed for {}: {}. Retrying...",
+                    attempt, symbol, last_err
+                );
+                tokio::time::sleep(tokio::time::Duration::from_millis(attempt as u64 * 350)).await;
+            }
+        }
+    }
+    let critical_msg = format!(
+        "🚨🚨 **CRITICAL: EMERGENCY FLATTEN EXHAUSTED ALL 3 RETRIES FOR {}!** Error: {}. MANUAL INTERVENTION REQUIRED IMMEDIATELY!",
+        symbol, last_err
+    );
+    eprintln!("{}", critical_msg);
+    crate::discord::send_alert(discord_url.as_deref(), &critical_msg).await;
+    Err(last_err)
 }
 
 #[tokio::main]
@@ -739,7 +781,7 @@ async fn main() {
                             );
                             crate::discord::send_alert(watcher_discord.as_deref(), &stop_msg).await;
 
-                            let _ = emergency_flatten(
+                            let _ = execute_emergency_flatten_with_retry(
                                 &watcher_state_path,
                                 &watcher_exchange,
                                 &watcher_info,
@@ -1228,7 +1270,7 @@ async fn main() {
                         let mut state_lock = active_state.lock().await;
                         if let Some(pos) = state_lock.get(&trading_symbol) {
                             if !pos.is_filled {
-                                let _ = emergency_flatten(
+                                let _ = execute_emergency_flatten_with_retry(
                                     &state_file_path,
                                     &exchange,
                                     &info_client,
@@ -1521,12 +1563,7 @@ async fn main() {
                         }
                     }
 
-                    let donchian_prior_bars = if finalized_15m_bar.is_some() && rolling_15m_bars.len() > 1 {
-                        &rolling_15m_bars[..rolling_15m_bars.len() - 1]
-                    } else {
-                        &rolling_15m_bars[..]
-                    };
-                    let donchian_channel_opt = calculate_donchian(donchian_prior_bars, donchian_period);
+                    let donchian_channel_opt = calculate_donchian(&rolling_15m_bars[..], donchian_period);
 
                     let closes_15m_curr: Vec<f64> = rolling_15m_bars.iter().map(|b| b.close).collect();
                     let alignment_curr = check_trend_alignment(&closes_15m_curr);
@@ -1781,7 +1818,7 @@ async fn main() {
                                 active_multiplier: shadow_trade.active_multiplier,
                             };
 
-                            let new_stop = chandelier.update_with_cap(high_price, low_price, current_atr, current_p_t, Some(0.5));
+                            let new_stop = chandelier.update_with_ratchet_and_cap(high_price, low_price, current_atr, current_p_t, Some(0.5), true);
                             shadow_trade.current_stop = new_stop;
                             shadow_trade.extreme_favorable_price = chandelier.extreme_favorable_price;
                             shadow_trade.active_multiplier = chandelier.active_multiplier;
@@ -1831,12 +1868,7 @@ async fn main() {
                             if is_cluster_blocked {
                                 println!("⏸️ [SHADOW-TREND VETO] Active cluster lease in place. Vetoing Engine B entry to prevent cross-engine conflict.");
                             } else {
-                                let prior_bars = if finalized_15m_bar.is_some() && rolling_15m_bars.len() > 1 {
-                                    &rolling_15m_bars[..rolling_15m_bars.len() - 1]
-                                } else {
-                                    &rolling_15m_bars[..]
-                                };
-                                let donchian_opt = calculate_donchian(prior_bars, donchian_period);
+                                let donchian_opt = calculate_donchian(&rolling_15m_bars[..], donchian_period);
                                 if let Some(ref donchian) = donchian_opt {
                                     let closes_15m: Vec<f64> = rolling_15m_bars.iter().map(|b| b.close).collect();
                                     let alignment = check_trend_alignment(&closes_15m);
@@ -2098,7 +2130,7 @@ async fn main() {
                                         "🛑 [RESTING ENTRY CANCELLED] Engine A invalidated (vol_ok: {}, mode: {}, Z15: {:.2}, Z60: {:.2}). Cancelling resting maker order for {}.",
                                         consolidation_vol_ok, controller.current_mode, z_15, z_60, symbol_clone
                                     );
-                                    let _ = emergency_flatten(
+                                    let _ = execute_emergency_flatten_with_retry(
                                         &state_path_clone,
                                         &exchange_clone,
                                         &info_clone,
@@ -2114,7 +2146,7 @@ async fn main() {
                                         "🛑 [RESTING ENTRY CANCELLED] Engine B invalidated (mode: {}, downside shock: {}). Cancelling resting maker order for {}.",
                                         controller.current_mode, is_downside_shock, symbol_clone
                                     );
-                                    let _ = emergency_flatten(
+                                    let _ = execute_emergency_flatten_with_retry(
                                         &state_path_clone,
                                         &exchange_clone,
                                         &info_clone,
@@ -2202,7 +2234,7 @@ async fn main() {
                                             active_multiplier: chandelier_atr_mult,
                                         };
 
-                                        let new_stop = chandelier.update_with_cap(high_price, low_price, current_atr, current_p_t, Some(0.5));
+                                        let new_stop = chandelier.update_with_ratchet_and_cap(high_price, low_price, current_atr, current_p_t, Some(0.5), true);
                                         pos.chandelier_stop = new_stop;
                                         pos.stop_loss_price = new_stop;
                                         pos.max_favorable_price = chandelier.extreme_favorable_price;
@@ -2405,7 +2437,7 @@ async fn main() {
                                 let mut cb_lock = cb_clone.lock().await;
                                 cb_lock.record_loss();
                                 save_circuit_breaker(&cb_path_clone, &cb_lock);
-                                let _ = emergency_flatten(
+                                let _ = execute_emergency_flatten_with_retry(
                                     &state_path_clone,
                                     &exchange_clone,
                                     &info_clone,
@@ -2429,9 +2461,7 @@ async fn main() {
                                     symbol_clone, close_price, sl_px
                                 );
                                 crate::discord::send_alert(discord_clone.as_deref(), &ch_msg).await;
-                                controller.notify_trend_stopped_out();
-                                save_controller_state(&symbol_clone, &controller);
-                                let _ = emergency_flatten(
+                                let flatten_res = execute_emergency_flatten_with_retry(
                                     &state_path_clone,
                                     &exchange_clone,
                                     &info_clone,
@@ -2441,12 +2471,21 @@ async fn main() {
                                     discord_clone.clone(),
                                 )
                                 .await;
+                                if flatten_res.is_ok() {
+                                    controller.notify_trend_stopped_out();
+                                    save_controller_state(&symbol_clone, &controller);
+                                } else {
+                                    eprintln!(
+                                        "❌ [CHANDELIER STOP DEFERRED] Incomplete flatten for {}; keeping controller armed for subsequent tick retry.",
+                                        symbol_clone
+                                    );
+                                }
                             } else if entry_ttl_expired {
                                 println!(
                                     "⏱️ [ENTRY TTL EXPIRED] Resting order for {} unfilled after {:.1}m. Flattening.",
                                     symbol_clone, elapsed_mins
                                 );
-                                let _ = emergency_flatten(
+                                let _ = execute_emergency_flatten_with_retry(
                                     &state_path_clone,
                                     &exchange_clone,
                                     &info_clone,
@@ -2474,7 +2513,7 @@ async fn main() {
                                     symbol_clone, peak_prog, close_price, ent_px
                                 );
                                 crate::discord::send_alert(discord_clone.as_deref(), &ratchet_msg).await;
-                                let _ = emergency_flatten(
+                                let _ = execute_emergency_flatten_with_retry(
                                     &state_path_clone,
                                     &exchange_clone,
                                     &info_clone,
@@ -2490,7 +2529,7 @@ async fn main() {
                                     "🚨 [SHOCK VETO ON POSITION] Severe adverse shock on {} (Z15: {:.2}, Z60: {:.2}, Engine: {})! Flattening.",
                                     symbol_clone, z_15, z_60, pos_engine_type
                                 );
-                                let _ = emergency_flatten(
+                                let _ = execute_emergency_flatten_with_retry(
                                     &state_path_clone,
                                     &exchange_clone,
                                     &info_clone,
@@ -2505,7 +2544,7 @@ async fn main() {
                                     "🚨 [INVALIDATION] Regime shift detected for {}. Flattening.",
                                     symbol_clone
                                 );
-                                let _ = emergency_flatten(
+                                let _ = execute_emergency_flatten_with_retry(
                                     &state_path_clone,
                                     &exchange_clone,
                                     &info_clone,
@@ -2532,7 +2571,7 @@ async fn main() {
                                     time_msg.push_str("\n🚨 **CIRCUIT BREAKER TRIGGERED:** 3 consecutive time stops! Trading paused 24h.");
                                 }
                                 crate::discord::send_alert(discord_clone.as_deref(), &time_msg).await;
-                                let _ = emergency_flatten(
+                                let _ = execute_emergency_flatten_with_retry(
                                     &state_path_clone,
                                     &exchange_clone,
                                     &info_clone,
@@ -2768,7 +2807,7 @@ async fn main() {
                                         } else {
                                             let entry_limit_price = close_price;
                                             // For Short: edge is entry_limit_price down to dynamic_exit_target
-                                            let net_edge_bps = (entry_limit_price / dynamic_exit_target).ln() * 10000.0;
+                                            let net_edge_bps = calculate_directional_edge_bps(entry_limit_price, dynamic_exit_target, false);
 
                                             if net_edge_bps < 20.0 {
                                                 funnel_counters.engine_a_reversal_hurdle_veto += 1;

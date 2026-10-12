@@ -238,9 +238,23 @@ pub fn load_state(file_path: &str) -> Result<StateMap, Box<dyn std::error::Error
 
 pub fn save_state(file_path: &str, state: &StateMap) -> Result<(), Box<dyn std::error::Error>> {
     let content = serde_json::to_string_pretty(state)?;
-    let temp_path = format!("{}.tmp", file_path);
-    fs::write(&temp_path, content)?;
+    let temp_path = format!("{}.tmp.{}", file_path, std::process::id());
+    {
+        use std::io::Write;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp_path)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+    }
     fs::rename(&temp_path, file_path)?;
+    let p = std::path::Path::new(file_path);
+    let parent = p.parent().unwrap_or_else(|| std::path::Path::new("."));
+    if let Ok(dir) = fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 
@@ -389,7 +403,7 @@ pub fn max_concurrent_cluster_positions() -> usize {
         .or_else(|_| std::env::var("MAX_CONCURRENT_POSITIONS"))
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(1)
+        .unwrap_or(2)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -981,6 +995,7 @@ mod tests {
     #[test]
     fn test_cluster_lease_isolation() {
         let _guard = TEST_MUTEX.lock().unwrap();
+        std::env::set_var("HL_MAX_CONCURRENT_POSITIONS", "1");
         let _ = fs::remove_file(CLUSTER_LOCK_FILE);
         let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
         let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
@@ -993,6 +1008,27 @@ mod tests {
         let _ = fs::remove_file(CLUSTER_LOCK_FILE);
         let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
         let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
+        std::env::remove_var("HL_MAX_CONCURRENT_POSITIONS");
+    }
+
+    #[test]
+    fn test_cluster_lease_concurrency_limit_2() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        std::env::set_var("HL_MAX_CONCURRENT_POSITIONS", "2");
+        let _ = fs::remove_file(CLUSTER_LOCK_FILE);
+        let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
+        let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
+        assert!(try_acquire_cluster_lease("BTC", 60));
+        // With limit = 2, second asset ETH can acquire concurrently
+        assert!(try_acquire_cluster_lease("ETH", 60));
+        // Third asset SOL is rejected
+        assert!(!try_acquire_cluster_lease("SOL", 60));
+        release_cluster_lease("BTC");
+        release_cluster_lease("ETH");
+        let _ = fs::remove_file(CLUSTER_LOCK_FILE);
+        let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
+        let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
+        std::env::remove_var("HL_MAX_CONCURRENT_POSITIONS");
     }
 
     #[test]

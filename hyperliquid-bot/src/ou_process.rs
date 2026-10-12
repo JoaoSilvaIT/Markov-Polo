@@ -197,14 +197,32 @@ pub fn calculate_mad_sigma(returns: &[f64]) -> f64 {
     (1.4826 * med_dev).max(1e-5)
 }
 
-/// Computes the net expected edge in basis points between entry and exit price:
+/// Computes the directional expected edge in basis points between entry and exit price:
+/// For Long (is_buy = true): ln(exit_target / entry_price) * 10,000 (target > entry)
+/// For Short (is_buy = false): ln(entry_price / exit_target) * 10,000 (entry > target)
+pub fn calculate_directional_edge_bps(entry_price: f64, exit_target: f64, is_buy: bool) -> f64 {
+    if entry_price <= 0.0 || exit_target <= 0.0 {
+        return 0.0;
+    }
+    if is_buy {
+        if exit_target > entry_price {
+            (exit_target / entry_price).ln() * 10_000.0
+        } else {
+            0.0
+        }
+    } else {
+        if entry_price > exit_target {
+            (entry_price / exit_target).ln() * 10_000.0
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Computes the net expected edge in basis points between entry and exit price (Long default):
 /// edge_bps = ln(exit_target / entry_price) * 10,000
 pub fn calculate_net_edge_bps(entry_price: f64, exit_target: f64) -> f64 {
-    if entry_price > 0.0 && exit_target > entry_price {
-        (exit_target / entry_price).ln() * 10_000.0
-    } else {
-        0.0
-    }
+    calculate_directional_edge_bps(entry_price, exit_target, true)
 }
 
 /// Calculates the Rogers-Satchell realized volatility over a series of OHLC price bars.
@@ -518,6 +536,18 @@ mod tests {
         // Inverted or flat price: 0 bps
         assert_eq!(calculate_net_edge_bps(100.0, 99.0), 0.0);
         assert_eq!(calculate_net_edge_bps(100.0, 100.0), 0.0);
+
+        // Directional Short edge: entry 100.0, exit 99.65 -> ~35.06 bps
+        let short_edge = calculate_directional_edge_bps(100.0, 99.65, false);
+        assert!(short_edge >= 25.0);
+        assert!((short_edge - 35.06).abs() < 0.1);
+
+        // Inverted short (exit > entry): 0 bps
+        assert_eq!(calculate_directional_edge_bps(100.0, 100.5, false), 0.0);
+
+        // Non-positive or zero prices
+        assert_eq!(calculate_directional_edge_bps(0.0, 100.0, true), 0.0);
+        assert_eq!(calculate_directional_edge_bps(100.0, -5.0, false), 0.0);
     }
 
     #[test]

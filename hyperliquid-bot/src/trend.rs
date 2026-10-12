@@ -639,6 +639,25 @@ impl ChandelierExitState {
         p_trend: f64,
         max_contraction_step: Option<f64>,
     ) -> f64 {
+        self.update_with_ratchet_and_cap(
+            current_high,
+            current_low,
+            current_atr,
+            p_trend,
+            max_contraction_step,
+            false,
+        )
+    }
+
+    pub fn update_with_ratchet_and_cap(
+        &mut self,
+        current_high: f64,
+        current_low: f64,
+        current_atr: f64,
+        p_trend: f64,
+        max_contraction_step: Option<f64>,
+        enable_breakeven_ratchet: bool,
+    ) -> f64 {
         // Guard against non-finite or invalid inputs
         if current_atr <= 0.0 || current_atr.is_nan() || current_atr.is_infinite()
             || p_trend.is_nan() || p_trend.is_infinite()
@@ -666,7 +685,21 @@ impl ChandelierExitState {
                 if current_high > self.extreme_favorable_price {
                     self.extreme_favorable_price = current_high;
                 }
-                let candidate_stop = self.extreme_favorable_price - self.active_multiplier * current_atr;
+                let mut candidate_stop = self.extreme_favorable_price - self.active_multiplier * current_atr;
+
+                if enable_breakeven_ratchet {
+                    let delta_fav = (self.extreme_favorable_price - self.entry_price).max(0.0);
+                    let eps = 1e-6;
+                    // 1. Breakeven Floor: once favorable progress >= 1.0 ATR, stop moves to at least entry + 10 bps
+                    if delta_fav >= (1.0 * current_atr) - eps {
+                        candidate_stop = f64::max(candidate_stop, self.entry_price * 1.0010);
+                    }
+                    // 2. 50% Profit Giveback Ratchet: once progress >= 1.5 ATR, protect at least 50% of peak progress
+                    if delta_fav >= (1.5 * current_atr) - eps {
+                        candidate_stop = f64::max(candidate_stop, self.entry_price + 0.5 * delta_fav);
+                    }
+                }
+
                 // Monotone Ratchet: stop strictly moves UP
                 self.current_stop = f64::max(self.current_stop, candidate_stop);
             }
@@ -674,7 +707,21 @@ impl ChandelierExitState {
                 if current_low < self.extreme_favorable_price {
                     self.extreme_favorable_price = current_low;
                 }
-                let candidate_stop = self.extreme_favorable_price + self.active_multiplier * current_atr;
+                let mut candidate_stop = self.extreme_favorable_price + self.active_multiplier * current_atr;
+
+                if enable_breakeven_ratchet {
+                    let delta_fav = (self.entry_price - self.extreme_favorable_price).max(0.0);
+                    let eps = 1e-6;
+                    // 1. Breakeven Floor: once favorable progress >= 1.0 ATR, stop moves to at least entry - 10 bps
+                    if delta_fav >= (1.0 * current_atr) - eps {
+                        candidate_stop = f64::min(candidate_stop, self.entry_price * 0.9990);
+                    }
+                    // 2. 50% Profit Giveback Ratchet: once progress >= 1.5 ATR, protect at least 50% of peak progress
+                    if delta_fav >= (1.5 * current_atr) - eps {
+                        candidate_stop = f64::min(candidate_stop, self.entry_price - 0.5 * delta_fav);
+                    }
+                }
+
                 // Monotone Ratchet: stop strictly moves DOWN
                 self.current_stop = f64::min(self.current_stop, candidate_stop);
             }
@@ -1230,6 +1277,39 @@ mod tests {
         chandelier.update(10.70, 10.63, 0.10, 0.30);
         assert!((chandelier.current_stop - 10.73).abs() < 1e-6);
         assert!(chandelier.current_stop < chandelier.entry_price);
+    }
+
+    #[test]
+    fn test_chandelier_breakeven_floor_short() {
+        // Short entry @ 10.00, ATR = 0.20, base_multiplier = 2.0
+        let mut chandelier = ChandelierExitState::new(Side::Short, 10.00, 0.20, 2.0);
+        // Initial stop: 10.00 + 2.0 * 0.20 = 10.40
+        assert_eq!(chandelier.current_stop, 10.40);
+
+        // Price drops to 9.80 (favorable excursion = 0.20 = 1.0 * ATR)
+        // P_T remains high (0.85 -> active mult = 2.0)
+        // Normal Chandelier stop would be: 9.80 + 2.0 * 0.20 = 10.20
+        // BUT with enable_breakeven_ratchet: true,
+        // excursion >= 1.0 ATR triggers Breakeven Floor: entry - 10 bps = 10.00 * 0.9990 = 9.99!
+        let stop = chandelier.update_with_ratchet_and_cap(9.85, 9.80, 0.20, 0.85, None, true);
+        assert!(stop <= 9.99, "Breakeven floor must lock stop below entry covering fees (stop: {})", stop);
+        assert!(stop < chandelier.entry_price);
+    }
+
+    #[test]
+    fn test_chandelier_profit_giveback_ratchet_long() {
+        // Long entry @ 100.00, ATR = 2.00, base_multiplier = 2.0
+        let mut chandelier = ChandelierExitState::new(Side::Long, 100.00, 2.00, 2.0);
+        // Initial stop: 100.00 - 2.0 * 2.0 = 96.00
+        assert_eq!(chandelier.current_stop, 96.00);
+
+        // Price rallies to 104.00 (favorable excursion = 4.00 = 2.0 * ATR >= 1.5 * ATR)
+        // P_T remains high (0.85 -> active mult = 2.0)
+        // Normal Chandelier stop would be: 104.00 - 2.0 * 2.0 = 100.00 (breakeven)
+        // BUT with 50% profit giveback ratchet:
+        // protects at least 50% of peak progress: 100.00 + 0.5 * 4.00 = 102.00!
+        let stop = chandelier.update_with_ratchet_and_cap(104.00, 102.00, 2.00, 0.85, None, true);
+        assert!(stop >= 102.00, "50% profit giveback ratchet must protect at least 102.00 (stop: {})", stop);
     }
 
     #[test]

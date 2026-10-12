@@ -18,8 +18,8 @@ pub fn get_tick_size(symbol: &str) -> f64 {
 }
 
 /// Official Hyperliquid Base Fee Structure (Perpetuals)
-pub const HYPERLIQUID_BASE_MAKER_FEE_BPS: f64 = 1.5; // 0.015%
-pub const HYPERLIQUID_BASE_TAKER_FEE_BPS: f64 = 4.5; // 0.045%
+pub const HYPERLIQUID_BASE_MAKER_FEE_BPS: f64 = 1.0; // 0.010% (1.0 bps)
+pub const HYPERLIQUID_BASE_TAKER_FEE_BPS: f64 = 3.5; // 0.035% (3.5 bps)
 pub const ESTIMATED_SLIPPAGE_BPS: f64 = 2.0;
 
 /// Veto Classification per Researcher 1 & 2 Consensus

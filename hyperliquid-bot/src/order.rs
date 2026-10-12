@@ -27,7 +27,7 @@ pub async fn place_ou_maker_entry(
     discord_url: Option<String>,
 ) -> Result<Value, String> {
     let position_size_usdc = position_size_usdc.max(11.0);
-    if state.len() >= 3 {
+    if state.len() >= crate::state::max_concurrent_cluster_positions() {
         return Ok(json!({"status": "REJECTED", "reason": "Max concurrent trades reached."}));
     }
     if state.contains_key(symbol) {
@@ -246,7 +246,7 @@ pub async fn place_trend_breakout_entry(
     discord_url: Option<String>,
 ) -> Result<Value, String> {
     let position_size_usdc = position_size_usdc.max(11.0);
-    if state.len() >= 3 {
+    if state.len() >= crate::state::max_concurrent_cluster_positions() {
         return Ok(json!({"status": "REJECTED", "reason": "Max concurrent trades reached."}));
     }
     if state.contains_key(symbol) {
