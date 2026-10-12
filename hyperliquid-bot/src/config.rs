@@ -72,7 +72,7 @@ impl Config {
         let chandelier_mult = env::var("HL_CHANDELIER_ATR_MULT")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(3.0);
+            .unwrap_or(2.0);
 
         Config {
             hl_private_key: env::var("HL_PRIVATE_KEY").unwrap_or_else(|_| {

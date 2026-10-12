@@ -648,7 +648,8 @@ impl ChandelierExitState {
         }
 
         let decay_factor = ((p_trend - 0.55) / (0.85 - 0.55)).clamp(0.0, 1.0);
-        let target_multiplier = 1.5 + (self.base_multiplier - 1.5) * decay_factor;
+        let min_multiplier = (self.base_multiplier * 0.5).max(1.0);
+        let target_multiplier = min_multiplier + (self.base_multiplier - min_multiplier) * decay_factor;
 
         if let Some(max_step) = max_contraction_step {
             if target_multiplier < self.active_multiplier {
@@ -1194,6 +1195,41 @@ mod tests {
         // Candidate stop: 110.0 - 1.5 * 2.0 = 107.0!
         chandelier.update(110.0, 108.0, 2.0, 0.40);
         assert_eq!(chandelier.current_stop, 107.0);
+    }
+
+    #[test]
+    fn test_chandelier_probability_compression_calibrated_2x() {
+        // Base multiplier = 2.0x, ATR = 2.0
+        let mut chandelier = ChandelierExitState::new(Side::Long, 100.0, 2.0, 2.0);
+        // Initial stop: 100.0 - 2.0 * 2.0 = 96.0
+        assert_eq!(chandelier.current_stop, 96.0);
+
+        // Price rises to 110.0 with P_T = 0.90 (active mult = 2.0)
+        chandelier.update(110.0, 105.0, 2.0, 0.90);
+        // Stop: 110.0 - 2.0 * 2.0 = 106.0
+        assert_eq!(chandelier.current_stop, 106.0);
+
+        // HMM trend probability decays to 0.40 (< 0.55 threshold)
+        // Multiplier compresses from 2.0 to 1.0 ATR
+        // Candidate stop: 110.0 - 1.0 * 2.0 = 108.0!
+        chandelier.update(110.0, 108.0, 2.0, 0.40);
+        assert_eq!(chandelier.current_stop, 108.0);
+        assert_eq!(chandelier.active_multiplier, 1.0);
+    }
+
+    #[test]
+    fn test_chandelier_short_locks_profit_with_2x_base() {
+        // Short entry @ 10.77, ATR = 0.10, base mult = 2.0
+        let mut chandelier = ChandelierExitState::new(Side::Short, 10.77, 0.10, 2.0);
+        // Initial stop: 10.77 + 2.0 * 0.10 = 10.97
+        assert!((chandelier.current_stop - 10.97).abs() < 1e-6);
+
+        // Price drops to 10.63, P_T decays to 0.30
+        // Extreme becomes 10.63, mult contracts to 1.0 ATR
+        // Stop: 10.63 + 1.0 * 0.10 = 10.73! (STRICTLY BELOW entry 10.77!)
+        chandelier.update(10.70, 10.63, 0.10, 0.30);
+        assert!((chandelier.current_stop - 10.73).abs() < 1e-6);
+        assert!(chandelier.current_stop < chandelier.entry_price);
     }
 
     #[test]
