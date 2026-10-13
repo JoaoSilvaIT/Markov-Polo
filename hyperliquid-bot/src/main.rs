@@ -27,7 +27,8 @@ use crate::telemetry::{
 };
 use crate::hmm::{compute_hmm_posteriors, train_hmm_offline, GaussianHMM};
 use crate::hyperliquid::{
-    cancel_order, fetch_book_ticker, fetch_sz_decimals_map, get_user_position, place_post_only_order, quantize_price,
+    calculate_dynamic_notional, cancel_order, fetch_book_ticker, fetch_sz_decimals_map,
+    get_account_value, get_user_position, place_post_only_order, quantize_price,
 };
 use crate::order::{emergency_flatten, place_ou_maker_entry};
 use crate::ou_process::{calculate_directional_edge_bps, calculate_features, calculate_net_edge_bps};
@@ -148,6 +149,49 @@ async fn backfill_missing_1m_candles(
         backfilled_count += 1;
     }
     Ok(backfilled_count)
+}
+
+/// Dynamically resolves the trade bank notional (in USDC).
+/// If sizing_mode is "dynamic", queries Hyperliquid for live account equity, caches it,
+/// and allocates `equity_fraction` of the total balance (e.g. 1/4 = 0.25, 1/3 = 0.33),
+/// clamped to Hyperliquid's minimum ($11.0) and the maximum safety cap.
+/// If live fetch fails or mode is "fixed", gracefully falls back to cached equity or `config.position_size_usdc`.
+async fn resolve_trade_bank(
+    info: &InfoClient,
+    address: H160,
+    config: &Config,
+    cached_equity: &RwLock<f64>,
+) -> f64 {
+    if config.sizing_mode == "fixed" {
+        return config.position_size_usdc;
+    }
+
+    if let Ok(account_val) = get_account_value(info, address).await {
+        if account_val > 0.0 {
+            let mut w = cached_equity.write().await;
+            *w = account_val;
+            return calculate_dynamic_notional(
+                account_val,
+                config.equity_fraction,
+                11.0,
+                config.max_position_size_usdc,
+                config.position_size_usdc,
+            );
+        }
+    }
+
+    let r = cached_equity.read().await;
+    if *r > 0.0 {
+        return calculate_dynamic_notional(
+            *r,
+            config.equity_fraction,
+            11.0,
+            config.max_position_size_usdc,
+            config.position_size_usdc,
+        );
+    }
+
+    config.position_size_usdc
 }
 
 pub async fn execute_emergency_flatten_with_retry(
@@ -516,6 +560,34 @@ async fn main() {
         }
     };
     let symbol_open_orders: Vec<_> = open_orders_res.into_iter().filter(|o| o.coin == trading_symbol).collect();
+
+    // Query live account equity for dynamic sizing
+    let initial_equity = match get_account_value(&info_client, user_address).await {
+        Ok(eq) => {
+            println!(
+                "💰 [STARTUP ACCOUNT EQUITY] Equity: ${:.2} USDC | Mode: {} | Fraction: {:.1}% | Initial Trade Bank: ${:.2} USDC",
+                eq,
+                config.sizing_mode.to_uppercase(),
+                config.equity_fraction * 100.0,
+                calculate_dynamic_notional(
+                    eq,
+                    config.equity_fraction,
+                    11.0,
+                    config.max_position_size_usdc,
+                    config.position_size_usdc,
+                )
+            );
+            eq
+        }
+        Err(e) => {
+            println!(
+                "⚠️ [STARTUP ACCOUNT EQUITY] Could not query initial account equity: {}. Using fallback base size: ${:.2} USDC",
+                e, config.position_size_usdc
+            );
+            0.0
+        }
+    };
+    let cached_account_equity = Arc::new(RwLock::new(initial_equity));
 
     // 3. Load local state and order intent WAL
     let pending_intent = crate::state::load_order_intent(&trading_symbol);
@@ -1095,14 +1167,24 @@ async fn main() {
     let trend_risk_fraction = config.trend_risk_fraction;
     let donchian_period = config.donchian_period;
     let chandelier_atr_mult = config.chandelier_atr_mult;
+    let initial_trade_bank = calculate_dynamic_notional(
+        initial_equity,
+        config.equity_fraction,
+        11.0,
+        config.max_position_size_usdc,
+        position_size_usdc,
+    );
     println!(
-        "⚙️ [STARTUP CONFIG] Symbol: {} | Engine A: LIVE (Maker Post-Only) | Engine B (Trend): {} | Leverage: {}x | Base Size: ${:.2} (Risk Fraction: {:.2})",
+        "⚙️ [STARTUP CONFIG] Symbol: {} | Engine A: LIVE (Maker Post-Only) | Engine B (Trend): {} | Leverage: {}x | Sizing: {} (Bank: ${:.2}, Frac: {:.1}%, Mult: {:.2})",
         trading_symbol,
         trend_engine_mode.to_uppercase(),
         config.hl_leverage,
-        position_size_usdc,
+        config.sizing_mode.to_uppercase(),
+        initial_trade_bank,
+        config.equity_fraction * 100.0,
         trend_risk_fraction
     );
+    let cached_equity_loop = cached_account_equity.clone();
     let mut controller = load_controller_state(&trading_symbol);
     let mut current_15m_bar: Option<CandleBar> = initial_15m_bar;
 
@@ -1609,6 +1691,20 @@ async fn main() {
                             println!("{}", funnel_counters.format_summary());
                             save_funnel_counters(&symbol_clone, &funnel_counters);
                         }
+
+                        // Non-blocking background equity refresh on 15m bar close
+                        if config.sizing_mode == "dynamic" {
+                            let info_bg = info_clone.clone();
+                            let cached_eq_bg = cached_equity_loop.clone();
+                            tokio::spawn(async move {
+                                if let Ok(account_val) = get_account_value(&info_bg, user_address).await {
+                                    if account_val > 0.0 {
+                                        let mut w = cached_eq_bg.write().await;
+                                        *w = account_val;
+                                    }
+                                }
+                            });
+                        }
                     }
 
                     let donchian_channel_opt = calculate_donchian(&rolling_15m_bars[..], donchian_period);
@@ -1955,7 +2051,8 @@ async fn main() {
 
                                             if obi_favorable {
                                                 funnel_counters.engine_b_orders_placed += 1;
-                                                let trend_notional = (position_size_usdc * trend_risk_fraction).max(11.0);
+                                                let trade_bank = resolve_trade_bank(&info_clone, user_address, &config, &cached_equity_loop).await;
+                                                let trend_notional = (trade_bank * trend_risk_fraction).max(11.0).min(config.max_position_size_usdc);
                                                 let shadow_size = trend_notional / close_price;
 
                                                 if trend_engine_mode == "live" {
@@ -2024,6 +2121,10 @@ async fn main() {
                                                 } else {
                                                     (close_price - 3.0 * current_atr, close_price + 2.0 * current_atr)
                                                 };
+                                                let cf_trend_notional = {
+                                                    let r = cached_equity_loop.read().await;
+                                                    calculate_dynamic_notional(*r, config.equity_fraction, 11.0, config.max_position_size_usdc, position_size_usdc) * trend_risk_fraction
+                                                };
                                                 let cf_opp = crate::counterfactual::ActiveOpportunity::new(
                                                     symbol_clone.clone(),
                                                     "EngineB_DonchianTrend".to_string(),
@@ -2056,7 +2157,7 @@ async fn main() {
                                                     crate::counterfactual::HypotheticalOrder {
                                                         order_type: "market".to_string(),
                                                         limit_price: close_price,
-                                                        size: (position_size_usdc * trend_risk_fraction) / close_price,
+                                                        size: cf_trend_notional / close_price,
                                                         time_in_force: "IOC".to_string(),
                                                         assumed_cancel_rule: "immediate".to_string(),
                                                         queue_ahead_estimate: None,
@@ -2119,6 +2220,10 @@ async fn main() {
                                     (close_price - 3.0 * atr_val, close_price + 2.0 * atr_val)
                                 };
                                 let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                                let cf_trend_notional = {
+                                    let r = cached_equity_loop.read().await;
+                                    calculate_dynamic_notional(*r, config.equity_fraction, 11.0, config.max_position_size_usdc, position_size_usdc) * trend_risk_fraction
+                                };
                                 let cf_opp = crate::counterfactual::ActiveOpportunity::new(
                                     symbol_clone.clone(),
                                     "EngineB_DonchianTrend".to_string(),
@@ -2151,7 +2256,7 @@ async fn main() {
                                     crate::counterfactual::HypotheticalOrder {
                                         order_type: "market".to_string(),
                                         limit_price: close_price,
-                                        size: (position_size_usdc * trend_risk_fraction) / close_price,
+                                        size: cf_trend_notional / close_price,
                                         time_in_force: "IOC".to_string(),
                                         assumed_cancel_rule: "immediate".to_string(),
                                         queue_ahead_estimate: None,
@@ -2769,10 +2874,11 @@ async fn main() {
                                                 armed_state.is_armed = false;
                                                 save_armed_signal(&arm_path_clone, &armed_state);
                                             } else {
+                                                let trade_bank = resolve_trade_bank(&info_clone, user_address, &config, &cached_equity_loop).await;
                                                 let trade_size_usdc = if is_tier2 {
-                                                    (position_size_usdc * 0.5).max(12.0)
+                                                    (trade_bank * 0.5).max(12.0)
                                                 } else {
-                                                    position_size_usdc
+                                                    trade_bank
                                                 };
 
                                                 funnel_counters.engine_a_orders_placed += 1;
@@ -2872,10 +2978,11 @@ async fn main() {
                                                 armed_state.is_armed = false;
                                                 save_armed_signal(&arm_path_clone, &armed_state);
                                             } else {
+                                                let trade_bank = resolve_trade_bank(&info_clone, user_address, &config, &cached_equity_loop).await;
                                                 let trade_size_usdc = if is_tier2 {
-                                                    (position_size_usdc * 0.5).max(12.0)
+                                                    (trade_bank * 0.5).max(12.0)
                                                 } else {
-                                                    position_size_usdc
+                                                    trade_bank
                                                 };
 
                                                 funnel_counters.engine_a_orders_placed += 1;
@@ -3027,6 +3134,11 @@ async fn main() {
                             // COUNTERFACTUAL ENGINE: Track Vetoed 1.50sigma & Relaxed 1.25sigma Opportunities
                             // ------------------------------------------------------------------
                             if !armed_state.is_armed {
+                                let cf_bank = {
+                                    let r = cached_equity_loop.read().await;
+                                    calculate_dynamic_notional(*r, config.equity_fraction, 11.0, config.max_position_size_usdc, position_size_usdc)
+                                };
+
                                 if let Some(ref th20) = thresholds_opt {
                                     let is_20_long = close_price <= th20.entry_long;
                                     let is_20_short = close_price >= th20.entry_short;
@@ -3039,7 +3151,7 @@ async fn main() {
                                         if is_shock { all_vetos.push("SHOCK_SENTINEL".to_string()); }
                                         if controller.shock_cooldown_bars > 0 { all_vetos.push("SHOCK_COOLDOWN_ACTIVE".to_string()); }
                                         if controller.current_mode != ControllerMode::MeanReversion {
-                                            all_vetos.push(format!("MODE_{:?}", controller.current_mode).to_uppercase());
+                                             all_vetos.push(format!("MODE_{:?}", controller.current_mode).to_uppercase());
                                         }
                                         if !consolidation_vol_ok { all_vetos.push("VOLATILITY_GATE_BREACH".to_string()); }
                                         if !is_valid_half_life { all_vetos.push("HALF_LIFE_INVALID".to_string()); }
@@ -3086,7 +3198,7 @@ async fn main() {
                                             crate::counterfactual::HypotheticalOrder {
                                                 order_type: "post_only_limit".to_string(),
                                                 limit_price: limit_px,
-                                                size: position_size_usdc / limit_px,
+                                                size: cf_bank / limit_px,
                                                 time_in_force: "GTC".to_string(),
                                                 assumed_cancel_rule: "timeout_or_reversion".to_string(),
                                                 queue_ahead_estimate: None,
@@ -3139,7 +3251,7 @@ async fn main() {
                                                     crate::counterfactual::HypotheticalOrder {
                                                         order_type: "post_only_limit".to_string(),
                                                         limit_price: limit_px,
-                                                        size: position_size_usdc / limit_px,
+                                                        size: ((cf_bank * 0.5).max(11.0)) / limit_px,
                                                         time_in_force: "GTC".to_string(),
                                                         assumed_cancel_rule: "timeout_or_reversion".to_string(),
                                                         queue_ahead_estimate: None,

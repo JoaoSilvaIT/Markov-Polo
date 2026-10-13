@@ -17,6 +17,9 @@ pub struct Config {
     pub trend_risk_fraction: f64,
     pub donchian_period: usize,
     pub chandelier_atr_mult: f64,
+    pub sizing_mode: String,
+    pub equity_fraction: f64,
+    pub max_position_size_usdc: f64,
 }
 
 impl Config {
@@ -64,7 +67,7 @@ impl Config {
         let trend_risk = env::var("HL_TREND_RISK_FRACTION")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.25);
+            .unwrap_or(1.0); // Default: 1.0 (allocate full trade bank to trend trades)
         let donchian_period = env::var("HL_DONCHIAN_PERIOD")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -73,6 +76,17 @@ impl Config {
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(2.0);
+        let sizing_mode = env::var("HL_SIZING_MODE")
+            .unwrap_or_else(|_| "dynamic".to_string())
+            .to_lowercase();
+        let equity_fraction = env::var("HL_EQUITY_FRACTION")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.25); // Default: 0.25 (1/4 of total account equity)
+        let max_size_usdc = env::var("HL_MAX_POSITION_SIZE_USDC")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(500.0);
 
         Config {
             hl_private_key: env::var("HL_PRIVATE_KEY").unwrap_or_else(|_| {
@@ -92,6 +106,9 @@ impl Config {
             trend_risk_fraction: trend_risk,
             donchian_period,
             chandelier_atr_mult: chandelier_mult,
+            sizing_mode,
+            equity_fraction,
+            max_position_size_usdc: max_size_usdc,
         }
     }
 }

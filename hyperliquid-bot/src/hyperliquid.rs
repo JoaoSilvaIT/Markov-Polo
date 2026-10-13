@@ -232,3 +232,86 @@ pub async fn get_user_position(
     }
     Ok((0.0, None))
 }
+
+/// Queries user's total account equity value in USDC from clearinghouse margin summary
+pub async fn get_account_value(
+    info: &InfoClient,
+    address: H160,
+) -> Result<f64, String> {
+    let state = info
+        .user_state(address)
+        .await
+        .map_err(|e| format!("Failed to get user state: {}", e))?;
+
+    state
+        .margin_summary
+        .account_value
+        .parse::<f64>()
+        .map_err(|e| format!("Failed to parse account_value '{}': {}", state.margin_summary.account_value, e))
+}
+
+/// Calculates dynamic order notional based on account equity, equity fraction, and safety boundaries.
+/// Guarantees:
+/// 1. Clamped to at least min_notional (Hyperliquid rule: >= 11.0 USDC)
+/// 2. Clamped to at most max_notional (safety cap: default 500.0 USDC)
+/// 3. Falls back to fallback_notional if equity is invalid or non-positive.
+pub fn calculate_dynamic_notional(
+    account_value: f64,
+    equity_fraction: f64,
+    min_notional: f64,
+    max_notional: f64,
+    fallback_notional: f64,
+) -> f64 {
+    if account_value.is_finite() && account_value > 0.0 && equity_fraction.is_finite() && equity_fraction > 0.0 {
+        let notional = account_value * equity_fraction;
+        notional.max(min_notional).min(max_notional)
+    } else {
+        fallback_notional.max(min_notional).min(max_notional)
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+
+    #[test]
+    fn test_calculate_dynamic_notional_quarter_balance() {
+        // 1/4 of $100 = $25.0
+        let notional = calculate_dynamic_notional(100.0, 0.25, 11.0, 500.0, 25.0);
+        assert!((notional - 25.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_calculate_dynamic_notional_third_balance() {
+        // 1/3 of $100 = $33.333...
+        let notional = calculate_dynamic_notional(100.0, 1.0 / 3.0, 11.0, 500.0, 25.0);
+        assert!((notional - 33.333333).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_calculate_dynamic_notional_min_clamp() {
+        // 1/4 of $30 = $7.5 -> clamped to min 11.0
+        let notional = calculate_dynamic_notional(30.0, 0.25, 11.0, 500.0, 25.0);
+        assert!((notional - 11.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_calculate_dynamic_notional_max_cap() {
+        // 1/4 of $4000 = $1000 -> clamped to max 500.0
+        let notional = calculate_dynamic_notional(4000.0, 0.25, 11.0, 500.0, 25.0);
+        assert!((notional - 500.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_calculate_dynamic_notional_fallback_on_invalid() {
+        // 0.0 or negative or NaN account value falls back safely
+        let notional_zero = calculate_dynamic_notional(0.0, 0.25, 11.0, 500.0, 25.0);
+        assert!((notional_zero - 25.0).abs() < 1e-4);
+
+        let notional_neg = calculate_dynamic_notional(-50.0, 0.25, 11.0, 500.0, 25.0);
+        assert!((notional_neg - 25.0).abs() < 1e-4);
+
+        let notional_nan = calculate_dynamic_notional(f64::NAN, 0.25, 11.0, 500.0, 25.0);
+        assert!((notional_nan - 25.0).abs() < 1e-4);
+    }
+}
