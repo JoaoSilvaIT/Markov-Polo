@@ -153,19 +153,61 @@ pub async fn place_ou_maker_entry(
         return Err(format!("Order boundary fencing assertion rejected: {}", e));
     }
 
-    // Submit Post-Only (Alo) Maker order with cloid
-    let oid = match place_post_only_order(
-        exchange,
-        symbol,
-        is_buy,
-        post_only_price,
-        amount_f,
-        false, // reduce_only = false for entry
-        Some(cloid_uuid),
-    )
-    .await
-    {
-        Ok(id) => {
+    // Submit Post-Only (Alo) Maker order with cloid (with up to 2 transit-jitter retries)
+    let mut current_price = post_only_price;
+    let mut current_amount = amount_f;
+    let mut last_err = String::new();
+    let mut oid_opt = None;
+
+    for attempt in 0..3 {
+        if attempt > 0 {
+            if let Ok((fresh_bid, fresh_ask)) = fetch_book_ticker(info, symbol).await {
+                if fresh_bid > 0.0 && fresh_ask > fresh_bid {
+                    let fresh_raw = if is_buy {
+                        f64::min(fresh_bid, entry_price)
+                    } else {
+                        f64::max(fresh_ask, entry_price)
+                    };
+                    current_price = quantize_price(fresh_raw, sz_decimals);
+                    let raw_amt = position_size_usdc / current_price;
+                    current_amount = round_to_decimals(raw_amt, sz_decimals);
+                    order_intent.limit_px = current_price;
+                    order_intent.sz = current_amount;
+                    let _ = save_order_intent_atomic(&order_intent);
+                }
+            }
+        }
+
+        match place_post_only_order(
+            exchange,
+            symbol,
+            is_buy,
+            current_price,
+            current_amount,
+            false, // reduce_only = false for entry
+            Some(cloid_uuid),
+        )
+        .await
+        {
+            Ok(id) => {
+                oid_opt = Some(id);
+                break;
+            }
+            Err(e) => {
+                if e.contains("Post only order would have immediately matched") && attempt < 2 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    last_err = e;
+                    continue;
+                } else {
+                    last_err = e;
+                    break;
+                }
+            }
+        }
+    }
+
+    let oid = match oid_opt {
+        Some(id) => {
             // Persist order_id into intent WAL
             order_intent.exchange_order_id = Some(id);
             order_intent.status = OrderIntentStatus::Submitted;
@@ -173,12 +215,12 @@ pub async fn place_ou_maker_entry(
             let _ = save_order_intent_atomic(&order_intent);
             id
         }
-        Err(e) => {
+        None => {
             order_intent.status = OrderIntentStatus::Aborted;
             let _ = save_order_intent_atomic(&order_intent);
             clear_order_intent(symbol);
             let _ = release_cluster_lease_authenticated(symbol, Some(&lease_uuid), Some(fencing_token));
-            return Err(e);
+            return Err(last_err);
         }
     };
 
@@ -187,8 +229,8 @@ pub async fn place_ou_maker_entry(
         side: side.to_string(),
         order_id: oid.to_string(),
         tp_order_id: "".to_string(), // Populated when entry fills and TP is placed
-        entry_price: post_only_price,
-        amount: amount_f,
+        entry_price: current_price,
+        amount: current_amount,
         stop_loss_price,
         take_profit_price: target_tp_quantized,
         opened_at: Utc::now().to_rfc3339(),
@@ -337,30 +379,69 @@ pub async fn place_trend_breakout_entry(
         return Err(format!("Order boundary fencing assertion rejected: {}", e));
     }
 
-    let oid = match place_post_only_order(
-        exchange,
-        symbol,
-        is_buy,
-        post_only_price,
-        amount_f,
-        false,
-        Some(cloid_uuid),
-    )
-    .await
-    {
-        Ok(id) => {
+    // Submit Post-Only (Alo) Maker order with cloid (with up to 2 transit-jitter retries)
+    let mut current_price = post_only_price;
+    let mut current_amount = amount_f;
+    let mut last_err = String::new();
+    let mut oid_opt = None;
+
+    for attempt in 0..3 {
+        if attempt > 0 {
+            if let Ok((fresh_bid, fresh_ask)) = fetch_book_ticker(info, symbol).await {
+                if fresh_bid > 0.0 && fresh_ask > fresh_bid {
+                    let fresh_raw = if is_buy { fresh_bid } else { fresh_ask };
+                    current_price = quantize_price(fresh_raw, sz_decimals);
+                    let raw_amt = position_size_usdc / current_price;
+                    current_amount = round_to_decimals(raw_amt, sz_decimals);
+                    order_intent.limit_px = current_price;
+                    order_intent.sz = current_amount;
+                    let _ = save_order_intent_atomic(&order_intent);
+                }
+            }
+        }
+
+        match place_post_only_order(
+            exchange,
+            symbol,
+            is_buy,
+            current_price,
+            current_amount,
+            false,
+            Some(cloid_uuid),
+        )
+        .await
+        {
+            Ok(id) => {
+                oid_opt = Some(id);
+                break;
+            }
+            Err(e) => {
+                if e.contains("Post only order would have immediately matched") && attempt < 2 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    last_err = e;
+                    continue;
+                } else {
+                    last_err = e;
+                    break;
+                }
+            }
+        }
+    }
+
+    let oid = match oid_opt {
+        Some(id) => {
             order_intent.exchange_order_id = Some(id);
             order_intent.status = OrderIntentStatus::Submitted;
             order_intent.updated_at_ms = Utc::now().timestamp_millis() as u64;
             let _ = save_order_intent_atomic(&order_intent);
             id
         }
-        Err(e) => {
+        None => {
             order_intent.status = OrderIntentStatus::Aborted;
             let _ = save_order_intent_atomic(&order_intent);
             clear_order_intent(symbol);
             let _ = release_cluster_lease_authenticated(symbol, Some(&lease_uuid), Some(fencing_token));
-            return Err(e);
+            return Err(last_err);
         }
     };
 
@@ -369,8 +450,8 @@ pub async fn place_trend_breakout_entry(
         side: side.to_string(),
         order_id: oid.to_string(),
         tp_order_id: "".to_string(),
-        entry_price: post_only_price,
-        amount: amount_f,
+        entry_price: current_price,
+        amount: current_amount,
         stop_loss_price,
         take_profit_price: 0.0,
         opened_at: Utc::now().to_rfc3339(),

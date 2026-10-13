@@ -2887,10 +2887,8 @@ async fn main() {
                                                     symbol_clone, armed_state.extreme_price, close_price, net_edge_bps, armed_state.tier, trade_size_usdc
                                                 );
                                                 let frozen_hl = armed_state.half_life_m;
-                                                armed_state.is_armed = false;
-                                                save_armed_signal(&arm_path_clone, &armed_state);
 
-                                                if let Err(e) = place_ou_maker_entry(
+                                                match place_ou_maker_entry(
                                                     &state_path_clone,
                                                     &exchange_clone,
                                                     &info_clone,
@@ -2906,8 +2904,14 @@ async fn main() {
                                                 )
                                                 .await
                                                 {
-                                                    funnel_counters.engine_a_orders_rejected += 1;
-                                                    eprintln!("❌ [ORDER ERROR] Long maker entry failed: {}", e);
+                                                    Ok(_) => {
+                                                        armed_state.is_armed = false;
+                                                        save_armed_signal(&arm_path_clone, &armed_state);
+                                                    }
+                                                    Err(e) => {
+                                                        funnel_counters.engine_a_orders_rejected += 1;
+                                                        eprintln!("❌ [ORDER ERROR] Long maker entry failed: {}. Signal remains armed for next tick.", e);
+                                                    }
                                                 }
                                             }
                                         }
@@ -2991,10 +2995,8 @@ async fn main() {
                                                     symbol_clone, armed_state.extreme_price, close_price, net_edge_bps, armed_state.tier, trade_size_usdc
                                                 );
                                                 let frozen_hl = armed_state.half_life_m;
-                                                armed_state.is_armed = false;
-                                                save_armed_signal(&arm_path_clone, &armed_state);
 
-                                                if let Err(e) = place_ou_maker_entry(
+                                                match place_ou_maker_entry(
                                                     &state_path_clone,
                                                     &exchange_clone,
                                                     &info_clone,
@@ -3010,8 +3012,14 @@ async fn main() {
                                                 )
                                                 .await
                                                 {
-                                                    funnel_counters.engine_a_orders_rejected += 1;
-                                                    eprintln!("❌ [ORDER ERROR] Short maker entry failed: {}", e);
+                                                    Ok(_) => {
+                                                        armed_state.is_armed = false;
+                                                        save_armed_signal(&arm_path_clone, &armed_state);
+                                                    }
+                                                    Err(e) => {
+                                                        funnel_counters.engine_a_orders_rejected += 1;
+                                                        eprintln!("❌ [ORDER ERROR] Short maker entry failed: {}. Signal remains armed for next tick.", e);
+                                                    }
                                                 }
                                             }
                                         }
