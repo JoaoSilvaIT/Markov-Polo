@@ -777,7 +777,7 @@ impl ChandelierExitState {
 }
 
 fn default_chandelier_mult() -> f64 {
-    3.0
+    2.0
 }
 
 /// Shadow Trading Record for Paper-Execution Validation
@@ -1262,7 +1262,8 @@ mod tests {
     }
 
     #[test]
-    fn test_chandelier_probability_compression() {
+    fn test_chandelier_probability_compression_legacy_3x() {
+        // Legacy test validating linear contraction when initialized with base multiplier = 3.0x
         let mut chandelier = ChandelierExitState::new(Side::Long, 100.0, 2.0, 3.0);
         chandelier.update(110.0, 105.0, 2.0, 0.90);
         assert_eq!(chandelier.current_stop, 104.0);

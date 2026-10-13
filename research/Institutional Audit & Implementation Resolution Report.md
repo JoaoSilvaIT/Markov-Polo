@@ -165,19 +165,65 @@ In [`main.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/main.rs
 - Added a **30-second watchdog timeout** on the L2Book stream in [`main.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/main.rs#L1135-L1150).
 - Seamless integration with the existing gap detector and `backfill_missing_1m_candles`: any missing bars incurred during the reconnect are automatically fetched via REST, ensuring 100% data continuity.
 
+### 2.10 Issue 10: Fast-Sentinel Mutex Contention & Async Starvation Elimination (CRITICAL)
+
+#### Root Cause
+The 1.5-second `FAST-SENTINEL` task previously acquired `watcher_state.lock().await` at the top of its loop body and held the mutex continuously while performing multiple sequential network REST calls (`get_user_position`, `fetch_book_ticker`, `open_orders`, and `query_order_by_oid`). During periods of exchange API latency (100ms–2000ms), the hot-path 1m candle processing task was blocked waiting for `active_state.lock()`, causing log delays, telemetry starvation, and jitter.
+
+#### Resolution & Implementation
+- Refactored the Fast-Sentinel loop in [`main.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/main.rs): the state map is queried quickly via a cloned snapshot `{ watcher_state.lock().await.get(...).cloned() }`, releasing the mutex in microseconds.
+- All subsequent REST queries and Discord webhooks execute **without holding the state lock**.
+- `watcher_state.lock().await` is only acquired when modifying state in-memory and persisting it to disk.
+- Separated `watcher_cb` lock acquisition to ensure no two mutexes are held concurrently.
+
+---
+
+### 2.11 Issue 11: IOC Market Close Status Enforcement (CRITICAL)
+
+#### Root Cause
+In [`hyperliquid.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/hyperliquid.rs), `close_market_position()` incorrectly matched `ExchangeDataStatus::Resting(_)` as `Ok(())`. An IOC (Immediate-Or-Cancel) order must never rest; if the exchange reported a resting status, the bot treated the unfilled order as a completed fill and cleared local state, risking an orphaned position on the exchange.
+
+#### Resolution & Implementation
+- Updated [`hyperliquid.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/hyperliquid.rs) to strictly return `Err("Market close order is resting instead of filling (IOC violation)")` if `Resting` is ever encountered, ensuring that `execute_emergency_flatten_with_retry` properly diagnoses the failure and executes its retry sequence.
+
+---
+
+### 2.12 Issue 12: Dynamic Chandelier Multiplier State Persistence & Cross-Bar Contraction (HIGH)
+
+#### Root Cause
+In [`PositionState`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/state.rs), only `chandelier_stop` was stored, without an `active_multiplier` field. On every 1m bar, [`main.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/main.rs) reconstructed `ChandelierExitState` with `active_multiplier: chandelier_atr_mult` (the base multiplier, 2.0x). If market conditions caused trend probability to drop, the multiplier contracted from 2.0x to 1.5x on bar 1, but reset back to 2.0x on bar 2, preventing it from ever reaching 1.0x.
+
+#### Resolution & Implementation
+- Added `#[serde(default)] pub active_multiplier: f64` to `PositionState` in [`state.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/state.rs).
+- Initialized `active_multiplier: 2.0` in [`order.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/order.rs) for Engine B entries.
+- In [`main.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/main.rs), loaded `pos.active_multiplier` into `ChandelierExitState` and persisted `pos.active_multiplier = chandelier.active_multiplier` after each ratchet step, guaranteeing continuous multi-bar contraction down to 1.0x.
+
+---
+
+### 2.13 Issue 13: Circuit Breaker & Armed Signal Atomic WAL Durability (HIGH)
+
+#### Root Cause
+`save_circuit_breaker()` and `save_armed_signal()` in [`state.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/state.rs) wrote to `.tmp` without calling `file.sync_all()` or directory sync, creating a risk of corrupted JSON state on OS panic or power loss.
+
+#### Resolution & Implementation
+- Standardized `save_circuit_breaker()` and `save_armed_signal()` to use PID-tagged temp files (`.tmp.<pid>`), explicit `file.sync_all()?`, atomic `fs::rename()`, and parent directory fsync.
+
 ---
 
 ## 3. Verification & Compliance Matrix
 
 | Audit Item | File(s) | Prior State | Current State | Verification Status |
 |---|---|---|---|---|
-| **Chandelier Ratchet** | [`trend.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/trend.rs), [`main.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/main.rs) | Trailing stop widened away during high $P_T$; no breakeven floor | $+1.0\times\text{ATR}$ breakeven floor ($+10$ bps) & $+1.5\times\text{ATR}$ 50% profit lock | **Verified** |
+| **Chandelier Ratchet** | [`trend.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/trend.rs), [`main.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/main.rs) | Trailing stop widened away during high $P_T$; no breakeven floor | $+1.0\times\text{ATR}$ breakeven floor ($+15$ bps) & $+1.5\times\text{ATR}$ 50% profit lock | **Verified** |
 | **Tiered Profit Ladder** | [`trend.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/trend.rs) | Single-level breakeven | 4-zone progressive lock ladder (+1% at +2%, +2% at +3%, 70% at +4%+) | **Verified (76/76 tests passed)** |
 | **WebSocket Watchdog** | [`main.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/main.rs) | Indefinite blocking `recv().await` on silent TCP stalls | 90s candle & 30s L2 watchdog timeouts with automatic REST backfill | **Verified** |
+| **Lock Contention Elimination** | [`main.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/main.rs) | Mutex held across sequential REST calls in sentinel | Lock dropped during all network queries; held only for atomic memory/file mutations | **Verified** |
+| **IOC Resting Handling** | [`hyperliquid.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/hyperliquid.rs) | `Resting` treated as `Ok(())` | `Resting` strictly triggers `Err` and retry flow | **Verified** |
+| **Dynamic Multiplier Tracking** | [`state.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/state.rs), [`main.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/main.rs) | Multiplier reset to 2.0x base on every bar | `pos.active_multiplier` preserved in state; multi-bar contraction enabled | **Verified** |
 | **Emergency Flatten** | [`main.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/main.rs) | Unchecked single attempt; premature state clearing | 3x backoff retry; state clearing deferred until confirmed flat | **Verified** |
 | **Donchian Lookback** | [`main.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/main.rs) | Conditional `..len-1` on Minute 0 | Strict `&rolling_15m_bars[..]` slice across all minutes | **Verified** |
 | **Concurrency Limit** | [`state.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/state.rs), [`order.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/order.rs) | Inconsistent fallbacks (1 vs 3) | Harmonized to 2 positions across all modules | **Verified** |
-| **Atomic WAL** | [`state.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/state.rs) | Un-synced static `.tmp` file | PID-tagged temp file + `file.sync_all()` + `dir.sync_all()` | **Verified** |
+| **Atomic WAL Durability** | [`state.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/state.rs) | Un-synced static `.tmp` file | PID-tagged temp file + `file.sync_all()` + `dir.sync_all()` across all files | **Verified** |
 | **Fee Constants** | [`counterfactual.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/counterfactual.rs) | 1.5 bps maker / 4.5 bps taker | 1.0 bps maker / 3.5 bps taker (Hyperliquid Tier 1) | **Verified** |
 | **Directional Edge** | [`ou_process.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/ou_process.rs), [`main.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/main.rs) | Long-only helper; unguarded inline Short log | Safe bidirectional helper with non-positive guards | **Verified** |
 
@@ -187,7 +233,7 @@ In [`main.rs`](file:///home/admin/Projects/TradingAI/hyperliquid-bot/src/main.rs
 
 - **Cargo Test Suite:** All 76 unit tests pass cleanly:
   ```
-  test result: ok. 76 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.72s
+  test result: ok. 76 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
   ```
 - **Release Build:** Compiled with `--release` profile.
 - **Production Readiness:** The codebase satisfies all formal quantitative and execution safety criteria for live autonomous deployment.

@@ -593,6 +593,7 @@ async fn main() {
                         candidate_lower_count: 0,
                         engine_type: "EngineA".to_string(),
                         chandelier_stop: 0.0,
+                        active_multiplier: 0.0,
                         current_atr: 0.0,
                         lease_fencing_token: fencing_tok,
                         lease_owner_uuid: lease_uuid,
@@ -650,6 +651,7 @@ async fn main() {
                                 candidate_lower_count: 0,
                                 engine_type: intent.engine_type.clone(),
                                 chandelier_stop: 0.0,
+                                active_multiplier: 0.0,
                                 current_atr: 0.0,
                                 lease_fencing_token: intent.fencing_token,
                                 lease_owner_uuid: intent.owner_uuid.clone(),
@@ -739,48 +741,59 @@ async fn main() {
         loop {
             interval.tick().await;
 
-            let mut state_lock = watcher_state.lock().await;
-            if let Some(pos) = state_lock.get(&watcher_symbol).cloned() {
-                // Cross-reference user position on live exchange (Fail-Closed)
-                let (current_szi, _) = match get_user_position(&watcher_info, user_address, &watcher_symbol).await {
-                    Ok(res) => res,
-                    Err(e) => {
-                        eprintln!(
-                            "⚠️ [FAST-SENTINEL] API failure fetching position for {}: {}. Retaining state (fail-closed).",
-                            watcher_symbol, e
+            // 1. Snapshot state quickly without holding lock during network calls
+            let pos_opt = {
+                let state_lock = watcher_state.lock().await;
+                state_lock.get(&watcher_symbol).cloned()
+            };
+
+            let pos = match pos_opt {
+                Some(p) => p,
+                None => continue,
+            };
+
+            // Cross-reference user position on live exchange (Fail-Closed)
+            let (current_szi, _) = match get_user_position(&watcher_info, user_address, &watcher_symbol).await {
+                Ok(res) => res,
+                Err(e) => {
+                    eprintln!(
+                        "⚠️ [FAST-SENTINEL] API failure fetching position for {}: {}. Retaining state (fail-closed).",
+                        watcher_symbol, e
+                    );
+                    continue;
+                }
+            };
+            let pos_exists = if pos.side == "LONG" {
+                current_szi > 0.0
+            } else {
+                current_szi < 0.0
+            };
+
+            // -------------------------------------------------------------
+            // Defense Layer 1: Live Order Book Catastrophe Stop Loss (1.5s Sentinel)
+            // -------------------------------------------------------------
+            if (pos.is_filled || pos_exists) && pos.stop_loss_price > 0.0 {
+                if let Ok((best_bid, best_ask)) = fetch_book_ticker(&watcher_info, &watcher_symbol).await {
+                    let is_breached = if pos.side == "LONG" {
+                        best_bid > 0.0 && best_bid <= pos.stop_loss_price
+                    } else {
+                        best_ask > 0.0 && best_ask >= pos.stop_loss_price
+                    };
+
+                    if is_breached {
+                        let breach_px = if pos.side == "LONG" { best_bid } else { best_ask };
+                        println!(
+                            "🛑 [FAST-SENTINEL 1.5s STOP LOSS] {} breached catastrophe stop at ${:.2} (Current: ${:.2})! Emergency flattening...",
+                            watcher_symbol, pos.stop_loss_price, breach_px
                         );
-                        continue;
-                    }
-                };
-                let pos_exists = if pos.side == "LONG" {
-                    current_szi > 0.0
-                } else {
-                    current_szi < 0.0
-                };
+                        let stop_msg = format!(
+                            "🛑 **CATASTROPHE STOP LOSS HIT (1.5s FAST-SENTINEL):** {}\n**Side:** {}\n**Breach Price:** ${:.2}\n**Hard Stop:** ${:.2}\nEmergency flattening immediately.",
+                            watcher_symbol, pos.side, breach_px, pos.stop_loss_price
+                        );
+                        crate::discord::send_alert(watcher_discord.as_deref(), &stop_msg).await;
 
-                // -------------------------------------------------------------
-                // Defense Layer 1: Live Order Book Catastrophe Stop Loss (1.5s Sentinel)
-                // -------------------------------------------------------------
-                if (pos.is_filled || pos_exists) && pos.stop_loss_price > 0.0 {
-                    if let Ok((best_bid, best_ask)) = fetch_book_ticker(&watcher_info, &watcher_symbol).await {
-                        let is_breached = if pos.side == "LONG" {
-                            best_bid > 0.0 && best_bid <= pos.stop_loss_price
-                        } else {
-                            best_ask > 0.0 && best_ask >= pos.stop_loss_price
-                        };
-
-                        if is_breached {
-                            let breach_px = if pos.side == "LONG" { best_bid } else { best_ask };
-                            println!(
-                                "🛑 [FAST-SENTINEL 1.5s STOP LOSS] {} breached catastrophe stop at ${:.2} (Current: ${:.2})! Emergency flattening...",
-                                watcher_symbol, pos.stop_loss_price, breach_px
-                            );
-                            let stop_msg = format!(
-                                "🛑 **CATASTROPHE STOP LOSS HIT (1.5s FAST-SENTINEL):** {}\n**Side:** {}\n**Breach Price:** ${:.2}\n**Hard Stop:** ${:.2}\nEmergency flattening immediately.",
-                                watcher_symbol, pos.side, breach_px, pos.stop_loss_price
-                            );
-                            crate::discord::send_alert(watcher_discord.as_deref(), &stop_msg).await;
-
+                        {
+                            let mut state_lock = watcher_state.lock().await;
                             let _ = execute_emergency_flatten_with_retry(
                                 &watcher_state_path,
                                 &watcher_exchange,
@@ -791,76 +804,79 @@ async fn main() {
                                 watcher_discord.clone(),
                             )
                             .await;
+                        }
 
-                            let mut cb_lock = watcher_cb.lock().await;
-                            cb_lock.record_loss();
-                            save_circuit_breaker(&watcher_cb_path, &cb_lock);
-                            continue;
+                        let mut cb_lock = watcher_cb.lock().await;
+                        cb_lock.record_loss();
+                        save_circuit_breaker(&watcher_cb_path, &cb_lock);
+                        continue;
+                    }
+                }
+            }
+
+            // -------------------------------------------------------------
+            // Scenario 1: Entry order pending or position open without resting TP
+            // -------------------------------------------------------------
+            if pos.tp_order_id.is_empty() {
+                let mut is_filled = pos_exists || pos.is_filled;
+                let mut is_truly_dead = false;
+                let mut reported_status = "UNKNOWN".to_string();
+
+                if !pos.order_id.is_empty() {
+                    if let Ok(oid) = pos.order_id.parse::<u64>() {
+                        let open_orders = match watcher_info.open_orders(user_address).await {
+                            Ok(o) => o,
+                            Err(e) => {
+                                eprintln!(
+                                    "⚠️ [FAST-SENTINEL] API failure querying open_orders for {}: {}. Retaining state (fail-closed).",
+                                    watcher_symbol, e
+                                );
+                                continue;
+                            }
+                        };
+                        let is_resting = open_orders.iter().any(|o| o.oid == oid);
+
+                        if is_resting {
+                            // Order is physically resting on matching engine
+                        } else if !pos_exists {
+                            let order_age_secs = if let Ok(opened_dt) = chrono::DateTime::parse_from_rfc3339(&pos.opened_at) {
+                                (chrono::Utc::now() - opened_dt.with_timezone(&chrono::Utc)).num_seconds()
+                            } else {
+                                10
+                            };
+
+                            if let Ok(order_status) = watcher_info.query_order_by_oid(user_address, oid).await {
+                                reported_status = if let Some(ref o) = order_status.order {
+                                    o.status.to_uppercase()
+                                } else {
+                                    order_status.status.to_uppercase()
+                                };
+
+                                if reported_status == "FILLED" {
+                                    is_filled = true;
+                                } else if reported_status == "CANCELED"
+                                    || reported_status == "REJECTED"
+                                    || reported_status == "MARGINCANCELED"
+                                {
+                                    is_truly_dead = true;
+                                } else if reported_status == "UNKNOWNOID" && order_age_secs >= 5 {
+                                    is_truly_dead = true;
+                                }
+                            } else if order_age_secs >= 15 {
+                                    is_truly_dead = true;
+                            }
                         }
                     }
                 }
 
-                // -------------------------------------------------------------
-                // Scenario 1: Entry order pending or position open without resting TP
-                // -------------------------------------------------------------
-                if pos.tp_order_id.is_empty() {
-                    let mut is_filled = pos_exists || pos.is_filled;
-                    let mut is_truly_dead = false;
-                    let mut reported_status = "UNKNOWN".to_string();
-
-                    if !pos.order_id.is_empty() {
-                        if let Ok(oid) = pos.order_id.parse::<u64>() {
-                            let open_orders = match watcher_info.open_orders(user_address).await {
-                                Ok(o) => o,
-                                Err(e) => {
-                                    eprintln!(
-                                        "⚠️ [FAST-SENTINEL] API failure querying open_orders for {}: {}. Retaining state (fail-closed).",
-                                        watcher_symbol, e
-                                    );
-                                    continue;
-                                }
-                            };
-                            let is_resting = open_orders.iter().any(|o| o.oid == oid);
-
-                            if is_resting {
-                                // Order is physically resting on matching engine
-                            } else if !pos_exists {
-                                let order_age_secs = if let Ok(opened_dt) = chrono::DateTime::parse_from_rfc3339(&pos.opened_at) {
-                                    (chrono::Utc::now() - opened_dt.with_timezone(&chrono::Utc)).num_seconds()
-                                } else {
-                                    10
-                                };
-
-                                if let Ok(order_status) = watcher_info.query_order_by_oid(user_address, oid).await {
-                                    reported_status = if let Some(ref o) = order_status.order {
-                                        o.status.to_uppercase()
-                                    } else {
-                                        order_status.status.to_uppercase()
-                                    };
-
-                                    if reported_status == "FILLED" {
-                                        is_filled = true;
-                                    } else if reported_status == "CANCELED"
-                                        || reported_status == "REJECTED"
-                                        || reported_status == "MARGINCANCELED"
-                                    {
-                                        is_truly_dead = true;
-                                    } else if reported_status == "UNKNOWNOID" && order_age_secs >= 5 {
-                                        is_truly_dead = true;
-                                    }
-                                } else if order_age_secs >= 15 {
-                                    is_truly_dead = true;
-                                }
-                            }
-                        }
-                    }
-
-                    if is_filled && pos.engine_type == "EngineB" && !pos.is_filled {
-                        println!(
-                            "🟢 [FAST-SENTINEL] Engine B Position Active for {} (Side: {})!",
-                            watcher_symbol, pos.side
-                        );
-                        let (side_str, entry_px, stop_px, amt) = if let Some(p) = state_lock.get_mut(&watcher_symbol) {
+                if is_filled && pos.engine_type == "EngineB" && !pos.is_filled {
+                    println!(
+                        "🟢 [FAST-SENTINEL] Engine B Position Active for {} (Side: {})!",
+                        watcher_symbol, pos.side
+                    );
+                    let (side_str, entry_px, stop_px, amt) = {
+                        let mut state_lock = watcher_state.lock().await;
+                        let res = if let Some(p) = state_lock.get_mut(&watcher_symbol) {
                             p.is_filled = true;
                             p.opened_at = chrono::Utc::now().to_rfc3339();
                             (p.side.clone(), p.entry_price, p.chandelier_stop, p.amount)
@@ -868,151 +884,159 @@ async fn main() {
                             (pos.side.clone(), pos.entry_price, pos.chandelier_stop, pos.amount)
                         };
                         let _ = save_state(&watcher_state_path, &state_lock);
-                        let msg = format!(
-                            "🟢 **ENGINE B BREAKOUT ENTRY FILLED (HYPERLIQUID):** {}\n**Side:** {}\n**Entry:** ${:.2}\n**Initial Stop:** ${:.2}\n**Size:** {:.5}",
-                            watcher_symbol, side_str, entry_px, stop_px, amt
-                        );
-                        crate::discord::send_alert(watcher_discord.as_deref(), &msg).await;
-                    } else if is_filled && pos.take_profit_price > 0.0 {
-                        println!(
-                            "🟢 [FAST-SENTINEL] Position Active for {} (Side: {})! Placing Take Profit Limit order at ${:.2}",
-                            watcher_symbol, pos.side, pos.take_profit_price
-                        );
+                        res
+                    };
+                    let msg = format!(
+                        "🟢 **ENGINE B BREAKOUT ENTRY FILLED (HYPERLIQUID):** {}\n**Side:** {}\n**Entry:** ${:.2}\n**Initial Stop:** ${:.2}\n**Size:** {:.5}",
+                        watcher_symbol, side_str, entry_px, stop_px, amt
+                    );
+                    crate::discord::send_alert(watcher_discord.as_deref(), &msg).await;
+                } else if is_filled && pos.take_profit_price > 0.0 {
+                    println!(
+                        "🟢 [FAST-SENTINEL] Position Active for {} (Side: {})! Placing Take Profit Limit order at ${:.2}",
+                        watcher_symbol, pos.side, pos.take_profit_price
+                    );
 
-                        // Long position -> TP Sell (is_buy = false, reduce_only = true)
-                        // Short position -> TP Buy (is_buy = true, reduce_only = true)
-                        let tp_is_buy = pos.side == "SHORT";
-                        let tp_price = quantize_price(pos.take_profit_price, watcher_sz_decimals);
-                        let tp_amount = if current_szi.abs() > 0.0 { current_szi.abs() } else { pos.amount };
+                    // Long position -> TP Sell (is_buy = false, reduce_only = true)
+                    // Short position -> TP Buy (is_buy = true, reduce_only = true)
+                    let tp_is_buy = pos.side == "SHORT";
+                    let tp_price = quantize_price(pos.take_profit_price, watcher_sz_decimals);
+                    let tp_amount = if current_szi.abs() > 0.0 { current_szi.abs() } else { pos.amount };
 
-                        if let Err(e) = crate::state::assert_current_lease(&watcher_symbol, &pos.lease_owner_uuid, pos.lease_fencing_token) {
-                            eprintln!("❌ [FAST-SENTINEL] TP order boundary fencing assertion failed for {}: {}", watcher_symbol, e);
-                            continue;
-                        }
+                    if let Err(e) = crate::state::assert_current_lease(&watcher_symbol, &pos.lease_owner_uuid, pos.lease_fencing_token) {
+                        eprintln!("❌ [FAST-SENTINEL] TP order boundary fencing assertion failed for {}: {}", watcher_symbol, e);
+                        continue;
+                    }
 
-                        let tp_cloid = uuid::Uuid::new_v4();
-                        match place_post_only_order(
-                            &watcher_exchange,
-                            &watcher_symbol,
-                            tp_is_buy,
-                            tp_price,
-                            tp_amount,
-                            true, // reduce_only = true (routes as Gtc in hyperliquid.rs)
-                            Some(tp_cloid),
-                        )
-                        .await
-                        {
-                            Ok(tp_oid) => {
+                    let tp_cloid = uuid::Uuid::new_v4();
+                    match place_post_only_order(
+                        &watcher_exchange,
+                        &watcher_symbol,
+                        tp_is_buy,
+                        tp_price,
+                        tp_amount,
+                        true, // reduce_only = true (routes as Gtc in hyperliquid.rs)
+                        Some(tp_cloid),
+                    )
+                    .await
+                    {
+                        Ok(tp_oid) => {
+                            {
+                                let mut state_lock = watcher_state.lock().await;
                                 if let Some(p) = state_lock.get_mut(&watcher_symbol) {
                                     p.tp_order_id = tp_oid.to_string();
                                     p.is_filled = true;
                                     p.opened_at = chrono::Utc::now().to_rfc3339();
                                     let _ = save_state(&watcher_state_path, &state_lock);
-                                    let msg = format!(
-                                        "🟢 **TAKE PROFIT PLACED (HYPERLIQUID):** {}\n**Side:** {} TP\n**Target:** ${:.2}\n**Size:** {:.5}",
-                                        watcher_symbol, pos.side, tp_price, tp_amount
-                                    );
-                                    crate::discord::send_alert(watcher_discord.as_deref(), &msg).await;
                                 }
                             }
-                            Err(e) => {
-                                eprintln!(
-                                    "❌ [FAST-SENTINEL] Failed to place TP for {}: {}",
-                                    watcher_symbol, e
-                                );
-                            }
+                            let msg = format!(
+                                "🟢 **TAKE PROFIT PLACED (HYPERLIQUID):** {}\n**Side:** {} TP\n**Target:** ${:.2}\n**Size:** {:.5}",
+                                watcher_symbol, pos.side, tp_price, tp_amount
+                            );
+                            crate::discord::send_alert(watcher_discord.as_deref(), &msg).await;
                         }
-                    } else if is_truly_dead && !pos.order_id.is_empty() {
-                        if let Ok(oid) = pos.order_id.parse::<u64>() {
-                            let _ = cancel_order(&watcher_exchange, &watcher_symbol, oid).await;
+                        Err(e) => {
+                            eprintln!(
+                                "❌ [FAST-SENTINEL] Failed to place TP for {}: {}",
+                                watcher_symbol, e
+                            );
+                        }
+                    }
+                } else if is_truly_dead && !pos.order_id.is_empty() {
+                    if let Ok(oid) = pos.order_id.parse::<u64>() {
+                        let _ = cancel_order(&watcher_exchange, &watcher_symbol, oid).await;
+                    }
+
+                    // Reconcile open orders and position before cleaning up state
+                    let eps = 1e-5;
+                    let verify_orders = match watcher_info.open_orders(user_address).await {
+                        Ok(orders) => orders,
+                        Err(e) => {
+                            eprintln!(
+                                "⚠️ [FAST-SENTINEL] Failed to verify open_orders before cleanup for {}: {}. Retaining state.",
+                                watcher_symbol, e
+                            );
+                            continue;
+                        }
+                    };
+                    let entry_oid_num = pos.order_id.parse::<u64>().unwrap_or(0);
+                    let is_still_resting = verify_orders.iter().any(|o| o.oid == entry_oid_num);
+
+                    if current_szi.abs() <= eps && !is_still_resting {
+                        let mut state_lock = watcher_state.lock().await;
+                        // Defensive sequence step 1: CloseConfirmed
+                        if let Some(p) = state_lock.get_mut(&watcher_symbol) {
+                            p.lifecycle = crate::state::PositionLifecycle::CloseConfirmed;
+                        }
+                        let _ = save_state(&watcher_state_path, &state_lock);
+
+                        let released = crate::state::release_cluster_lease_authenticated(
+                            &watcher_symbol,
+                            Some(&pos.lease_owner_uuid),
+                            Some(pos.lease_fencing_token),
+                        );
+                        if !released {
+                            eprintln!(
+                                "⚠️ [FAST-SENTINEL] Lease release authentication failed for {}. Retaining state.",
+                                watcher_symbol
+                            );
+                            continue;
                         }
 
-                        // Reconcile open orders and position before cleaning up state
-                        let eps = 1e-5;
-                        let verify_orders = match watcher_info.open_orders(user_address).await {
-                            Ok(orders) => orders,
-                            Err(e) => {
-                                eprintln!(
-                                    "⚠️ [FAST-SENTINEL] Failed to verify open_orders before cleanup for {}: {}. Retaining state.",
-                                    watcher_symbol, e
-                                );
-                                continue;
-                            }
+                        // Defensive sequence step 2: LeaseReleased
+                        if let Some(p) = state_lock.get_mut(&watcher_symbol) {
+                            p.lifecycle = crate::state::PositionLifecycle::LeaseReleased;
+                        }
+                        let _ = save_state(&watcher_state_path, &state_lock);
+
+                        println!(
+                            "⚪ [FAST-SENTINEL] Entry for {} dead (status: {}). Position flat, lease released, clearing state.",
+                            watcher_symbol, reported_status
+                        );
+                        state_lock.remove(&watcher_symbol);
+                        let _ = save_state(&watcher_state_path, &state_lock);
+                    }
+                }
+            }
+            // -------------------------------------------------------------
+            // Scenario 2: TP order resting on book. Check if filled or position closed
+            // -------------------------------------------------------------
+            else if !pos.tp_order_id.is_empty() {
+                let eps = 1e-5;
+                let is_flat = current_szi.abs() <= eps;
+                let mut is_tp_filled = false;
+
+                if let Ok(tp_oid) = pos.tp_order_id.parse::<u64>() {
+                    if let Ok(order_status) = watcher_info.query_order_by_oid(user_address, tp_oid).await {
+                        let inner_status = if let Some(ref o) = order_status.order {
+                            o.status.to_uppercase()
+                        } else {
+                            order_status.status.to_uppercase()
                         };
-                        let entry_oid_num = pos.order_id.parse::<u64>().unwrap_or(0);
-                        let is_still_resting = verify_orders.iter().any(|o| o.oid == entry_oid_num);
 
-                        if current_szi.abs() <= eps && !is_still_resting {
-                            // Defensive sequence step 1: CloseConfirmed
-                            if let Some(p) = state_lock.get_mut(&watcher_symbol) {
-                                p.lifecycle = crate::state::PositionLifecycle::CloseConfirmed;
-                            }
-                            let _ = save_state(&watcher_state_path, &state_lock);
-
-                            let released = crate::state::release_cluster_lease_authenticated(
-                                &watcher_symbol,
-                                Some(&pos.lease_owner_uuid),
-                                Some(pos.lease_fencing_token),
-                            );
-                            if !released {
-                                eprintln!(
-                                    "⚠️ [FAST-SENTINEL] Lease release authentication failed for {}. Retaining state.",
-                                    watcher_symbol
-                                );
-                                continue;
-                            }
-
-                            // Defensive sequence step 2: LeaseReleased
-                            if let Some(p) = state_lock.get_mut(&watcher_symbol) {
-                                p.lifecycle = crate::state::PositionLifecycle::LeaseReleased;
-                            }
-                            let _ = save_state(&watcher_state_path, &state_lock);
-
-                            println!(
-                                "⚪ [FAST-SENTINEL] Entry for {} dead (status: {}). Position flat, lease released, clearing state.",
-                                watcher_symbol, reported_status
-                            );
-                            state_lock.remove(&watcher_symbol);
-                            let _ = save_state(&watcher_state_path, &state_lock);
+                        if inner_status == "FILLED" {
+                            is_tp_filled = true;
                         }
                     }
                 }
-                // -------------------------------------------------------------
-                // Scenario 2: TP order resting on book. Check if filled or position closed
-                // -------------------------------------------------------------
-                else if !pos.tp_order_id.is_empty() {
-                    let eps = 1e-5;
-                    let is_flat = current_szi.abs() <= eps;
-                    let mut is_tp_filled = false;
 
-                    if let Ok(tp_oid) = pos.tp_order_id.parse::<u64>() {
-                        if let Ok(order_status) = watcher_info.query_order_by_oid(user_address, tp_oid).await {
-                            let inner_status = if let Some(ref o) = order_status.order {
-                                o.status.to_uppercase()
-                            } else {
-                                order_status.status.to_uppercase()
-                            };
-
-                            if inner_status == "FILLED" {
-                                is_tp_filled = true;
-                            }
+                if is_tp_filled || is_flat {
+                    let final_orders = match watcher_info.open_orders(user_address).await {
+                        Ok(orders) => orders,
+                        Err(e) => {
+                            eprintln!(
+                                "⚠️ [FAST-SENTINEL] Failed to query open_orders on TP close for {}: {}. Retaining state.",
+                                watcher_symbol, e
+                            );
+                            continue;
                         }
-                    }
+                    };
+                    let symbol_orders_remain = final_orders.iter().any(|o| o.coin == watcher_symbol);
 
-                    if is_tp_filled || is_flat {
-                        let final_orders = match watcher_info.open_orders(user_address).await {
-                            Ok(orders) => orders,
-                            Err(e) => {
-                                eprintln!(
-                                    "⚠️ [FAST-SENTINEL] Failed to query open_orders on TP close for {}: {}. Retaining state.",
-                                    watcher_symbol, e
-                                );
-                                continue;
-                            }
-                        };
-                        let symbol_orders_remain = final_orders.iter().any(|o| o.coin == watcher_symbol);
-
-                        if is_flat && !symbol_orders_remain {
+                    if is_flat && !symbol_orders_remain {
+                        {
+                            let mut state_lock = watcher_state.lock().await;
                             // Defensive sequence step 1: CloseConfirmed
                             if let Some(p) = state_lock.get_mut(&watcher_symbol) {
                                 p.lifecycle = crate::state::PositionLifecycle::CloseConfirmed;
@@ -1044,18 +1068,19 @@ async fn main() {
                             );
                             state_lock.remove(&watcher_symbol);
                             let _ = save_state(&watcher_state_path, &state_lock);
-
-                            // Reset circuit breaker
-                            let mut cb_lock = watcher_cb.lock().await;
-                            cb_lock.record_win();
-                            save_circuit_breaker(&watcher_cb_path, &cb_lock);
-
-                            let msg = format!(
-                                "🎉 **TRADE CLOSED IN PROFIT (HYPERLIQUID)!** {} {} Take Profit has filled successfully.",
-                                watcher_symbol, pos.side
-                            );
-                            crate::discord::send_alert(watcher_discord.as_deref(), &msg).await;
                         }
+
+                        // Reset circuit breaker (WITHOUT holding state_lock!)
+                        let mut cb_lock = watcher_cb.lock().await;
+                        cb_lock.record_win();
+                        save_circuit_breaker(&watcher_cb_path, &cb_lock);
+                        drop(cb_lock);
+
+                        let msg = format!(
+                            "🎉 **TRADE CLOSED IN PROFIT (HYPERLIQUID):** {} {} Take Profit has filled successfully.",
+                            watcher_symbol, pos.side
+                        );
+                        crate::discord::send_alert(watcher_discord.as_deref(), &msg).await;
                     }
                 }
             }
@@ -1771,7 +1796,7 @@ async fn main() {
                         is_stationary,
                         z_15,
                         z_60,
-                        is_severe_shock: z_15.abs() >= 3.0 || z_60.abs() >= 3.0,
+                        is_severe_shock: is_controller_shock_1m || controller.shock_cooldown_bars > 0,
                         obi_instant: l2_instant,
                         obi_1s: l2_1s,
                         obi_5s: l2_5s,
@@ -2247,6 +2272,11 @@ async fn main() {
                                     } else if pos.engine_type == "EngineB" {
                                         let current_atr = calculate_atr(&rolling_15m_bars, 20).unwrap_or(pos.current_atr);
                                         let side_enum = if pos.side == "LONG" { Side::Long } else { Side::Short };
+                                        let active_mult = if pos.active_multiplier > 0.0 {
+                                            pos.active_multiplier
+                                        } else {
+                                            chandelier_atr_mult
+                                        };
                                         let mut chandelier = crate::trend::ChandelierExitState {
                                             side: side_enum,
                                             entry_price: pos.entry_price,
@@ -2254,13 +2284,14 @@ async fn main() {
                                             current_stop: pos.chandelier_stop,
                                             initial_stop: pos.stop_loss_price,
                                             base_multiplier: chandelier_atr_mult,
-                                            active_multiplier: chandelier_atr_mult,
+                                            active_multiplier: active_mult,
                                         };
 
                                         let new_stop = chandelier.update_with_ratchet_and_cap(high_price, low_price, current_atr, current_p_t, Some(0.5), true);
                                         pos.chandelier_stop = new_stop;
                                         pos.stop_loss_price = new_stop;
                                         pos.max_favorable_price = chandelier.extreme_favorable_price;
+                                        pos.active_multiplier = chandelier.active_multiplier;
 
                                         println!(
                                             "🚀 [LIVE-TREND MONITOR] {} {} | Price: ${:.2} (H: ${:.2}, L: ${:.2}) | Chandelier Stop: ${:.2} | Extreme: ${:.2}",

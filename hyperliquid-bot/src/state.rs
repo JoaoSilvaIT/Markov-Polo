@@ -95,6 +95,8 @@ pub struct PositionState {
     #[serde(default)]
     pub chandelier_stop: f64,
     #[serde(default)]
+    pub active_multiplier: f64,
+    #[serde(default)]
     pub current_atr: f64,
     #[serde(default)]
     pub lease_fencing_token: u64,
@@ -306,9 +308,26 @@ pub fn load_circuit_breaker(file_path: &str) -> CircuitBreaker {
 
 pub fn save_circuit_breaker(file_path: &str, cb: &CircuitBreaker) {
     if let Ok(content) = serde_json::to_string_pretty(cb) {
-        let temp_path = format!("{}.tmp", file_path);
-        let _ = fs::write(&temp_path, content);
-        let _ = fs::rename(&temp_path, file_path);
+        let temp_path = format!("{}.tmp.{}", file_path, std::process::id());
+        let write_ok = (|| -> Result<(), std::io::Error> {
+            use std::io::Write;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temp_path)?;
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if write_ok.is_ok() {
+            let _ = fs::rename(&temp_path, file_path);
+            let p = std::path::Path::new(file_path);
+            let parent = p.parent().unwrap_or_else(|| std::path::Path::new("."));
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
     }
 }
 
@@ -344,9 +363,26 @@ pub fn load_armed_signal(file_path: &str) -> ArmedSignal {
 
 pub fn save_armed_signal(file_path: &str, armed: &ArmedSignal) {
     if let Ok(content) = serde_json::to_string_pretty(armed) {
-        let temp_path = format!("{}.tmp", file_path);
-        let _ = fs::write(&temp_path, content);
-        let _ = fs::rename(&temp_path, file_path);
+        let temp_path = format!("{}.tmp.{}", file_path, std::process::id());
+        let write_ok = (|| -> Result<(), std::io::Error> {
+            use std::io::Write;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temp_path)?;
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if write_ok.is_ok() {
+            let _ = fs::rename(&temp_path, file_path);
+            let p = std::path::Path::new(file_path);
+            let parent = p.parent().unwrap_or_else(|| std::path::Path::new("."));
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
     }
 }
 
@@ -1135,6 +1171,7 @@ mod tests {
             candidate_lower_count: 0,
             engine_type: "EngineA".to_string(),
             chandelier_stop: 0.0,
+            active_multiplier: 0.0,
             current_atr: 0.0,
             lease_fencing_token: 0,
             lease_owner_uuid: "".to_string(),

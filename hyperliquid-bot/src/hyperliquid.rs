@@ -193,7 +193,9 @@ pub async fn close_market_position(
                 if let Some(first) = data.statuses.first() {
                     match first {
                         ExchangeDataStatus::Filled(_) => Ok(()),
-                        ExchangeDataStatus::Resting(_) => Ok(()),
+                        ExchangeDataStatus::Resting(_) => {
+                            Err("Market close order is resting instead of filling (IOC violation)".to_string())
+                        }
                         ExchangeDataStatus::Error(msg) => {
                             Err(format!("Exchange rejected market close order: {}", msg))
                         }
