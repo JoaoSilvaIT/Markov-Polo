@@ -1,4 +1,4 @@
-use crate::state::{FlockGuard, Side};
+use crate::state::{sync_parent_dir, FlockGuard, Side};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
@@ -594,6 +594,112 @@ impl L2ObiTracker {
     }
 }
 
+/// Exogenous Funding, Open Interest & Basis Crowding Hazard Tracker (MS-X Overlay)
+/// Preserves the 4D price-based Gaussian HMM while scaling/vetoing crowded leveraged breakouts.
+#[derive(Debug, Clone, Default)]
+pub struct MarketCrowdingTracker {
+    pub funding_1h: f64,
+    pub open_interest: f64,
+    pub mark_px: f64,
+    pub oracle_px: f64,
+    pub funding_samples: Vec<f64>,
+    pub oi_samples: Vec<f64>,
+    pub dlog_oi_samples: Vec<f64>,
+    pub basis_samples: Vec<f64>,
+    pub funding_z: f64,
+    pub dlog_oi_z: f64,
+    pub basis_z: f64,
+}
+
+impl MarketCrowdingTracker {
+    fn robust_z(val: f64, samples: &[f64], min_scale: f64) -> f64 {
+        if samples.len() < 8 {
+            return 0.0;
+        }
+        let mut sorted = samples.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mid = sorted.len() / 2;
+        let median = if sorted.len() % 2 == 0 {
+            (sorted[mid - 1] + sorted[mid]) / 2.0
+        } else {
+            sorted[mid]
+        };
+        let mut abs_devs: Vec<f64> = sorted.iter().map(|&x| (x - median).abs()).collect();
+        abs_devs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mad = if abs_devs.len() % 2 == 0 {
+            (abs_devs[mid - 1] + abs_devs[mid]) / 2.0
+        } else {
+            abs_devs[mid]
+        };
+        let scale = (mad / 0.6745).max(min_scale);
+        ((val - median) / scale).clamp(-5.0, 5.0)
+    }
+
+    pub fn update(&mut self, funding_1h: f64, open_interest: f64, mark_px: f64, oracle_px: f64) {
+        if !funding_1h.is_finite() || !open_interest.is_finite() || open_interest <= 0.0 {
+            return;
+        }
+        self.funding_1h = funding_1h;
+        self.open_interest = open_interest;
+        self.mark_px = mark_px;
+        self.oracle_px = oracle_px;
+
+        self.funding_samples.push(funding_1h);
+        if self.funding_samples.len() > 240 {
+            self.funding_samples.remove(0);
+        }
+
+        if let Some(&prev_oi) = self.oi_samples.first() {
+            if prev_oi > 0.0 {
+                let dlog_oi = (open_interest / prev_oi).ln();
+                self.dlog_oi_samples.push(dlog_oi);
+                if self.dlog_oi_samples.len() > 240 {
+                    self.dlog_oi_samples.remove(0);
+                }
+                self.dlog_oi_z = Self::robust_z(dlog_oi, &self.dlog_oi_samples, 1e-4);
+            }
+        }
+        self.oi_samples.push(open_interest);
+        if self.oi_samples.len() > 60 {
+            self.oi_samples.remove(0);
+        }
+
+        if oracle_px > 0.0 && mark_px > 0.0 {
+            let basis = (mark_px - oracle_px) / oracle_px;
+            self.basis_samples.push(basis);
+            if self.basis_samples.len() > 240 {
+                self.basis_samples.remove(0);
+            }
+            self.basis_z = Self::robust_z(basis, &self.basis_samples, 1e-4);
+        }
+
+        self.funding_z = Self::robust_z(funding_1h, &self.funding_samples, 1e-5);
+    }
+
+    /// Computes the exogenous Crowding Hazard Multiplier H_t in [0.25, 1.0]:
+    /// H_t = exp(-0.35 * max(0, |F_z| - 2.0) - 0.25 * max(0, dOI_z - 2.0) - 0.15 * max(0, |basis_z| - 1.5))
+    pub fn crowding_hazard(&self) -> f64 {
+        let f_term = 0.35 * (self.funding_z.abs() - 2.0).max(0.0);
+        let oi_term = 0.25 * (self.dlog_oi_z - 2.0).max(0.0);
+        let basis_term = 0.15 * (self.basis_z.abs() - 1.5).max(0.0);
+        (-f_term - oi_term - basis_term).exp().clamp(0.25, 1.0)
+    }
+
+    /// Returns directional exposure multiplier for Engine B breakouts:
+    /// Only penalizes breakouts aligned with crowded funding (e.g. Long breakout into extreme positive funding + surging OI).
+    pub fn directional_trend_multiplier(&self, side: &Side) -> f64 {
+        let is_crowded_direction = match side {
+            Side::Long => self.funding_1h > 0.0001 && self.funding_z > 1.5,
+            Side::Short => self.funding_1h < -0.0001 && self.funding_z < -1.5,
+        };
+        if is_crowded_direction {
+            self.crowding_hazard()
+        } else {
+            1.0
+        }
+    }
+}
+
 /// Monotone Hybrid Ratchet Chandelier Exit State
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChandelierExitState {
@@ -692,9 +798,10 @@ impl ChandelierExitState {
                     let ret_fav_pct = if self.entry_price > 0.0 { delta_fav / self.entry_price } else { 0.0 };
                     let eps = 1e-6;
 
-                    // 1. Breakeven Floor: once favorable progress >= 1.0 ATR or >= 1.0%, stop moves to at least entry + 15 bps (covers round-trip fees)
+                    // 1. Breakeven Floor: once favorable progress >= 1.0 ATR or >= 1.0%, stop moves to at least entry + 15 bps (bounded by 60% of delta_fav when ATR is tight)
                     if delta_fav >= (1.0 * current_atr) - eps || ret_fav_pct >= 0.010 {
-                        candidate_stop = f64::max(candidate_stop, self.entry_price * 1.0015);
+                        let be_stop = (self.entry_price * 1.0015).min(self.entry_price + 0.60 * delta_fav);
+                        candidate_stop = f64::max(candidate_stop, be_stop);
                     }
                     // 2. Tier 2 (+2% Gain Rule): once gain >= +2.0%, lock in at least +1.0% net profit
                     if ret_fav_pct >= 0.020 {
@@ -729,9 +836,10 @@ impl ChandelierExitState {
                     let ret_fav_pct = if self.entry_price > 0.0 { delta_fav / self.entry_price } else { 0.0 };
                     let eps = 1e-6;
 
-                    // 1. Breakeven Floor: once favorable progress >= 1.0 ATR or >= 1.0%, stop moves to at least entry - 15 bps (covers round-trip fees)
+                    // 1. Breakeven Floor: once favorable progress >= 1.0 ATR or >= 1.0%, stop moves to at least entry - 15 bps (bounded by 60% of delta_fav when ATR is tight)
                     if delta_fav >= (1.0 * current_atr) - eps || ret_fav_pct >= 0.010 {
-                        candidate_stop = f64::min(candidate_stop, self.entry_price * 0.9985);
+                        let be_stop = (self.entry_price * 0.9985).max(self.entry_price - 0.60 * delta_fav);
+                        candidate_stop = f64::min(candidate_stop, be_stop);
                     }
                     // 2. Tier 2 (+2% Gain Rule): once gain >= +2.0%, lock in at least +1.0% net profit
                     if ret_fav_pct >= 0.020 {
@@ -768,10 +876,10 @@ impl ChandelierExitState {
         }
     }
 
-    pub fn is_bar_stopped_out(&self, bar_high: f64, bar_low: f64) -> bool {
+    pub fn is_bar_stopped_out(&self, prev_stop: f64, bar_high: f64, bar_low: f64, bar_close: f64) -> bool {
         match self.side {
-            Side::Long => bar_low <= self.current_stop,
-            Side::Short => bar_high >= self.current_stop,
+            Side::Long => bar_low <= prev_stop || bar_close <= self.current_stop,
+            Side::Short => bar_high >= prev_stop || bar_close >= self.current_stop,
         }
     }
 }
@@ -847,11 +955,7 @@ pub fn get_and_inc_shadow_counter() -> Result<u64, String> {
     fs::rename(&tmp_path, counter_path)
         .map_err(|e| format!("Failed to atomically rename shadow counter: {}", e))?;
 
-    if let Some(parent) = counter_path.parent() {
-        if let Ok(dir) = fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
+    sync_parent_dir(SHADOW_CLUSTER_COUNTER);
 
     Ok(next)
 }
@@ -888,11 +992,7 @@ fn write_shadow_lease_atomic(lease: &ShadowClusterLease) -> Result<(), String> {
     }
     fs::rename(&tmp_path, lock_path)
         .map_err(|e| format!("Failed to rename shadow lease file: {}", e))?;
-    if let Some(parent) = lock_path.parent() {
-        if let Ok(dir) = fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
+    sync_parent_dir(SHADOW_CLUSTER_LOCK);
     Ok(())
 }
 
@@ -1020,10 +1120,22 @@ pub fn save_shadow_trade(symbol: &str, trade: Option<&ShadowTrade>) {
     let path = shadow_state_path(symbol);
     if let Some(t) = trade {
         if let Ok(c) = serde_json::to_string_pretty(t) {
-            let _ = fs::write(&path, c);
+            let tmp_path = format!("{}.tmp.{}", path, std::process::id());
+            if let Ok(mut file) = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)
+            {
+                if file.write_all(c.as_bytes()).is_ok() && file.sync_all().is_ok() {
+                    let _ = fs::rename(&tmp_path, &path);
+                    sync_parent_dir(&path);
+                }
+            }
         }
     } else {
         let _ = fs::remove_file(&path);
+        sync_parent_dir(&path);
     }
 }
 
@@ -1700,5 +1812,36 @@ mod tests {
         // 7. NaN / Infinity
         assert!(validate_candle(f64::NAN, 105.0, 95.0, 102.0, 1.0).is_err());
         assert!(validate_candle(100.0, f64::INFINITY, 95.0, 102.0, 1.0).is_err());
+    }
+
+    #[test]
+    fn test_chandelier_breakeven_never_overshoots_price_under_tight_atr() {
+        // BTC at $100,000 with tight 10 bps ATR ($100.0)
+        let mut chandelier = ChandelierExitState::new(Side::Long, 100_000.0, 100.0, 2.0);
+        let prev_stop = chandelier.current_stop;
+        // Price advances +10 bps ($100,100.0 = 1.0 * ATR).
+        // Stop must NOT jump to $100,150.0 (+15 bps) above the high of $100,100.0!
+        let stop = chandelier.update_with_ratchet_and_cap(100_100.0, 100_020.0, 100.0, 0.85, None, true);
+        assert!(stop < 100_100.0, "Breakeven stop {} must never exceed extreme high 100100.0", stop);
+        assert!(!chandelier.is_bar_stopped_out(prev_stop, 100_100.0, 100_020.0, 100_100.0));
+    }
+
+    #[test]
+    fn test_crowding_hazard_overlay_scales_and_vetoes_squeeze() {
+        let mut tracker = MarketCrowdingTracker::default();
+        // Baseline normal funding (0.0000125 = 0.125 bps/hr) and steady OI (1000.0)
+        for i in 0..30 {
+            let jitter = if i % 2 == 0 { 1e-6 } else { -1e-6 };
+            tracker.update(0.0000125 + jitter, 1000.0 + (i as f64) * 0.5, 100.01, 100.00);
+        }
+        assert!((tracker.crowding_hazard() - 1.0).abs() < 1e-4);
+        assert_eq!(tracker.directional_trend_multiplier(&Side::Long), 1.0);
+
+        // Now inject an extreme positive funding spike (+8 bps/hr = 0.0008), OI surge (1250.0), and wide mark-oracle basis
+        tracker.update(0.0008, 1250.0, 100.80, 100.00);
+        let mult_long = tracker.directional_trend_multiplier(&Side::Long);
+        let mult_short = tracker.directional_trend_multiplier(&Side::Short);
+        assert!(mult_long < 0.45, "Extreme crowded positive funding + OI surge must suppress Long breakout (mult={})", mult_long);
+        assert_eq!(mult_short, 1.0, "Opposite Short breakout should not be penalized by positive funding crowding");
     }
 }

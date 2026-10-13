@@ -1,6 +1,6 @@
 use crate::hyperliquid::{
-    cancel_order, close_market_position, fetch_book_ticker, get_user_position, quantize_price,
-    round_to_decimals, place_post_only_order,
+    cancel_order, close_market_position, effective_tick_size, fetch_book_ticker,
+    get_user_position, place_post_only_order, quantize_price, quantize_size_for_notional,
 };
 use crate::state::{
     assert_current_lease, clear_order_intent, release_cluster_lease_authenticated, save_order_intent_atomic,
@@ -71,38 +71,67 @@ pub async fn place_ou_maker_entry(
     }
 
     let is_buy = side == Side::Long;
-    let raw_post_only_price = if is_buy {
-        f64::min(top_bid, entry_price)
+    let book_tick = effective_tick_size(top_bid, sz_decimals);
+    let spread = top_ask - top_bid;
+    // Spread-Inside Queue Priority Optimization:
+    // If bid-ask spread is >= 2 ticks wide, step 1 tick inside the spread to achieve FIFO Queue Rank #1
+    // with zero queue-ahead volume while remaining strictly Post-Only (Alo).
+    let best_passive_quote = if is_buy {
+        if spread >= 2.0 * book_tick - 1e-9 && top_bid + book_tick < top_ask - 1e-9 {
+            top_bid + book_tick
+        } else {
+            top_bid
+        }
+    } else if spread >= 2.0 * book_tick - 1e-9 && top_ask - book_tick > top_bid + 1e-9 {
+        top_ask - book_tick
     } else {
-        f64::max(top_ask, entry_price)
+        top_ask
+    };
+    let raw_post_only_price = if is_buy {
+        f64::min(best_passive_quote, entry_price)
+    } else {
+        f64::max(best_passive_quote, entry_price)
     };
 
     let post_only_price = quantize_price(raw_post_only_price, sz_decimals);
     let target_mu_quantized = quantize_price(target_mu, sz_decimals);
 
-    let amount_raw = position_size_usdc / post_only_price;
-    let amount_f = round_to_decimals(amount_raw, sz_decimals);
+    let amount_f = quantize_size_for_notional(position_size_usdc, post_only_price, sz_decimals);
 
     if amount_f <= 0.0 {
         let _ = release_cluster_lease_authenticated(symbol, Some(&lease_uuid), Some(fencing_token));
         return Err(format!(
             "Calculated size {:.6} is zero or below minimum size decimals {}",
-            amount_raw, sz_decimals
+            position_size_usdc / post_only_price, sz_decimals
         ));
     }
 
     // Epsilon Shave + Avellaneda-Stoikov Inventory Skew:
-    // Front-run the mean by 5 bps (min 2 ticks) plus AS inventory skew (~4 bps)
+    // Tick-aware front-run (5 bps + 4 bps, floored in ticks and capped at 25% of gross target distance)
     // to aggressively exit inventory, accelerate fill probability, and free cluster lock faster.
-    let base_shave = (target_mu * 0.0005).max(0.02);
-    let as_inventory_skew = (target_mu * 0.0004).max(0.015);
-    let total_shave = base_shave + as_inventory_skew;
+    let tick_sz = effective_tick_size(target_mu, sz_decimals);
+    let gross_dist = (target_mu - post_only_price).abs();
+    let base_shave = (target_mu * 0.0005).max(2.0 * tick_sz);
+    let as_inventory_skew = (target_mu * 0.0004).max(1.5 * tick_sz);
+    let total_shave = (base_shave + as_inventory_skew).min(0.25 * gross_dist);
     let target_tp = if is_buy {
         target_mu - total_shave
     } else {
         target_mu + total_shave
     };
     let target_tp_quantized = quantize_price(target_tp, sz_decimals);
+    let min_profitable_tp = if is_buy {
+        target_tp_quantized > post_only_price + tick_sz
+    } else {
+        target_tp_quantized + tick_sz < post_only_price
+    };
+    if !min_profitable_tp {
+        let _ = release_cluster_lease_authenticated(symbol, Some(&lease_uuid), Some(fencing_token));
+        return Err(format!(
+            "Quantized TP ${:.4} does not clear entry ${:.4} for {} ({})",
+            target_tp_quantized, post_only_price, symbol, side
+        ));
+    }
 
     // Structural Catastrophe Stop Loss: 2.0x expected target edge (min 1.5% from entry)
     let edge_dist = (post_only_price - target_tp_quantized).abs();
@@ -169,8 +198,7 @@ pub async fn place_ou_maker_entry(
                         f64::max(fresh_ask, entry_price)
                     };
                     current_price = quantize_price(fresh_raw, sz_decimals);
-                    let raw_amt = position_size_usdc / current_price;
-                    current_amount = round_to_decimals(raw_amt, sz_decimals);
+                    current_amount = quantize_size_for_notional(position_size_usdc, current_price, sz_decimals);
                     order_intent.limit_px = current_price;
                     order_intent.sz = current_amount;
                     let _ = save_order_intent_atomic(&order_intent);
@@ -224,6 +252,17 @@ pub async fn place_ou_maker_entry(
         }
     };
 
+    let final_edge_dist = (current_price - target_tp_quantized).abs();
+    let final_sl_dist = (2.0 * final_edge_dist).max(current_price * 0.015);
+    let stop_loss_price = quantize_price(
+        if is_buy {
+            current_price - final_sl_dist
+        } else {
+            current_price + final_sl_dist
+        },
+        sz_decimals,
+    );
+
     let new_state = PositionState {
         symbol: symbol.to_string(),
         side: side.to_string(),
@@ -239,7 +278,7 @@ pub async fn place_ou_maker_entry(
         half_life_minutes,
         client_order_id,
         max_progress: 0.0,
-        max_favorable_price: post_only_price,
+        max_favorable_price: current_price,
         effective_tp: target_tp_quantized,
         last_reprice_time: Utc::now().timestamp_millis(),
         reprice_count: 0,
@@ -267,7 +306,7 @@ pub async fn place_ou_maker_entry(
 
     let msg = format!(
         "{} **O-U {} ENTRY SIGNAL (MAKER):** {}\n**Limit Maker {}:** ${:.2} (Best Bid: ${:.2}, Ask: ${:.2})\n**Target Mean (μ):** ${:.2}\n**Take Profit Target:** ${:.2}\n**Hard Stop Loss:** ${:.2}\n**Size:** {:.5} (${:.2})\n**Half-Life:** {:.1}m (Max Hold: {:.1}m)",
-        side_emoji, side_label, symbol, side_label, post_only_price, top_bid, top_ask, target_mu_quantized, target_tp_quantized, stop_loss_price, amount_f, position_size_usdc, half_life_minutes, max_hold
+        side_emoji, side_label, symbol, side_label, current_price, top_bid, top_ask, target_mu_quantized, target_tp_quantized, stop_loss_price, current_amount, position_size_usdc, half_life_minutes, max_hold
     );
     crate::discord::send_alert(discord_url.as_deref(), &msg).await;
 
@@ -332,16 +371,29 @@ pub async fn place_trend_breakout_entry(
     }
 
     let is_buy = side == Side::Long;
-    let raw_post_only_price = if is_buy { top_bid } else { top_ask };
+    let book_tick = effective_tick_size(top_bid, sz_decimals);
+    let spread = top_ask - top_bid;
+    // Spread-Inside Queue Priority Optimization for Engine B:
+    // Step 1 tick inside a multi-tick spread to secure FIFO Queue Rank #1 on momentum breakouts.
+    let raw_post_only_price = if is_buy {
+        if spread >= 2.0 * book_tick - 1e-9 && top_bid + book_tick < top_ask - 1e-9 {
+            top_bid + book_tick
+        } else {
+            top_bid
+        }
+    } else if spread >= 2.0 * book_tick - 1e-9 && top_ask - book_tick > top_bid + 1e-9 {
+        top_ask - book_tick
+    } else {
+        top_ask
+    };
     let post_only_price = quantize_price(raw_post_only_price, sz_decimals);
-    let amount_raw = position_size_usdc / post_only_price;
-    let amount_f = round_to_decimals(amount_raw, sz_decimals);
+    let amount_f = quantize_size_for_notional(position_size_usdc, post_only_price, sz_decimals);
 
     if amount_f <= 0.0 {
         let _ = release_cluster_lease_authenticated(symbol, Some(&lease_uuid), Some(fencing_token));
         return Err(format!(
             "Calculated size {:.6} is zero or below minimum size decimals {}",
-            amount_raw, sz_decimals
+            position_size_usdc / post_only_price, sz_decimals
         ));
     }
 
@@ -391,8 +443,7 @@ pub async fn place_trend_breakout_entry(
                 if fresh_bid > 0.0 && fresh_ask > fresh_bid {
                     let fresh_raw = if is_buy { fresh_bid } else { fresh_ask };
                     current_price = quantize_price(fresh_raw, sz_decimals);
-                    let raw_amt = position_size_usdc / current_price;
-                    current_amount = round_to_decimals(raw_amt, sz_decimals);
+                    current_amount = quantize_size_for_notional(position_size_usdc, current_price, sz_decimals);
                     order_intent.limit_px = current_price;
                     order_intent.sz = current_amount;
                     let _ = save_order_intent_atomic(&order_intent);
@@ -460,7 +511,7 @@ pub async fn place_trend_breakout_entry(
         half_life_minutes: 0.0,
         client_order_id,
         max_progress: 0.0,
-        max_favorable_price: post_only_price,
+        max_favorable_price: current_price,
         effective_tp: 0.0,
         last_reprice_time: Utc::now().timestamp_millis(),
         reprice_count: 0,
@@ -486,7 +537,7 @@ pub async fn place_trend_breakout_entry(
 
     let msg = format!(
         "{} **ENGINE B {} BREAKOUT ENTRY (MAKER):** {}\n**Limit Maker {}:** ${:.2} (Breakout: ${:.2})\n**Initial Chandelier Stop:** ${:.2}\n**Size:** {:.5} (${:.2})\n**ATR:** ${:.2}",
-        side_emoji, side_label, symbol, side_label, post_only_price, breakout_price, stop_loss_price, amount_f, position_size_usdc, current_atr
+        side_emoji, side_label, symbol, side_label, current_price, breakout_price, stop_loss_price, current_amount, position_size_usdc, current_atr
     );
     crate::discord::send_alert(discord_url.as_deref(), &msg).await;
 
@@ -500,6 +551,7 @@ pub async fn emergency_flatten(
     wallet_address: H160,
     state: &mut StateMap,
     symbol: &str,
+    sz_decimals: u32,
     discord_url: Option<String>,
 ) -> Result<(), String> {
     let pos = match state.get(symbol).cloned() {
@@ -568,7 +620,7 @@ pub async fn emergency_flatten(
         );
         crate::discord::send_alert(discord_url.as_deref(), &msg).await;
 
-        if let Err(e) = close_market_position(exchange, info, symbol, szi, 0.02).await {
+        if let Err(e) = close_market_position(exchange, info, symbol, szi, 0.02, sz_decimals).await {
             eprintln!("❌ [EMERGENCY FLATTEN FAILED] Close failed for {}: {}", symbol, e);
             let err_msg = format!("❌ **EMERGENCY FLATTEN FAILED:** Close failed for {}: {}", symbol, e);
             crate::discord::send_alert(discord_url.as_deref(), &err_msg).await;
@@ -605,13 +657,10 @@ pub async fn emergency_flatten(
         };
 
         if !released {
-            let err = format!(
-                "Exchange flat for {}, but cluster lease release authentication failed. Retaining state.",
+            eprintln!(
+                "⚠️ [EMERGENCY FLATTEN] Lease for {} owned by a newer epoch on disk, but exchange is verified 100% flat. Proceeding to clear stale local state.",
                 symbol
             );
-            eprintln!("❌ [EMERGENCY FLATTEN BLOCKED] {}", err);
-            crate::discord::send_alert(discord_url.as_deref(), &format!("🚨 {}", err)).await;
-            return Err(err);
         }
 
         // Defensive sequence step 3: Mark state as LeaseReleased and fsync

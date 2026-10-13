@@ -169,6 +169,17 @@ pub fn order_intent_path(symbol: &str) -> String {
     format!("hl_order_intent_{}.json", symbol)
 }
 
+pub fn sync_parent_dir(file_path: &str) {
+    let p = std::path::Path::new(file_path);
+    let parent = match p.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => std::path::Path::new("."),
+    };
+    if let Ok(dir) = fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+}
+
 pub fn save_order_intent_atomic(intent: &OrderIntent) -> Result<(), String> {
     let path = order_intent_path(&intent.symbol);
     let tmp_path = format!("{}.tmp.{}", path, std::process::id());
@@ -189,11 +200,7 @@ pub fn save_order_intent_atomic(intent: &OrderIntent) -> Result<(), String> {
     }
     fs::rename(&tmp_path, &path)
         .map_err(|e| format!("Failed to atomically rename intent file: {}", e))?;
-    if let Some(parent) = std::path::Path::new(&path).parent() {
-        if let Ok(dir) = fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
+    sync_parent_dir(&path);
     Ok(())
 }
 
@@ -252,11 +259,7 @@ pub fn save_state(file_path: &str, state: &StateMap) -> Result<(), Box<dyn std::
         file.sync_all()?;
     }
     fs::rename(&temp_path, file_path)?;
-    let p = std::path::Path::new(file_path);
-    let parent = p.parent().unwrap_or_else(|| std::path::Path::new("."));
-    if let Ok(dir) = fs::File::open(parent) {
-        let _ = dir.sync_all();
-    }
+    sync_parent_dir(file_path);
     Ok(())
 }
 
@@ -322,11 +325,7 @@ pub fn save_circuit_breaker(file_path: &str, cb: &CircuitBreaker) {
         })();
         if write_ok.is_ok() {
             let _ = fs::rename(&temp_path, file_path);
-            let p = std::path::Path::new(file_path);
-            let parent = p.parent().unwrap_or_else(|| std::path::Path::new("."));
-            if let Ok(dir) = fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
+            sync_parent_dir(file_path);
         }
     }
 }
@@ -377,11 +376,7 @@ pub fn save_armed_signal(file_path: &str, armed: &ArmedSignal) {
         })();
         if write_ok.is_ok() {
             let _ = fs::rename(&temp_path, file_path);
-            let p = std::path::Path::new(file_path);
-            let parent = p.parent().unwrap_or_else(|| std::path::Path::new("."));
-            if let Ok(dir) = fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
+            sync_parent_dir(file_path);
         }
     }
 }
@@ -425,11 +420,7 @@ pub fn get_and_inc_cluster_counter() -> Result<u64, String> {
     fs::rename(&tmp_path, counter_path)
         .map_err(|e| format!("Failed to atomically rename counter file: {}", e))?;
 
-    if let Some(parent) = counter_path.parent() {
-        if let Ok(dir) = fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
+    sync_parent_dir(CLUSTER_COUNTER_FILE);
 
     Ok(next)
 }
@@ -510,11 +501,7 @@ fn write_leases_atomic(leases: &HashMap<String, ClusterLease>) -> Result<(), Str
     }
     fs::rename(&tmp_path, lock_path)
         .map_err(|e| format!("Failed to rename lease file: {}", e))?;
-    if let Some(parent) = lock_path.parent() {
-        if let Ok(dir) = fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
+    sync_parent_dir(CLUSTER_LOCK_FILE);
     Ok(())
 }
 
@@ -601,7 +588,7 @@ pub fn try_acquire_cluster_lease_for_engine_with_uuid(
         let exp_dt = chrono::DateTime::parse_from_rfc3339(&existing_lease.expires_at)
             .map(|dt| dt.with_timezone(&chrono::Utc))
             .ok();
-        let is_unexpired = exp_dt.map(|exp| now < exp).unwrap_or(true);
+        let is_unexpired = exp_dt.map(|exp| now < exp).unwrap_or(false);
 
         if is_unexpired {
             // Same symbol: only same UUID/process is authorized to refresh/reacquire!
@@ -633,7 +620,7 @@ pub fn try_acquire_cluster_lease_for_engine_with_uuid(
     leases.retain(|other_sym, lease| {
         let is_unexp = chrono::DateTime::parse_from_rfc3339(&lease.expires_at)
             .map(|dt| now < dt.with_timezone(&chrono::Utc))
-            .unwrap_or(true);
+            .unwrap_or(false);
         if !is_unexp {
             let state_file = format!("hl_hmm_state_{}.json", other_sym);
             let has_pos = load_state(&state_file)
@@ -757,20 +744,26 @@ pub fn release_cluster_lease_authenticated(
     };
     let mut leases = load_cluster_leases();
     if let Some(lease) = leases.get(symbol) {
-        if let Some(expected_uuid) = owner_uuid {
-            if !lease.owner_uuid.is_empty() && lease.owner_uuid != expected_uuid {
-                return false;
+        let is_expired = chrono::DateTime::parse_from_rfc3339(&lease.expires_at)
+            .map(|dt| chrono::Utc::now() >= dt.with_timezone(&chrono::Utc))
+            .unwrap_or(true);
+        if !is_expired {
+            if let Some(expected_uuid) = owner_uuid {
+                if !lease.owner_uuid.is_empty() && lease.owner_uuid != expected_uuid {
+                    return false;
+                }
             }
-        }
-        if let Some(expected_token) = fencing_token {
-            if lease.fencing_token != expected_token {
-                return false;
+            if let Some(expected_token) = fencing_token {
+                if lease.fencing_token != expected_token {
+                    return false;
+                }
             }
         }
         leases.remove(symbol);
         return write_leases_atomic(&leases).is_ok();
     }
-    false
+    // Idempotent success if lease for symbol is already absent from lock map
+    true
 }
 
 /// Asserts that the caller owns the active cluster lease immediately before an exchange operation.
@@ -1338,5 +1331,16 @@ mod tests {
         let _ = fs::remove_file(CLUSTER_LOCK_FILE);
         let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
         let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
+    }
+
+    #[test]
+    fn test_idempotent_lease_release_when_absent_or_expired() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let _ = fs::remove_file(CLUSTER_LOCK_FILE);
+        let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
+        let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
+
+        // Releasing a lease that is already absent from disk must succeed idempotently (never wedge)
+        assert!(release_cluster_lease_authenticated("BTC", Some("stale_uuid"), Some(99)));
     }
 }

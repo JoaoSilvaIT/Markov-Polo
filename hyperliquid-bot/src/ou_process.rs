@@ -35,26 +35,28 @@ fn estimate_ar1_raw(data: &[f64]) -> Option<(f64, f64, f64)> {
     let n = data.len() - 1;
     let mut sum_x = 0.0;
     let mut sum_y = 0.0;
-    let mut sum_xx = 0.0;
-    let mut sum_xy = 0.0;
     
     for i in 0..n {
-        let x = data[i];
-        let y = data[i+1];
-        sum_x += x;
-        sum_y += y;
-        sum_xx += x * x;
-        sum_xy += x * y;
+        sum_x += data[i];
+        sum_y += data[i + 1];
     }
     
     let nf = n as f64;
     let mean_x = sum_x / nf;
     let mean_y = sum_y / nf;
     
-    let cov_xy = (sum_xy / nf) - (mean_x * mean_y);
-    let var_x = (sum_xx / nf) - (mean_x * mean_x);
+    let mut sum_dx_dy = 0.0;
+    let mut sum_dx_sq = 0.0;
+    for i in 0..n {
+        let dx = data[i] - mean_x;
+        let dy = data[i + 1] - mean_y;
+        sum_dx_dy += dx * dy;
+        sum_dx_sq += dx * dx;
+    }
+    let cov_xy = sum_dx_dy / nf;
+    let var_x = sum_dx_sq / nf;
     
-    if var_x <= 0.0 {
+    if var_x <= 1e-18 {
         return None;
     }
     
@@ -115,7 +117,7 @@ pub fn estimate_ou_parameters(data: &[f64], dt: f64) -> Option<OuParameters> {
     // This removes the O(1/T) Hurwicz bias that artificially inflates mean-reversion speed.
     let mid = log_data.len() / 2;
     let theta = if mid >= 4 {
-        let part1 = estimate_ar1_raw(&log_data[..mid]);
+        let part1 = estimate_ar1_raw(&log_data[..=mid]);
         let part2 = estimate_ar1_raw(&log_data[mid..]);
 
         if let (Some((_, b1, _)), Some((_, b2, _))) = (part1, part2) {
@@ -125,10 +127,10 @@ pub fn estimate_ou_parameters(data: &[f64], dt: f64) -> Option<OuParameters> {
             if th_jack > 1e-5 {
                 th_jack
             } else {
-                theta_full
+                return None;
             }
         } else {
-            theta_full
+            return None;
         }
     } else {
         theta_full
@@ -147,13 +149,16 @@ pub fn estimate_ou_parameters(data: &[f64], dt: f64) -> Option<OuParameters> {
     // This preserves the interface: sigma_eq = sigma_price / sqrt(2θ) gives the correct
     // equilibrium ±1σ price band. For thresholds: entry = mu - 1.75×sigma_eq in price space,
     // which equals mu × (1 - 1.75×sigma_log/sqrt(2θ)) — multiplicatively consistent.
-    let sigma_log = sigma_eps_log * ((2.0 * theta) / (1.0 - b_log * b_log)).sqrt();
+    let b_jack = (-theta * dt).exp();
+    let denom_sq = (1.0 - b_jack * b_jack).max(1e-12);
+    let sigma_log = sigma_eps_log * ((2.0 * theta) / denom_sq).sqrt();
     let sigma = mu * sigma_log;
 
     Some(OuParameters { theta, mu, sigma })
 }
 
 
+#[allow(dead_code)]
 pub fn calculate_thresholds_at_sigma(params: &OuParameters, transaction_cost: f64, num_sigma: f64) -> OptimalThresholds {
     let sigma_eq = (params.sigma * params.sigma / (2.0 * params.theta)).sqrt();
     let min_required_profit = transaction_cost * 2.5;
@@ -169,8 +174,67 @@ pub fn calculate_thresholds_at_sigma(params: &OuParameters, transaction_cost: f6
 /// Calculates the optimal entry and exit boundaries using a closed-form approximation 
 /// derived from the Bertram Optimization Model for Statistical Arbitrage.
 /// Maximizes the expected return per unit of time based on mean-reversion speed.
+#[allow(dead_code)]
 pub fn calculate_optimal_thresholds(params: &OuParameters, transaction_cost: f64) -> OptimalThresholds {
     calculate_thresholds_at_sigma(params, transaction_cost, 1.50)
+}
+
+/// Calculates asymmetric carry-shifted Bertram O-U entry/exit thresholds:
+/// Positive carry (receiving funding) relaxes the required entry excursion toward `min_sigma` (e.g. 1.30σ);
+/// Negative carry (paying funding) widens the required entry excursion toward `max_sigma` (e.g. 1.75σ).
+pub fn calculate_carry_adjusted_thresholds(
+    params: &OuParameters,
+    transaction_cost: f64,
+    base_sigma: f64,
+    hourly_funding_rate: f64,
+    min_sigma: f64,
+    max_sigma: f64,
+) -> OptimalThresholds {
+    let sigma_eq = (params.sigma * params.sigma / (2.0 * params.theta)).sqrt();
+    let min_required_profit = transaction_cost * 2.5;
+
+    let (sigma_long, sigma_short) = if hourly_funding_rate.is_finite()
+        && hourly_funding_rate.abs() > 1e-7
+        && params.mu > 0.0
+        && params.theta > 1e-5
+    {
+        let sigma_stat_log = (sigma_eq / params.mu).max(1e-6);
+        let kappa_1h = params.theta * 60.0;
+        let denom = (kappa_1h * sigma_stat_log).max(1e-8);
+        // Long carry is -funding_1h; Short carry is +funding_1h
+        let dz_long = (-hourly_funding_rate / denom).clamp(-2.0, 2.0);
+        let dz_short = (hourly_funding_rate / denom).clamp(-2.0, 2.0);
+        let gamma = 0.50;
+        let s_long = (base_sigma - gamma * dz_long).clamp(min_sigma, max_sigma);
+        let s_short = (base_sigma - gamma * dz_short).clamp(min_sigma, max_sigma);
+        (s_long, s_short)
+    } else {
+        (base_sigma, base_sigma)
+    };
+
+    let dev_long = (sigma_long * sigma_eq).max(min_required_profit);
+    let dev_short = (sigma_short * sigma_eq).max(min_required_profit);
+
+    OptimalThresholds {
+        entry_long: params.mu - dev_long,
+        exit_long: params.mu,
+        entry_short: params.mu + dev_short,
+        exit_short: params.mu,
+    }
+}
+
+/// Returns the UTC session-conditioned O-U sigma offset:
+/// - Session 1 (US Macro & Equity Open: 13:00-17:00 UTC Mon-Fri): +0.10σ wider to guard against jump shocks
+/// - Session 3 (Asian / Off-Peak / Weekends: 00:00-08:00 UTC or Sat/Sun): -0.05σ tighter for stationary ranges
+/// - Session 2 (Normal transition hours): 0.0σ
+pub fn utc_session_sigma_offset(utc_hour: u32, is_weekend: bool) -> f64 {
+    if !is_weekend && (13..17).contains(&utc_hour) {
+        0.10
+    } else if is_weekend || utc_hour < 8 {
+        -0.05
+    } else {
+        0.0
+    }
 }
 
 /// Computes the robust Median Absolute Deviation (MAD) of a return series,
@@ -310,7 +374,18 @@ pub struct FeatureSnapshot {
 }
 
 /// Evaluates stochastic O-U, drift, and Z-score features at an exact time cutoff.
+#[allow(dead_code)]
 pub fn calculate_features(closes_history: &[f64], eval_close: f64, symbol: &str) -> Option<FeatureSnapshot> {
+    calculate_features_with_funding(closes_history, eval_close, symbol, 0.0)
+}
+
+/// Evaluates stochastic O-U, drift, and Z-score features incorporating Hyperliquid hourly funding rate carry drift.
+pub fn calculate_features_with_funding(
+    closes_history: &[f64],
+    eval_close: f64,
+    symbol: &str,
+    hourly_funding_rate: f64,
+) -> Option<FeatureSnapshot> {
     if closes_history.len() < 100 || eval_close <= 0.0 {
         return None;
     }
@@ -326,9 +401,15 @@ pub fn calculate_features(closes_history: &[f64], eval_close: f64, symbol: &str)
 
     // O-U Parameter Estimation with Phillips & Yu Jackknife bias correction (log-price space)
     let (thresholds_opt, thresholds_175_opt, half_life_m) =
-        if let Some(ou_params) = estimate_ou_parameters(closes_history, 1.0) {
+        if let Some(mut ou_params) = estimate_ou_parameters(closes_history, 1.0) {
             let hl = ou_params.half_life_minutes();
             let is_hl_ok = hl >= min_hl && hl <= max_hl;
+            // Apply continuous-time hourly funding carry drift adjustment to equilibrium mean mu:
+            // mu_carry = mu * (1 - F_1h / (60 * theta)), bounded to +/- 15 bps to prevent spike distortion.
+            if hourly_funding_rate.is_finite() && hourly_funding_rate.abs() > 1e-7 && ou_params.theta > 1e-5 {
+                let carry_shift = (-hourly_funding_rate / (60.0 * ou_params.theta)).clamp(-0.0015, 0.0015);
+                ou_params.mu *= 1.0 + carry_shift;
+            }
             // Tighter 7% gate: log-space estimation is more stable, so a wider mu deviation
             // reliably signals a unit-root explosion or a structural break rather than noise.
             let mu_dev = (ou_params.mu - hist_last_price).abs() / hist_last_price;
@@ -336,8 +417,30 @@ pub fn calculate_features(closes_history: &[f64], eval_close: f64, symbol: &str)
 
             if is_hl_ok && is_mu_ok {
                 let tx_cost = hist_last_price * 0.0005; // ~5 bps roundtrip on Hyperliquid Maker
-                let th = calculate_optimal_thresholds(&ou_params, tx_cost);
-                let th_125 = calculate_thresholds_at_sigma(&ou_params, tx_cost, 1.25);
+                let session_offset = if hourly_funding_rate.abs() > 1e-9 {
+                    use chrono::{Datelike, Timelike};
+                    let now_utc = chrono::Utc::now();
+                    let is_weekend = matches!(now_utc.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun);
+                    utc_session_sigma_offset(now_utc.hour(), is_weekend)
+                } else {
+                    0.0
+                };
+                let th = calculate_carry_adjusted_thresholds(
+                    &ou_params,
+                    tx_cost,
+                    1.50 + session_offset,
+                    hourly_funding_rate,
+                    1.30,
+                    1.75,
+                );
+                let th_125 = calculate_carry_adjusted_thresholds(
+                    &ou_params,
+                    tx_cost,
+                    1.25 + session_offset * 0.5,
+                    hourly_funding_rate,
+                    1.15,
+                    1.45,
+                );
                 (Some(th), Some(th_125), hl)
             } else {
                 (None, None, hl)
@@ -346,42 +449,42 @@ pub fn calculate_features(closes_history: &[f64], eval_close: f64, symbol: &str)
             (None, None, 999.0)
         };
 
-    // Scale-Invariant Log-Price OLS Slope Drift Test with Student's t-statistic
-    let n_drift = closes_history.len() as f64;
-    let mut sum_i = 0.0_f64;
-    let mut sum_lp = 0.0_f64;
-    let mut sum_ilp = 0.0_f64;
-    let mut sum_ii = 0.0_f64;
-    for (i, &p) in closes_history.iter().enumerate() {
-        if p <= 0.0 { continue; }
-        let lp = p.ln();
-        let idx = i as f64;
-        sum_i += idx;
-        sum_lp += lp;
-        sum_ilp += idx * lp;
-        sum_ii += idx * idx;
+    // Scale-Invariant Log-Price OLS Slope Drift Test with Student's t-statistic (Two-Pass Centered)
+    let valid_lps: Vec<(f64, f64)> = closes_history
+        .iter()
+        .enumerate()
+        .filter(|(_, &p)| p > 0.0 && p.is_finite())
+        .map(|(i, &p)| (i as f64, p.ln()))
+        .collect();
+    let n_drift = valid_lps.len() as f64;
+    let mean_i = valid_lps.iter().map(|(i, _)| *i).sum::<f64>() / n_drift.max(1.0);
+    let mean_lp = valid_lps.iter().map(|(_, lp)| *lp).sum::<f64>() / n_drift.max(1.0);
+
+    let mut ss_xx = 0.0_f64;
+    let mut ss_xy = 0.0_f64;
+    for &(idx, lp) in &valid_lps {
+        let di = idx - mean_i;
+        let dlp = lp - mean_lp;
+        ss_xx += di * di;
+        ss_xy += di * dlp;
     }
-    let det = n_drift * sum_ii - sum_i * sum_i;
-    let (slope_log, intercept_log) = if det.abs() > 1e-12 {
-        let slope = (n_drift * sum_ilp - sum_i * sum_lp) / det;
-        let intercept = (sum_lp - slope * sum_i) / n_drift;
+    let (slope_log, intercept_log) = if ss_xx > 1e-12 {
+        let slope = ss_xy / ss_xx;
+        let intercept = mean_lp - slope * mean_i;
         (slope, intercept)
     } else {
-        (0.0, 0.0)
+        (0.0, mean_lp)
     };
 
     // Compute residual variance and t-statistic for OLS slope significance (H0: slope == 0)
     let mut sum_sq_residuals = 0.0_f64;
-    for (i, &p) in closes_history.iter().enumerate() {
-        if p <= 0.0 { continue; }
-        let lp = p.ln();
-        let y_hat = intercept_log + slope_log * (i as f64);
+    for &(idx, lp) in &valid_lps {
+        let y_hat = intercept_log + slope_log * idx;
         sum_sq_residuals += (lp - y_hat).powi(2);
     }
     let df = (n_drift - 2.0).max(1.0);
     let s_err_sq = sum_sq_residuals / df;
-    let ss_xx = (det / n_drift).max(1e-12);
-    let se_slope = (s_err_sq / ss_xx).sqrt();
+    let se_slope = (s_err_sq / ss_xx.max(1e-12)).sqrt();
     let t_stat_slope = if se_slope > 1e-12 {
         slope_log / se_slope
     } else {
@@ -637,6 +740,33 @@ mod tests {
         let feat_dump = calculate_features(&history, 98.00, "BTC").expect("features");
         assert!(feat_dump.z_15 < -3.0);
         assert!(feat_dump.is_downside_shock, "-200 bps flash crash must trigger downside shock!");
+    }
+
+    #[test]
+    fn test_monotone_trend_rejected_by_ou_jackknife() {
+        // Pure exponential trend should be rejected as non-stationary (None)
+        let mut trend_prices = Vec::with_capacity(200);
+        for i in 0..200 {
+            trend_prices.push(100.0 * (0.001 * i as f64).exp());
+        }
+        assert!(estimate_ou_parameters(&trend_prices, 1.0).is_none());
+    }
+
+    #[test]
+    fn test_carry_adjusted_asymmetric_ou_thresholds() {
+        let params = OuParameters {
+            theta: 0.02, // 1.2 per hour
+            mu: 100.0,
+            sigma: 0.20,
+        };
+        let tx_cost = 0.05;
+        let neutral = calculate_carry_adjusted_thresholds(&params, tx_cost, 1.50, 0.0, 1.30, 1.75);
+        // Positive hourly funding (+0.05% / hr): longs pay shorts
+        // Short receives positive carry -> entry_short moves closer to mu (lower)
+        // Long pays negative carry -> entry_long moves farther from mu (lower)
+        let pos_fund = calculate_carry_adjusted_thresholds(&params, tx_cost, 1.50, 0.0005, 1.30, 1.75);
+        assert!(pos_fund.entry_short < neutral.entry_short, "Positive carry for short should relax short entry threshold closer to mu");
+        assert!(pos_fund.entry_long < neutral.entry_long, "Negative carry for long should require deeper discount below mu");
     }
 }
 

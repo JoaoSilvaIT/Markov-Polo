@@ -63,9 +63,19 @@ pub struct LiveTelemetry {
 pub fn save_telemetry(symbol: &str, telemetry: &LiveTelemetry) {
     let file_path = format!("hl_telemetry_{}.json", symbol);
     if let Ok(content) = serde_json::to_string_pretty(telemetry) {
-        let temp = format!("{}.tmp", file_path);
-        let _ = fs::write(&temp, content);
-        let _ = fs::rename(&temp, file_path);
+        let temp = format!("{}.tmp.{}", file_path, std::process::id());
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp)
+        {
+            use std::io::Write;
+            if file.write_all(content.as_bytes()).is_ok() && file.sync_all().is_ok() {
+                let _ = fs::rename(&temp, &file_path);
+                crate::state::sync_parent_dir(&file_path);
+            }
+        }
     }
 }
 
@@ -133,9 +143,19 @@ pub fn funnel_counters_path(symbol: &str) -> String {
 pub fn save_funnel_counters(symbol: &str, counters: &FunnelAuditCounters) {
     let file_path = funnel_counters_path(symbol);
     if let Ok(content) = serde_json::to_string_pretty(counters) {
-        let temp = format!("{}.tmp", file_path);
-        let _ = fs::write(&temp, content);
-        let _ = fs::rename(&temp, file_path);
+        let temp = format!("{}.tmp.{}", file_path, std::process::id());
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp)
+        {
+            use std::io::Write;
+            if file.write_all(content.as_bytes()).is_ok() && file.sync_all().is_ok() {
+                let _ = fs::rename(&temp, &file_path);
+                crate::state::sync_parent_dir(&file_path);
+            }
+        }
     }
 }
 
@@ -148,6 +168,84 @@ pub fn load_funnel_counters(symbol: &str) -> FunnelAuditCounters {
         .ok()
         .and_then(|c| serde_json::from_str(&c).ok())
         .unwrap_or_else(|| FunnelAuditCounters::new(symbol))
+}
+
+/// Returns the empirical Hyperliquid BTC-to-altcoin beta seed for causal impulse scaling.
+pub fn empirical_btc_beta(symbol: &str, is_stress: bool) -> f64 {
+    match (symbol.to_uppercase().as_str(), is_stress) {
+        ("ETH", false) => 1.20,
+        ("ETH", true) => 1.45,
+        ("SOL", false) => 1.60,
+        ("SOL", true) => 1.80,
+        ("AVAX", false) => 1.60,
+        ("AVAX", true) => 1.80,
+        _ => 1.20,
+    }
+}
+
+/// Evaluates cross-asset BTC lead-lag impulse spillover using the Beta-Scaled Multiscale Impulse Score I_{BTC->k}(t).
+/// Fails open (returns None) if current symbol is BTC or if BTC telemetry is missing/stale (>90s).
+pub fn check_btc_lead_lag_veto(
+    current_symbol: &str,
+    proposed_is_long: bool,
+    is_trend_engine: bool,
+    now_ms: u64,
+) -> Option<String> {
+    if current_symbol.eq_ignore_ascii_case("BTC") {
+        return None;
+    }
+    let btc_telem: LiveTelemetry = fs::read_to_string("hl_telemetry_BTC.json")
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())?;
+
+    // Only enforce lead-lag filter if BTC telemetry snapshot is fresh within 90 seconds
+    if now_ms.saturating_sub(btc_telem.timestamp_ms) > 90_000 {
+        return None;
+    }
+
+    let is_stress = btc_telem.is_severe_shock || btc_telem.z_15.abs() >= 2.5;
+    let beta = empirical_btc_beta(current_symbol, is_stress);
+    // Multiscale BTC OBI composite: 0.50 * inst + 0.30 * 1s + 0.20 * 5s
+    let obi_composite = 0.50 * btc_telem.obi_instant + 0.30 * btc_telem.obi_1s + 0.20 * btc_telem.obi_5s;
+    // Causal Cross-Asset Impulse Score I_{BTC->k}(t) = beta_k * (0.65 * Z_BTC + 0.35 * Z_OBI)
+    let impulse_score = beta * (0.65 * btc_telem.z_15 + 0.35 * (2.5 * obi_composite));
+
+    if is_trend_engine {
+        // Engine B (Trend Breakout): veto altcoin breakout if BTC is actively crashing/surging in opposite direction
+        if proposed_is_long && (btc_telem.z_15 <= -2.0 || impulse_score <= -2.2) {
+            return Some(format!(
+                "BTC Lead-Lag Downside Impulse (I={:.2}, BTC Z15={:.2})",
+                impulse_score, btc_telem.z_15
+            ));
+        } else if !proposed_is_long && (btc_telem.z_15 >= 2.0 || impulse_score >= 2.2) {
+            return Some(format!(
+                "BTC Lead-Lag Upside Impulse (I={:.2}, BTC Z15={:.2})",
+                impulse_score, btc_telem.z_15
+            ));
+        }
+    } else {
+        // Engine A (Mean Reversion): veto catching an altcoin falling knife while BTC impulse is adverse
+        if proposed_is_long {
+            if impulse_score <= -1.35
+                || btc_telem.z_15 <= -1.8
+                || (btc_telem.is_severe_shock && btc_telem.z_15 < -1.0)
+            {
+                return Some(format!(
+                    "BTC Lead-Lag Cascade Veto (I={:.2}, beta={:.2}, BTC Z15={:.2}, OBI_1s={:.2})",
+                    impulse_score, beta, btc_telem.z_15, btc_telem.obi_1s
+                ));
+            }
+        } else if impulse_score >= 1.35
+            || btc_telem.z_15 >= 1.8
+            || (btc_telem.is_severe_shock && btc_telem.z_15 > 1.0)
+        {
+            return Some(format!(
+                "BTC Lead-Lag Squeeze Veto (I={:.2}, beta={:.2}, BTC Z15={:.2}, OBI_1s={:.2})",
+                impulse_score, beta, btc_telem.z_15, btc_telem.obi_1s
+            ));
+        }
+    }
+    None
 }
 
 #[cfg(test)]

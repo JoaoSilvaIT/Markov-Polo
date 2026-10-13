@@ -501,9 +501,19 @@ pub fn controller_state_path(symbol: &str) -> String {
 pub fn save_controller_state(symbol: &str, controller: &RegimeController) {
     let path = controller_state_path(symbol);
     if let Ok(c) = serde_json::to_string_pretty(controller) {
-        let temp = format!("{}.tmp", path);
-        let _ = fs::write(&temp, c);
-        let _ = fs::rename(&temp, &path);
+        let temp = format!("{}.tmp.{}", path, std::process::id());
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp)
+        {
+            use std::io::Write;
+            if file.write_all(c.as_bytes()).is_ok() && file.sync_all().is_ok() {
+                let _ = fs::rename(&temp, &path);
+                crate::state::sync_parent_dir(&path);
+            }
+        }
     }
 }
 

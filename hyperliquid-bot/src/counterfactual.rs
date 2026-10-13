@@ -287,9 +287,8 @@ impl ActiveOpportunity {
                 return Some(self.finalize_unfilled(close));
             }
 
-            if !self.trade_through_filled {
-                return None; // Still waiting for fill
-            }
+            // Evaluate post-fill MFE/MAE and TP/SL strictly on subsequent candles
+            return None;
         }
 
         // 2. STEP 2: POSITION MONITORING (post-fill)
@@ -574,7 +573,7 @@ impl CounterfactualTracker {
             opp.asset == asset
                 && opp.engine == engine
                 && !opp.is_resolved
-                && (now_ms - opp.created_at_ms) < self.de_duplication_cooldown_ms
+                && now_ms.saturating_sub(opp.created_at_ms) < self.de_duplication_cooldown_ms
         })
     }
 

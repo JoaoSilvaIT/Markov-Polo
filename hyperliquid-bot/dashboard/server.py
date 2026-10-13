@@ -43,6 +43,8 @@ def get_telemetry_data():
         "max_concurrent": MAX_CONCURRENT,
         "data_dir": "/app/data",
         "assets": {},
+        "armed_signals": {},
+        "controllers": {},
         "positions": {},
         "order_intents": {},
         "cluster_leases": [],
@@ -54,7 +56,7 @@ def get_telemetry_data():
     if not valid_dirs:
         valid_dirs = ["."]
 
-    # 1. Load telemetry for all symbols (BTC, ETH, SOL, AVAX)
+    # 1. Load telemetry, armed signals, and controller states for all symbols (BTC, ETH, SOL, AVAX)
     for d in valid_dirs:
         for path in glob.glob(os.path.join(d, "hl_telemetry_*.json")):
             base = os.path.basename(path)
@@ -64,6 +66,24 @@ def get_telemetry_data():
                     with open(path, "r", encoding="utf-8") as f:
                         results["assets"][sym] = json.load(f)
                         results["data_dir"] = d
+                except Exception:
+                    pass
+        for path in glob.glob(os.path.join(d, "hl_hmm_arm_*.json")):
+            base = os.path.basename(path)
+            sym = base.replace("hl_hmm_arm_", "").replace(".json", "")
+            if sym not in results["armed_signals"]:
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        results["armed_signals"][sym] = json.load(f)
+                except Exception:
+                    pass
+        for path in glob.glob(os.path.join(d, "hl_controller_state_*.json")):
+            base = os.path.basename(path)
+            sym = base.replace("hl_controller_state_", "").replace(".json", "")
+            if sym not in results["controllers"]:
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        results["controllers"][sym] = json.load(f)
                 except Exception:
                     pass
 
@@ -186,17 +206,18 @@ def get_telemetry_data():
                 except Exception:
                     pass
 
-    # 5. Load Circuit Breakers (hl_cb_*.json or hl_circuit_breaker.json)
+    # 5. Load Circuit Breakers (hl_hmm_cb_*.json, hl_cb_*.json, or hl_circuit_breaker.json)
     for d in valid_dirs:
-        for path in glob.glob(os.path.join(d, "hl_cb_*.json")):
-            base = os.path.basename(path)
-            sym = base.replace("hl_cb_", "").replace(".json", "")
-            if sym not in results["circuit_breakers"]:
-                try:
-                    with open(path, "r", encoding="utf-8") as f:
-                        results["circuit_breakers"][sym] = json.load(f)
-                except Exception:
-                    pass
+        for pattern, prefix in (("hl_hmm_cb_*.json", "hl_hmm_cb_"), ("hl_cb_*.json", "hl_cb_")):
+            for path in glob.glob(os.path.join(d, pattern)):
+                base = os.path.basename(path)
+                sym = base.replace(prefix, "").replace(".json", "")
+                if sym not in results["circuit_breakers"]:
+                    try:
+                        with open(path, "r", encoding="utf-8") as f:
+                            results["circuit_breakers"][sym] = json.load(f)
+                    except Exception:
+                        pass
         legacy_cb = os.path.join(d, "hl_circuit_breaker.json")
         if os.path.exists(legacy_cb) and "GLOBAL" not in results["circuit_breakers"]:
             try:
@@ -325,8 +346,11 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
         super().do_GET()
 
+class ThreadingHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
 if __name__ == "__main__":
-    socketserver.TCPServer.allow_reuse_address = True
-    with socketserver.TCPServer(("0.0.0.0", PORT), DashboardHandler) as httpd:
+    with ThreadingHTTPServer(("0.0.0.0", PORT), DashboardHandler) as httpd:
         print(f"🚀 [DASHBOARD] Institutional Trading Terminal listening on http://0.0.0.0:{PORT}")
         httpd.serve_forever()

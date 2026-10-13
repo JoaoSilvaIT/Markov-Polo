@@ -3,11 +3,11 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>TradingAI // Hyperliquid Institutional Terminal</title>
+  <title>Hyperliquid Desk</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800;1,400&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
   <script>
     tailwind.config = {
       darkMode: 'class',
@@ -18,22 +18,15 @@
             mono: ['"JetBrains Mono"', 'monospace'],
           },
           colors: {
-            term: {
-              base: '#090d16',
-              surface: '#101623',
-              card: '#131b2c',
-              border: '#1d273d',
-              borderLight: '#2c3957',
-              hover: '#192339',
-              text: '#e2e8f0',
-              muted: '#74839e',
-            },
-            status: {
-              long: '#10b981',
-              short: '#f43f5e',
-              trend: '#06b6d4',
-              neutral: '#f59e0b',
-              shock: '#ef4444',
+            desk: {
+              bg: '#0b0e14',
+              panel: '#11161f',
+              inset: '#0d1118',
+              border: '#1e2636',
+              borderSubtle: '#171e2b',
+              text: '#e5e7eb',
+              muted: '#8b95a5',
+              dim: '#566070'
             }
           }
         }
@@ -42,279 +35,152 @@
   </script>
   <style>
     body {
-      background-color: #090d16;
-      color: #e2e8f0;
+      background-color: #0b0e14;
+      color: #e5e7eb;
       font-family: 'Inter', sans-serif;
       font-feature-settings: 'tnum' on, 'zero' on;
+      -webkit-font-smoothing: antialiased;
     }
     .font-mono {
       font-family: 'JetBrains Mono', monospace;
       font-feature-settings: 'tnum' on, 'zero' on;
     }
-    .panel {
-      background: #101623;
-      border: 1px solid #1d273d;
+    .card {
+      background-color: #11161f;
+      border: 1px solid #1e2636;
     }
-    .panel-card {
-      background: #131b2c;
-      border: 1px solid #1d273d;
+    .inset-box {
+      background-color: #0d1118;
+      border: 1px solid #171e2b;
     }
-    .custom-scrollbar::-webkit-scrollbar {
+    ::-webkit-scrollbar {
       width: 6px;
       height: 6px;
     }
-    .custom-scrollbar::-webkit-scrollbar-track {
-      background: #090d16;
+    ::-webkit-scrollbar-track {
+      background: #0b0e14;
     }
-    .custom-scrollbar::-webkit-scrollbar-thumb {
-      background: #1d273d;
+    ::-webkit-scrollbar-thumb {
+      background: #1e2636;
       border-radius: 3px;
-    }
-    .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-      background: #2c3957;
     }
   </style>
 </head>
-<body class="min-h-screen text-[13px] leading-relaxed selection:bg-cyan-500 selection:text-black">
+<body class="min-h-screen text-[13px] leading-snug">
 
-  <!-- Top Institutional Header -->
-  <header class="border-b border-term-border bg-term-surface sticky top-0 z-50">
-    <div class="max-w-[1680px] mx-auto px-4 py-2.5 flex flex-wrap items-center justify-between gap-3">
-      <!-- Left: Logo & System Identity -->
-      <div class="flex items-center gap-4">
+  <!-- Top Bar -->
+  <header class="border-b border-desk-border bg-desk-panel sticky top-0 z-40">
+    <div class="max-w-[1640px] mx-auto px-4 h-12 flex items-center justify-between gap-4">
+      <div class="flex items-center gap-5">
         <div class="flex items-center gap-2">
-          <div class="w-2.5 h-2.5 rounded-full bg-status-long ring-4 ring-emerald-500/20"></div>
-          <span class="font-mono font-extrabold text-sm tracking-wider text-white">TRADING<span class="text-cyan-400">AI</span></span>
-          <span class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-term-card border border-term-border text-term-muted">v2.1 QUANT</span>
+          <span id="conn-dot" class="w-2 h-2 rounded-full bg-emerald-500"></span>
+          <span class="font-semibold text-sm text-white tracking-tight">Hyperliquid Perps</span>
         </div>
-        <div class="hidden md:flex items-center gap-2 text-[11px] font-mono text-term-muted border-l border-term-border pl-4">
-          <span class="text-emerald-400">● MAINNET</span>
-          <span>•</span>
-          <span>HYPERLIQUID L1</span>
-          <span>•</span>
-          <span class="text-slate-300">DUAL-ENGINE ARCHITECTURE</span>
+
+        <div class="hidden sm:flex items-center gap-4 text-xs border-l border-desk-border pl-4">
+          <div class="flex items-center gap-2">
+            <span class="text-desk-muted">Portfolio Slots</span>
+            <span id="concurrency-badge" class="font-mono font-semibold px-2 py-0.5 rounded bg-desk-inset border border-desk-border text-white">0 / 2</span>
+          </div>
+          <div id="cluster-occupied-symbols" class="flex items-center gap-1.5 font-mono text-xs text-desk-muted">
+            Flat
+          </div>
+        </div>
+
+        <div class="hidden lg:flex items-center gap-2 text-xs border-l border-desk-border pl-4">
+          <span class="text-desk-muted">BTC Lead Vector</span>
+          <span id="btc-lead-summary" class="font-mono text-xs text-desk-text">--</span>
         </div>
       </div>
 
-      <!-- Center: Portfolio Cluster Concurrency Meter -->
-      <div class="flex items-center gap-2">
-        <div class="panel px-3 py-1 rounded flex items-center gap-2.5 font-mono text-xs">
-          <span class="text-term-muted text-[11px] uppercase tracking-wider">CLUSTER CONCURRENCY:</span>
-          <div id="cluster-concurrency-indicator" class="flex items-center gap-2">
-            <span id="concurrency-badge" class="px-2 py-0.5 rounded text-[11px] font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-              0 / 2 ACTIVE
-            </span>
-          </div>
-          <div id="cluster-occupied-symbols" class="flex items-center gap-1.5 text-[11px]">
-            <!-- Dynamically populated with active symbol badges -->
-            <span class="text-slate-500 italic">No locks held</span>
-          </div>
-        </div>
-      </div>
-
-      <!-- Right: Status, Refresh & Controls -->
-      <div class="flex items-center gap-3 font-mono text-xs">
-        <div class="hidden sm:flex items-center gap-1.5 text-term-muted">
-          <span>LATENCY:</span>
-          <span id="server-latency" class="text-slate-300 font-semibold">-- ms</span>
-        </div>
-        <div class="flex items-center gap-1.5 text-term-muted">
-          <span>SYNC:</span>
-          <span id="last-sync-time" class="text-slate-300 font-semibold">--:--:--</span>
-        </div>
-        <button id="toggle-refresh-btn" onclick="toggleAutoRefresh()" class="px-2.5 py-1 rounded bg-term-card hover:bg-term-hover border border-term-border text-cyan-400 hover:text-white transition-colors flex items-center gap-1.5">
-          <span id="refresh-status-dot" class="w-1.5 h-1.5 rounded-full bg-cyan-400"></span>
-          <span id="refresh-btn-label">2s LIVE</span>
+      <div class="flex items-center gap-4 font-mono text-xs">
+        <span class="text-desk-muted hidden md:inline">Sync <span id="last-sync-time" class="text-desk-text">--:--:--</span> (<span id="server-latency">--</span>ms)</span>
+        <button id="toggle-refresh-btn" onclick="toggleAutoRefresh()" class="px-2.5 py-1 rounded bg-desk-inset hover:bg-desk-border border border-desk-border text-desk-text transition-colors flex items-center gap-1.5">
+          <span id="refresh-status-dot" class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+          <span id="refresh-btn-label">Live (2s)</span>
         </button>
       </div>
     </div>
   </header>
 
-  <!-- Main Container -->
-  <main class="max-w-[1680px] mx-auto p-4 space-y-4">
+  <main class="max-w-[1640px] mx-auto px-4 py-4 space-y-4">
 
-    <!-- Active Positions & Open Orders Section -->
-    <section class="panel rounded-lg overflow-hidden">
-      <div class="px-4 py-2.5 border-b border-term-border flex items-center justify-between bg-term-card/60">
-        <div class="flex items-center gap-3">
-          <h2 class="font-mono text-xs font-bold tracking-wider text-white uppercase flex items-center gap-2">
-            <svg class="w-3.5 h-3.5 text-cyan-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-            </svg>
-            Active Portfolio Positions & Live Orders
-          </h2>
-          <span id="positions-count-badge" class="text-[10px] font-mono px-2 py-0.5 rounded bg-term-border text-term-muted font-semibold">
-            0 ACTIVE
-          </span>
+    <!-- Active Positions & Working Orders -->
+    <section id="positions-section" class="card rounded-md overflow-hidden">
+      <div class="px-4 py-2 border-b border-desk-border flex items-center justify-between">
+        <div class="flex items-center gap-2.5">
+          <h2 class="text-xs font-semibold uppercase tracking-wider text-desk-muted">Active Positions & Working Orders</h2>
+          <span id="positions-count-badge" class="font-mono text-[11px] px-1.5 py-0.2 rounded bg-desk-inset border border-desk-border text-desk-muted">0</span>
         </div>
-        <div class="text-[11px] font-mono text-term-muted">
-          MAX CONCURRENT SLOTS: <span id="max-concurrent-label" class="text-white font-bold">2</span>
-        </div>
+        <span class="font-mono text-[11px] text-desk-dim">Max <span id="max-concurrent-label">2</span> concurrent</span>
       </div>
-
-      <div class="overflow-x-auto">
-        <table class="w-full font-mono text-left text-xs">
-          <thead>
-            <tr class="text-term-muted border-b border-term-border bg-term-surface/50 text-[11px]">
-              <th class="py-2 px-4">ASSET</th>
-              <th class="py-2 px-3">ENGINE</th>
-              <th class="py-2 px-3">SIDE</th>
-              <th class="py-2 px-3 text-right">SIZE</th>
-              <th class="py-2 px-3 text-right">ENTRY PX</th>
-              <th class="py-2 px-3 text-right">CURRENT PX</th>
-              <th class="py-2 px-3 text-right">UNREALIZED PNL</th>
-              <th class="py-2 px-3 text-right">CHANDELIER STOP / SL</th>
-              <th class="py-2 px-3 text-right">EFFECTIVE TP</th>
-              <th class="py-2 px-3">HALF-LIFE / HOLD</th>
-              <th class="py-2 px-4 text-center">FENCING TOKEN</th>
-            </tr>
-          </thead>
-          <tbody id="positions-table-body" class="divide-y divide-term-border text-term-text">
-            <tr>
-              <td colspan="11" class="py-6 text-center text-term-muted italic">
-                No active positions currently open • Cluster mutex idle • Capital ready
-              </td>
-            </tr>
-          </tbody>
-        </table>
+      <div id="positions-container">
+        <div class="px-4 py-2.5 text-xs text-desk-muted font-mono">
+          No open positions or resting orders on exchange.
+        </div>
       </div>
     </section>
 
-    <!-- 4-Asset Institutional Matrix: BTC, ETH, SOL, AVAX -->
+    <!-- 4-Asset Readiness & Condition Cards -->
     <section>
-      <div class="flex items-center justify-between mb-2">
-        <h2 class="font-mono text-xs font-bold tracking-wider text-term-muted uppercase flex items-center gap-2">
-          <span>QUAD-ASSET TRADING MATRIX</span>
-          <span class="text-slate-600">•</span>
-          <span class="text-slate-400 font-normal">CONTINUOUS STATISTICAL GAUGES & L2 MICROSTRUCTURE</span>
-        </h2>
-        <div class="text-[11px] font-mono text-term-muted flex items-center gap-3">
-          <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-emerald-400"></span> CONSOLIDATION (ENGINE A)</span>
-          <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-cyan-400"></span> TREND BREAKOUT (ENGINE B)</span>
-          <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-amber-400"></span> NEUTRAL COOLDOWN</span>
-        </div>
-      </div>
-
-      <div id="assets-grid" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
-        <!-- Rendered dynamically -->
-        <div class="panel rounded-lg p-5 animate-pulse text-center text-term-muted font-mono">
-          Loading BTC telemetry...
-        </div>
-        <div class="panel rounded-lg p-5 animate-pulse text-center text-term-muted font-mono">
-          Loading ETH telemetry...
-        </div>
-        <div class="panel rounded-lg p-5 animate-pulse text-center text-term-muted font-mono">
-          Loading SOL telemetry...
-        </div>
-        <div class="panel rounded-lg p-5 animate-pulse text-center text-term-muted font-mono">
-          Loading AVAX telemetry...
-        </div>
+      <div id="assets-grid" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3.5">
+        <div class="card rounded-md p-4 text-desk-muted font-mono text-xs">Loading BTC...</div>
+        <div class="card rounded-md p-4 text-desk-muted font-mono text-xs">Loading ETH...</div>
+        <div class="card rounded-md p-4 text-desk-muted font-mono text-xs">Loading SOL...</div>
+        <div class="card rounded-md p-4 text-desk-muted font-mono text-xs">Loading AVAX...</div>
       </div>
     </section>
 
-    <!-- Quantitative Counterfactual & Veto Attribution Panel -->
-    <section class="panel rounded-lg overflow-hidden">
-      <div class="px-4 py-2.5 border-b border-term-border bg-term-card/60 flex flex-wrap items-center justify-between gap-3">
-        <div class="flex items-center gap-3">
-          <h2 class="font-mono text-xs font-bold tracking-wider text-white uppercase flex items-center gap-2">
-            <svg class="w-3.5 h-3.5 text-cyan-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-            </svg>
-            Counterfactual Alpha Analytics & Veto Attribution
-          </h2>
-          <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-term-border text-term-muted">
-            STRICT TRADE-THROUGH SIMULATOR
-          </span>
+    <!-- Counterfactual Veto Scorecard (Clean & Collapsible) -->
+    <section class="card rounded-md overflow-hidden">
+      <div class="px-4 py-2.5 border-b border-desk-border flex flex-wrap items-center justify-between gap-4">
+        <div class="flex items-center gap-4">
+          <h2 class="text-xs font-semibold uppercase tracking-wider text-desk-muted">Shadow Veto Attribution</h2>
+          <div class="flex items-center gap-4 font-mono text-xs">
+            <span>Evaluated: <strong id="cf-total-evaluated" class="text-white">0</strong></span>
+            <span>Fills: <strong id="cf-strict-fills" class="text-white">0</strong>/<span id="cf-total-touches" class="text-desk-muted">0</span> (<span id="cf-fill-conversion">0%</span>)</span>
+            <span class="text-emerald-400">Saved: <strong id="cf-protective-count">0</strong> (<span id="cf-protective-bps">+0.0 bps</span>)</span>
+            <span class="text-rose-400">Missed: <strong id="cf-strangling-count">0</strong> (<span id="cf-strangling-bps">-0.0 bps</span>)</span>
+            <span>Net Gate Value: <strong id="cf-net-edge-bps" class="text-white">0.0 bps</strong></span>
+          </div>
         </div>
-        <div class="text-[11px] font-mono text-term-muted">
-          EVALUATED: <span id="cf-total-evaluated" class="text-white font-bold">0</span> SIGNALS
-        </div>
+        <button onclick="toggleVetoDetails()" id="veto-toggle-btn" class="font-mono text-xs text-desk-muted hover:text-white">
+          Show Details ▾
+        </button>
       </div>
 
-      <!-- Top Metric KPI Strips -->
-      <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 divide-x divide-y lg:divide-y-0 divide-term-border border-b border-term-border bg-term-surface text-center font-mono">
-        <div class="p-3">
-          <div class="text-[10px] text-term-muted uppercase">TOTAL TOUCHES</div>
-          <div id="cf-total-touches" class="text-base font-bold text-white mt-0.5">0</div>
-          <div class="text-[10px] text-term-muted">L2 Touch Opportunities</div>
-        </div>
-        <div class="p-3">
-          <div class="text-[10px] text-term-muted uppercase">STRICT FILLS</div>
-          <div id="cf-strict-fills" class="text-base font-bold text-cyan-400 mt-0.5">0</div>
-          <div class="text-[10px] text-term-muted">Trade-Through Confirmed</div>
-        </div>
-        <div class="p-3">
-          <div class="text-[10px] text-term-muted uppercase">FILL CONVERSION</div>
-          <div id="cf-fill-conversion" class="text-base font-bold text-white mt-0.5">0.0%</div>
-          <div class="text-[10px] text-term-muted">Strict / Touches</div>
-        </div>
-        <div class="p-3">
-          <div class="text-[10px] text-emerald-400 uppercase font-semibold">ALPHA PROTECTIVE</div>
-          <div id="cf-protective-count" class="text-base font-bold text-emerald-400 mt-0.5">0</div>
-          <div id="cf-protective-bps" class="text-[10px] text-emerald-400/80">+0.0 bps avoided</div>
-        </div>
-        <div class="p-3">
-          <div class="text-[10px] text-rose-400 uppercase font-semibold">ALPHA STRANGLING</div>
-          <div id="cf-strangling-count" class="text-base font-bold text-rose-400 mt-0.5">0</div>
-          <div id="cf-strangling-bps" class="text-[10px] text-rose-400/80">-0.0 bps missed</div>
-        </div>
-        <div class="p-3">
-          <div class="text-[10px] text-term-muted uppercase">NET GATE ALPHA</div>
-          <div id="cf-net-edge-bps" class="text-base font-bold text-white mt-0.5">+0.0 bps</div>
-          <div id="cf-net-verdict" class="text-[10px] text-slate-400">Neutral Filter</div>
-        </div>
-      </div>
-
-      <div class="grid grid-cols-1 lg:grid-cols-2 divide-y lg:divide-y-0 lg:divide-x divide-term-border">
-        <!-- Veto Attribution Breakdown Table -->
-        <div class="p-4">
-          <div class="flex items-center justify-between mb-2.5">
-            <h3 class="font-mono text-xs font-bold text-white uppercase">Veto Filter Breakdown Scorecard</h3>
-            <span class="text-[10px] font-mono text-term-muted">Aggregated across all assets</span>
-          </div>
-          <div class="overflow-x-auto">
-            <table class="w-full font-mono text-left text-xs">
-              <thead>
-                <tr class="text-term-muted border-b border-term-border text-[10px]">
-                  <th class="pb-1.5">VETO REASON</th>
-                  <th class="pb-1.5 text-center">N</th>
-                  <th class="pb-1.5 text-center text-emerald-400">PROTECTIVE</th>
-                  <th class="pb-1.5 text-center text-rose-400">STRANGLING</th>
-                  <th class="pb-1.5 text-right">NET EDGE (BPS)</th>
-                </tr>
-              </thead>
-              <tbody id="cf-veto-breakdown-body" class="divide-y divide-term-border text-term-text">
-                <tr>
-                  <td colspan="5" class="py-4 text-center text-term-muted italic">No veto events recorded yet</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
+      <div id="veto-details-panel" class="hidden grid grid-cols-1 lg:grid-cols-2 divide-y lg:divide-y-0 lg:divide-x divide-desk-border">
+        <div class="p-3.5">
+          <div class="text-[11px] font-semibold uppercase tracking-wider text-desk-muted mb-2">Veto Breakdown by Rule</div>
+          <table class="w-full font-mono text-xs">
+            <thead>
+              <tr class="text-desk-dim border-b border-desk-border text-[11px] text-left">
+                <th class="pb-1.5 font-normal">Rule</th>
+                <th class="pb-1.5 font-normal text-center">Count</th>
+                <th class="pb-1.5 font-normal text-center">Saved Loss</th>
+                <th class="pb-1.5 font-normal text-center">Missed Win</th>
+                <th class="pb-1.5 font-normal text-right">Net bps</th>
+              </tr>
+            </thead>
+            <tbody id="cf-veto-breakdown-body" class="divide-y divide-desk-borderSubtle"></tbody>
+          </table>
         </div>
 
-        <!-- Recent Real-Time Audit Stream -->
-        <div class="p-4">
-          <div class="flex items-center justify-between mb-2.5">
-            <h3 class="font-mono text-xs font-bold text-white uppercase">Real-Time Audit Stream (Last 20)</h3>
-            <span class="text-[10px] font-mono text-term-muted">Causal event execution audit</span>
-          </div>
-          <div class="overflow-x-auto max-h-[320px] custom-scrollbar">
-            <table class="w-full font-mono text-left text-xs">
-              <thead class="sticky top-0 bg-term-surface">
-                <tr class="text-term-muted border-b border-term-border text-[10px]">
-                  <th class="pb-1.5">TIME</th>
-                  <th class="pb-1.5">ASSET</th>
-                  <th class="pb-1.5">SIDE</th>
-                  <th class="pb-1.5">PRIMARY VETO</th>
-                  <th class="pb-1.5">FILL</th>
-                  <th class="pb-1.5 text-right">OUTCOME</th>
+        <div class="p-3.5">
+          <div class="text-[11px] font-semibold uppercase tracking-wider text-desk-muted mb-2">Recent Shadow Outcomes (Last 20)</div>
+          <div class="max-h-[240px] overflow-y-auto">
+            <table class="w-full font-mono text-xs">
+              <thead class="sticky top-0 bg-desk-panel">
+                <tr class="text-desk-dim border-b border-desk-border text-[11px] text-left">
+                  <th class="pb-1.5 font-normal">Time</th>
+                  <th class="pb-1.5 font-normal">Asset</th>
+                  <th class="pb-1.5 font-normal">Side</th>
+                  <th class="pb-1.5 font-normal">Veto</th>
+                  <th class="pb-1.5 font-normal">Fill</th>
+                  <th class="pb-1.5 font-normal text-right">Verdict</th>
                 </tr>
               </thead>
-              <tbody id="cf-stream-body" class="divide-y divide-term-border text-term-text">
-                <tr>
-                  <td colspan="6" class="py-4 text-center text-term-muted italic">Awaiting causal trade events...</td>
-                </tr>
-              </tbody>
+              <tbody id="cf-stream-body" class="divide-y divide-desk-borderSubtle"></tbody>
             </table>
           </div>
         </div>
@@ -323,57 +189,64 @@
 
   </main>
 
-  <!-- Institutional Footer -->
-  <footer class="border-t border-term-border mt-8 py-4 bg-term-surface text-term-muted font-mono text-xs">
-    <div class="max-w-[1680px] mx-auto px-4 flex flex-wrap items-center justify-between gap-3">
-      <div>
-        <span>TradingAI Autonomous Cluster</span>
-        <span class="mx-2">•</span>
-        <span>Hyperliquid Mainnet API</span>
-        <span class="mx-2">•</span>
-        <span class="text-slate-400">POSIX Kernel Flock & Monotonic Fencing Protected</span>
-      </div>
-      <div>
-        <span id="footer-data-dir">Data Dir: /app/data</span>
-        <span class="mx-2">•</span>
-        <span id="system-clock">UTC Clock: --:--:--</span>
-      </div>
-    </div>
-  </footer>
-
-  <!-- Terminal Client-Side Scripts -->
   <script>
     let autoRefresh = true;
     let refreshTimer = null;
-    let lastFetchTimestamp = 0;
+    let vetoExpanded = false;
+
+    function toggleVetoDetails() {
+      vetoExpanded = !vetoExpanded;
+      const panel = document.getElementById('veto-details-panel');
+      const btn = document.getElementById('veto-toggle-btn');
+      if (vetoExpanded) {
+        panel.classList.remove('hidden');
+        btn.textContent = 'Hide Details ▴';
+      } else {
+        panel.classList.add('hidden');
+        btn.textContent = 'Show Details ▾';
+      }
+    }
 
     function toggleAutoRefresh() {
       autoRefresh = !autoRefresh;
       const dot = document.getElementById('refresh-status-dot');
       const label = document.getElementById('refresh-btn-label');
       if (autoRefresh) {
-        dot.className = "w-1.5 h-1.5 rounded-full bg-cyan-400";
-        label.textContent = "2s LIVE";
+        dot.className = 'w-1.5 h-1.5 rounded-full bg-emerald-400';
+        label.textContent = 'Live (2s)';
         fetchTelemetry();
       } else {
-        dot.className = "w-1.5 h-1.5 rounded-full bg-amber-400";
-        label.textContent = "PAUSED";
+        dot.className = 'w-1.5 h-1.5 rounded-full bg-amber-400';
+        label.textContent = 'Paused';
       }
+    }
+
+    function fmtPx(px, sym) {
+      if (px === undefined || px === null || isNaN(px) || Number(px) <= 0) return '--';
+      const num = Number(px);
+      const dec = (sym === 'AVAX' || num < 25) ? 3 : (num < 500 ? 2 : 2);
+      return '$' + num.toLocaleString('en-US', { minimumFractionDigits: dec, maximumFractionDigits: dec });
+    }
+
+    function fmtSignedBps(bps) {
+      if (bps === undefined || bps === null || isNaN(bps)) return '--';
+      const n = Number(bps);
+      return (n >= 0 ? '+' : '') + n.toFixed(1) + ' bps';
     }
 
     async function fetchTelemetry() {
       const startMs = Date.now();
       try {
         const res = await fetch('/api/telemetry?t=' + startMs);
-        if (!res.ok) throw new Error("HTTP error " + res.status);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
-        const latency = Date.now() - startMs;
-        document.getElementById('server-latency').textContent = latency + ' ms';
+        document.getElementById('server-latency').textContent = (Date.now() - startMs);
         document.getElementById('last-sync-time').textContent = new Date().toLocaleTimeString();
+        document.getElementById('conn-dot').className = 'w-2 h-2 rounded-full bg-emerald-500';
         renderTerminal(data);
       } catch (err) {
-        console.error("Telemetry fetch error:", err);
-        document.getElementById('server-latency').textContent = 'ERR';
+        console.error('Telemetry error:', err);
+        document.getElementById('conn-dot').className = 'w-2 h-2 rounded-full bg-rose-500';
       } finally {
         if (autoRefresh) {
           clearTimeout(refreshTimer);
@@ -384,391 +257,431 @@
 
     function renderTerminal(data) {
       if (!data) return;
-
       const maxConcurrent = data.max_concurrent || 2;
       document.getElementById('max-concurrent-label').textContent = maxConcurrent;
-      if (data.data_dir) {
-        document.getElementById('footer-data-dir').textContent = 'Data Dir: ' + data.data_dir;
-      }
-      document.getElementById('system-clock').textContent = 'UTC: ' + new Date().toISOString().substring(11, 19);
 
-      // 1. Render Cluster Concurrency Meter & Active Occupants
-      renderClusterConcurrency(data, maxConcurrent);
-
-      // 2. Render Active Positions Table
-      renderPositionsTable(data);
-
-      // 3. Render Asset Cards (BTC, ETH, SOL, AVAX)
-      renderAssetCards(data);
-
-      // 4. Render Counterfactual & Veto Attribution
-      renderCounterfactualAnalytics(data.counterfactual || {});
+      renderTopStatus(data, maxConcurrent);
+      renderPositions(data);
+      renderAssetCards(data, maxConcurrent);
+      renderCounterfactual(data.counterfactual || {});
     }
 
-    function renderClusterConcurrency(data, maxConcurrent) {
+    function renderTopStatus(data, maxConcurrent) {
       const activeLeases = data.cluster_leases || [];
-      const occupiedPositions = data.positions ? Object.keys(data.positions) : [];
+      const positions = data.positions || {};
+      const activeSet = new Set();
+      activeLeases.forEach(l => { if (l.symbol) activeSet.add(l.symbol); });
+      Object.keys(positions).forEach(s => activeSet.add(s));
 
-      // Combine symbols holding leases or positions
-      const activeSymbolsSet = new Set();
-      activeLeases.forEach(l => { if (l.symbol) activeSymbolsSet.add(l.symbol); });
-      occupiedPositions.forEach(s => activeSymbolsSet.add(s));
-
-      const activeCount = activeSymbolsSet.size;
+      const count = activeSet.size;
       const badge = document.getElementById('concurrency-badge');
-      const symbolsContainer = document.getElementById('cluster-occupied-symbols');
+      badge.textContent = `${count} / ${maxConcurrent}`;
+      badge.className = count >= maxConcurrent
+        ? 'font-mono font-semibold px-2 py-0.5 rounded bg-amber-500/15 border border-amber-500/40 text-amber-300'
+        : 'font-mono font-semibold px-2 py-0.5 rounded bg-desk-inset border border-desk-border text-white';
 
-      badge.textContent = `${activeCount} / ${maxConcurrent} ACTIVE`;
-      if (activeCount >= maxConcurrent) {
-        badge.className = "px-2 py-0.5 rounded text-[11px] font-bold bg-amber-500/20 text-amber-400 border border-amber-500/40";
-      } else if (activeCount > 0) {
-        badge.className = "px-2 py-0.5 rounded text-[11px] font-bold bg-cyan-500/20 text-cyan-400 border border-cyan-500/40";
+      const symContainer = document.getElementById('cluster-occupied-symbols');
+      if (count === 0) {
+        symContainer.innerHTML = '<span class="text-desk-dim">All slots available</span>';
       } else {
-        badge.className = "px-2 py-0.5 rounded text-[11px] font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20";
+        let html = '';
+        activeSet.forEach(s => {
+          const p = positions[s];
+          const side = p ? p.side : 'LOCK';
+          const col = side === 'LONG' ? 'text-emerald-400' : (side === 'SHORT' ? 'text-rose-400' : 'text-amber-400');
+          html += `<span class="px-1.5 py-0.5 rounded bg-desk-inset border border-desk-border text-white">${s} <span class="${col}">${side}</span></span>`;
+        });
+        symContainer.innerHTML = html;
       }
 
-      if (activeSymbolsSet.size > 0) {
-        let symHtml = '';
-        activeSymbolsSet.forEach(s => {
-          const pos = data.positions ? data.positions[s] : null;
-          const engine = pos ? (pos.engine_type || 'EngineA') : 'Lease';
-          const side = pos ? (pos.side || 'LONG') : '';
-          const sideColor = side === 'LONG' ? 'text-emerald-400' : (side === 'SHORT' ? 'text-rose-400' : 'text-slate-300');
-          symHtml += `<span class="px-1.5 py-0.5 rounded bg-term-border text-white border border-slate-700 flex items-center gap-1 font-mono text-[10px]">
-            <span class="font-bold">${s}</span>
-            <span class="text-term-muted">(${engine})</span>
-            ${side ? `<span class="${sideColor} font-bold">${side[0]}</span>` : ''}
-          </span>`;
-        });
-        symbolsContainer.innerHTML = symHtml;
-      } else {
-        symbolsContainer.innerHTML = '<span class="text-slate-500 italic">No locks held</span>';
+      // BTC Lead Vector Summary
+      const btc = data.assets ? data.assets['BTC'] : null;
+      const btcLeadEl = document.getElementById('btc-lead-summary');
+      if (btc) {
+        const z15 = Number(btc.z_15 || 0);
+        const obi1s = Number(btc.obi_1s || 0);
+        const downVeto = z15 <= -1.8 || (z15 <= -1.2 && obi1s <= -0.25) || (btc.is_severe_shock && z15 < -1.0);
+        const upVeto = z15 >= 1.8 || (z15 >= 1.2 && obi1s >= 0.25) || (btc.is_severe_shock && z15 > 1.0);
+        let statusTag = '<span class="text-emerald-400">Neutral (Alt Entries Allowed)</span>';
+        if (downVeto) statusTag = '<span class="text-rose-400 font-semibold">Downside Impulse (Alt Longs Vetoed)</span>';
+        else if (upVeto) statusTag = '<span class="text-amber-400 font-semibold">Upside Impulse (Alt Shorts Vetoed)</span>';
+        btcLeadEl.innerHTML = `Z15: ${z15 >= 0 ? '+' : ''}${z15.toFixed(2)}σ · OBI: ${obi1s >= 0 ? '+' : ''}${obi1s.toFixed(2)} · ${statusTag}`;
       }
     }
 
-    function renderPositionsTable(data) {
+    function renderPositions(data) {
       const positions = data.positions || {};
-      const tbody = document.getElementById('positions-table-body');
-      const badge = document.getElementById('positions-count-badge');
       const syms = Object.keys(positions);
-
-      badge.textContent = `${syms.length} ACTIVE`;
+      const container = document.getElementById('positions-container');
+      document.getElementById('positions-count-badge').textContent = syms.length;
 
       if (syms.length === 0) {
-        tbody.innerHTML = `<tr>
-          <td colspan="11" class="py-6 text-center text-term-muted italic">
-            No active positions currently open • Cluster mutex idle • Capital ready
-          </td>
-        </tr>`;
+        container.innerHTML = `<div class="px-4 py-2.5 text-xs text-desk-muted font-mono">No open positions or resting orders on exchange.</div>`;
         return;
       }
 
-      let html = '';
+      let rows = '';
       syms.forEach(sym => {
         const p = positions[sym];
         const side = String(p.side || 'LONG').toUpperCase();
-        const sideColor = side === 'LONG' ? 'text-emerald-400' : 'text-rose-400';
-        const sideBg = side === 'LONG' ? 'bg-emerald-500/10 border-emerald-500/30' : 'bg-rose-500/10 border-rose-500/30';
-        const amount = Number(p.amount || 0).toLocaleString('en-US', { minimumFractionDigits: 4, maximumFractionDigits: 5 });
-        const entryPx = Number(p.entry_price || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-        const curPx = p.current_price ? Number(p.current_price).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '--';
+        const isLong = side === 'LONG';
+        const sideBadge = isLong
+          ? '<span class="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 font-semibold">LONG</span>'
+          : '<span class="px-1.5 py-0.5 rounded bg-rose-500/15 text-rose-400 border border-rose-500/30 font-semibold">SHORT</span>';
+        const statusBadge = p.is_filled
+          ? '<span class="text-emerald-400">FILLED</span>'
+          : '<span class="text-amber-400">RESTING ENTRY</span>';
 
-        const pnlUsd = p.unrealized_pnl_usd !== undefined ? p.unrealized_pnl_usd : null;
-        const pnlBps = p.unrealized_pnl_bps !== undefined ? p.unrealized_pnl_bps : null;
+        const engineLabel = (p.engine_type === 'EngineB') ? 'Engine B (Trend)' : 'Engine A (O-U)';
+        const sizeStr = Number(p.amount || 0).toFixed(sym === 'BTC' ? 5 : (sym === 'ETH' ? 4 : 2));
+        const entryStr = fmtPx(p.entry_price, sym);
+        const curStr = fmtPx(p.current_price, sym);
 
         let pnlHtml = '--';
-        if (pnlUsd !== null && pnlBps !== null) {
-          const isProf = pnlUsd >= 0;
-          const pnlColor = isProf ? 'text-emerald-400' : 'text-rose-400';
-          const sign = isProf ? '+' : '';
-          pnlHtml = `<span class="${pnlColor} font-bold">${sign}$${pnlUsd.toFixed(2)}</span>
-            <span class="text-[10px] ${pnlColor} block">(${sign}${pnlBps.toFixed(1)} bps)</span>`;
+        if (p.unrealized_pnl_usd !== undefined && p.is_filled) {
+          const u = Number(p.unrealized_pnl_usd);
+          const b = Number(p.unrealized_pnl_bps || 0);
+          const col = u >= 0 ? 'text-emerald-400' : 'text-rose-400';
+          const s = u >= 0 ? '+' : '';
+          pnlHtml = `<span class="${col} font-semibold">${s}$${u.toFixed(2)} (${s}${b.toFixed(1)} bps)</span>`;
         }
 
-        const slPx = p.stop_loss_price > 0 ? '$' + Number(p.stop_loss_price).toFixed(2) : (p.chandelier_stop > 0 ? '$' + Number(p.chandelier_stop).toFixed(2) : '--');
-        const tpPx = p.effective_tp > 0 ? '$' + Number(p.effective_tp).toFixed(2) : (p.take_profit_price > 0 ? '$' + Number(p.take_profit_price).toFixed(2) : '--');
-        const thalf = p.half_life_minutes ? `${Number(p.half_life_minutes).toFixed(1)}m` : '--';
-        const token = p.lease_fencing_token || '--';
-        const engine = p.engine_type || 'EngineA';
+        const slVal = p.chandelier_stop > 0 ? p.chandelier_stop : p.stop_loss_price;
+        const tpVal = p.effective_tp > 0 ? p.effective_tp : p.take_profit_price;
 
-        html += `<tr class="hover:bg-term-hover/40 transition-colors">
-          <td class="py-2.5 px-4 font-bold text-white">${sym}</td>
-          <td class="py-2.5 px-3 text-term-muted text-[11px]">${engine}</td>
-          <td class="py-2.5 px-3">
-            <span class="px-1.5 py-0.5 rounded text-[10px] font-bold border ${sideBg} ${sideColor}">${side}</span>
-          </td>
-          <td class="py-2.5 px-3 text-right font-medium">${amount}</td>
-          <td class="py-2.5 px-3 text-right font-medium">$${entryPx}</td>
-          <td class="py-2.5 px-3 text-right font-bold text-white">$${curPx}</td>
-          <td class="py-2.5 px-3 text-right">${pnlHtml}</td>
-          <td class="py-2.5 px-3 text-right text-rose-400/90 font-medium">${slPx}</td>
-          <td class="py-2.5 px-3 text-right text-emerald-400/90 font-medium">${tpPx}</td>
-          <td class="py-2.5 px-3 text-term-muted">${thalf}</td>
-          <td class="py-2.5 px-4 text-center text-cyan-400 font-mono text-[11px]">#${token}</td>
+        rows += `<tr class="border-t border-desk-borderSubtle">
+          <td class="py-2 px-4 font-semibold text-white">${sym}</td>
+          <td class="py-2 px-3">${sideBadge}</td>
+          <td class="py-2 px-3 text-desk-muted">${ statusBadge }</td>
+          <td class="py-2 px-3 text-desk-muted">${engineLabel}</td>
+          <td class="py-2 px-3 text-right">${sizeStr}</td>
+          <td class="py-2 px-3 text-right">${entryStr}</td>
+          <td class="py-2 px-3 text-right text-white font-semibold">${curStr}</td>
+          <td class="py-2 px-3 text-right">${pnlHtml}</td>
+          <td class="py-2 px-3 text-right text-rose-400">${fmtPx(slVal, sym)}</td>
+          <td class="py-2 px-4 text-right text-emerald-400">${tpVal > 0 ? fmtPx(tpVal, sym) : 'Chandelier Trail'}</td>
         </tr>`;
       });
-      tbody.innerHTML = html;
+
+      container.innerHTML = `<div class="overflow-x-auto">
+        <table class="w-full font-mono text-xs text-left">
+          <thead>
+            <tr class="text-desk-dim bg-desk-inset text-[11px]">
+              <th class="py-1.5 px-4 font-normal">Asset</th>
+              <th class="py-1.5 px-3 font-normal">Side</th>
+              <th class="py-1.5 px-3 font-normal">State</th>
+              <th class="py-1.5 px-3 font-normal">Engine</th>
+              <th class="py-1.5 px-3 font-normal text-right">Size</th>
+              <th class="py-1.5 px-3 font-normal text-right">Entry</th>
+              <th class="py-1.5 px-3 font-normal text-right">Mark</th>
+              <th class="py-1.5 px-3 font-normal text-right">Unrealized PnL</th>
+              <th class="py-1.5 px-3 font-normal text-right">Stop Loss</th>
+              <th class="py-1.5 px-4 font-normal text-right">Take Profit</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
     }
 
-    function renderAssetCards(data) {
+    function gateRow(status, label, detail) {
+      let icon = '<span class="text-emerald-400 font-bold w-3.5 inline-block">✓</span>';
+      let valColor = 'text-desk-text';
+      if (status === 'wait') {
+        icon = '<span class="text-amber-400 font-bold w-3.5 inline-block">•</span>';
+        valColor = 'text-amber-300';
+      } else if (status === 'fail') {
+        icon = '<span class="text-rose-400 font-bold w-3.5 inline-block">×</span>';
+        valColor = 'text-rose-400';
+      }
+      return `<div class="flex items-center justify-between py-1 text-xs border-b border-desk-borderSubtle last:border-b-0">
+        <div class="flex items-center gap-1.5 text-desk-muted">
+          ${icon}
+          <span>${label}</span>
+        </div>
+        <span class="font-mono text-[11px] ${valColor} text-right">${detail}</span>
+      </div>`;
+    }
+
+    function renderAssetCards(data, maxConcurrent) {
       const container = document.getElementById('assets-grid');
       const symbols = ['BTC', 'ETH', 'SOL', 'AVAX'];
-      let html = '';
+      const btc = data.assets ? data.assets['BTC'] : null;
 
+      // Count other active positions
+      const activePositions = data.positions ? Object.keys(data.positions) : [];
+
+      let html = '';
       symbols.forEach(sym => {
         const d = (data.assets && data.assets[sym]) ? data.assets[sym] : null;
         if (!d) {
-          html += renderEmptyAssetCard(sym);
+          html += `<div class="card rounded-md p-4 font-mono text-xs text-desk-muted">${sym}: Waiting for telemetry...</div>`;
           return;
         }
 
-        const price = (d.price !== undefined && d.price !== null)
-          ? Number(d.price).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-          : '0.00';
+        const armed = (data.armed_signals && data.armed_signals[sym] && data.armed_signals[sym].is_armed)
+          ? data.armed_signals[sym]
+          : null;
+        const cb = (data.circuit_breakers && data.circuit_breakers[sym]) ? data.circuit_breakers[sym] : null;
+        const pos = (data.positions && data.positions[sym]) ? data.positions[sym] : null;
 
-        const buyPx = d.long_buy ? Number(d.long_buy).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : null;
-        const sellPx = d.short_sell ? Number(d.short_sell).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : null;
-
-        // Spread & Distance
-        let buyDistBps = '--';
-        let sellDistBps = '--';
-        if (d.price && d.long_buy) {
-          buyDistBps = (((d.long_buy - d.price) / d.price) * 10000).toFixed(1);
-        }
-        if (d.price && d.short_sell) {
-          sellDistBps = (((d.short_sell - d.price) / d.price) * 10000).toFixed(1);
-        }
-
-        // Engine B: 3h Donchian Breakout Levels
-        const donchianUpper = d.donchian_upper ? Number(d.donchian_upper).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : null;
-        const donchianLower = d.donchian_lower ? Number(d.donchian_lower).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : null;
-        const donchianStatus = d.donchian_status || 'COILING';
-        const distUpperPct = d.donchian_dist_upper_pct !== undefined ? Number(d.donchian_dist_upper_pct).toFixed(2) : '--';
-        const distLowerPct = d.donchian_dist_lower_pct !== undefined ? Number(d.donchian_dist_lower_pct).toFixed(2) : '--';
-        const align = d.trend_alignment || 'NEUTRAL';
-
-        // Mode & Engine Differentiation
+        const price = Number(d.price || 0);
         const mode = String(d.mode || 'NEUTRAL').toUpperCase();
+        const isMR = (mode === 'MEANREVERSION' || mode === 'MEAN_REVERSION' || mode === 'CONSOLIDATION');
         const isTrend = (mode === 'TREND');
-        const isConsolidation = (mode === 'CONSOLIDATION' || mode === 'MEANREVERSION' || mode === 'MEAN_REVERSION');
-        const isNeutral = !isTrend && !isConsolidation;
 
-        let modeColor = 'bg-slate-800 text-slate-300 border-slate-700';
-        if (isConsolidation) {
-          modeColor = 'bg-emerald-500/15 text-emerald-400 border-emerald-500/40';
+        // Header Badge
+        let modeBadge = '<span class="px-2 py-0.5 rounded text-[11px] font-mono font-medium bg-amber-500/15 text-amber-300 border border-amber-500/30">NEUTRAL · STANDBY</span>';
+        if (isMR) {
+          modeBadge = '<span class="px-2 py-0.5 rounded text-[11px] font-mono font-medium bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">ENGINE A · MEAN REV</span>';
         } else if (isTrend) {
-          modeColor = 'bg-cyan-500/15 text-cyan-400 border-cyan-500/40';
-        } else if (mode === 'NEUTRAL') {
-          modeColor = 'bg-amber-500/15 text-amber-400 border-amber-500/40';
-        } else if (mode === 'SHOCK') {
-          modeColor = 'bg-rose-500/15 text-rose-400 border-rose-500/40';
+          modeBadge = '<span class="px-2 py-0.5 rounded text-[11px] font-mono font-medium bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">ENGINE B · TREND</span>';
         }
 
-        // Donchian Status Badge
-        let donchianBadgeClass = 'bg-slate-800 text-slate-400 border border-slate-700';
-        let donchianBadgeText = 'COILING';
-        if (donchianStatus === 'BREAKOUT_HIGH') {
-          donchianBadgeClass = 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 font-bold';
-          donchianBadgeText = 'BREAKOUT HIGH';
-        } else if (donchianStatus === 'BREAKOUT_LOW') {
-          donchianBadgeClass = 'bg-rose-500/20 text-rose-400 border border-rose-500/40 font-bold';
-          donchianBadgeText = 'BREAKOUT LOW';
-        } else if (isTrend) {
-          donchianBadgeClass = 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/30';
-          donchianBadgeText = 'COILING IN RANGE';
-        }
-
-        // Half-Life Quantitative Bounds Check (Relative bounds: [30m, 480m] for N=960)
-        const thalf = Number(d.half_life_m || 0);
-        let thalfStatus = 'IN BOUNDS [30m-480m]';
-        let thalfColor = 'text-emerald-400';
-        let thalfBg = 'bg-emerald-500';
-        if (thalf < 30) {
-          thalfStatus = 'MICRO-NOISE (<30m)';
-          thalfColor = 'text-amber-400';
-          thalfBg = 'bg-amber-400';
-        } else if (thalf > 480) {
-          thalfStatus = 'SLOW / UNIT ROOT (>480m)';
-          thalfColor = 'text-rose-400';
-          thalfBg = 'bg-rose-400';
-        }
-
-        // Percentage for 0 to 600m
-        const thalfBarPct = Math.min(Math.max((thalf / 500) * 100, 2), 100);
-
-        // HMM Posteriors
+        // Probabilities & Streaks
         const pC = Math.round((d.p_consolidation || 0) * 100);
         const pT = Math.round((d.p_trend || 0) * 100);
         const pS = Math.round((d.p_shock || 0) * 100);
-
-        // Volatility Z-scores
-        const z15 = Number(d.z_15 || 0);
-        const z60 = Number(d.z_60 || 0);
-        let z15Color = 'text-emerald-400';
-        if (Math.abs(z15) >= 2.5) z15Color = 'text-rose-400 font-bold';
-        else if (Math.abs(z15) >= 1.5) z15Color = 'text-amber-400';
-
-        let z60Color = 'text-emerald-400';
-        if (Math.abs(z60) >= 2.5) z60Color = 'text-rose-400 font-bold';
-        else if (Math.abs(z60) >= 1.5) z60Color = 'text-amber-400';
-
-        // Drift
-        const drift = Number(d.drift_pct || 0);
-
-        // Dwell Streaks
         const streakC = Number(d.streak_consolidation || 0);
         const streakT = Number(d.streak_trend || 0);
         const cdBars = Number(d.shock_cooldown_bars || 0);
 
-        let dwellBadge = `C: ${streakC}/2 | T: ${streakT}/2`;
-        if (cdBars > 0) {
-          dwellBadge = `Cooldown: ${cdBars} bars`;
+        // Compute Nearest Target & Distance
+        const buyPx = d.long_buy ? Number(d.long_buy) : null;
+        const sellPx = d.short_sell ? Number(d.short_sell) : null;
+        const meanPx = d.exit_long ? Number(d.exit_long) : null;
+        const donUp = d.donchian_upper ? Number(d.donchian_upper) : null;
+        const donLow = d.donchian_lower ? Number(d.donchian_lower) : null;
+
+        // Distances in bps (+ means price is above level, - means below)
+        const distToBuyBps = (buyPx && price > 0) ? ((price - buyPx) / price) * 10000 : null;
+        const distToSellBps = (sellPx && price > 0) ? ((sellPx - price) / price) * 10000 : null;
+        const distToDonUpBps = (donUp && price > 0) ? ((donUp - price) / price) * 10000 : null;
+        const distToDonLowBps = (donLow && price > 0) ? ((price - donLow) / price) * 10000 : null;
+
+        // Determine primary watch target
+        let watchTitle = '';
+        let watchTarget = '';
+        let watchDistStr = '';
+        let proxPct = Math.round(d.overall_proximity_pct || 0);
+
+        if (pos) {
+          watchTitle = `IN POSITION (${pos.side})`;
+          watchTarget = `Entry ${fmtPx(pos.entry_price, sym)}`;
+          watchDistStr = pos.is_filled ? 'Active on exchange' : 'Resting maker order';
+          proxPct = 100;
+        } else if (armed) {
+          watchTitle = `ARMED ${armed.side} (${armed.tier === 'TIER_2_CONDITIONAL' ? '1.25σ' : '1.50σ'})`;
+          watchTarget = `Extreme ${fmtPx(armed.extreme_price, sym)}`;
+          watchDistStr = armed.side === 'LONG' ? 'Waiting for 1m green bounce' : 'Waiting for 1m red rejection';
+          proxPct = 95;
+        } else if (isTrend || (!isMR && pT > pC && donUp && donLow)) {
+          const closerUp = (distToDonUpBps !== null && distToDonLowBps !== null) ? (distToDonUpBps <= distToDonLowBps) : true;
+          if (closerUp && donUp) {
+            watchTitle = 'Next Trigger: Engine B Long Breakout';
+            watchTarget = `> ${fmtPx(donUp, sym)}`;
+            watchDistStr = distToDonUpBps <= 0 ? 'Breakout level breached' : `${distToDonUpBps.toFixed(0)} bps (${(distToDonUpBps / 100).toFixed(2)}%) away`;
+          } else if (donLow) {
+            watchTitle = 'Next Trigger: Engine B Short Breakout';
+            watchTarget = `< ${fmtPx(donLow, sym)}`;
+            watchDistStr = distToDonLowBps <= 0 ? 'Breakout level breached' : `${distToDonLowBps.toFixed(0)} bps (${(distToDonLowBps / 100).toFixed(2)}%) away`;
+          }
+        } else if (buyPx && sellPx) {
+          const closerLong = distToBuyBps <= distToSellBps;
+          if (closerLong) {
+            watchTitle = 'Next Trigger: Engine A Long Dip';
+            watchTarget = `≤ ${fmtPx(buyPx, sym)}`;
+            watchDistStr = distToBuyBps <= 0 ? 'At / below band (touching)' : `${distToBuyBps.toFixed(0)} bps (${fmtPx(price - buyPx, sym)}) above band`;
+          } else {
+            watchTitle = 'Next Trigger: Engine A Short Fade';
+            watchTarget = `≥ ${fmtPx(sellPx, sym)}`;
+            watchDistStr = distToSellBps <= 0 ? 'At / above band (touching)' : `${distToSellBps.toFixed(0)} bps (${fmtPx(sellPx - price, sym)}) below band`;
+          }
+        } else {
+          watchTitle = 'Next Trigger: Awaiting Stationary Bands';
+          watchTarget = '--';
+          watchDistStr = d.is_half_life_valid ? 'Calibrating O-U model' : `Half-life ${Number(d.half_life_m || 0).toFixed(0)}m out of [30m–480m]`;
         }
 
-        // Trade Proximity
-        const prox = Math.round(d.overall_proximity_pct || 0);
-        let proxColor = 'text-slate-400';
-        if (prox >= 80) proxColor = 'text-cyan-400 font-bold';
-        else if (prox >= 50) proxColor = 'text-amber-400';
+        // Visual Channel Bar position (0% = lower trigger, 100% = upper trigger)
+        let channelPosPct = 50;
+        let lowBoundLabel = '--';
+        let highBoundLabel = '--';
+        let midBoundLabel = '';
+
+        if (isTrend && donLow && donUp && donUp > donLow) {
+          channelPosPct = Math.max(0, Math.min(100, ((price - donLow) / (donUp - donLow)) * 100));
+          lowBoundLabel = `Donchian Low ${fmtPx(donLow, sym)}`;
+          highBoundLabel = `Donchian High ${fmtPx(donUp, sym)}`;
+          midBoundLabel = '3h Channel';
+        } else if (buyPx && sellPx && sellPx > buyPx) {
+          channelPosPct = Math.max(0, Math.min(100, ((price - buyPx) / (sellPx - buyPx)) * 100));
+          lowBoundLabel = `Buy ${fmtPx(buyPx, sym)}`;
+          highBoundLabel = `Sell ${fmtPx(sellPx, sym)}`;
+          midBoundLabel = meanPx ? `μ ${fmtPx(meanPx, sym)}` : '';
+        } else if (donLow && donUp && donUp > donLow) {
+          channelPosPct = Math.max(0, Math.min(100, ((price - donLow) / (donUp - donLow)) * 100));
+          lowBoundLabel = `3h Low ${fmtPx(donLow, sym)}`;
+          highBoundLabel = `3h High ${fmtPx(donUp, sym)}`;
+          midBoundLabel = '3h Donchian';
+        }
+
+        // Evaluate the 5 Entry Readiness Gates
+        // Gate 1: Regime & Dwell
+        let g1Status = 'wait';
+        let g1Detail = '';
+        if (cdBars > 0) {
+          g1Status = 'fail';
+          g1Detail = `Shock Cooldown (${cdBars}b left)`;
+        } else if (isMR) {
+          g1Status = 'pass';
+          g1Detail = `MeanRev Active (P_C ${pC}%)`;
+        } else if (isTrend) {
+          g1Status = 'pass';
+          g1Detail = `Trend Active (P_T ${pT}%)`;
+        } else {
+          const reqC = (pC >= 78 && Math.abs(d.z_15 || 0) < 1.8) ? 1 : (pC >= 70 ? 2 : 3);
+          const reqT = pT >= 85 ? 2 : 3;
+          g1Status = 'wait';
+          g1Detail = `Dwell C:${streakC}/${reqC} (P_C ${pC}%) · T:${streakT}/${reqT} (P_T ${pT}%)`;
+        }
+
+        // Gate 2: Model Validity (O-U Half-Life / Stationarity OR EMA Alignment)
+        const thalf = Number(d.half_life_m || 0);
+        const hlValid = Boolean(d.is_half_life_valid && d.is_stationary);
+        const align = String(d.trend_alignment || 'NEUTRAL').toUpperCase();
+        let g2Status = 'pass';
+        let g2Label = isTrend ? 'Trend EMA 16/64' : 'O-U Half-Life';
+        let g2Detail = '';
+        if (isTrend) {
+          g2Status = (align === 'BULLISH' || align === 'BEARISH') ? 'pass' : 'wait';
+          g2Detail = `${align} (t_half ${thalf.toFixed(0)}m)`;
+        } else {
+          g2Status = hlValid ? 'pass' : 'fail';
+          g2Detail = hlValid
+            ? `${thalf.toFixed(1)}m (Stationary)`
+            : `${thalf >= 990 ? 'Non-Stationary' : thalf.toFixed(0) + 'm'} (Need 30–480m)`;
+        }
+
+        // Gate 3: Volatility & Shock Gate
+        const z15 = Number(d.z_15 || 0);
+        const z60 = Number(d.z_60 || 0);
+        const volOk = isTrend ? (z60 > -2.5 && !d.is_severe_shock) : (Math.abs(z15) < 2.2 && Math.abs(z60) < 2.5 && !d.is_severe_shock);
+        const g3Status = volOk ? 'pass' : 'fail';
+        const g3Detail = `Z15: ${z15 >= 0 ? '+' : ''}${z15.toFixed(2)}σ · Z60: ${z60 >= 0 ? '+' : ''}${z60.toFixed(2)}σ`;
+
+        // Gate 4: Microstructure & L2 Order Book
+        const obi1s = Number(d.obi_1s || 0);
+        const obi5s = Number(d.obi_5s || 0);
+        const l2Fresh = Boolean(d.l2_fresh);
+        const g4Status = l2Fresh ? 'pass' : 'fail';
+        const g4Detail = `${l2Fresh ? 'Fresh' : 'Stale'} · OBI 1s:${obi1s >= 0 ? '+' : ''}${obi1s.toFixed(2)} 5s:${obi5s >= 0 ? '+' : ''}${obi5s.toFixed(2)}`;
+
+        // Gate 5: Price Trigger / Bounce Confirmation
+        let g5Status = 'wait';
+        let g5Label = isTrend ? 'Breakout Trigger' : 'Band & Reversal';
+        let g5Detail = '';
+        if (pos) {
+          g5Status = 'pass';
+          g5Detail = `Active ${pos.side} @ ${fmtPx(pos.entry_price, sym)}`;
+        } else if (armed) {
+          g5Status = 'wait';
+          g5Detail = `ARMED ${armed.side} · Awaiting bounce`;
+        } else if (isTrend) {
+          const bo = (d.donchian_status === 'BREAKOUT_HIGH' || d.donchian_status === 'BREAKOUT_LOW');
+          g5Status = bo ? 'pass' : 'wait';
+          g5Detail = bo ? d.donchian_status : `Inside 3h range (${proxPct}% close)`;
+        } else if (buyPx && sellPx) {
+          const touching = (price <= buyPx || price >= sellPx);
+          g5Status = touching ? 'pass' : 'wait';
+          g5Detail = touching ? 'Band touched · Arming' : `Inside bands (${proxPct}% close)`;
+        } else {
+          g5Status = 'fail';
+          g5Detail = 'Bands unavailable (O-U gated)';
+        }
 
         html += `
-        <div class="panel-card rounded-lg p-3.5 space-y-3 font-mono">
-          <!-- Card Header: Symbol, Price, Mode -->
-          <div class="flex items-start justify-between border-b border-term-border pb-2.5">
-            <div>
+        <div class="card rounded-md p-4 flex flex-col justify-between space-y-3.5">
+          <!-- Top: Asset & Price -->
+          <div>
+            <div class="flex items-center justify-between">
               <div class="flex items-center gap-2">
-                <span class="text-base font-extrabold text-white tracking-wide">${sym}</span>
-                <span class="text-[10px] px-2 py-0.5 rounded border ${modeColor} font-semibold">${d.mode}</span>
+                <span class="text-base font-bold text-white">${sym}</span>
+                <span class="text-xs text-desk-muted font-mono">PERP</span>
               </div>
-              <div class="text-xl font-extrabold text-white tracking-tight mt-0.5">
-                $${price}
-              </div>
+              ${modeBadge}
             </div>
-            <div class="text-right">
-              <span class="text-[10px] text-term-muted block uppercase">DWELL STREAK</span>
-              <span class="text-[11px] text-slate-300 font-semibold">${dwellBadge}</span>
+            <div class="mt-1 flex items-baseline justify-between">
+              <span class="font-mono text-2xl font-bold text-white tracking-tight">${fmtPx(price, sym)}</span>
+              <span class="font-mono text-xs text-desk-muted">HMM: <span class="text-emerald-400">C ${pC}%</span> · <span class="text-cyan-400">T ${pT}%</span> · <span class="text-rose-400">S ${pS}%</span></span>
             </div>
           </div>
 
-          <!-- Trade Execution Targets (Dual Engine: Donchian & Mean Reversion) -->
-          <div class="bg-term-surface rounded p-2.5 border border-term-border space-y-2">
+          <!-- Middle: How Close to Trade & Visual Price Range -->
+          <div class="inset-box rounded p-3 space-y-2">
             <div class="flex items-center justify-between text-xs">
-              <span class="text-term-muted text-[11px] flex items-center gap-1.5">
-                <span class="w-1.5 h-1.5 rounded-full ${isTrend ? 'bg-cyan-400 animate-pulse' : (isConsolidation ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400')}"></span>
-                <span class="font-bold text-white">${isTrend ? 'ENGINE B PROXIMITY' : (isConsolidation ? 'ENGINE A PROXIMITY' : 'TRADE PROXIMITY')}</span>
-              </span>
-              <span class="${proxColor}">${prox}%</span>
+              <span class="font-medium text-white">${watchTitle}</span>
+              <span class="font-mono font-semibold text-white">${watchTarget}</span>
             </div>
-            <div class="w-full bg-term-border h-1.5 rounded-full overflow-hidden">
-              <div class="h-full ${isTrend ? 'bg-cyan-400' : (isConsolidation ? 'bg-emerald-400' : 'bg-amber-400')} transition-all duration-500" style="width: ${prox}%"></div>
-            </div>
-            <div class="text-[10px] text-term-muted truncate">
-              ${d.proximity_summary || (isTrend ? 'Awaiting 3h Donchian breakout' : 'Awaiting O-U band touch')}
+            <div class="flex items-center justify-between text-[11px] font-mono text-desk-muted">
+              <span>${watchDistStr}</span>
+              <span>Proximity: <strong class="text-white">${proxPct}%</strong></span>
             </div>
 
-            <!-- Dual-Engine Execution Boxes -->
-            <div class="space-y-1.5 pt-1">
-              <!-- Engine B: Trend Momentum Breakout -->
-              <div class="p-2 rounded border transition-all ${isTrend ? 'bg-cyan-500/10 border-cyan-500/40' : 'bg-term-card/40 border-term-border/40 opacity-60'}">
-                <div class="flex items-center justify-between text-[10px] mb-1">
-                  <span class="font-bold ${isTrend ? 'text-cyan-400' : 'text-term-muted'} flex items-center gap-1">
-                    <span class="w-1.5 h-1.5 rounded-full ${isTrend ? 'bg-cyan-400' : 'bg-slate-600'}"></span>
-                    ENGINE B • 3H DONCHIAN
-                  </span>
-                  <span class="text-[9px] px-1.5 py-0.2 rounded font-semibold ${donchianBadgeClass}">${donchianBadgeText}</span>
-                </div>
-                <div class="grid grid-cols-2 gap-2 text-[11px]">
-                  <div>
-                    <span class="text-[9px] text-cyan-400/90 block font-semibold uppercase">LONG BREAKOUT</span>
-                    <span class="text-white font-bold block">${donchianUpper ? '$' + donchianUpper : 'N/A'}</span>
-                    <span class="text-[9px] text-term-muted">${distUpperPct !== '--' ? (Number(distUpperPct) <= 0 ? 'TRIGGERED' : '+' + distUpperPct + '% away') : ''}</span>
-                  </div>
-                  <div class="text-right">
-                    <span class="text-[9px] text-rose-400/90 block font-semibold uppercase">SHORT BREAKOUT</span>
-                    <span class="text-white font-bold block">${donchianLower ? '$' + donchianLower : 'N/A'}</span>
-                    <span class="text-[9px] text-term-muted">${distLowerPct !== '--' ? (Number(distLowerPct) <= 0 ? 'TRIGGERED' : '-' + distLowerPct + '% away') : ''}</span>
-                  </div>
-                </div>
+            <!-- Position in Channel Bar -->
+            <div class="pt-1">
+              <div class="relative w-full h-2 bg-desk-border rounded-full overflow-hidden">
+                <div class="absolute top-0 bottom-0 w-1.5 bg-white rounded-full -ml-0.5" style="left: ${channelPosPct}%"></div>
               </div>
-
-              <!-- Engine A: Mean Reversion Bands -->
-              <div class="p-2 rounded border transition-all ${isConsolidation ? 'bg-emerald-500/10 border-emerald-500/40' : 'bg-term-card/40 border-term-border/40 opacity-60'}">
-                <div class="flex items-center justify-between text-[10px] mb-1">
-                  <span class="font-bold ${isConsolidation ? 'text-emerald-400' : 'text-term-muted'} flex items-center gap-1">
-                    <span class="w-1.5 h-1.5 rounded-full ${isConsolidation ? 'bg-emerald-400' : 'bg-slate-600'}"></span>
-                    ENGINE A • MEAN REVERSION
-                  </span>
-                  <span class="text-[9px] px-1.5 py-0.2 rounded font-semibold ${isConsolidation ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-slate-800 text-slate-400'}">${isConsolidation ? 'ARMED' : 'INACTIVE'}</span>
-                </div>
-                <div class="grid grid-cols-2 gap-2 text-[11px]">
-                  <div>
-                    <span class="text-[9px] text-emerald-400/90 block font-semibold uppercase">LONG DIP BUY</span>
-                    <span class="text-white font-bold block">${buyPx ? '$' + buyPx : 'N/A'}</span>
-                    <span class="text-[9px] text-term-muted">${buyDistBps !== '--' ? buyDistBps + ' bps' : ''}</span>
-                  </div>
-                  <div class="text-right">
-                    <span class="text-[9px] text-rose-400/90 block font-semibold uppercase">SHORT FADE SELL</span>
-                    <span class="text-white font-bold block">${sellPx ? '$' + sellPx : 'N/A'}</span>
-                    <span class="text-[9px] text-term-muted">${sellDistBps !== '--' ? sellDistBps + ' bps' : ''}</span>
-                  </div>
-                </div>
+              <div class="flex items-center justify-between text-[10px] font-mono text-desk-dim mt-1">
+                <span>${lowBoundLabel}</span>
+                <span>${midBoundLabel}</span>
+                <span>${highBoundLabel}</span>
               </div>
             </div>
           </div>
 
-          <!-- Model Parameters: Half-Life, Posteriors, Volatility -->
-          <div class="space-y-2 text-[11px]">
-            <!-- Half-Life Meter -->
-            <div>
-              <div class="flex items-center justify-between text-[10px]">
-                <span class="text-term-muted">HALF-LIFE (t_half):</span>
-                <span class="font-bold ${thalfColor}">${thalf.toFixed(1)}m <span class="text-term-muted font-normal text-[9px]">• ${thalfStatus}</span></span>
+          <!-- Both Engines Trigger Levels Reference -->
+          <div class="grid grid-cols-2 gap-2 font-mono text-[11px]">
+            <div class="inset-box rounded p-2 ${isMR ? 'border-emerald-500/40' : ''}">
+              <div class="text-[10px] text-desk-muted uppercase flex justify-between">
+                <span>Engine A (O-U)</span>
+                <span class="${isMR ? 'text-emerald-400' : 'text-desk-dim'}">${isMR ? 'ACTIVE' : 'STANDBY'}</span>
               </div>
-              <div class="w-full bg-term-border h-1 rounded-full overflow-hidden mt-1">
-                <div class="h-full ${thalfBg}" style="width: ${thalfBarPct}%"></div>
+              <div class="mt-1 flex justify-between">
+                <span class="text-desk-muted">Buy Dip:</span>
+                <span class="text-emerald-400">${fmtPx(buyPx, sym)}</span>
+              </div>
+              <div class="flex justify-between">
+                <span class="text-desk-muted">Sell Fade:</span>
+                <span class="text-rose-400">${fmtPx(sellPx, sym)}</span>
               </div>
             </div>
 
-            <!-- Regime Posteriors Bar -->
-            <div>
-              <div class="flex items-center justify-between text-[10px] mb-1">
-                <span class="text-term-muted">HMM REGIME POSTERIORS:</span>
-                <span class="text-slate-300">C:${pC}% | T:${pT}% | S:${pS}%</span>
+            <div class="inset-box rounded p-2 ${isTrend ? 'border-cyan-500/40' : ''}">
+              <div class="text-[10px] text-desk-muted uppercase flex justify-between">
+                <span>Engine B (3h BO)</span>
+                <span class="${isTrend ? 'text-cyan-400' : 'text-desk-dim'}">${isTrend ? 'ACTIVE' : 'STANDBY'}</span>
               </div>
-              <div class="w-full h-1.5 rounded-full overflow-hidden flex bg-term-border">
-                <div class="bg-emerald-400" style="width: ${pC}%"></div>
-                <div class="bg-cyan-400" style="width: ${pT}%"></div>
-                <div class="bg-rose-400" style="width: ${pS}%"></div>
+              <div class="mt-1 flex justify-between">
+                <span class="text-desk-muted">Break Up:</span>
+                <span class="text-cyan-400">${fmtPx(donUp, sym)}</span>
+              </div>
+              <div class="flex justify-between">
+                <span class="text-desk-muted">Break Dn:</span>
+                <span class="text-rose-400">${fmtPx(donLow, sym)}</span>
               </div>
             </div>
+          </div>
 
-            <!-- Quantitative Telemetry Metrics -->
-            <div class="grid grid-cols-2 gap-x-3 gap-y-1 pt-1 text-[10px] text-term-muted border-t border-term-border">
-              <div class="flex justify-between">
-                <span>Z15 Shock:</span>
-                <span class="${z15Color} font-semibold">${z15.toFixed(2)}σ</span>
-              </div>
-              <div class="flex justify-between">
-                <span>Z60 Shock:</span>
-                <span class="${z60Color} font-semibold">${z60.toFixed(2)}σ</span>
-              </div>
-              <div class="flex justify-between">
-                <span>Total Drift:</span>
-                <span class="text-slate-300 font-semibold">${drift.toFixed(2)}%</span>
-              </div>
-              <div class="flex justify-between">
-                <span>EMA Align:</span>
-                <span class="${align === 'BULLISH' ? 'text-emerald-400 font-semibold' : (align === 'BEARISH' ? 'text-rose-400 font-semibold' : 'text-slate-300')}">${align}</span>
-              </div>
-              <div class="flex justify-between">
-                <span>Active Engine:</span>
-                <span class="${isTrend ? 'text-cyan-400 font-bold' : (isConsolidation ? 'text-emerald-400 font-bold' : 'text-amber-400 font-semibold')}">${isTrend ? 'ENGINE B' : (isConsolidation ? 'ENGINE A' : 'NEUTRAL')}</span>
-              </div>
-              <div class="flex justify-between">
-                <span>Feed Status:</span>
-                <span class="${d.l2_fresh ? 'text-emerald-400' : 'text-amber-400'} font-semibold">${d.l2_fresh ? 'L2 FRESH' : 'L2 STALE'}</span>
-              </div>
-            </div>
+          <!-- Bottom: 5-Gate Entry Conditions Checklist -->
+          <div class="border-t border-desk-border pt-2">
+            <div class="text-[10px] font-semibold uppercase tracking-wider text-desk-dim mb-1">Entry Gate Conditions</div>
+            ${gateRow(g1Status, '1. Regime & Dwell', g1Detail)}
+            ${gateRow(g2Status, '2. ' + g2Label, g2Detail)}
+            ${gateRow(g3Status, '3. Volatility Gate', g3Detail)}
+            ${gateRow(g4Status, '4. L2 Order Book', g4Detail)}
+            ${gateRow(g5Status, '5. ' + g5Label, g5Detail)}
           </div>
         </div>`;
       });
@@ -776,17 +689,8 @@
       container.innerHTML = html;
     }
 
-    function renderEmptyAssetCard(sym) {
-      return `
-      <div class="panel-card rounded-lg p-5 text-center text-term-muted font-mono space-y-2">
-        <div class="text-base font-bold text-white">${sym}</div>
-        <div class="text-xs italic">Awaiting telemetry stream...</div>
-      </div>`;
-    }
-
-    function renderCounterfactualAnalytics(cf) {
+    function renderCounterfactual(cf) {
       if (!cf) return;
-
       const evaluated = cf.total_evaluated || 0;
       const touches = cf.touch_only_count || 0;
       const fills = cf.trade_through_count || 0;
@@ -795,113 +699,91 @@
       const protBps = cf.alpha_protective_avoided_bps || 0.0;
       const strangCount = cf.alpha_strangling_count || 0;
       const strangBps = cf.alpha_strangling_missed_bps || 0.0;
-
       const netEdgeBps = protBps - strangBps;
 
-      document.getElementById('cf-total-evaluated').textContent = evaluated.toLocaleString();
-      document.getElementById('cf-total-touches').textContent = touches.toLocaleString();
-      document.getElementById('cf-strict-fills').textContent = fills.toLocaleString();
+      document.getElementById('cf-total-evaluated').textContent = evaluated;
+      document.getElementById('cf-total-touches').textContent = touches;
+      document.getElementById('cf-strict-fills').textContent = fills;
       document.getElementById('cf-fill-conversion').textContent = fillRate.toFixed(1) + '%';
-      document.getElementById('cf-protective-count').textContent = protCount.toLocaleString();
-      document.getElementById('cf-protective-bps').textContent = `+${protBps.toFixed(1)} bps avoided`;
-      document.getElementById('cf-strangling-count').textContent = strangCount.toLocaleString();
-      document.getElementById('cf-strangling-bps').textContent = `-${strangBps.toFixed(1)} bps missed`;
+      document.getElementById('cf-protective-count').textContent = protCount;
+      document.getElementById('cf-protective-bps').textContent = '+' + protBps.toFixed(1) + ' bps';
+      document.getElementById('cf-strangling-count').textContent = strangCount;
+      document.getElementById('cf-strangling-bps').textContent = '-' + strangBps.toFixed(1) + ' bps';
 
-      const netEdgeEl = document.getElementById('cf-net-edge-bps');
-      const netVerdictEl = document.getElementById('cf-net-verdict');
+      const netEl = document.getElementById('cf-net-edge-bps');
       const sign = netEdgeBps >= 0 ? '+' : '';
-      netEdgeEl.textContent = `${sign}${netEdgeBps.toFixed(1)} bps`;
-      if (netEdgeBps > 0) {
-        netEdgeEl.className = "text-base font-bold text-emerald-400 mt-0.5";
-        netVerdictEl.textContent = "Positive Alpha Shield";
-      } else if (netEdgeBps < 0) {
-        netEdgeEl.className = "text-base font-bold text-rose-400 mt-0.5";
-        netVerdictEl.textContent = "Over-Constrained Gates";
-      } else {
-        netEdgeEl.className = "text-base font-bold text-white mt-0.5";
-        netVerdictEl.textContent = "Neutral Filter";
-      }
+      netEl.textContent = `${sign}${netEdgeBps.toFixed(1)} bps`;
+      netEl.className = netEdgeBps > 0 ? 'text-emerald-400 font-bold' : (netEdgeBps < 0 ? 'text-rose-400 font-bold' : 'text-white font-bold');
 
-      // Veto Breakdown Table
+      // Breakdown table
       const breakdownBody = document.getElementById('cf-veto-breakdown-body');
       const breakdown = cf.veto_breakdown || {};
       const reasons = Object.keys(breakdown);
-
       if (reasons.length === 0) {
-        breakdownBody.innerHTML = `<tr>
-          <td colspan="5" class="py-4 text-center text-term-muted italic">No veto events recorded yet</td>
-        </tr>`;
+        breakdownBody.innerHTML = `<tr><td colspan="5" class="py-3 text-center text-desk-dim">No veto records yet</td></tr>`;
       } else {
         let bHtml = '';
         reasons.sort((a, b) => (breakdown[b].count || 0) - (breakdown[a].count || 0)).forEach(r => {
           const item = breakdown[r];
-          const count = item.count || 0;
-          const prot = item.protective || 0;
-          const strang = item.strangling || 0;
-          const netBps = item.net_bps || 0.0;
-          const bSign = netBps >= 0 ? '+' : '';
-          const bColor = netBps >= 0 ? 'text-emerald-400' : 'text-rose-400';
-
-          bHtml += `<tr class="hover:bg-term-hover/40 transition-colors">
-            <td class="py-1.5 font-bold text-white">${r}</td>
-            <td class="py-1.5 text-center text-term-muted">${count}</td>
-            <td class="py-1.5 text-center text-emerald-400 font-semibold">${prot}</td>
-            <td class="py-1.5 text-center text-rose-400 font-semibold">${strang}</td>
-            <td class="py-1.5 text-right ${bColor} font-bold">${bSign}${netBps.toFixed(1)}</td>
+          const net = item.net_bps || 0;
+          const col = net >= 0 ? 'text-emerald-400' : 'text-rose-400';
+          bHtml += `<tr>
+            <td class="py-1.5 text-white">${r}</td>
+            <td class="py-1.5 text-center text-desk-muted">${item.count || 0}</td>
+            <td class="py-1.5 text-center text-emerald-400">${item.protective || 0}</td>
+            <td class="py-1.5 text-center text-rose-400">${item.strangling || 0}</td>
+            <td class="py-1.5 text-right ${col}">${net >= 0 ? '+' : ''}${net.toFixed(1)}</td>
           </tr>`;
         });
         breakdownBody.innerHTML = bHtml;
       }
 
-      // Recent Records Stream
+      // Recent stream (supports both ts_utc/asset and legacy timestamp_ms/symbol)
       const streamBody = document.getElementById('cf-stream-body');
       const recent = cf.recent_records || [];
       if (recent.length === 0) {
-        streamBody.innerHTML = `<tr>
-          <td colspan="6" class="py-4 text-center text-term-muted italic">Awaiting causal trade events...</td>
-        </tr>`;
+        streamBody.innerHTML = `<tr><td colspan="6" class="py-3 text-center text-desk-dim">No resolved shadow trades yet</td></tr>`;
       } else {
         let sHtml = '';
         recent.forEach(rec => {
           const decision = rec.decision || {};
           const outcome = rec.outcome || {};
           const fillM = rec.fill_model || {};
-
-          const timeStr = rec.timestamp_ms ? new Date(rec.timestamp_ms).toLocaleTimeString() : '--:--:--';
-          const sym = rec.symbol || '--';
-          const side = rec.side || 'LONG';
-          const sideColor = side === 'LONG' ? 'text-emerald-400' : 'text-rose-400';
+          const timeStr = rec.ts_utc
+            ? new Date(rec.ts_utc).toLocaleTimeString()
+            : (rec.timestamp_ms ? new Date(rec.timestamp_ms).toLocaleTimeString() : '--:--:--');
+          const sym = rec.asset || rec.symbol || '--';
+          const side = String(rec.side || 'LONG').toUpperCase();
+          const isLong = (side === 'LONG' || side === 'BUY');
+          const sideCol = isLong ? 'text-emerald-400' : 'text-rose-400';
           const veto = decision.primary_veto || 'GATED';
           const isStrict = fillM.trade_through_filled || outcome.fill_status === 'trade_through_confirmed';
-          const fillBadge = isStrict
-            ? '<span class="text-cyan-400 font-bold">FILLED</span>'
-            : '<span class="text-term-muted">TOUCH</span>';
-
           const vClass = String(outcome.veto_classification || 'NEUTRAL').toUpperCase();
-          let outBadge = '<span class="text-term-muted">NEUTRAL</span>';
+          const pnlBps = outcome.counterfactual_net_pnl_bps !== undefined && outcome.counterfactual_net_pnl_bps !== null
+            ? Number(outcome.counterfactual_net_pnl_bps).toFixed(1) + ' bps'
+            : '';
+
+          let verdict = `<span class="text-desk-dim">SCRATCH</span>`;
           if (vClass.includes('PROTECTIVE')) {
-            outBadge = '<span class="text-emerald-400 font-bold">PROTECTIVE</span>';
+            verdict = `<span class="text-emerald-400">SAVED (${pnlBps})</span>`;
           } else if (vClass.includes('STRANGLING')) {
-            outBadge = '<span class="text-rose-400 font-bold">STRANGLING</span>';
+            verdict = `<span class="text-rose-400">MISSED (+${pnlBps})</span>`;
           }
 
-          sHtml += `<tr class="hover:bg-term-hover/40 transition-colors text-[11px]">
-            <td class="py-1.5 text-term-muted">${timeStr}</td>
-            <td class="py-1.5 font-bold text-white">${sym}</td>
-            <td class="py-1.5 font-bold ${sideColor}">${side}</td>
-            <td class="py-1.5 text-slate-300 font-medium">${veto}</td>
-            <td class="py-1.5">${fillBadge}</td>
-            <td class="py-1.5 text-right">${outBadge}</td>
+          sHtml += `<tr>
+            <td class="py-1.5 text-desk-muted">${timeStr}</td>
+            <td class="py-1.5 font-semibold text-white">${sym}</td>
+            <td class="py-1.5 ${sideCol}">${side}</td>
+            <td class="py-1.5 text-desk-text">${veto}</td>
+            <td class="py-1.5 text-desk-muted">${isStrict ? 'Filled' : 'Touch'}</td>
+            <td class="py-1.5 text-right">${verdict}</td>
           </tr>`;
         });
         streamBody.innerHTML = sHtml;
       }
     }
 
-    // Startup initialization
-    window.addEventListener('DOMContentLoaded', () => {
-      fetchTelemetry();
-    });
+    window.addEventListener('DOMContentLoaded', fetchTelemetry);
   </script>
 </body>
 </html>

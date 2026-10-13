@@ -1,12 +1,36 @@
+x-bot-common: &bot-common
+  image: hyperliquid-bot:latest
+  build:
+    context: .
+    dockerfile: Dockerfile
+  init: true
+  restart: unless-stopped
+  stop_grace_period: 15s
+  mem_limit: 256m
+  memswap_limit: 256m
+  cpus: "1.0"
+  env_file:
+    - path: .env
+      required: false
+  dns:
+    - 1.1.1.1
+    - 8.8.8.8
+  ulimits:
+    nofile:
+      soft: 65535
+      hard: 65535
+  volumes:
+    - ./hl_bot_data:/app
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
+
 services:
   hl_bot_btc:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *bot-common
     container_name: hl_bot_btc
-    restart: unless-stopped
-    env_file:
-      - .env
     environment:
       - HL_TRADING_SYMBOL=BTC
       - HL_LEVERAGE=${HL_LEVERAGE:-3}
@@ -15,17 +39,15 @@ services:
       - HL_PORTFOLIO_SYMBOLS=${HL_PORTFOLIO_SYMBOLS:-BTC,ETH,SOL,AVAX}
       - HL_MAX_CONCURRENT_POSITIONS=${HL_MAX_CONCURRENT_POSITIONS:-2}
       - HL_DONCHIAN_PERIOD=${HL_DONCHIAN_PERIOD:-12}
-    volumes:
-      - ./hl_bot_data:/app
+      - HL_CHANDELIER_ATR_MULT=${HL_CHANDELIER_ATR_MULT:-2.0}
+      - HL_SIZING_MODE=${HL_SIZING_MODE:-dynamic}
+      - HL_EQUITY_FRACTION=${HL_EQUITY_FRACTION:-0.25}
+      - HL_TREND_RISK_FRACTION=${HL_TREND_RISK_FRACTION:-1.0}
+      - HL_MAX_POSITION_SIZE_USDC=${HL_MAX_POSITION_SIZE_USDC:-500.0}
 
   hl_bot_eth:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *bot-common
     container_name: hl_bot_eth
-    restart: unless-stopped
-    env_file:
-      - .env
     environment:
       - HL_TRADING_SYMBOL=ETH
       - HL_LEVERAGE=${HL_LEVERAGE:-3}
@@ -34,17 +56,15 @@ services:
       - HL_PORTFOLIO_SYMBOLS=${HL_PORTFOLIO_SYMBOLS:-BTC,ETH,SOL,AVAX}
       - HL_MAX_CONCURRENT_POSITIONS=${HL_MAX_CONCURRENT_POSITIONS:-2}
       - HL_DONCHIAN_PERIOD=${HL_DONCHIAN_PERIOD:-12}
-    volumes:
-      - ./hl_bot_data:/app
+      - HL_CHANDELIER_ATR_MULT=${HL_CHANDELIER_ATR_MULT:-2.0}
+      - HL_SIZING_MODE=${HL_SIZING_MODE:-dynamic}
+      - HL_EQUITY_FRACTION=${HL_EQUITY_FRACTION:-0.25}
+      - HL_TREND_RISK_FRACTION=${HL_TREND_RISK_FRACTION:-1.0}
+      - HL_MAX_POSITION_SIZE_USDC=${HL_MAX_POSITION_SIZE_USDC:-500.0}
 
   hl_bot_sol:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *bot-common
     container_name: hl_bot_sol
-    restart: unless-stopped
-    env_file:
-      - .env
     environment:
       - HL_TRADING_SYMBOL=SOL
       - HL_LEVERAGE=${HL_LEVERAGE:-3}
@@ -53,17 +73,15 @@ services:
       - HL_PORTFOLIO_SYMBOLS=${HL_PORTFOLIO_SYMBOLS:-BTC,ETH,SOL,AVAX}
       - HL_MAX_CONCURRENT_POSITIONS=${HL_MAX_CONCURRENT_POSITIONS:-2}
       - HL_DONCHIAN_PERIOD=${HL_DONCHIAN_PERIOD:-12}
-    volumes:
-      - ./hl_bot_data:/app
+      - HL_CHANDELIER_ATR_MULT=${HL_CHANDELIER_ATR_MULT:-2.0}
+      - HL_SIZING_MODE=${HL_SIZING_MODE:-dynamic}
+      - HL_EQUITY_FRACTION=${HL_EQUITY_FRACTION:-0.25}
+      - HL_TREND_RISK_FRACTION=${HL_TREND_RISK_FRACTION:-1.0}
+      - HL_MAX_POSITION_SIZE_USDC=${HL_MAX_POSITION_SIZE_USDC:-500.0}
 
   hl_bot_avax:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *bot-common
     container_name: hl_bot_avax
-    restart: unless-stopped
-    env_file:
-      - .env
     environment:
       - HL_TRADING_SYMBOL=AVAX
       - HL_LEVERAGE=${HL_LEVERAGE:-3}
@@ -72,20 +90,30 @@ services:
       - HL_PORTFOLIO_SYMBOLS=${HL_PORTFOLIO_SYMBOLS:-BTC,ETH,SOL,AVAX}
       - HL_MAX_CONCURRENT_POSITIONS=${HL_MAX_CONCURRENT_POSITIONS:-2}
       - HL_DONCHIAN_PERIOD=${HL_DONCHIAN_PERIOD:-12}
-    volumes:
-      - ./hl_bot_data:/app
+      - HL_CHANDELIER_ATR_MULT=${HL_CHANDELIER_ATR_MULT:-2.0}
+      - HL_SIZING_MODE=${HL_SIZING_MODE:-dynamic}
+      - HL_EQUITY_FRACTION=${HL_EQUITY_FRACTION:-0.25}
+      - HL_TREND_RISK_FRACTION=${HL_TREND_RISK_FRACTION:-1.0}
+      - HL_MAX_POSITION_SIZE_USDC=${HL_MAX_POSITION_SIZE_USDC:-500.0}
 
   hl_dashboard:
     image: python:3.11-alpine
     container_name: hl_dashboard
+    init: true
     restart: unless-stopped
     ports:
       - "${DASHBOARD_PORT:-8088}:8088"
     environment:
       - DASHBOARD_PORT=${DASHBOARD_PORT:-8088}
       - HL_MAX_CONCURRENT_POSITIONS=${HL_MAX_CONCURRENT_POSITIONS:-2}
+      - PYTHONUNBUFFERED=1
     volumes:
-      - ./dashboard:/app/dashboard
-      - ./hl_bot_data:/app/data
+      - ./dashboard:/app/dashboard:ro
+      - ./hl_bot_data:/app/data:ro
     working_dir: /app
     command: python3 /app/dashboard/server.py
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,10 +1,11 @@
+use chrono::Timelike;
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::H160;
 use hyperliquid_rust_sdk::{BaseUrl, ExchangeClient, InfoClient, Message, Subscription};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc::unbounded_channel, Mutex, RwLock};
+use tokio::sync::{mpsc::unbounded_channel, Mutex, Notify, RwLock};
 
 mod config;
 mod controller;
@@ -23,15 +24,20 @@ use crate::controller::{
     load_controller_state, save_controller_state, ControllerMode,
 };
 use crate::telemetry::{
-    load_funnel_counters, save_funnel_counters, save_telemetry, LiveTelemetry,
+    check_btc_lead_lag_veto, load_funnel_counters, save_funnel_counters, save_telemetry,
+    LiveTelemetry,
 };
 use crate::hmm::{compute_hmm_posteriors, train_hmm_offline, GaussianHMM};
 use crate::hyperliquid::{
-    calculate_dynamic_notional, cancel_order, fetch_book_ticker, fetch_sz_decimals_map,
-    get_account_value, get_user_position, place_post_only_order, quantize_price,
+    calculate_dynamic_notional, calculate_risk_scaled_notional, cancel_order,
+    compute_drawdown_risk_multiplier, effective_tick_size, exceeds_micro_account_step_risk,
+    fetch_book_ticker, fetch_sz_decimals_map, get_account_value, get_user_position,
+    place_post_only_order, quantize_price,
 };
 use crate::order::{emergency_flatten, place_ou_maker_entry};
-use crate::ou_process::{calculate_directional_edge_bps, calculate_features, calculate_net_edge_bps};
+use crate::ou_process::{
+    calculate_directional_edge_bps, calculate_features_with_funding, calculate_net_edge_bps,
+};
 use crate::state::{
     has_active_cluster_position, load_armed_signal, load_circuit_breaker, load_state,
     save_armed_signal, save_circuit_breaker, save_state, Side, StateMap,
@@ -39,7 +45,7 @@ use crate::state::{
 use crate::trend::{
     append_candidate_log, calculate_atr, calculate_donchian, check_trend_alignment,
     load_shadow_trade, record_shadow_entry, record_shadow_exit, save_shadow_trade, CandleBar,
-    ChandelierExitState, EngineBCandidateLog, L2ObiTracker, TrendAlignment,
+    ChandelierExitState, EngineBCandidateLog, L2ObiTracker, MarketCrowdingTracker, TrendAlignment,
 };
 
 async fn backfill_missing_1m_candles(
@@ -201,6 +207,7 @@ pub async fn execute_emergency_flatten_with_retry(
     wallet_address: H160,
     state: &mut StateMap,
     symbol: &str,
+    sz_decimals: u32,
     discord_url: Option<String>,
 ) -> Result<(), String> {
     let mut last_err = String::new();
@@ -212,6 +219,7 @@ pub async fn execute_emergency_flatten_with_retry(
             wallet_address,
             state,
             symbol,
+            sz_decimals,
             discord_url.clone(),
         )
         .await
@@ -241,6 +249,16 @@ async fn main() {
     println!("🚀 [HYPERLIQUID PERP START] Fully Autonomous Deterministic O-U Architecture Initialized.");
 
     let config = Config::from_env();
+    let startup_stagger_ms: u64 = match config.trading_symbol.as_str() {
+        "BTC" => 0,
+        "ETH" => 750,
+        "SOL" => 1500,
+        "AVAX" => 2250,
+        _ => 500,
+    };
+    if startup_stagger_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(startup_stagger_ms)).await;
+    }
     let base_url = if config.hl_is_mainnet {
         BaseUrl::Mainnet
     } else {
@@ -282,7 +300,7 @@ async fn main() {
     let trading_symbol = config.trading_symbol.clone();
     let trading_sz_decimals = {
         let lock = sz_decimals_map.read().await;
-        *lock.get(&trading_symbol).unwrap_or(&4)
+        *lock.get(&trading_symbol).unwrap_or(&2)
     };
 
     println!(
@@ -352,6 +370,8 @@ async fn main() {
                 )
                 .await
             {
+                candles.sort_by_key(|c| c.time_open);
+                candles.dedup_by_key(|c| c.time_open);
                 let cur_utc_ms = chrono::Utc::now().timestamp_millis() as u64;
                 if let Some(last) = candles.last() {
                     if last.time_open + 15 * 60 * 1000 > cur_utc_ms {
@@ -362,7 +382,9 @@ async fn main() {
                 let mut closes = Vec::new();
                 for c in candles {
                     if let Ok(close_val) = c.close.parse::<f64>() {
-                        closes.push(close_val);
+                        if close_val.is_finite() && close_val > 0.0 {
+                            closes.push(close_val);
+                        }
                     }
                 }
 
@@ -409,6 +431,8 @@ async fn main() {
         .await
     {
         Ok(mut candles) => {
+            candles.sort_by_key(|c| c.time_open);
+            candles.dedup_by_key(|c| c.time_open);
             // Exclude potentially incomplete final candle returned by REST
             if let Some(last) = candles.last() {
                 if last.time_open + 60_000 > now_ms {
@@ -478,6 +502,8 @@ async fn main() {
         .await
     {
         Ok(mut candles) => {
+            candles.sort_by_key(|c| c.time_open);
+            candles.dedup_by_key(|c| c.time_open);
             // Exclude potentially incomplete final candle returned by REST
             if let Some(last) = candles.last() {
                 if last.time_open + 15 * 60 * 1000 > now_ms {
@@ -628,9 +654,16 @@ async fn main() {
                 if pos.stop_loss_price <= 0.0 {
                     pos.stop_loss_price = default_sl;
                 }
-                if pos.lease_owner_uuid.is_empty() {
+                if !lease_uuid.is_empty() && fencing_tok > 0 {
                     pos.lease_owner_uuid = lease_uuid;
                     pos.lease_fencing_token = fencing_tok;
+                }
+                if !pos.tp_order_id.is_empty()
+                    && !symbol_open_orders
+                        .iter()
+                        .any(|o| o.oid.to_string() == pos.tp_order_id)
+                {
+                    pos.tp_order_id.clear();
                 }
             } else {
                 let default_tp = quantize_price(
@@ -722,8 +755,16 @@ async fn main() {
                                 reprice_count: 0,
                                 candidate_lower_count: 0,
                                 engine_type: intent.engine_type.clone(),
-                                chandelier_stop: 0.0,
-                                active_multiplier: 0.0,
+                                chandelier_stop: if intent.engine_type == "EngineB" {
+                                    intent.stop_loss
+                                } else {
+                                    0.0
+                                },
+                                active_multiplier: if intent.engine_type == "EngineB" {
+                                    2.0
+                                } else {
+                                    0.0
+                                },
                                 current_atr: 0.0,
                                 lease_fencing_token: intent.fencing_token,
                                 lease_owner_uuid: intent.owner_uuid.clone(),
@@ -807,11 +848,21 @@ async fn main() {
     let watcher_cb = active_cb.clone();
     let watcher_cb_path = cb_file_path.clone();
     let watcher_sz_decimals = trading_sz_decimals;
+    let obi_tracker = Arc::new(RwLock::new(L2ObiTracker::default()));
+    let watcher_obi = obi_tracker.clone();
+    let live_funding_rate = Arc::new(RwLock::new(0.0_f64));
+    let crowding_tracker = Arc::new(RwLock::new(MarketCrowdingTracker::default()));
+    let high_water_mark_equity = Arc::new(RwLock::new(initial_equity));
+    let sentinel_notify = Arc::new(Notify::new());
+    let watcher_notify = sentinel_notify.clone();
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(1500));
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {},
+                _ = watcher_notify.notified() => {},
+            }
 
             // 1. Snapshot state quickly without holding lock during network calls
             let pos_opt = {
@@ -845,7 +896,20 @@ async fn main() {
             // Defense Layer 1: Live Order Book Catastrophe Stop Loss (1.5s Sentinel)
             // -------------------------------------------------------------
             if (pos.is_filled || pos_exists) && pos.stop_loss_price > 0.0 {
-                if let Ok((best_bid, best_ask)) = fetch_book_ticker(&watcher_info, &watcher_symbol).await {
+                let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                let ws_quotes = {
+                    let guard = watcher_obi.read().await;
+                    if guard.is_fresh_and_uncrossed(now_ms, 2500) {
+                        Some((guard.best_bid, guard.best_ask))
+                    } else {
+                        None
+                    }
+                };
+                let quotes_res = match ws_quotes {
+                    Some(q) => Ok(q),
+                    None => fetch_book_ticker(&watcher_info, &watcher_symbol).await,
+                };
+                if let Ok((best_bid, best_ask)) = quotes_res {
                     let is_breached = if pos.side == "LONG" {
                         best_bid > 0.0 && best_bid <= pos.stop_loss_price
                     } else {
@@ -873,6 +937,7 @@ async fn main() {
                                 user_address,
                                 &mut state_lock,
                                 &watcher_symbol,
+                                watcher_sz_decimals,
                                 watcher_discord.clone(),
                             )
                             .await;
@@ -894,7 +959,7 @@ async fn main() {
                 let mut is_truly_dead = false;
                 let mut reported_status = "UNKNOWN".to_string();
 
-                if !pos.order_id.is_empty() {
+                if !pos.order_id.is_empty() && !pos.is_filled {
                     if let Ok(oid) = pos.order_id.parse::<u64>() {
                         let open_orders = match watcher_info.open_orders(user_address).await {
                             Ok(o) => o,
@@ -909,7 +974,45 @@ async fn main() {
                         let is_resting = open_orders.iter().any(|o| o.oid == oid);
 
                         if is_resting {
-                            // Order is physically resting on matching engine
+                            // If partially filled while still resting, cancel remainder so inventory is fixed and protected
+                            if pos_exists {
+                                let _ = cancel_order(&watcher_exchange, &watcher_symbol, oid).await;
+                            } else {
+                                // Toxic-OBI Queue Protection: cancel resting maker entry if book depth collapses against order
+                                let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                                let toxic_obi = {
+                                    let guard = watcher_obi.read().await;
+                                    if guard.is_fresh_and_uncrossed(now_ms, 2500) {
+                                        if pos.side == "LONG" {
+                                            guard.instant_obi <= -0.45 && guard.ewma_1s_obi <= -0.35
+                                        } else {
+                                            guard.instant_obi >= 0.45 && guard.ewma_1s_obi >= 0.35
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                };
+                                if toxic_obi {
+                                    println!(
+                                        "🛡️ [FAST-SENTINEL TOXIC-OBI ABORT] Order book collapsing against resting {} entry {} on {}. Cancelling before adverse sweep!",
+                                        pos.side, oid, watcher_symbol
+                                    );
+                                    is_truly_dead = true;
+                                    reported_status = "TOXIC_OBI_ABORT".to_string();
+                                } else if let Some(btc_veto) = check_btc_lead_lag_veto(
+                                    &watcher_symbol,
+                                    pos.side == "LONG",
+                                    pos.engine_type == "EngineB",
+                                    now_ms,
+                                ) {
+                                    println!(
+                                        "🛡️ [FAST-SENTINEL BTC IMPULSE ABORT] Cancelling resting {} entry {} on {} due to adverse BTC lead impulse: {}",
+                                        pos.side, oid, watcher_symbol, btc_veto
+                                    );
+                                    is_truly_dead = true;
+                                    reported_status = "BTC_IMPULSE_ABORT".to_string();
+                                }
+                            }
                         } else if !pos_exists {
                             let order_age_secs = if let Ok(opened_dt) = chrono::DateTime::parse_from_rfc3339(&pos.opened_at) {
                                 (chrono::Utc::now() - opened_dt.with_timezone(&chrono::Utc)).num_seconds()
@@ -941,6 +1044,11 @@ async fn main() {
                     }
                 }
 
+                if pos.is_filled && !pos_exists {
+                    is_truly_dead = true;
+                    reported_status = "CLOSED_ON_EXCHANGE".to_string();
+                }
+
                 if is_filled && pos.engine_type == "EngineB" && !pos.is_filled {
                     println!(
                         "🟢 [FAST-SENTINEL] Engine B Position Active for {} (Side: {})!",
@@ -950,6 +1058,9 @@ async fn main() {
                         let mut state_lock = watcher_state.lock().await;
                         let res = if let Some(p) = state_lock.get_mut(&watcher_symbol) {
                             p.is_filled = true;
+                            if current_szi.abs() > 0.0 {
+                                p.amount = current_szi.abs();
+                            }
                             p.opened_at = chrono::Utc::now().to_rfc3339();
                             (p.side.clone(), p.entry_price, p.chandelier_stop, p.amount)
                         } else {
@@ -963,16 +1074,30 @@ async fn main() {
                         watcher_symbol, side_str, entry_px, stop_px, amt
                     );
                     crate::discord::send_alert(watcher_discord.as_deref(), &msg).await;
-                } else if is_filled && pos.take_profit_price > 0.0 {
+                } else if is_filled && pos_exists && pos.take_profit_price > 0.0 {
+                    if !pos.is_filled {
+                        let mut state_lock = watcher_state.lock().await;
+                        if let Some(p) = state_lock.get_mut(&watcher_symbol) {
+                            p.is_filled = true;
+                            p.amount = current_szi.abs();
+                            p.opened_at = chrono::Utc::now().to_rfc3339();
+                            let _ = save_state(&watcher_state_path, &state_lock);
+                        }
+                    }
+                    let raw_tp = if pos.effective_tp > 0.0 {
+                        pos.effective_tp
+                    } else {
+                        pos.take_profit_price
+                    };
+                    let tp_price = quantize_price(raw_tp, watcher_sz_decimals);
                     println!(
                         "🟢 [FAST-SENTINEL] Position Active for {} (Side: {})! Placing Take Profit Limit order at ${:.2}",
-                        watcher_symbol, pos.side, pos.take_profit_price
+                        watcher_symbol, pos.side, tp_price
                     );
 
                     // Long position -> TP Sell (is_buy = false, reduce_only = true)
                     // Short position -> TP Buy (is_buy = true, reduce_only = true)
                     let tp_is_buy = pos.side == "SHORT";
-                    let tp_price = quantize_price(pos.take_profit_price, watcher_sz_decimals);
                     let tp_amount = if current_szi.abs() > 0.0 { current_szi.abs() } else { pos.amount };
 
                     if let Err(e) = crate::state::assert_current_lease(&watcher_symbol, &pos.lease_owner_uuid, pos.lease_fencing_token) {
@@ -998,7 +1123,7 @@ async fn main() {
                                 if let Some(p) = state_lock.get_mut(&watcher_symbol) {
                                     p.tp_order_id = tp_oid.to_string();
                                     p.is_filled = true;
-                                    p.opened_at = chrono::Utc::now().to_rfc3339();
+                                    p.amount = tp_amount;
                                     let _ = save_state(&watcher_state_path, &state_lock);
                                 }
                             }
@@ -1015,7 +1140,7 @@ async fn main() {
                             );
                         }
                     }
-                } else if is_truly_dead && !pos.order_id.is_empty() {
+                } else if is_truly_dead {
                     if let Ok(oid) = pos.order_id.parse::<u64>() {
                         let _ = cancel_order(&watcher_exchange, &watcher_symbol, oid).await;
                     }
@@ -1050,10 +1175,9 @@ async fn main() {
                         );
                         if !released {
                             eprintln!(
-                                "⚠️ [FAST-SENTINEL] Lease release authentication failed for {}. Retaining state.",
+                                "⚠️ [FAST-SENTINEL] Lease for {} owned by newer epoch on disk, but exchange is verified flat. Proceeding to clear stale local state.",
                                 watcher_symbol
                             );
-                            continue;
                         }
 
                         // Defensive sequence step 2: LeaseReleased
@@ -1078,6 +1202,7 @@ async fn main() {
                 let eps = 1e-5;
                 let is_flat = current_szi.abs() <= eps;
                 let mut is_tp_filled = false;
+                let mut is_tp_dead = false;
 
                 if let Ok(tp_oid) = pos.tp_order_id.parse::<u64>() {
                     if let Ok(order_status) = watcher_info.query_order_by_oid(user_address, tp_oid).await {
@@ -1089,8 +1214,22 @@ async fn main() {
 
                         if inner_status == "FILLED" {
                             is_tp_filled = true;
+                        } else if inner_status == "CANCELED"
+                            || inner_status == "REJECTED"
+                            || inner_status == "MARGINCANCELED"
+                        {
+                            is_tp_dead = true;
                         }
                     }
+                }
+
+                if is_tp_dead && !is_flat {
+                    let mut state_lock = watcher_state.lock().await;
+                    if let Some(p) = state_lock.get_mut(&watcher_symbol) {
+                        p.tp_order_id.clear();
+                        let _ = save_state(&watcher_state_path, &state_lock);
+                    }
+                    continue;
                 }
 
                 if is_tp_filled || is_flat {
@@ -1122,10 +1261,9 @@ async fn main() {
                             );
                             if !released {
                                 eprintln!(
-                                    "⚠️ [FAST-SENTINEL] Cluster lease release failed authentication on TP close for {}. Retaining state.",
+                                    "⚠️ [FAST-SENTINEL] Lease for {} owned by newer epoch on TP close, but exchange is verified flat. Proceeding to clear stale local state.",
                                     watcher_symbol
                                 );
-                                continue;
                             }
 
                             // Defensive sequence step 2: LeaseReleased
@@ -1207,8 +1345,11 @@ async fn main() {
     );
     let mut last_shock_bar_ms: u64 = 0;
 
-    let obi_tracker = Arc::new(RwLock::new(L2ObiTracker::default()));
     let obi_tracker_bg = obi_tracker.clone();
+    let funding_bg = live_funding_rate.clone();
+    let crowding_bg = crowding_tracker.clone();
+    let notify_bg = sentinel_notify.clone();
+    let state_bg = active_state.clone();
     let symbol_bg = trading_symbol.clone();
     let base_url_bg = base_url.clone();
 
@@ -1229,7 +1370,7 @@ async fn main() {
                     Subscription::L2Book {
                         coin: symbol_bg.clone(),
                     },
-                    l2_sender,
+                    l2_sender.clone(),
                 )
                 .await
             {
@@ -1238,7 +1379,35 @@ async fn main() {
                 continue;
             }
 
-            println!("📡 [L2 WEBSOCKET] Subscribed to continuous L2Book stream for {}.", symbol_bg);
+            // Subscribe to real-time Asset Context (hourly funding rate & mark price)
+            let _ = l2_client
+                .subscribe(
+                    Subscription::ActiveAssetCtx {
+                        coin: symbol_bg.clone(),
+                    },
+                    l2_sender.clone(),
+                )
+                .await;
+
+            // Subscribe to private OrderUpdates & UserFills for sub-50ms Fast-Sentinel wakeup
+            let _ = l2_client
+                .subscribe(
+                    Subscription::OrderUpdates {
+                        user: user_address,
+                    },
+                    l2_sender.clone(),
+                )
+                .await;
+            let _ = l2_client
+                .subscribe(
+                    Subscription::UserFills {
+                        user: user_address,
+                    },
+                    l2_sender,
+                )
+                .await;
+
+            println!("📡 [L2 + USER WEBSOCKET] Subscribed to continuous L2Book, ActiveAssetCtx, OrderUpdates & UserFills for {}.", symbol_bg);
 
             loop {
                 let msg_res = tokio::time::timeout(Duration::from_secs(30), l2_receiver.recv()).await;
@@ -1251,18 +1420,65 @@ async fn main() {
                     }
                 };
 
-                if let Message::L2Book(l2_msg) = msg {
-                    let local_recv_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-                    let l2_data = l2_msg.data;
-                    let bids: Vec<(f64, f64)> = l2_data.levels.first().cloned().unwrap_or_default()
-                        .into_iter()
-                        .filter_map(|l| Some((l.px.parse::<f64>().ok()?, l.sz.parse::<f64>().ok()?)))
-                        .collect();
-                    let asks: Vec<(f64, f64)> = l2_data.levels.get(1).cloned().unwrap_or_default()
-                        .into_iter()
-                        .filter_map(|l| Some((l.px.parse::<f64>().ok()?, l.sz.parse::<f64>().ok()?)))
-                        .collect();
-                    obi_tracker_bg.write().await.update(&bids, &asks, l2_data.time, local_recv_ms);
+                match msg {
+                    Message::L2Book(l2_msg) => {
+                        let local_recv_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                        let l2_data = l2_msg.data;
+                        let bids: Vec<(f64, f64)> = l2_data.levels.first().cloned().unwrap_or_default()
+                            .into_iter()
+                            .filter_map(|l| Some((l.px.parse::<f64>().ok()?, l.sz.parse::<f64>().ok()?)))
+                            .collect();
+                        let asks: Vec<(f64, f64)> = l2_data.levels.get(1).cloned().unwrap_or_default()
+                            .into_iter()
+                            .filter_map(|l| Some((l.px.parse::<f64>().ok()?, l.sz.parse::<f64>().ok()?)))
+                            .collect();
+                        let best_bid = bids.first().map(|b| b.0).unwrap_or(0.0);
+                        let best_ask = asks.first().map(|a| a.0).unwrap_or(0.0);
+                        obi_tracker_bg.write().await.update(&bids, &asks, l2_data.time, local_recv_ms);
+
+                        // Instant event-driven stop-loss wakeup if L2 quote crosses active stop
+                        if best_bid > 0.0 && best_ask > 0.0 {
+                            if let Ok(guard) = state_bg.try_lock() {
+                                if let Some(pos) = guard.get(&symbol_bg) {
+                                    if pos.stop_loss_price > 0.0 {
+                                        let breached = if pos.side == "LONG" {
+                                            best_bid <= pos.stop_loss_price
+                                        } else {
+                                            best_ask >= pos.stop_loss_price
+                                        };
+                                        if breached {
+                                            notify_bg.notify_one();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Message::ActiveAssetCtx(ctx_msg) => {
+                        if ctx_msg.data.coin == symbol_bg {
+                            if let hyperliquid_rust_sdk::AssetCtx::Perps(perp_ctx) = ctx_msg.data.ctx {
+                                let f_rate = perp_ctx.funding.parse::<f64>().unwrap_or(0.0);
+                                let oi_val = perp_ctx.open_interest.parse::<f64>().unwrap_or(0.0);
+                                let mark_val = perp_ctx.shared.mark_px.parse::<f64>().unwrap_or(0.0);
+                                let oracle_val = perp_ctx.oracle_px.parse::<f64>().unwrap_or(0.0);
+                                if f_rate.is_finite() {
+                                    *funding_bg.write().await = f_rate;
+                                }
+                                crowding_bg.write().await.update(f_rate, oi_val, mark_val, oracle_val);
+                            }
+                        }
+                    }
+                    Message::OrderUpdates(upd_msg) => {
+                        if upd_msg.data.iter().any(|u| u.order.coin == symbol_bg) {
+                            notify_bg.notify_one();
+                        }
+                    }
+                    Message::UserFills(fills_msg) => {
+                        if fills_msg.data.fills.iter().any(|f| f.coin == symbol_bg) {
+                            notify_bg.notify_one();
+                        }
+                    }
+                    _ => {}
                 }
             }
             eprintln!("⚠️ [L2 WEBSOCKET] Disconnected. Reconnecting in 3s...");
@@ -1407,6 +1623,7 @@ async fn main() {
                                     user_address,
                                     &mut state_lock,
                                     &trading_symbol,
+                                    trading_sz_decimals,
                                     discord_url.clone(),
                                 ).await;
                             }
@@ -1466,22 +1683,31 @@ async fn main() {
                 cf_tracker.on_candle_bar(&trading_symbol, high_price, low_price, close_price, now_candle_ms);
 
                 let candle_bucket_15m = (completed_bar.time_open / (15 * 60 * 1000)) * (15 * 60 * 1000);
+                let is_last_1m_of_15m = completed_bar.time_open + 60_000 >= candle_bucket_15m + 15 * 60 * 1000;
                 let mut finalized_15m_bar: Option<CandleBar> = None;
 
-                if let Some(ref mut cur_15m) = current_15m_bar {
+                if let Some(mut cur_15m) = current_15m_bar.take() {
                     if cur_15m.time_open == candle_bucket_15m {
                         cur_15m.high = cur_15m.high.max(high_price);
                         cur_15m.low = cur_15m.low.min(low_price);
                         cur_15m.close = close_price;
                         cur_15m.volume += vol_val;
+                        if is_last_1m_of_15m {
+                            rolling_15m_bars.push(cur_15m.clone());
+                            if rolling_15m_bars.len() > 100 {
+                                rolling_15m_bars.remove(0);
+                            }
+                            finalized_15m_bar = Some(cur_15m);
+                        } else {
+                            current_15m_bar = Some(cur_15m);
+                        }
                     } else {
-                        let closed = cur_15m.clone();
-                        rolling_15m_bars.push(closed.clone());
+                        rolling_15m_bars.push(cur_15m.clone());
                         if rolling_15m_bars.len() > 100 {
                             rolling_15m_bars.remove(0);
                         }
-                        finalized_15m_bar = Some(closed);
-                        *cur_15m = CandleBar {
+                        finalized_15m_bar = Some(cur_15m);
+                        let new_bar = CandleBar {
                             time_open: candle_bucket_15m,
                             open: open_price,
                             high: high_price,
@@ -1489,16 +1715,34 @@ async fn main() {
                             close: close_price,
                             volume: vol_val,
                         };
+                        if is_last_1m_of_15m {
+                            rolling_15m_bars.push(new_bar.clone());
+                            if rolling_15m_bars.len() > 100 {
+                                rolling_15m_bars.remove(0);
+                            }
+                            finalized_15m_bar = Some(new_bar);
+                        } else {
+                            current_15m_bar = Some(new_bar);
+                        }
                     }
                 } else {
-                    current_15m_bar = Some(CandleBar {
+                    let new_bar = CandleBar {
                         time_open: candle_bucket_15m,
                         open: open_price,
                         high: high_price,
                         low: low_price,
                         close: close_price,
                         volume: vol_val,
-                    });
+                    };
+                    if is_last_1m_of_15m {
+                        rolling_15m_bars.push(new_bar.clone());
+                        if rolling_15m_bars.len() > 100 {
+                            rolling_15m_bars.remove(0);
+                        }
+                        finalized_15m_bar = Some(new_bar);
+                    } else {
+                        current_15m_bar = Some(new_bar);
+                    }
                 }
 
                 let exchange_clone = exchange.clone();
@@ -1512,20 +1756,23 @@ async fn main() {
                 let arm_path_clone = arm_file_path.clone();
                 let sz_decimals = trading_sz_decimals;
 
-                // Causal Feature Isolation: evaluate live 1m features and 15m cutoff decision features separately
+                // Causal Feature Isolation: evaluate live 1m features and 15m cutoff decision features
                 let current_close = close_price;
                 let closes_clone = rolling_closes.clone();
                 let finalized_15m_clone = finalized_15m_bar.clone();
 
+                let current_funding_1h = *live_funding_rate.read().await;
                 let (live_features, decision_features) = if closes_clone.len() >= 100 {
                     let symbol_for_feat = symbol_clone.clone();
                     tokio::task::spawn_blocking(move || {
-                        let live_feat = calculate_features(&closes_clone, current_close, &symbol_for_feat);
+                        let live_feat = calculate_features_with_funding(&closes_clone, current_close, &symbol_for_feat, current_funding_1h);
                         let decision_feat = if let Some(ref closed_15m) = finalized_15m_clone {
-                            if closes_clone.len() > 1 {
-                                calculate_features(&closes_clone[..closes_clone.len() - 1], closed_15m.close, &symbol_for_feat)
+                            if (closed_15m.close - current_close).abs() < 1e-9 {
+                                live_feat.clone()
+                            } else if closes_clone.len() > 1 {
+                                calculate_features_with_funding(&closes_clone[..closes_clone.len() - 1], closed_15m.close, &symbol_for_feat, current_funding_1h)
                             } else {
-                                calculate_features(&closes_clone, closed_15m.close, &symbol_for_feat)
+                                calculate_features_with_funding(&closes_clone, closed_15m.close, &symbol_for_feat, current_funding_1h)
                             }
                         } else {
                             None
@@ -1613,6 +1860,15 @@ async fn main() {
                         controller.notify_model_hotswap();
                         controller.model_generation = active_gen;
                         save_controller_state(&symbol_clone, &controller);
+                        if rolling_15m_bars.len() >= 15 {
+                            let hmm_lock = hmm_model.read().await;
+                            let closes_15m: Vec<f64> = rolling_15m_bars.iter().map(|b| b.close).collect();
+                            if let Some((p_c, p_t, p_s)) = compute_hmm_posteriors(&*hmm_lock, &closes_15m) {
+                                current_p_c = p_c;
+                                current_p_t = p_t;
+                                current_p_s = p_s;
+                            }
+                        }
                     }
 
                     // Strictly evaluate 15m dwell streaks & state transitions on finalized 15m candle closes!
@@ -1696,11 +1952,18 @@ async fn main() {
                         if config.sizing_mode == "dynamic" {
                             let info_bg = info_clone.clone();
                             let cached_eq_bg = cached_equity_loop.clone();
+                            let hwm_bg = high_water_mark_equity.clone();
                             tokio::spawn(async move {
                                 if let Ok(account_val) = get_account_value(&info_bg, user_address).await {
                                     if account_val > 0.0 {
-                                        let mut w = cached_eq_bg.write().await;
-                                        *w = account_val;
+                                        {
+                                            let mut w = cached_eq_bg.write().await;
+                                            *w = account_val;
+                                        }
+                                        let mut hwm = hwm_bg.write().await;
+                                        if account_val > *hwm {
+                                            *hwm = account_val;
+                                        }
                                     }
                                 }
                             });
@@ -1952,11 +2215,12 @@ async fn main() {
                             }
 
                             let current_atr = calculate_atr(&rolling_15m_bars, 20).unwrap_or(shadow_trade.atr_at_entry);
+                            let prev_stop = shadow_trade.current_stop;
                             let mut chandelier = ChandelierExitState {
                                 side: shadow_trade.side.clone(),
                                 entry_price: shadow_trade.entry_price,
                                 extreme_favorable_price: shadow_trade.extreme_favorable_price,
-                                current_stop: shadow_trade.current_stop,
+                                current_stop: prev_stop,
                                 initial_stop: shadow_trade.initial_stop,
                                 base_multiplier: chandelier_atr_mult,
                                 active_multiplier: shadow_trade.active_multiplier,
@@ -1973,7 +2237,7 @@ async fn main() {
                                 symbol_clone, shadow_trade.side, close_price, high_price, low_price, new_stop, chandelier.active_multiplier, shadow_trade.extreme_favorable_price
                             );
 
-                            if chandelier.is_bar_stopped_out(high_price, low_price) {
+                            if chandelier.is_bar_stopped_out(prev_stop, high_price, low_price, close_price) {
                                 let exit_price = if shadow_trade.side == Side::Long {
                                     open_price.min(chandelier.current_stop)
                                 } else {
@@ -2049,20 +2313,72 @@ async fn main() {
                                             let candidate_id = format!("{}-{}-{}", symbol_clone, now_ms, if side == Side::Long { "L" } else { "S" });
                                             let mut portfolio_selected = false;
 
-                                            if obi_favorable {
+                                            let btc_lead_veto = check_btc_lead_lag_veto(
+                                                &symbol_clone,
+                                                side == Side::Long,
+                                                true,
+                                                now_ms,
+                                            );
+                                            if let Some(ref veto_msg) = btc_lead_veto {
+                                                println!(
+                                                    "⏸️ [ENGINE B BTC LEAD-LAG VETO] {} {:?} breakout vetoed: {}",
+                                                    symbol_clone, side, veto_msg
+                                                );
+                                            }
+
+                                            let crowding_mult = crowding_tracker.read().await.directional_trend_multiplier(&side);
+                                            if crowding_mult < 0.45 {
+                                                println!(
+                                                    "⚠️ [ENGINE B CROWDING HAZARD VETO] {} {:?} breakout vetoed: extreme crowded funding/OI squeeze hazard (H_t = {:.2} < 0.45).",
+                                                    symbol_clone, side, crowding_mult
+                                                );
+                                            }
+
+                                            if obi_favorable && btc_lead_veto.is_none() && crowding_mult >= 0.45 {
                                                 funnel_counters.engine_b_orders_placed += 1;
                                                 let trade_bank = resolve_trade_bank(&info_clone, user_address, &config, &cached_equity_loop).await;
-                                                let trend_notional = (trade_bank * trend_risk_fraction).max(11.0).min(config.max_position_size_usdc);
+                                                let initial_sl = if side == Side::Long {
+                                                    close_price - chandelier_atr_mult * current_atr
+                                                } else {
+                                                    close_price + chandelier_atr_mult * current_atr
+                                                };
+                                                let live_eq = *cached_equity_loop.read().await;
+                                                let hwm_eq = *high_water_mark_equity.read().await;
+                                                let dd_mult = compute_drawdown_risk_multiplier(live_eq, hwm_eq);
+                                                let eff_trend_risk = 0.0060 * trend_risk_fraction * dd_mult * crowding_mult;
+                                                let trend_notional = if config.sizing_mode == "dynamic" && live_eq > 0.0 {
+                                                    calculate_risk_scaled_notional(
+                                                        live_eq,
+                                                        trade_bank * trend_risk_fraction * crowding_mult,
+                                                        eff_trend_risk,
+                                                        close_price,
+                                                        initial_sl,
+                                                        config.hl_leverage,
+                                                        crate::state::max_concurrent_cluster_positions(),
+                                                        11.0,
+                                                        config.max_position_size_usdc,
+                                                    )
+                                                } else {
+                                                    (trade_bank * trend_risk_fraction * crowding_mult).max(11.0).min(config.max_position_size_usdc)
+                                                };
+                                                let step_risk_exceeded = exceeds_micro_account_step_risk(
+                                                    live_eq,
+                                                    trend_notional,
+                                                    close_price,
+                                                    initial_sl,
+                                                    0.0175,
+                                                );
+                                                if step_risk_exceeded {
+                                                    println!(
+                                                        "⚠️ [ENGINE B STEP-FUNCTION RISK VETO] {} {:?} stop distance ({:.2} vs {:.2}) exceeds 1.75% equity risk cap at $11 min notional.",
+                                                        symbol_clone, side, close_price, initial_sl
+                                                    );
+                                                }
                                                 let shadow_size = trend_notional / close_price;
 
-                                                if trend_engine_mode == "live" {
+                                                if !step_risk_exceeded && trend_engine_mode == "live" {
                                                     let mut state_lock = state_clone.lock().await;
                                                     if !state_lock.contains_key(&symbol_clone) && !is_cluster_blocked {
-                                                        let initial_sl = if side == Side::Long {
-                                                            close_price - chandelier_atr_mult * current_atr
-                                                        } else {
-                                                            close_price + chandelier_atr_mult * current_atr
-                                                        };
                                                         match crate::order::place_trend_breakout_entry(
                                                             &state_path_clone,
                                                             &exchange_clone,
@@ -2290,6 +2606,7 @@ async fn main() {
                                         user_address,
                                         &mut state_lock,
                                         &symbol_clone,
+                                        sz_decimals,
                                         discord_clone.clone(),
                                     )
                                     .await;
@@ -2306,6 +2623,7 @@ async fn main() {
                                         user_address,
                                         &mut state_lock,
                                         &symbol_clone,
+                                        sz_decimals,
                                         discord_clone.clone(),
                                     )
                                     .await;
@@ -2382,11 +2700,16 @@ async fn main() {
                                         } else {
                                             chandelier_atr_mult
                                         };
+                                        let prev_stop = if pos.chandelier_stop > 0.0 {
+                                            pos.chandelier_stop
+                                        } else {
+                                            pos.stop_loss_price
+                                        };
                                         let mut chandelier = crate::trend::ChandelierExitState {
-                                            side: side_enum,
+                                            side: side_enum.clone(),
                                             entry_price: pos.entry_price,
                                             extreme_favorable_price: pos.max_favorable_price,
-                                            current_stop: pos.chandelier_stop,
+                                            current_stop: prev_stop,
                                             initial_stop: pos.stop_loss_price,
                                             base_multiplier: chandelier_atr_mult,
                                             active_multiplier: active_mult,
@@ -2403,7 +2726,7 @@ async fn main() {
                                             symbol_clone, pos.side, close_price, high_price, low_price, new_stop, pos.max_favorable_price
                                         );
 
-                                        if chandelier.is_bar_stopped_out(high_price, low_price) {
+                                        if chandelier.is_bar_stopped_out(prev_stop, high_price, low_price, close_price) {
                                             chandelier_stopped = true;
                                         }
                                     } else {
@@ -2469,11 +2792,13 @@ async fn main() {
 
                                                 if is_long {
                                                     let live_mu = th.exit_long;
-                                                    let eps_shave = (live_mu * 0.0005).max(0.02);
-                                                    let b_cand = live_mu - eps_shave;
+                                                    let tick_sz = effective_tick_size(live_mu, sz_decimals);
+                                                    let eps_shave = (live_mu * 0.0005).max(2.0 * tick_sz);
+                                                    let b_cand = quantize_price(live_mu - eps_shave, sz_decimals);
                                                     let p_min = pos.entry_price * 1.0020;
 
                                                     if b_cand <= pos.effective_tp - delta_reprice
+                                                        && b_cand < quantize_price(pos.effective_tp, sz_decimals)
                                                         && b_cand >= p_min
                                                     {
                                                         pos.candidate_lower_count += 1;
@@ -2497,11 +2822,13 @@ async fn main() {
                                                 } else {
                                                     // SHORT position
                                                     let live_mu = th.exit_short;
-                                                    let eps_shave = (live_mu * 0.0005).max(0.02);
-                                                    let b_cand = live_mu + eps_shave;
+                                                    let tick_sz = effective_tick_size(live_mu, sz_decimals);
+                                                    let eps_shave = (live_mu * 0.0005).max(2.0 * tick_sz);
+                                                    let b_cand = quantize_price(live_mu + eps_shave, sz_decimals);
                                                     let p_max = pos.entry_price * 0.9980;
 
                                                     if b_cand >= pos.effective_tp + delta_reprice
+                                                        && b_cand > quantize_price(pos.effective_tp, sz_decimals)
                                                         && b_cand <= p_max
                                                     {
                                                         pos.candidate_lower_count += 1;
@@ -2564,7 +2891,6 @@ async fn main() {
                                     Ok(new_oid) => {
                                         if let Some(p) = state_lock.get_mut(&symbol_clone) {
                                             p.tp_order_id = new_oid.to_string();
-                                            p.take_profit_price = rounded_target;
                                             let _ = crate::state::save_state(&state_path_clone, &state_lock);
                                         }
                                         let reprice_msg = format!(
@@ -2575,6 +2901,10 @@ async fn main() {
                                     }
                                     Err(e) => {
                                         eprintln!("❌ [REPRICE FAILED HL] Could not replace TP order for {}: {}", symbol_clone, e);
+                                        if let Some(p) = state_lock.get_mut(&symbol_clone) {
+                                            p.tp_order_id.clear();
+                                            let _ = crate::state::save_state(&state_path_clone, &state_lock);
+                                        }
                                     }
                                 }
                             }
@@ -2593,9 +2923,6 @@ async fn main() {
                                     symbol_clone, sl_px, close_price
                                 );
                                 crate::discord::send_alert(discord_clone.as_deref(), &sl_msg).await;
-                                let mut cb_lock = cb_clone.lock().await;
-                                cb_lock.record_loss();
-                                save_circuit_breaker(&cb_path_clone, &cb_lock);
                                 let _ = execute_emergency_flatten_with_retry(
                                     &state_path_clone,
                                     &exchange_clone,
@@ -2603,9 +2930,14 @@ async fn main() {
                                     user_address,
                                     &mut state_lock,
                                     &symbol_clone,
+                                    sz_decimals,
                                     discord_clone.clone(),
                                 )
                                 .await;
+                                drop(state_lock);
+                                let mut cb_lock = cb_clone.lock().await;
+                                cb_lock.record_loss();
+                                save_circuit_breaker(&cb_path_clone, &cb_lock);
                             } else if chandelier_stopped {
                                 let sl_px = state_lock
                                     .get(&symbol_clone)
@@ -2627,6 +2959,7 @@ async fn main() {
                                     user_address,
                                     &mut state_lock,
                                     &symbol_clone,
+                                    sz_decimals,
                                     discord_clone.clone(),
                                 )
                                 .await;
@@ -2651,6 +2984,7 @@ async fn main() {
                                     user_address,
                                     &mut state_lock,
                                     &symbol_clone,
+                                    sz_decimals,
                                     discord_clone.clone(),
                                 )
                                 .await;
@@ -2679,6 +3013,7 @@ async fn main() {
                                     user_address,
                                     &mut state_lock,
                                     &symbol_clone,
+                                    sz_decimals,
                                     discord_clone.clone(),
                                 )
                                 .await;
@@ -2695,6 +3030,7 @@ async fn main() {
                                     user_address,
                                     &mut state_lock,
                                     &symbol_clone,
+                                    sz_decimals,
                                     discord_clone.clone(),
                                 )
                                 .await;
@@ -2710,6 +3046,7 @@ async fn main() {
                                     user_address,
                                     &mut state_lock,
                                     &symbol_clone,
+                                    sz_decimals,
                                     discord_clone.clone(),
                                 )
                                 .await;
@@ -2718,9 +3055,22 @@ async fn main() {
                                     "⏱️ [TIME-STOP] {} reached max hold {:.1}m >= limit {:.1}m. Flattening.",
                                     symbol_clone, elapsed_mins, max_allowed_mins
                                 );
+                                let _ = execute_emergency_flatten_with_retry(
+                                    &state_path_clone,
+                                    &exchange_clone,
+                                    &info_clone,
+                                    user_address,
+                                    &mut state_lock,
+                                    &symbol_clone,
+                                    sz_decimals,
+                                    discord_clone.clone(),
+                                )
+                                .await;
+                                drop(state_lock);
                                 let mut cb_lock = cb_clone.lock().await;
                                 let tripped = cb_lock.record_time_stop();
                                 save_circuit_breaker(&cb_path_clone, &cb_lock);
+                                drop(cb_lock);
 
                                 let mut time_msg = format!(
                                     "⏱️ **HALF-LIFE TIME-STOP EXPIRED (HL):** {} held for {:.1}m (limit: {:.1}m). Exiting.",
@@ -2730,16 +3080,6 @@ async fn main() {
                                     time_msg.push_str("\n🚨 **CIRCUIT BREAKER TRIGGERED:** 3 consecutive time stops! Trading paused 24h.");
                                 }
                                 crate::discord::send_alert(discord_clone.as_deref(), &time_msg).await;
-                                let _ = execute_emergency_flatten_with_retry(
-                                    &state_path_clone,
-                                    &exchange_clone,
-                                    &info_clone,
-                                    user_address,
-                                    &mut state_lock,
-                                    &symbol_clone,
-                                    discord_clone.clone(),
-                                )
-                                .await;
                             }
                         } else if !has_position {
                             // ------------------------------------------------------------------
@@ -2815,6 +3155,11 @@ async fn main() {
                                             if let Some(ref th) = thresholds_opt {
                                                 if current_extreme <= th.entry_long {
                                                     armed_state.tier = "TIER_1_NORMAL".to_string();
+                                                    let baseline_arm = rolling_closes.iter().sum::<f64>()
+                                                        / rolling_closes.len() as f64;
+                                                    armed_state.entry_threshold = th.entry_long;
+                                                    armed_state.unitless_entry_dev =
+                                                        (th.entry_long / baseline_arm).ln();
                                                     println!(
                                                         "⏫ [TIER UPGRADED] {} reached Tier 1 hurdle (${:.2} <= ${:.2}). Upgraded to TIER_1_NORMAL (full size).",
                                                         symbol_clone, current_extreme, th.entry_long
@@ -2853,33 +3198,77 @@ async fn main() {
                                             true
                                         };
 
+                                        let now_ms_check = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                                        let btc_lead_veto = check_btc_lead_lag_veto(&symbol_clone, true, false, now_ms_check);
+                                        let cur_min_utc = chrono::Utc::now().minute();
+                                        let top_of_hour_adverse_funding = cur_min_utc >= 56 && current_funding_1h > 0.00025;
+
                                         if !obi_confirmed {
                                             println!(
                                                 "⚠️ [TIER 2 OBI VETO] {} Long reversal bounce vetoed: sell pressure in order book (instant: {:.2}, 1s: {:.2} < -0.20). Waiting.",
                                                 symbol_clone, l2_instant, l2_1s
                                             );
+                                        } else if let Some(veto_reason) = btc_lead_veto {
+                                            println!(
+                                                "⏸️ [BTC LEAD-LAG VETO] {} Long reversal bounce held: {}. Waiting for BTC stabilization.",
+                                                symbol_clone, veto_reason
+                                            );
+                                        } else if top_of_hour_adverse_funding {
+                                            println!(
+                                                "⏳ [FUNDING BOUNDARY GATE] {} Long entry deferred at minute :{:02} UTC due to adverse hourly funding ({:.2} bps/hr). Holding armed until :00.",
+                                                symbol_clone, cur_min_utc, current_funding_1h * 10_000.0
+                                            );
                                         } else {
                                             let entry_limit_price = close_price;
-                                            let net_edge_bps = calculate_net_edge_bps(
+                                            let raw_edge_bps = calculate_net_edge_bps(
                                                 entry_limit_price,
                                                 dynamic_exit_target,
                                             );
+                                            let expected_funding_drag_bps = (current_funding_1h * 10_000.0) * (armed_state.half_life_m / 60.0);
+                                            let net_edge_bps = raw_edge_bps - expected_funding_drag_bps;
 
                                             if net_edge_bps < 20.0 {
                                                 funnel_counters.engine_a_reversal_hurdle_veto += 1;
                                                 println!(
-                                                    "⚠️ [LONG HURDLE VETO] Edge too narrow for {}: {:.1} bps (< 20 bps).",
-                                                    symbol_clone, net_edge_bps
+                                                    "⚠️ [LONG HURDLE VETO] Carry-adjusted edge too narrow for {}: {:.1} bps (raw: {:.1} bps, funding drag: {:.1} bps < 20 bps).",
+                                                    symbol_clone, net_edge_bps, raw_edge_bps, expected_funding_drag_bps
                                                 );
                                                 armed_state.is_armed = false;
                                                 save_armed_signal(&arm_path_clone, &armed_state);
                                             } else {
                                                 let trade_bank = resolve_trade_bank(&info_clone, user_address, &config, &cached_equity_loop).await;
-                                                let trade_size_usdc = if is_tier2 {
+                                                let live_eq = *cached_equity_loop.read().await;
+                                                let hwm_eq = *high_water_mark_equity.read().await;
+                                                let dd_mult = compute_drawdown_risk_multiplier(live_eq, hwm_eq);
+                                                let est_sl_dist = (2.0 * (dynamic_exit_target - entry_limit_price).abs()).max(entry_limit_price * 0.015);
+                                                let est_sl_px = entry_limit_price - est_sl_dist;
+                                                let risk_frac = (if is_tier2 { 0.00375 } else { 0.0075 }) * dd_mult;
+                                                let trade_size_usdc = if config.sizing_mode == "dynamic" && live_eq > 0.0 {
+                                                    calculate_risk_scaled_notional(
+                                                        live_eq,
+                                                        if is_tier2 { (trade_bank * 0.5).max(12.0) } else { trade_bank },
+                                                        risk_frac,
+                                                        entry_limit_price,
+                                                        est_sl_px,
+                                                        config.hl_leverage,
+                                                        crate::state::max_concurrent_cluster_positions(),
+                                                        if is_tier2 { 12.0 } else { 11.0 },
+                                                        config.max_position_size_usdc,
+                                                    )
+                                                } else if is_tier2 {
                                                     (trade_bank * 0.5).max(12.0)
                                                 } else {
                                                     trade_bank
                                                 };
+                                                if exceeds_micro_account_step_risk(live_eq, trade_size_usdc, entry_limit_price, est_sl_px, 0.0175) {
+                                                    println!(
+                                                        "⚠️ [LONG STEP-FUNCTION RISK VETO] {} stop distance (${:.2} vs ${:.2}) exceeds 1.75% equity risk cap on micro-account.",
+                                                        symbol_clone, entry_limit_price, est_sl_px
+                                                    );
+                                                    armed_state.is_armed = false;
+                                                    save_armed_signal(&arm_path_clone, &armed_state);
+                                                    continue;
+                                                }
 
                                                 funnel_counters.engine_a_orders_placed += 1;
                                                 println!(
@@ -2925,6 +3314,11 @@ async fn main() {
                                             if let Some(ref th) = thresholds_opt {
                                                 if current_extreme >= th.entry_short {
                                                     armed_state.tier = "TIER_1_NORMAL".to_string();
+                                                    let baseline_arm = rolling_closes.iter().sum::<f64>()
+                                                        / rolling_closes.len() as f64;
+                                                    armed_state.entry_threshold = th.entry_short;
+                                                    armed_state.unitless_entry_dev =
+                                                        (th.entry_short / baseline_arm).ln();
                                                     println!(
                                                         "⏫ [TIER UPGRADED] {} reached Tier 1 hurdle (${:.2} >= ${:.2}). Upgraded to TIER_1_NORMAL (full size).",
                                                         symbol_clone, current_extreme, th.entry_short
@@ -2963,31 +3357,76 @@ async fn main() {
                                             true
                                         };
 
+                                        let now_ms_check = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                                        let btc_lead_veto = check_btc_lead_lag_veto(&symbol_clone, false, false, now_ms_check);
+                                        let cur_min_utc = chrono::Utc::now().minute();
+                                        let top_of_hour_adverse_funding = cur_min_utc >= 56 && current_funding_1h < -0.00025;
+
                                         if !obi_confirmed {
                                             println!(
                                                 "⚠️ [TIER 2 OBI VETO] {} Short rejection bounce vetoed: buy pressure in order book (instant: {:.2}, 1s: {:.2} > 0.20). Waiting.",
                                                 symbol_clone, l2_instant, l2_1s
                                             );
+                                        } else if let Some(veto_reason) = btc_lead_veto {
+                                            println!(
+                                                "⏸️ [BTC LEAD-LAG VETO] {} Short rejection bounce held: {}. Waiting for BTC stabilization.",
+                                                symbol_clone, veto_reason
+                                            );
+                                        } else if top_of_hour_adverse_funding {
+                                            println!(
+                                                "⏳ [FUNDING BOUNDARY GATE] {} Short entry deferred at minute :{:02} UTC due to adverse negative hourly funding ({:.2} bps/hr). Holding armed until :00.",
+                                                symbol_clone, cur_min_utc, current_funding_1h * 10_000.0
+                                            );
                                         } else {
                                             let entry_limit_price = close_price;
                                             // For Short: edge is entry_limit_price down to dynamic_exit_target
-                                            let net_edge_bps = calculate_directional_edge_bps(entry_limit_price, dynamic_exit_target, false);
+                                            let raw_edge_bps = calculate_directional_edge_bps(entry_limit_price, dynamic_exit_target, false);
+                                            // Short receives positive funding and pays negative funding
+                                            let expected_funding_drag_bps = (-current_funding_1h * 10_000.0) * (armed_state.half_life_m / 60.0);
+                                            let net_edge_bps = raw_edge_bps - expected_funding_drag_bps;
 
                                             if net_edge_bps < 20.0 {
                                                 funnel_counters.engine_a_reversal_hurdle_veto += 1;
                                                 println!(
-                                                    "⚠️ [SHORT HURDLE VETO] Edge too narrow for {}: {:.1} bps (< 20 bps).",
-                                                    symbol_clone, net_edge_bps
+                                                    "⚠️ [SHORT HURDLE VETO] Carry-adjusted edge too narrow for {}: {:.1} bps (raw: {:.1} bps, funding drag: {:.1} bps < 20 bps).",
+                                                    symbol_clone, net_edge_bps, raw_edge_bps, expected_funding_drag_bps
                                                 );
                                                 armed_state.is_armed = false;
                                                 save_armed_signal(&arm_path_clone, &armed_state);
                                             } else {
                                                 let trade_bank = resolve_trade_bank(&info_clone, user_address, &config, &cached_equity_loop).await;
-                                                let trade_size_usdc = if is_tier2 {
+                                                let live_eq = *cached_equity_loop.read().await;
+                                                let hwm_eq = *high_water_mark_equity.read().await;
+                                                let dd_mult = compute_drawdown_risk_multiplier(live_eq, hwm_eq);
+                                                let est_sl_dist = (2.0 * (entry_limit_price - dynamic_exit_target).abs()).max(entry_limit_price * 0.015);
+                                                let est_sl_px = entry_limit_price + est_sl_dist;
+                                                let risk_frac = (if is_tier2 { 0.00375 } else { 0.0075 }) * dd_mult;
+                                                let trade_size_usdc = if config.sizing_mode == "dynamic" && live_eq > 0.0 {
+                                                    calculate_risk_scaled_notional(
+                                                        live_eq,
+                                                        if is_tier2 { (trade_bank * 0.5).max(12.0) } else { trade_bank },
+                                                        risk_frac,
+                                                        entry_limit_price,
+                                                        est_sl_px,
+                                                        config.hl_leverage,
+                                                        crate::state::max_concurrent_cluster_positions(),
+                                                        if is_tier2 { 12.0 } else { 11.0 },
+                                                        config.max_position_size_usdc,
+                                                    )
+                                                } else if is_tier2 {
                                                     (trade_bank * 0.5).max(12.0)
                                                 } else {
                                                     trade_bank
                                                 };
+                                                if exceeds_micro_account_step_risk(live_eq, trade_size_usdc, entry_limit_price, est_sl_px, 0.0175) {
+                                                    println!(
+                                                        "⚠️ [SHORT STEP-FUNCTION RISK VETO] {} stop distance (${:.2} vs ${:.2}) exceeds 1.75% equity risk cap on micro-account.",
+                                                        symbol_clone, entry_limit_price, est_sl_px
+                                                    );
+                                                    armed_state.is_armed = false;
+                                                    save_armed_signal(&arm_path_clone, &armed_state);
+                                                    continue;
+                                                }
 
                                                 funnel_counters.engine_a_orders_placed += 1;
                                                 println!(
