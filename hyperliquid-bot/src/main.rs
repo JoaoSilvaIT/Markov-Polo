@@ -1133,7 +1133,17 @@ async fn main() {
 
             println!("📡 [L2 WEBSOCKET] Subscribed to continuous L2Book stream for {}.", symbol_bg);
 
-            while let Some(msg) = l2_receiver.recv().await {
+            loop {
+                let msg_res = tokio::time::timeout(Duration::from_secs(30), l2_receiver.recv()).await;
+                let msg = match msg_res {
+                    Ok(Some(m)) => m,
+                    Ok(None) => break,
+                    Err(_) => {
+                        eprintln!("⚠️ [L2 WEBSOCKET WATCHDOG] No L2 book update received for 30s on {}. Stalled connection detected! Reconnecting...", symbol_bg);
+                        break;
+                    }
+                };
+
                 if let Message::L2Book(l2_msg) = msg {
                     let local_recv_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
                     let l2_data = l2_msg.data;
@@ -1189,7 +1199,20 @@ async fn main() {
 
         println!("📡 [WEBSOCKET] Successfully subscribed to 1m candles for {}.", trading_symbol);
 
-        while let Some(msg) = receiver.recv().await {
+        loop {
+            let recv_res = tokio::time::timeout(Duration::from_secs(90), receiver.recv()).await;
+            let msg = match recv_res {
+                Ok(Some(m)) => m,
+                Ok(None) => {
+                    eprintln!("⚠️ [WEBSOCKET] Candle stream channel closed for {}. Reconnecting in 3s...", trading_symbol);
+                    break;
+                }
+                Err(_) => {
+                    eprintln!("⚠️ [WEBSOCKET WATCHDOG] No 1m candle received for 90s on {}. Stalled connection detected! Reconnecting WebSocket...", trading_symbol);
+                    break;
+                }
+            };
+
             if let Message::Candle(candle_msg) = msg {
                 let candle = candle_msg.data;
                 let open_ms = candle.time_open;

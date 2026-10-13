@@ -689,12 +689,27 @@ impl ChandelierExitState {
 
                 if enable_breakeven_ratchet {
                     let delta_fav = (self.extreme_favorable_price - self.entry_price).max(0.0);
+                    let ret_fav_pct = if self.entry_price > 0.0 { delta_fav / self.entry_price } else { 0.0 };
                     let eps = 1e-6;
-                    // 1. Breakeven Floor: once favorable progress >= 1.0 ATR, stop moves to at least entry + 10 bps
-                    if delta_fav >= (1.0 * current_atr) - eps {
-                        candidate_stop = f64::max(candidate_stop, self.entry_price * 1.0010);
+
+                    // 1. Breakeven Floor: once favorable progress >= 1.0 ATR or >= 1.0%, stop moves to at least entry + 15 bps (covers round-trip fees)
+                    if delta_fav >= (1.0 * current_atr) - eps || ret_fav_pct >= 0.010 {
+                        candidate_stop = f64::max(candidate_stop, self.entry_price * 1.0015);
                     }
-                    // 2. 50% Profit Giveback Ratchet: once progress >= 1.5 ATR, protect at least 50% of peak progress
+                    // 2. Tier 2 (+2% Gain Rule): once gain >= +2.0%, lock in at least +1.0% net profit
+                    if ret_fav_pct >= 0.020 {
+                        candidate_stop = f64::max(candidate_stop, self.entry_price * 1.0100);
+                    }
+                    // 3. Tier 3 (+3% Gain Rule): once gain >= +3.0%, lock in at least +2.0% net profit
+                    if ret_fav_pct >= 0.030 {
+                        candidate_stop = f64::max(candidate_stop, self.entry_price * 1.0200);
+                    }
+                    // 4. Tier 4 (Super-Trend Runner): once gain >= +4.0%, protect at least 70% of peak excursion
+                    if ret_fav_pct >= 0.040 {
+                        let locked_70 = self.entry_price + 0.70 * delta_fav;
+                        candidate_stop = f64::max(candidate_stop, f64::max(self.entry_price * 1.0250, locked_70));
+                    }
+                    // 5. ATR Giveback Floor: once progress >= 1.5 ATR, protect at least 50% of peak progress
                     if delta_fav >= (1.5 * current_atr) - eps {
                         candidate_stop = f64::max(candidate_stop, self.entry_price + 0.5 * delta_fav);
                     }
@@ -711,12 +726,27 @@ impl ChandelierExitState {
 
                 if enable_breakeven_ratchet {
                     let delta_fav = (self.entry_price - self.extreme_favorable_price).max(0.0);
+                    let ret_fav_pct = if self.entry_price > 0.0 { delta_fav / self.entry_price } else { 0.0 };
                     let eps = 1e-6;
-                    // 1. Breakeven Floor: once favorable progress >= 1.0 ATR, stop moves to at least entry - 10 bps
-                    if delta_fav >= (1.0 * current_atr) - eps {
-                        candidate_stop = f64::min(candidate_stop, self.entry_price * 0.9990);
+
+                    // 1. Breakeven Floor: once favorable progress >= 1.0 ATR or >= 1.0%, stop moves to at least entry - 15 bps (covers round-trip fees)
+                    if delta_fav >= (1.0 * current_atr) - eps || ret_fav_pct >= 0.010 {
+                        candidate_stop = f64::min(candidate_stop, self.entry_price * 0.9985);
                     }
-                    // 2. 50% Profit Giveback Ratchet: once progress >= 1.5 ATR, protect at least 50% of peak progress
+                    // 2. Tier 2 (+2% Gain Rule): once gain >= +2.0%, lock in at least +1.0% net profit
+                    if ret_fav_pct >= 0.020 {
+                        candidate_stop = f64::min(candidate_stop, self.entry_price * 0.9900);
+                    }
+                    // 3. Tier 3 (+3% Gain Rule): once gain >= +3.0%, lock in at least +2.0% net profit
+                    if ret_fav_pct >= 0.030 {
+                        candidate_stop = f64::min(candidate_stop, self.entry_price * 0.9800);
+                    }
+                    // 4. Tier 4 (Super-Trend Runner): once gain >= +4.0%, protect at least 70% of peak excursion
+                    if ret_fav_pct >= 0.040 {
+                        let locked_70 = self.entry_price - 0.70 * delta_fav;
+                        candidate_stop = f64::min(candidate_stop, f64::min(self.entry_price * 0.9750, locked_70));
+                    }
+                    // 5. ATR Giveback Floor: once progress >= 1.5 ATR, protect at least 50% of peak progress
                     if delta_fav >= (1.5 * current_atr) - eps {
                         candidate_stop = f64::min(candidate_stop, self.entry_price - 0.5 * delta_fav);
                     }
@@ -1310,6 +1340,24 @@ mod tests {
         // protects at least 50% of peak progress: 100.00 + 0.5 * 4.00 = 102.00!
         let stop = chandelier.update_with_ratchet_and_cap(104.00, 102.00, 2.00, 0.85, None, true);
         assert!(stop >= 102.00, "50% profit giveback ratchet must protect at least 102.00 (stop: {})", stop);
+    }
+
+    #[test]
+    fn test_chandelier_tiered_profit_lock_ladder() {
+        // Short entry @ 10.00, ATR = 0.10, base_multiplier = 2.0
+        let mut chandelier = ChandelierExitState::new(Side::Short, 10.00, 0.10, 2.0);
+
+        // 1. Gain reaches +2.0% (price drops to 9.80): stop locks at least +1.0% profit (<= 9.90)
+        let stop_tier2 = chandelier.update_with_ratchet_and_cap(9.85, 9.80, 0.10, 0.85, None, true);
+        assert!(stop_tier2 <= 9.90, "Tier 2 (+2% gain) must lock in at least +1.0% profit (stop: {})", stop_tier2);
+
+        // 2. Gain reaches +3.0% (price drops to 9.70): stop locks at least +2.0% profit (<= 9.80)
+        let stop_tier3 = chandelier.update_with_ratchet_and_cap(9.75, 9.70, 0.10, 0.85, None, true);
+        assert!(stop_tier3 <= 9.80, "Tier 3 (+3% gain) must lock in at least +2.0% profit (stop: {})", stop_tier3);
+
+        // 3. Gain reaches +5.0% (price drops to 9.50): delta_fav = 0.50, locks 70% of peak progress (0.50 * 0.70 = 0.35 -> stop <= 9.65)
+        let stop_tier4 = chandelier.update_with_ratchet_and_cap(9.55, 9.50, 0.10, 0.85, None, true);
+        assert!(stop_tier4 <= 9.65, "Tier 4 (Super-Trend) must protect at least 70% of peak gain (stop: {})", stop_tier4);
     }
 
     #[test]
