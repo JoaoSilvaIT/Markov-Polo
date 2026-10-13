@@ -233,21 +233,41 @@ pub async fn get_user_position(
     Ok((0.0, None))
 }
 
-/// Queries user's total account equity value in USDC from clearinghouse margin summary
+/// Queries user's total account equity value in USDC across clearinghouse perps and spot balances
 pub async fn get_account_value(
     info: &InfoClient,
     address: H160,
 ) -> Result<f64, String> {
-    let state = info
-        .user_state(address)
-        .await
-        .map_err(|e| format!("Failed to get user state: {}", e))?;
+    let mut total_val = 0.0;
+    let mut query_success = false;
 
-    state
-        .margin_summary
-        .account_value
-        .parse::<f64>()
-        .map_err(|e| format!("Failed to parse account_value '{}': {}", state.margin_summary.account_value, e))
+    // 1. Query clearinghouse perp account value
+    if let Ok(state) = info.user_state(address).await {
+        if let Ok(perp_val) = state.margin_summary.account_value.parse::<f64>() {
+            total_val += perp_val;
+            query_success = true;
+        }
+    }
+
+    // 2. Query spot token balances (e.g. USDC deposited in spot clearinghouse)
+    if let Ok(token_balances) = info.user_token_balances(address).await {
+        for b in token_balances.balances {
+            if b.coin == "USDC" {
+                if let Ok(spot_val) = b.total.parse::<f64>() {
+                    total_val += spot_val;
+                    query_success = true;
+                }
+            }
+        }
+    }
+
+    if query_success && total_val > 0.0 {
+        Ok(total_val)
+    } else if query_success {
+        Ok(0.0)
+    } else {
+        Err("Failed to query user clearinghouse or token balance state".to_string())
+    }
 }
 
 /// Calculates dynamic order notional based on account equity, equity fraction, and safety boundaries.
@@ -314,4 +334,16 @@ pub mod tests {
         let notional_nan = calculate_dynamic_notional(f64::NAN, 0.25, 11.0, 500.0, 25.0);
         assert!((notional_nan - 25.0).abs() < 1e-4);
     }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_live_account_value_query() {
+        use std::str::FromStr;
+        let info = InfoClient::new(None, Some(hyperliquid_rust_sdk::BaseUrl::Mainnet)).await.unwrap();
+        let addr = H160::from_str("0x0000000000000000000000000000000000000000").unwrap();
+        let val = get_account_value(&info, addr).await.unwrap();
+        println!("LIVE VAL: {}", val);
+        assert!(val > 150.0);
+    }
 }
+
