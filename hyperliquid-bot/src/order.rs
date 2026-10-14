@@ -1,6 +1,7 @@
 use crate::hyperliquid::{
     cancel_order, close_market_position, effective_tick_size, fetch_book_ticker,
-    get_user_position, place_post_only_order, quantize_price, quantize_size_for_notional,
+    get_user_position, optimal_engine_b_tp_atr_multiple, place_post_only_order, quantize_price,
+    quantize_size_for_notional,
 };
 use crate::state::{
     assert_current_lease, clear_order_intent, release_cluster_lease_authenticated, save_order_intent_atomic,
@@ -398,7 +399,8 @@ pub async fn place_trend_breakout_entry(
     }
 
     let stop_loss_price = quantize_price(initial_stop, sz_decimals);
-    let tp_dist = (2.0 * current_atr).max(post_only_price * 0.0080);
+    let k_tp = optimal_engine_b_tp_atr_multiple(symbol);
+    let tp_dist = (k_tp * current_atr).max(post_only_price * 0.0045);
     let raw_tp = if is_buy {
         post_only_price + tp_dist
     } else {

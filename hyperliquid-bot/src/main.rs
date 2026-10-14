@@ -32,7 +32,8 @@ use crate::hyperliquid::{
     calculate_dynamic_notional, calculate_risk_scaled_notional, cancel_order,
     compute_drawdown_risk_multiplier, effective_tick_size, exceeds_micro_account_step_risk,
     fetch_book_ticker, fetch_sz_decimals_map, get_account_value, get_user_position,
-    place_post_only_order, quantize_price,
+    optimal_engine_b_tp_atr_multiple, place_disaster_stop_trigger_order, place_post_only_order,
+    quantize_price,
 };
 use crate::order::{emergency_flatten, place_ou_maker_entry};
 use crate::ou_process::{
@@ -44,8 +45,9 @@ use crate::state::{
 };
 use crate::trend::{
     append_candidate_log, calculate_atr, calculate_donchian, check_trend_alignment,
-    load_shadow_trade, record_shadow_entry, record_shadow_exit, save_shadow_trade, CandleBar,
-    ChandelierExitState, EngineBCandidateLog, L2ObiTracker, MarketCrowdingTracker, TrendAlignment,
+    evaluate_pre_breakout_budget, load_shadow_trade, record_shadow_entry, record_shadow_exit,
+    save_shadow_trade, CandleBar, ChandelierExitState, EngineBCandidateLog, L2ObiTracker,
+    MarketCrowdingTracker, TrendAlignment,
 };
 
 async fn backfill_missing_1m_candles(
@@ -656,7 +658,8 @@ async fn main() {
                 }
                 if pos.take_profit_price <= 0.0 {
                     let base_px = if pos.entry_price > 0.0 { pos.entry_price } else { ep };
-                    let tp_dist = (2.0 * pos.current_atr).max(base_px * 0.0080);
+                    let k_tp = optimal_engine_b_tp_atr_multiple(&trading_symbol);
+                    let tp_dist = (k_tp * pos.current_atr).max(base_px * 0.0045);
                     let calc_tp = quantize_price(
                         if is_long {
                             base_px + tp_dist
@@ -1152,6 +1155,42 @@ async fn main() {
                                 watcher_symbol, pos.side, tp_price, tp_amount
                             );
                             crate::discord::send_alert(watcher_discord.as_deref(), &msg).await;
+
+                            // Layer 2: Also place Exchange-Native Reduce-Only Disaster Stop-Market Trigger Order on Hyperliquid
+                            // (15 bps behind Fast-Sentinel soft stop so Mark-Price basis noise never front-runs Fast-Sentinel)
+                            if pos.stop_loss_price > 0.0 {
+                                let raw_disaster_sl = if pos.side == "LONG" {
+                                    pos.stop_loss_price * 0.9985
+                                } else {
+                                    pos.stop_loss_price * 1.0015
+                                };
+                                let disaster_sl_px = quantize_price(raw_disaster_sl, watcher_sz_decimals);
+                                let sl_cloid = uuid::Uuid::new_v4();
+                                match place_disaster_stop_trigger_order(
+                                    &watcher_exchange,
+                                    &watcher_symbol,
+                                    tp_is_buy,
+                                    disaster_sl_px,
+                                    tp_amount,
+                                    watcher_sz_decimals,
+                                    Some(sl_cloid),
+                                )
+                                .await
+                                {
+                                    Ok(sl_oid) => {
+                                        println!(
+                                            "🛡️ [FAST-SENTINEL] Exchange-Native Disaster Stop-Market Trigger placed on Hyperliquid for {} at ${:.2} (oid: {})",
+                                            watcher_symbol, disaster_sl_px, sl_oid
+                                        );
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "⚠️ [FAST-SENTINEL] Could not place exchange-native disaster stop trigger for {}: {} (Fast-Sentinel 1.5s L2 stop remains active)",
+                                            watcher_symbol, e
+                                        );
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             eprintln!(
@@ -1263,7 +1302,17 @@ async fn main() {
                             continue;
                         }
                     };
-                    let symbol_orders_remain = final_orders.iter().any(|o| o.coin == watcher_symbol);
+                    let mut symbol_orders_remain = false;
+                    if is_flat {
+                        // Cancel any sibling orders (such as the Exchange-Native Disaster Stop-Market trigger order)
+                        for o in final_orders.iter().filter(|o| o.coin == watcher_symbol) {
+                            if cancel_order(&watcher_exchange, &watcher_symbol, o.oid).await.is_err() {
+                                symbol_orders_remain = true;
+                            }
+                        }
+                    } else {
+                        symbol_orders_remain = final_orders.iter().any(|o| o.coin == watcher_symbol);
+                    }
 
                     if is_flat && !symbol_orders_remain {
                         {
@@ -2381,12 +2430,29 @@ async fn main() {
                                                 );
                                             }
 
-                                            let channel_width_atr = (donchian.upper - donchian.lower) / current_atr;
-                                            let residual_budget_ok = channel_width_atr <= 5.0 && donchian_distance_bps <= 45.0;
+                                            let budget_verdict = evaluate_pre_breakout_budget(
+                                                &symbol_clone,
+                                                &rolling_15m_bars,
+                                                donchian,
+                                                current_atr,
+                                                close_price,
+                                                z_60,
+                                                &side,
+                                            );
+                                            let residual_budget_ok = budget_verdict.approved;
                                             if !residual_budget_ok {
                                                 println!(
-                                                    "⏸️ [ENGINE B RESIDUAL BUDGET VETO] {} {:?} breakout exhausted (channel width: {:.2}x ATR > 5.0x or extension: {:.1} bps > 45 bps). Skipping late entry.",
-                                                    symbol_clone, side, channel_width_atr, donchian_distance_bps
+                                                    "⏸️ [ENGINE B RESIDUAL BUDGET VETO] {} {:?} breakout exhausted (coiled: {}, DCW20: {:.2}x ATR, BBW20: {:.2}x, RMB: {:.2}x < {:.2}x, Overshoot: {:.2}x ATR, |Z60|: {:.2} vs {:.2}). Skipping late entry.",
+                                                    symbol_clone,
+                                                    side,
+                                                    budget_verdict.is_coiled,
+                                                    budget_verdict.dcw_20,
+                                                    budget_verdict.bbw_atr_20,
+                                                    budget_verdict.rmb_atr,
+                                                    budget_verdict.min_rmb_atr,
+                                                    budget_verdict.overshoot_atr,
+                                                    z_60.abs(),
+                                                    budget_verdict.max_z60
                                                 );
                                             }
 
@@ -2803,7 +2869,7 @@ async fn main() {
                                                 pos.max_progress = q_t;
                                             }
                                             let q_be = 0.15;
-                                            if pos.max_progress >= 0.75
+                                            if pos.max_progress >= 0.70
                                                 && q_t <= f64::max(q_be, pos.max_progress - 0.20)
                                             {
                                                 giveback_triggered = true;

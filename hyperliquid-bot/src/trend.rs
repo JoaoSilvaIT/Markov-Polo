@@ -148,6 +148,95 @@ pub fn calculate_obi_score(bids: &[(f64, f64)], asks: &[(f64, f64)], depth: usiz
     (sum_bid_vlm - sum_ask_vlm) / total
 }
 
+#[derive(Debug, Clone)]
+pub struct BreakoutBudgetVerdict {
+    pub approved: bool,
+    pub is_coiled: bool,
+    pub dcw_20: f64,
+    pub bbw_atr_20: f64,
+    pub overshoot_atr: f64,
+    pub rmb_atr: f64,
+    pub min_rmb_atr: f64,
+    pub max_z60: f64,
+}
+
+/// Evaluates causal Track 1 Pre-Breakout Compression ("Coil") and Residual Move Budget (`RMB_t`)
+/// calibrated from the 2024–2026 Hyperliquid L1 15-minute event study (`asset_thresholds.csv`).
+pub fn evaluate_pre_breakout_budget(
+    symbol: &str,
+    bars_15m: &[CandleBar],
+    donchian: &DonchianChannel,
+    current_atr: f64,
+    current_px: f64,
+    z_60: f64,
+    side: &Side,
+) -> BreakoutBudgetVerdict {
+    let atr = current_atr.max(1e-9);
+    let dcw_20 = (donchian.upper - donchian.lower).max(0.0) / atr;
+
+    let slice_len = bars_15m.len().min(20);
+    let bbw_atr_20 = if slice_len >= 5 {
+        let slice = &bars_15m[bars_15m.len() - slice_len..];
+        let mean_c = slice.iter().map(|b| b.close).sum::<f64>() / (slice_len as f64);
+        let var_c = slice.iter().map(|b| (b.close - mean_c).powi(2)).sum::<f64>() / (slice_len as f64);
+        (4.0 * var_c.sqrt()) / atr
+    } else {
+        dcw_20 * 0.75
+    };
+
+    let (coil_dcw, coil_bbw, max_z60, max_overshoot_atr, b_max_atr, min_rmb_atr) =
+        match symbol.to_uppercase().as_str() {
+            "BTC" => (3.207, 2.518, 2.347, 0.25, 3.05, 1.05),
+            "ETH" => (3.149, 2.370, 2.394, 0.30, 3.25, 1.15),
+            "SOL" => (3.163, 2.516, 2.261, 0.35, 3.55, 1.25),
+            "AVAX" => (3.203, 2.567, 2.222, 0.35, 3.70, 1.30),
+            _ => (3.200, 2.500, 2.300, 0.30, 3.25, 1.15),
+        };
+
+    let overshoot_atr = match side {
+        Side::Long => (current_px - donchian.upper).max(0.0) / atr,
+        Side::Short => (donchian.lower - current_px).max(0.0) / atr,
+    };
+
+    // Active 60m (4-bar) directional displacement from the 60m-ago open/close
+    let recent_n = bars_15m.len().min(4);
+    let d_60_atr = if recent_n >= 1 {
+        let anchor_px = bars_15m[bars_15m.len() - recent_n].open;
+        match side {
+            Side::Long => (current_px - anchor_px).max(0.0) / atr,
+            Side::Short => (anchor_px - current_px).max(0.0) / atr,
+        }
+    } else {
+        0.5 * dcw_20
+    };
+
+    let consumed_budget = (0.5 * dcw_20).max(d_60_atr) + 0.50 * overshoot_atr;
+    let rmb_atr = b_max_atr - consumed_budget;
+
+    let is_coiled = dcw_20 >= 1.20
+        && dcw_20 <= coil_dcw
+        && bbw_atr_20 <= coil_bbw
+        && z_60.abs() <= 1.76;
+
+    // Hard reject if DCW_20 >= 4.5, |Z60| >= asset 90th-pct cutoff, overshoot > max_overshoot_atr, or RMB < min_rmb_atr
+    let approved = dcw_20 >= 1.20
+        && dcw_20 < 4.50
+        && z_60.abs() < max_z60
+        && overshoot_atr <= max_overshoot_atr
+        && rmb_atr >= min_rmb_atr;
+
+    BreakoutBudgetVerdict {
+        approved,
+        is_coiled,
+        dcw_20,
+        bbw_atr_20,
+        overshoot_atr,
+        rmb_atr,
+        min_rmb_atr,
+        max_z60,
+    }
+}
+
 /// Feed quality statistics for WebSocket L2 telemetry monitoring
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeedQualityStats {
@@ -1851,5 +1940,55 @@ mod tests {
         let mult_short = tracker.directional_trend_multiplier(&Side::Short);
         assert!(mult_long < 0.45, "Extreme crowded positive funding + OI surge must suppress Long breakout (mult={})", mult_long);
         assert_eq!(mult_short, 1.0, "Opposite Short breakout should not be penalized by positive funding crowding");
+    }
+
+    #[test]
+    fn test_pre_breakout_budget_approves_coiled_and_rejects_exhausted_cascade() {
+        // 1. Coiled range on SOL: 20 bars oscillating tightly between 106.00 and 107.00 (width = 1.00 = 2.5x ATR of 0.40)
+        let mut bars = Vec::with_capacity(20);
+        for i in 0..20 {
+            let base = if i % 2 == 0 { 106.35 } else { 106.65 };
+            bars.push(CandleBar {
+                time_open: i as u64 * 900_000,
+                open: base,
+                high: base + 0.30,
+                low: base - 0.30,
+                close: base,
+                volume: 100.0,
+            });
+        }
+        let donchian_coiled = DonchianChannel {
+            upper: 106.95,
+            lower: 106.05,
+            middle: 106.50,
+        };
+        let verdict_fresh = evaluate_pre_breakout_budget(
+            "SOL",
+            &bars,
+            &donchian_coiled,
+            0.40,
+            107.02, // 0.07 overshoot = 0.175x ATR
+            1.15,   // calm Z60
+            &Side::Long,
+        );
+        assert!(verdict_fresh.approved, "Coiled fresh breakout must be approved (rmb={})", verdict_fresh.rmb_atr);
+        assert!(verdict_fresh.is_coiled, "Tight DCW20=2.25x and low BBW must be classified as coiled");
+
+        // 2. Exhausted cascade on SOL: channel already expanded to $3.85 (6.0x ATR of 0.64) and Z60 = -3.76
+        let donchian_wide = DonchianChannel {
+            upper: 107.89,
+            lower: 104.04,
+            middle: 105.965,
+        };
+        let verdict_exhausted = evaluate_pre_breakout_budget(
+            "SOL",
+            &bars,
+            &donchian_wide,
+            0.64,
+            103.98,
+            -3.76,
+            &Side::Short,
+        );
+        assert!(!verdict_exhausted.approved, "Exhausted cascade with DCW20=6.0x and Z60=-3.76 must be rejected");
     }
 }

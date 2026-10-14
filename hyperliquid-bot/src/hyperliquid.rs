@@ -1,7 +1,7 @@
 use ethers::types::H160;
 use hyperliquid_rust_sdk::{
-    ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest, ExchangeClient,
-    ExchangeDataStatus, ExchangeResponseStatus, InfoClient,
+    ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest, ClientTrigger,
+    ExchangeClient, ExchangeDataStatus, ExchangeResponseStatus, InfoClient,
 };
 use std::collections::HashMap;
 
@@ -155,6 +155,79 @@ pub async fn place_post_only_order(
             }
         }
         ExchangeResponseStatus::Err(e) => Err(format!("Exchange error: {}", e)),
+    }
+}
+
+/// Places an Exchange-Native Reduce-Only Disaster Stop-Market Trigger Order (`tpsl: "sl"`, `is_market: true`)
+/// with a 5.0% protective worst-price slippage collar on `limit_px` so flash-gap triggers never fail with `iocCancelRejected`.
+pub async fn place_disaster_stop_trigger_order(
+    exchange: &ExchangeClient,
+    coin: &str,
+    is_buy_to_close: bool,
+    trigger_px: f64,
+    size: f64,
+    sz_decimals: u32,
+    cloid: Option<uuid::Uuid>,
+) -> Result<u64, String> {
+    let clean_trigger_px = quantize_price(trigger_px, sz_decimals);
+    let raw_limit_px = if is_buy_to_close {
+        clean_trigger_px * 1.05
+    } else {
+        clean_trigger_px * 0.95
+    };
+    let clean_limit_px = quantize_price(raw_limit_px, sz_decimals);
+
+    let order_req = ClientOrderRequest {
+        asset: coin.to_string(),
+        is_buy: is_buy_to_close,
+        reduce_only: true,
+        limit_px: clean_limit_px,
+        sz: size,
+        cloid,
+        order_type: ClientOrder::Trigger(ClientTrigger {
+            is_market: true,
+            trigger_px: clean_trigger_px,
+            tpsl: "sl".to_string(),
+        }),
+    };
+
+    let res = exchange
+        .order(order_req, None)
+        .await
+        .map_err(|e| format!("Disaster stop trigger submission failed: {}", e))?;
+
+    match res {
+        ExchangeResponseStatus::Ok(resp) => {
+            if let Some(data) = resp.data {
+                if let Some(first) = data.statuses.first() {
+                    match first {
+                        ExchangeDataStatus::Resting(resting) => Ok(resting.oid),
+                        ExchangeDataStatus::Filled(filled) => Ok(filled.oid),
+                        ExchangeDataStatus::Error(msg) => {
+                            Err(format!("Exchange rejected disaster stop trigger: {}", msg))
+                        }
+                        other => Err(format!("Unexpected trigger order status: {:?}", other)),
+                    }
+                } else {
+                    Err("Empty trigger order statuses returned".to_string())
+                }
+            } else {
+                Err("Missing trigger response data".to_string())
+            }
+        }
+        ExchangeResponseStatus::Err(e) => Err(format!("Exchange trigger error: {}", e)),
+    }
+}
+
+/// Asset-specific optimal resting Maker Take-Profit ATR multiple (`k_tp_atr`) for Engine B 15m breakouts,
+/// derived from the 2024–2026 Hyperliquid L1 empirical MFE hazard-rate optimization.
+pub fn optimal_engine_b_tp_atr_multiple(symbol: &str) -> f64 {
+    match symbol.to_uppercase().as_str() {
+        "BTC" => 1.05,
+        "ETH" => 1.15,
+        "SOL" => 1.20,
+        "AVAX" => 1.25,
+        _ => 1.15,
     }
 }
 
