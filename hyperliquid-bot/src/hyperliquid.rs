@@ -220,14 +220,15 @@ pub async fn place_disaster_stop_trigger_order(
 }
 
 /// Asset-specific optimal resting Maker Take-Profit ATR multiple (`k_tp_atr`) for Engine B 15m breakouts,
-/// derived from the 2024–2026 Hyperliquid L1 empirical MFE hazard-rate optimization.
+/// anchored to the empirical 2024–2026 Hyperliquid L1 event study (`final_hyperliquid_breakout_report.md` & `final_backtest_summary.csv`
+/// where fresh 60m median MFE is 0.85x–0.90x ATR).
 pub fn optimal_engine_b_tp_atr_multiple(symbol: &str) -> f64 {
     match symbol.to_uppercase().as_str() {
-        "BTC" => 1.05,
-        "ETH" => 1.15,
-        "SOL" => 1.20,
-        "AVAX" => 1.25,
-        _ => 1.15,
+        "BTC" => 0.75,
+        "ETH" => 0.80,
+        "SOL" => 0.80,
+        "AVAX" => 0.85,
+        _ => 0.80,
     }
 }
 

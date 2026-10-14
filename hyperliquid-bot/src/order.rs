@@ -400,7 +400,7 @@ pub async fn place_trend_breakout_entry(
 
     let stop_loss_price = quantize_price(initial_stop, sz_decimals);
     let k_tp = optimal_engine_b_tp_atr_multiple(symbol);
-    let tp_dist = (k_tp * current_atr).max(post_only_price * 0.0045);
+    let tp_dist = (k_tp * current_atr).max(post_only_price * 0.0040);
     let raw_tp = if is_buy {
         post_only_price + tp_dist
     } else {

@@ -659,7 +659,7 @@ async fn main() {
                 if pos.take_profit_price <= 0.0 {
                     let base_px = if pos.entry_price > 0.0 { pos.entry_price } else { ep };
                     let k_tp = optimal_engine_b_tp_atr_multiple(&trading_symbol);
-                    let tp_dist = (k_tp * pos.current_atr).max(base_px * 0.0045);
+                    let tp_dist = (k_tp * pos.current_atr).max(base_px * 0.0040);
                     let calc_tp = quantize_price(
                         if is_long {
                             base_px + tp_dist
