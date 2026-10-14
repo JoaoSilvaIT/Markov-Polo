@@ -654,6 +654,24 @@ async fn main() {
                 if pos.stop_loss_price <= 0.0 {
                     pos.stop_loss_price = default_sl;
                 }
+                if pos.take_profit_price <= 0.0 {
+                    let base_px = if pos.entry_price > 0.0 { pos.entry_price } else { ep };
+                    let tp_dist = (2.0 * pos.current_atr).max(base_px * 0.0080);
+                    let calc_tp = quantize_price(
+                        if is_long {
+                            base_px + tp_dist
+                        } else {
+                            (base_px - tp_dist).max(effective_tick_size(base_px, trading_sz_decimals))
+                        },
+                        trading_sz_decimals,
+                    );
+                    pos.take_profit_price = calc_tp;
+                    pos.effective_tp = calc_tp;
+                    println!(
+                        "🎯 [STARTUP RECONCILIATION] Backfilled missing Take-Profit target (${:.2}) for active {} {} position.",
+                        calc_tp, trading_symbol, pos.engine_type
+                    );
+                }
                 if !lease_uuid.is_empty() && fencing_tok > 0 {
                     pos.lease_owner_uuid = lease_uuid;
                     pos.lease_fencing_token = fencing_tok;
@@ -1074,7 +1092,9 @@ async fn main() {
                         watcher_symbol, side_str, entry_px, stop_px, amt
                     );
                     crate::discord::send_alert(watcher_discord.as_deref(), &msg).await;
-                } else if is_filled && pos_exists && pos.take_profit_price > 0.0 {
+                }
+
+                if is_filled && pos_exists && pos.take_profit_price > 0.0 {
                     if !pos.is_filled {
                         let mut state_lock = watcher_state.lock().await;
                         if let Some(p) = state_lock.get_mut(&watcher_symbol) {
@@ -2292,15 +2312,21 @@ async fn main() {
                                         .map(|b| b.low)
                                         .unwrap_or(low_price);
                                     // Engine B Execution: Trend Regime confirmed by 15m candle close.
-                                    // Entry requires a fresh 1m expansion close near the forming 15m extreme (prevents re-entering fading pullbacks after an expired maker order).
+                                    // Entry requires a fresh 1m expansion close near the forming 15m extreme AND unexhausted macro Z-score (|Z60| < 2.5, |Z15| < 3.0).
                                     let is_long_breakout = !candle_feed_degraded
                                         && !is_candle_gap
+                                        && !is_upside_shock
+                                        && z_60 < 2.5
+                                        && z_15 < 3.0
                                         && close_price > donchian.upper
                                         && close_price >= open_price
                                         && close_price >= forming_15m_high * 0.9992
                                         && alignment == TrendAlignment::Bullish;
                                     let is_short_breakout = !candle_feed_degraded
                                         && !is_candle_gap
+                                        && !is_downside_shock
+                                        && z_60 > -2.5
+                                        && z_15 > -3.0
                                         && close_price < donchian.lower
                                         && close_price <= open_price
                                         && close_price <= forming_15m_low * 1.0008
@@ -2355,7 +2381,16 @@ async fn main() {
                                                 );
                                             }
 
-                                            if obi_favorable && btc_lead_veto.is_none() && crowding_mult >= 0.45 {
+                                            let channel_width_atr = (donchian.upper - donchian.lower) / current_atr;
+                                            let residual_budget_ok = channel_width_atr <= 5.0 && donchian_distance_bps <= 45.0;
+                                            if !residual_budget_ok {
+                                                println!(
+                                                    "⏸️ [ENGINE B RESIDUAL BUDGET VETO] {} {:?} breakout exhausted (channel width: {:.2}x ATR > 5.0x or extension: {:.1} bps > 45 bps). Skipping late entry.",
+                                                    symbol_clone, side, channel_width_atr, donchian_distance_bps
+                                                );
+                                            }
+
+                                            if obi_favorable && btc_lead_veto.is_none() && crowding_mult >= 0.45 && residual_budget_ok {
                                                 funnel_counters.engine_b_orders_placed += 1;
                                                 let trade_bank = resolve_trade_bank(&info_clone, user_address, &config, &cached_equity_loop).await;
                                                 let initial_sl = if side == Side::Long {
@@ -2749,6 +2784,30 @@ async fn main() {
 
                                         if chandelier.is_bar_stopped_out(prev_stop, high_price, low_price, close_price) {
                                             chandelier_stopped = true;
+                                        }
+
+                                        // Also track normalized progress & 20% giveback ratchet relative to Engine B Take-Profit target
+                                        let is_long = pos.side == "LONG";
+                                        let d_0 = if is_long {
+                                            pos.take_profit_price - pos.entry_price
+                                        } else {
+                                            pos.entry_price - pos.take_profit_price
+                                        };
+                                        if d_0 > 0.0 && pos.take_profit_price > 0.0 {
+                                            let q_t = if is_long {
+                                                (close_price - pos.entry_price) / d_0
+                                            } else {
+                                                (pos.entry_price - close_price) / d_0
+                                            };
+                                            if q_t > pos.max_progress {
+                                                pos.max_progress = q_t;
+                                            }
+                                            let q_be = 0.15;
+                                            if pos.max_progress >= 0.75
+                                                && q_t <= f64::max(q_be, pos.max_progress - 0.20)
+                                            {
+                                                giveback_triggered = true;
+                                            }
                                         }
                                     } else {
                                         // Hard Catastrophe Stop Loss check

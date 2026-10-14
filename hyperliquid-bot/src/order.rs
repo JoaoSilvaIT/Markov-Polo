@@ -398,6 +398,13 @@ pub async fn place_trend_breakout_entry(
     }
 
     let stop_loss_price = quantize_price(initial_stop, sz_decimals);
+    let tp_dist = (2.0 * current_atr).max(post_only_price * 0.0080);
+    let raw_tp = if is_buy {
+        post_only_price + tp_dist
+    } else {
+        (post_only_price - tp_dist).max(book_tick)
+    };
+    let take_profit_price = quantize_price(raw_tp, sz_decimals);
     let cloid_uuid = uuid::Uuid::new_v4();
     let client_order_id = format!("{}_{}", symbol, Utc::now().timestamp_millis());
 
@@ -412,7 +419,7 @@ pub async fn place_trend_breakout_entry(
         limit_px: post_only_price,
         sz: amount_f,
         sz_decimals,
-        target_tp: 0.0,
+        target_tp: take_profit_price,
         stop_loss: stop_loss_price,
         half_life_minutes: 0.0,
         position_size_usdc,
@@ -504,7 +511,7 @@ pub async fn place_trend_breakout_entry(
         entry_price: current_price,
         amount: current_amount,
         stop_loss_price,
-        take_profit_price: 0.0,
+        take_profit_price,
         opened_at: Utc::now().to_rfc3339(),
         risk_amount_usdc: position_size_usdc,
         is_filled: false,
@@ -512,7 +519,7 @@ pub async fn place_trend_breakout_entry(
         client_order_id,
         max_progress: 0.0,
         max_favorable_price: current_price,
-        effective_tp: 0.0,
+        effective_tp: take_profit_price,
         last_reprice_time: Utc::now().timestamp_millis(),
         reprice_count: 0,
         candidate_lower_count: 0,
