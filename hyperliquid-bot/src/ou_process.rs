@@ -391,19 +391,19 @@ pub fn calculate_features_with_funding(
     }
     let hist_last_price = *closes_history.last().unwrap_or(&eval_close);
 
-    // Lookback-relative half-life bounds (Quant Researcher Consensus):
-    // Lower bound: max(30.0 min, 0.03 * N) to filter microstructure noise and bid-ask bounce
-    // Upper bound: 0.50 * N (e.g. 480 mins for 960 bars) to ensure mean reversion materializes within window
-    // Assets with t_half > 0.50 * N (like AVAX at ~770m) are classified as slow/uncertain unit-root and rejected.
-    let n_bars = closes_history.len() as f64;
-    let min_hl = 30.0_f64.max(0.03 * n_bars);
-    let max_hl = 0.50 * n_bars;
+    // Operating half-life bounds (15m to 120m per Quant Research & Backtest Spec):
+    // - Lower bound (min_hl = 15.0m): filters sub-15m bid-ask bounce while allowing fast intraday consolidation (15m-30m).
+    // - Upper bound (max_hl = 120.0m): ensures mean reversion materializes within the 2*t_half horizon without bleeding funding/time-stop fees.
+    // Note: if 0 < hl < min_hl, the series is still stationary (reverting faster than 15m) so thresholds remain populated for active position management.
+    let _n_bars = closes_history.len() as f64;
+    let min_hl = 15.0_f64;
+    let max_hl = 120.0_f64;
 
     // O-U Parameter Estimation with Phillips & Yu Jackknife bias correction (log-price space)
     let (thresholds_opt, thresholds_175_opt, half_life_m) =
         if let Some(mut ou_params) = estimate_ou_parameters(closes_history, 1.0) {
             let hl = ou_params.half_life_minutes();
-            let is_hl_ok = hl >= min_hl && hl <= max_hl;
+            let is_stationary_hl = hl > 0.0 && hl <= max_hl;
             // Apply continuous-time hourly funding carry drift adjustment to equilibrium mean mu:
             // mu_carry = mu * (1 - F_1h / (60 * theta)), bounded to +/- 15 bps to prevent spike distortion.
             if hourly_funding_rate.is_finite() && hourly_funding_rate.abs() > 1e-7 && ou_params.theta > 1e-5 {
@@ -415,7 +415,7 @@ pub fn calculate_features_with_funding(
             let mu_dev = (ou_params.mu - hist_last_price).abs() / hist_last_price;
             let is_mu_ok = mu_dev <= 0.07;
 
-            if is_hl_ok && is_mu_ok {
+            if is_stationary_hl && is_mu_ok {
                 let tx_cost = hist_last_price * 0.0005; // ~5 bps roundtrip on Hyperliquid Maker
                 let session_offset = if hourly_funding_rate.abs() > 1e-9 {
                     use chrono::{Datelike, Timelike};
@@ -767,6 +767,21 @@ mod tests {
         let pos_fund = calculate_carry_adjusted_thresholds(&params, tx_cost, 1.50, 0.0005, 1.30, 1.75);
         assert!(pos_fund.entry_short < neutral.entry_short, "Positive carry for short should relax short entry threshold closer to mu");
         assert!(pos_fund.entry_long < neutral.entry_long, "Negative carry for long should require deeper discount below mu");
+    }
+
+    #[test]
+    fn test_fast_reversion_preserves_stationarity_and_validates_15_to_120m_band() {
+        // Generate a fast-reverting stationary sine-wave series with t_half around ~20m
+        let mut history = Vec::with_capacity(300);
+        for i in 0..300 {
+            history.push(100.0 + (i as f64 * 0.26).sin() * 0.6);
+        }
+        let feat = calculate_features(&history, 100.0, "SOL").expect("Features calculated");
+        assert!(feat.half_life_m >= 15.0 && feat.half_life_m < 30.0, "Expected t_half in 15m-30m band, got {}", feat.half_life_m);
+        assert!(feat.is_stationary, "Fast mean-reverting process in 15m-30m band must be stationary");
+        assert!(feat.is_valid_half_life, "t_half in 15m-30m band must pass is_valid_half_life");
+        assert!(feat.is_consolidation, "Non-drifting stationary series must be valid consolidation");
+        assert!(feat.thresholds_opt.is_some(), "Thresholds must be populated for 15m-30m half-life");
     }
 }
 

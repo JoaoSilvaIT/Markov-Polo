@@ -2226,7 +2226,7 @@ async fn main() {
                                 active_multiplier: shadow_trade.active_multiplier,
                             };
 
-                            let new_stop = chandelier.update_with_ratchet_and_cap(high_price, low_price, current_atr, current_p_t, Some(0.5), true);
+                            let new_stop = chandelier.update_with_ratchet_and_cap(high_price, low_price, current_atr, current_p_t, Some(0.5 / 15.0), true);
                             shadow_trade.current_stop = new_stop;
                             shadow_trade.extreme_favorable_price = chandelier.extreme_favorable_price;
                             shadow_trade.active_multiplier = chandelier.active_multiplier;
@@ -2281,9 +2281,30 @@ async fn main() {
                                     let closes_15m: Vec<f64> = rolling_15m_bars.iter().map(|b| b.close).collect();
                                     let alignment = check_trend_alignment(&closes_15m);
                                     let has_donchian_breakout_1m = close_price > donchian.upper || close_price < donchian.lower;
-                                    // Engine B Execution: Trend Regime confirmed by 15m candle close. Entry confirmed by 1m close breakout + Continuous L2 OBI hurdle (never wicks).
-                                    let is_long_breakout = !candle_feed_degraded && !is_candle_gap && close_price > donchian.upper && alignment == TrendAlignment::Bullish;
-                                    let is_short_breakout = !candle_feed_degraded && !is_candle_gap && close_price < donchian.lower && alignment == TrendAlignment::Bearish;
+                                    let forming_15m_high = current_15m_bar
+                                        .as_ref()
+                                        .or(finalized_15m_bar.as_ref())
+                                        .map(|b| b.high)
+                                        .unwrap_or(high_price);
+                                    let forming_15m_low = current_15m_bar
+                                        .as_ref()
+                                        .or(finalized_15m_bar.as_ref())
+                                        .map(|b| b.low)
+                                        .unwrap_or(low_price);
+                                    // Engine B Execution: Trend Regime confirmed by 15m candle close.
+                                    // Entry requires a fresh 1m expansion close near the forming 15m extreme (prevents re-entering fading pullbacks after an expired maker order).
+                                    let is_long_breakout = !candle_feed_degraded
+                                        && !is_candle_gap
+                                        && close_price > donchian.upper
+                                        && close_price >= open_price
+                                        && close_price >= forming_15m_high * 0.9992
+                                        && alignment == TrendAlignment::Bullish;
+                                    let is_short_breakout = !candle_feed_degraded
+                                        && !is_candle_gap
+                                        && close_price < donchian.lower
+                                        && close_price <= open_price
+                                        && close_price <= forming_15m_low * 1.0008
+                                        && alignment == TrendAlignment::Bearish;
 
                                     if is_long_breakout || is_short_breakout {
                                         let side = if is_long_breakout { Side::Long } else { Side::Short };
@@ -2715,7 +2736,7 @@ async fn main() {
                                             active_multiplier: active_mult,
                                         };
 
-                                        let new_stop = chandelier.update_with_ratchet_and_cap(high_price, low_price, current_atr, current_p_t, Some(0.5), true);
+                                        let new_stop = chandelier.update_with_ratchet_and_cap(high_price, low_price, current_atr, current_p_t, Some(0.5 / 15.0), true);
                                         pos.chandelier_stop = new_stop;
                                         pos.stop_loss_price = new_stop;
                                         pos.max_favorable_price = chandelier.extreme_favorable_price;
@@ -3034,10 +3055,14 @@ async fn main() {
                                     discord_clone.clone(),
                                 )
                                 .await;
-                            } else if pos_engine_type == "EngineA" && !is_consolidation {
+                            } else if pos_engine_type == "EngineA"
+                                && (live_feat.is_drifting
+                                    || controller.current_mode == ControllerMode::Trend
+                                    || half_life_m >= 480.0)
+                            {
                                 println!(
-                                    "🚨 [INVALIDATION] Regime shift detected for {}. Flattening.",
-                                    symbol_clone
+                                    "🚨 [INVALIDATION] Regime shift detected for {} (drifting: {}, mode: {}, t_half: {:.1}m). Flattening.",
+                                    symbol_clone, live_feat.is_drifting, controller.current_mode, half_life_m
                                 );
                                 let _ = execute_emergency_flatten_with_retry(
                                     &state_path_clone,
@@ -3139,13 +3164,33 @@ async fn main() {
                                     is_upside_shock
                                 };
 
-                                if !is_eligible || expired || shock_vetoed {
+                                let thesis_invalidated = !is_consolidation
+                                    || !consolidation_vol_ok
+                                    || is_cb_paused
+                                    || controller.current_mode != ControllerMode::MeanReversion;
+
+                                if thesis_invalidated || expired || shock_vetoed {
                                     println!(
-                                        "⚪ [DISARMED] {} {} signal disarmed (Shock: {}, Expired: {})",
-                                        symbol_clone, arm_side, shock_vetoed, expired
+                                        "⚪ [DISARMED] {} {} signal disarmed (Shock: {}, Expired: {}, ThesisInvalid: {})",
+                                        symbol_clone, arm_side, shock_vetoed, expired, thesis_invalidated
                                     );
                                     armed_state.is_armed = false;
                                     save_armed_signal(&arm_path_clone, &armed_state);
+                                } else if candle_feed_degraded || is_candle_gap || is_cluster_blocked {
+                                    // Preserve armed extreme dip/peak across transient 1-bar REST backfill or cluster lock congestion
+                                    if arm_side == "LONG" {
+                                        let current_extreme = f64::min(close_price, low_price);
+                                        if current_extreme < armed_state.extreme_price {
+                                            armed_state.extreme_price = current_extreme;
+                                            save_armed_signal(&arm_path_clone, &armed_state);
+                                        }
+                                    } else if arm_side == "SHORT" {
+                                        let current_extreme = f64::max(close_price, high_price);
+                                        if current_extreme > armed_state.extreme_price {
+                                            armed_state.extreme_price = current_extreme;
+                                            save_armed_signal(&arm_path_clone, &armed_state);
+                                        }
+                                    }
                                 } else if arm_side == "LONG" {
                                     // Update lowest dip price
                                     let current_extreme = f64::min(close_price, low_price);

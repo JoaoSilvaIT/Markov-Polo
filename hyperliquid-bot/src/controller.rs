@@ -463,8 +463,10 @@ impl RegimeController {
             format!("BLOCKED(Vol Z15={:.2}, Z60={:.2})", z_15, z_60)
         } else if p_consolidation < 0.65 {
             format!("BLOCKED(P_C={:.1}% < 65%)", p_consolidation * 100.0)
-        } else if !is_ou_stationary || !is_half_life_valid {
+        } else if !is_ou_stationary {
             "BLOCKED(O-U non-stationary)".to_string()
+        } else if !is_half_life_valid {
+            "BLOCKED(t_half outside 15-120m)".to_string()
         } else if self.consolidation_streak < required_c_dwell {
             format!("DWELL({}/{})", self.consolidation_streak, required_c_dwell)
         } else {
