@@ -1,4 +1,4 @@
-# TradingAI — Quantitative Perpetuals Research & Execution Stack
+# Markov Polo — Quantitative Perpetuals Research & Execution Stack
 
 This repository contains the production Rust execution engine, real-time telemetry terminal, and quantitative research papers for an autonomous multi-asset trading system deployed on the **Hyperliquid L1 DEX** (`BTC`, `ETH`, `SOL`, `AVAX`).
 
