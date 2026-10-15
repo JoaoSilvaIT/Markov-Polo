@@ -580,18 +580,21 @@ pub async fn emergency_flatten(
         }
     }
 
-    // 2. Cancel resting TP order if it was active
+    // 2. Cancel resting TP order if active
     if !pos.tp_order_id.is_empty() {
         if let Ok(tp_oid) = pos.tp_order_id.parse::<u64>() {
             let _ = cancel_order(exchange, symbol, tp_oid).await;
         }
     }
 
-    // 3. Reconcile open orders on exchange: confirm entry order is no longer resting
+    // 3. Reconcile open orders on exchange: cancel any sibling orders and confirm entry order is no longer resting
     let open_orders = info
         .open_orders(wallet_address)
         .await
         .map_err(|e| format!("Failed to query open_orders in emergency_flatten: {}", e))?;
+    for sym_ord in open_orders.iter().filter(|o| o.coin == symbol) {
+        let _ = cancel_order(exchange, symbol, sym_ord.oid).await;
+    }
     if !pos.order_id.is_empty() {
         if let Ok(entry_oid) = pos.order_id.parse::<u64>() {
             if open_orders.iter().any(|o| o.oid == entry_oid) {
@@ -636,15 +639,27 @@ pub async fn emergency_flatten(
             return Err(e);
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(650)).await;
     }
 
     // 5. Final multi-step verification: position == 0 AND no orders remain for symbol
-    let (final_szi, _) = get_user_position(info, wallet_address, symbol).await?;
-    let final_orders = info
+    let (mut final_szi, _) = get_user_position(info, wallet_address, symbol).await?;
+    let mut final_orders = info
         .open_orders(wallet_address)
         .await
         .map_err(|e| format!("Failed to query final open_orders: {}", e))?;
+    for rem in final_orders.iter().filter(|o| o.coin == symbol) {
+        let _ = cancel_order(exchange, symbol, rem.oid).await;
+    }
+    if final_szi.abs() > eps || final_orders.iter().any(|o| o.coin == symbol) {
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        if let Ok((recheck_szi, _)) = get_user_position(info, wallet_address, symbol).await {
+            final_szi = recheck_szi;
+        }
+        if let Ok(recheck_orders) = info.open_orders(wallet_address).await {
+            final_orders = recheck_orders;
+        }
+    }
     let symbol_orders_remaining = final_orders.iter().any(|o| o.coin == symbol);
 
     if final_szi.abs() <= eps && !symbol_orders_remaining {

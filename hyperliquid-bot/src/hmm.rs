@@ -52,13 +52,46 @@ impl GaussianHMM {
     pub fn fit(&mut self, x: &Array2<f64>, n_iter: usize) {
         let n_samples = x.nrows();
         let n_features = x.ncols();
-        
-        // Quantile initialization for means to seed distinct market regimes
-        let step = (n_samples / (self.n_components + 1)).max(1);
-        for c in 0..self.n_components {
-            let sample_idx = ((c + 1) * step).min(n_samples - 1);
-            for d in 0..n_features {
-                self.means[[c, d]] = x[[sample_idx, d]];
+
+        // Empirical feature-quantile initialization to seed distinct market regimes:
+        // State 0 (Consolidation): low vol (25th pct), low ER (20th pct), low |D| (20th pct)
+        // State 1 (Trend): moderate-high vol (65th pct), high ER (85th pct), high |D| (85th pct)
+        // State 2 (Shock): extreme vol (92nd pct), moderate ER (40th pct), high jump dispersion
+        let col_quantile = |col_idx: usize, q: f64| -> f64 {
+            let mut vals: Vec<f64> = x.column(col_idx).iter().copied().collect();
+            vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            if vals.is_empty() {
+                return 0.0;
+            }
+            let idx = ((q.clamp(0.0, 1.0)) * (vals.len() - 1) as f64).round() as usize;
+            vals[idx.min(vals.len() - 1)]
+        };
+
+        if self.n_components == 3 && n_features >= 4 {
+            // State 0: Consolidation
+            self.means[[0, 0]] = 0.0;
+            self.means[[0, 1]] = col_quantile(1, 0.25);
+            self.means[[0, 2]] = col_quantile(2, 0.20);
+            self.means[[0, 3]] = col_quantile(3, 0.20);
+
+            // State 1: Directional Trend
+            self.means[[1, 0]] = 0.0;
+            self.means[[1, 1]] = col_quantile(1, 0.60);
+            self.means[[1, 2]] = col_quantile(2, 0.80);
+            self.means[[1, 3]] = col_quantile(3, 0.80);
+
+            // State 2: Volatility Shock
+            self.means[[2, 0]] = 0.0;
+            self.means[[2, 1]] = col_quantile(1, 0.85);
+            self.means[[2, 2]] = col_quantile(2, 0.35);
+            self.means[[2, 3]] = col_quantile(3, 0.50);
+        } else {
+            let step = (n_samples / (self.n_components + 1)).max(1);
+            for c in 0..self.n_components {
+                let sample_idx = ((c + 1) * step).min(n_samples - 1);
+                for d in 0..n_features {
+                    self.means[[c, d]] = x[[sample_idx, d]];
+                }
             }
         }
 
@@ -306,32 +339,36 @@ impl GaussianHMM {
             return false;
         }
 
-        // 1. Identify Shock state: state with maximum volatility (Feature 1: ln_sigma)
-        let mut shock_state = 0;
-        let mut max_vol = f64::NEG_INFINITY;
+        // 1. Identify Directional Trend state first: state with maximum directional efficiency & drift (ER + |D|)
+        // Trending bars naturally have higher volatility than quiet range bars; selecting Shock by ln_sigma first
+        // would falsely mislabel the Trend cluster as Shock!
+        let mut trend_state = 0;
+        let mut max_trend_score = f64::NEG_INFINITY;
         for c in 0..3 {
-            let vol_score = self.means[[c, 1]];
-            if vol_score > max_vol {
-                max_vol = vol_score;
-                shock_state = c;
+            let er_score = self.means[[c, 2]];
+            let drift_score = self.means[[c, 3]];
+            let trend_score = 2.0 * er_score + 0.25 * drift_score;
+            if trend_score > max_trend_score {
+                max_trend_score = trend_score;
+                trend_state = c;
             }
         }
 
-        // 2. Between the remaining two states, identify Trend vs Consolidation by ER
-        let remaining: Vec<usize> = (0..3).filter(|&c| c != shock_state).collect();
+        // 2. Between the remaining two non-trend states, identify Consolidation (lower vol) vs Shock (higher vol)
+        let remaining: Vec<usize> = (0..3).filter(|&c| c != trend_state).collect();
         let s_a = remaining[0];
         let s_b = remaining[1];
 
-        let er_a = self.means[[s_a, 2]];
-        let er_b = self.means[[s_b, 2]];
+        let vol_a = self.means[[s_a, 1]] + 0.25 * self.covars[[s_a, 0]].max(1e-6).ln();
+        let vol_b = self.means[[s_b, 1]] + 0.25 * self.covars[[s_b, 0]].max(1e-6).ln();
 
-        let (consol_state, trend_state) = if er_a <= er_b {
+        let (consol_state, shock_state) = if vol_a <= vol_b {
             (s_a, s_b)
         } else {
             (s_b, s_a)
         };
 
-        // If both states have virtually indistinguishable ER, verify if directional drift |D| separates them
+        // Verify that Trend and Consolidation are non-degenerate
         let er_diff = (self.means[[trend_state, 2]] - self.means[[consol_state, 2]]).abs();
         if er_diff < 1e-4 {
             let d_trend = self.means[[trend_state, 3]];
@@ -447,6 +484,7 @@ impl GaussianHMM {
             hmm.eff_sample_sizes = Array1::from_vec(weights.eff_sample_sizes);
         }
 
+        let _ = hmm.sort_semantically();
         Ok(hmm)
     }
 }
@@ -533,13 +571,15 @@ pub fn train_hmm_offline(closes: &[f64]) -> Option<GaussianHMM> {
     }
 
     // Rare-State Rejection Gate (P0 Quant Specification):
-    // If any fitted regime has Neff,k < 40, reject the model rather than hot-swapping
-    // an under-identified or data-starved regime into live memory.
+    // Core operating regimes (Consolidation=0, Trend=1) require N_eff >= 25.0, while the tail
+    // Shock regime (State 2, regularized by Ledoit-Wolf shrinkage rho_k) requires N_eff >= 10.0
+    // so genuine tail shocks (1-5% of bars) are not forced to swallow normal daytime bars.
     for (state_idx, &n_eff) in hmm.eff_sample_sizes.iter().enumerate() {
-        if n_eff < 40.0 {
+        let min_n_eff = if state_idx == 2 { 10.0 } else { 25.0 };
+        if n_eff < min_n_eff {
             println!(
-                "⚠️ [COLD-PATH] HMM candidate rejected: State {} has insufficient effective sample size (N_eff = {:.1} < 40.0)",
-                state_idx, n_eff
+                "⚠️ [COLD-PATH] HMM candidate rejected: State {} has insufficient effective sample size (N_eff = {:.1} < {:.1})",
+                state_idx, n_eff, min_n_eff
             );
             return None;
         }
@@ -550,13 +590,50 @@ pub fn train_hmm_offline(closes: &[f64]) -> Option<GaussianHMM> {
 
 pub fn compute_hmm_posteriors(hmm: &GaussianHMM, closes: &[f64]) -> Option<(f64, f64, f64)> {
     let x = extract_4d_features(closes, 16)?;
-    if x.nrows() == 0 {
+    let n = x.nrows();
+    if n == 0 {
         return None;
     }
 
     let post = hmm.filtered_posteriors(&x);
     if post.len() >= 3 {
-        Some((post[0], post[1], post[2]))
+        let last_idx = n - 1;
+        let norm_ret_abs = x[[last_idx, 0]].abs();
+        let ln_sigma_last = x[[last_idx, 1]];
+        let er_last = x[[last_idx, 2]];
+        let d_last = x[[last_idx, 3]];
+
+        // Compute rolling mean and std of ln_sigma across the observation window
+        let mean_ln_vol = x.column(1).mean().unwrap_or(ln_sigma_last);
+        let var_ln_vol = x
+            .column(1)
+            .iter()
+            .map(|&v| (v - mean_ln_vol).powi(2))
+            .sum::<f64>()
+            / (n as f64).max(1.0);
+        let std_ln_vol = var_ln_vol.sqrt().max(1e-4);
+        let z_ln_vol = (ln_sigma_last - mean_ln_vol) / std_ln_vol;
+
+        // Physical shock gate: prevent State 2 from locking P_S near 100% during calm/normal daytime volatility
+        // when EM splits a non-crash training window into two range clusters + one trend cluster.
+        let shock_intensity = ((norm_ret_abs - 1.60).max(0.0) / 1.00)
+            .max((z_ln_vol - 1.00).max(0.0) / 0.85)
+            .clamp(0.0, 1.0);
+
+        let raw_c = post[0];
+        let raw_t = post[1];
+        let raw_s = post[2];
+
+        let p_s = raw_s * shock_intensity;
+        let reallocated = raw_s * (1.0 - shock_intensity);
+        let trend_affinity = ((er_last - 0.24) / 0.22)
+            .max((d_last - 1.05) / 0.90)
+            .clamp(0.0, 1.0);
+
+        let p_t = raw_t + reallocated * trend_affinity;
+        let p_c = raw_c + reallocated * (1.0 - trend_affinity);
+        let sum = (p_c + p_t + p_s).max(1e-12);
+        Some((p_c / sum, p_t / sum, p_s / sum))
     } else {
         None
     }
@@ -608,5 +685,52 @@ mod tests {
         }
         let hmm_opt = train_hmm_offline(&closes);
         assert!(hmm_opt.is_none(), "Under-identified series must be rejected by rare-state gate");
+    }
+
+    #[test]
+    fn test_hmm_sort_semantically_never_mislabels_high_vol_trend_as_shock() {
+        let mut closes = Vec::new();
+        let mut p = 100.0;
+        // 1. Quiet consolidation (120 bars)
+        for i in 0..120 {
+            p += 0.04 * (i as f64 * 0.7).sin();
+            closes.push(p);
+        }
+        // 2. Moderate-volatility consolidation (120 bars)
+        for i in 0..120 {
+            p += 0.15 * (i as f64 * 1.1).cos();
+            closes.push(p);
+        }
+        // 3. Strong directional trend with highest volatility (120 bars)
+        for i in 0..120 {
+            p += 0.65 + 0.25 * (i as f64 * 0.5).sin();
+            closes.push(p);
+        }
+
+        let hmm = train_hmm_offline(&closes).expect("HMM should train on 360-bar series");
+        // State 1 (Trend) must have the highest Kaufman Efficiency Ratio (Feature 2)
+        assert!(
+            hmm.means[[1, 2]] >= hmm.means[[0, 2]] && hmm.means[[1, 2]] >= hmm.means[[2, 2]],
+            "State 1 (Trend) must hold the highest ER cluster: means={:?}",
+            hmm.means
+        );
+
+        // During the final trending phase, P_T must dominate and P_S must not be stuck near 100%
+        let (_, p_t, p_s) = compute_hmm_posteriors(&hmm, &closes).unwrap();
+        assert!(
+            p_t > 0.75 && p_s < 0.25,
+            "Trending phase must yield high P_T ({:.3}) and low P_S ({:.3})",
+            p_t,
+            p_s
+        );
+
+        // During the moderate-vol consolidation phase (slice 0..240), P_C must dominate over P_S
+        let (p_c_range, _, p_s_range) = compute_hmm_posteriors(&hmm, &closes[..240]).unwrap();
+        assert!(
+            p_c_range > 0.70 && p_s_range < 0.25,
+            "Calm/moderate range must yield high P_C ({:.3}) and low P_S ({:.3})",
+            p_c_range,
+            p_s_range
+        );
     }
 }
