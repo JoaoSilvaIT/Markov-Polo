@@ -58,6 +58,10 @@ pub struct LiveTelemetry {
     pub trend_alignment: String,
     #[serde(default)]
     pub active_engine: String,
+    #[serde(default)]
+    pub account_equity: f64,
+    #[serde(default)]
+    pub high_water_mark: f64,
 }
 
 pub fn save_telemetry(symbol: &str, telemetry: &LiveTelemetry) {
@@ -248,6 +252,41 @@ pub fn check_btc_lead_lag_veto(
     None
 }
 
+/// Persistent ledger record for a completed real exchange trade on Hyperliquid L1.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RealTradeRecord {
+    pub symbol: String,
+    pub side: String,
+    pub engine: String,
+    pub amount: f64,
+    pub entry_price: f64,
+    pub exit_price: f64,
+    pub opened_at: String,
+    pub closed_at: String,
+    pub pnl_usd: f64,
+    pub pnl_bps: f64,
+    pub exit_reason: String,
+    pub is_win: bool,
+}
+
+/// Atomically appends a completed real trade to `hl_real_trades.jsonl` with cross-process flock + fsync.
+pub fn append_real_trade_record(record: &RealTradeRecord) {
+    let lock_path = "hl_real_trades.jsonl.lock";
+    let _guard = crate::state::FlockGuard::acquire(lock_path);
+    if let Ok(line) = serde_json::to_string(record) {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("hl_real_trades.jsonl")
+        {
+            use std::io::Write;
+            let _ = writeln!(file, "{}", line);
+            let _ = file.sync_all();
+            crate::state::sync_parent_dir("hl_real_trades.jsonl");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,5 +363,29 @@ mod tests {
         assert_eq!(telem.donchian_status, "");
         assert_eq!(telem.donchian_dist_upper_pct, 0.0);
         assert_eq!(telem.active_engine, "");
+        assert_eq!(telem.account_equity, 0.0);
+    }
+
+    #[test]
+    fn test_real_trade_record_roundtrip() {
+        let rec = RealTradeRecord {
+            symbol: "SOL".to_string(),
+            side: "SHORT".to_string(),
+            engine: "EngineA".to_string(),
+            amount: 0.67,
+            entry_price: 107.12,
+            exit_price: 106.53,
+            opened_at: "2026-10-16T08:10:00Z".to_string(),
+            closed_at: "2026-10-16T08:42:03Z".to_string(),
+            pnl_usd: 0.3953,
+            pnl_bps: 55.08,
+            exit_reason: "PROFIT_LOCK_EXIT".to_string(),
+            is_win: true,
+        };
+        let s = serde_json::to_string(&rec).unwrap();
+        let parsed: RealTradeRecord = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed.symbol, "SOL");
+        assert!(parsed.is_win);
+        assert!((parsed.pnl_usd - 0.3953).abs() < 1e-6);
     }
 }

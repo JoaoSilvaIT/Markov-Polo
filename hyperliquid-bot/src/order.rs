@@ -697,6 +697,42 @@ pub async fn emergency_flatten(
             "✅ [EMERGENCY FLATTEN] Successfully verified zero position, zero open orders, and released cluster lease for {}. Clearing state.",
             symbol
         );
+        if (pos.is_filled || szi.abs() > eps) && pos.entry_price > 0.0 && pos.amount > 0.0 {
+            let mut exit_px = pos.entry_price;
+            if let Ok(l2) = info.l2_snapshot(symbol.to_string()).await {
+                if l2.levels.len() >= 2 && !l2.levels[0].is_empty() && !l2.levels[1].is_empty() {
+                    let bid = l2.levels[0][0].px.parse::<f64>().unwrap_or(0.0);
+                    let ask = l2.levels[1][0].px.parse::<f64>().unwrap_or(0.0);
+                    if bid > 0.0 && ask > 0.0 {
+                        exit_px = if pos.side == "LONG" { bid } else { ask };
+                    }
+                }
+            }
+            let pnl_usd = if pos.side == "LONG" {
+                (exit_px - pos.entry_price) * pos.amount
+            } else {
+                (pos.entry_price - exit_px) * pos.amount
+            };
+            let pnl_bps = if pos.side == "LONG" {
+                ((exit_px - pos.entry_price) / pos.entry_price) * 10_000.0
+            } else {
+                ((pos.entry_price - exit_px) / pos.entry_price) * 10_000.0
+            };
+            crate::telemetry::append_real_trade_record(&crate::telemetry::RealTradeRecord {
+                symbol: symbol.to_string(),
+                side: pos.side.clone(),
+                engine: pos.engine_type.clone(),
+                amount: pos.amount,
+                entry_price: pos.entry_price,
+                exit_price: exit_px,
+                opened_at: pos.opened_at.clone(),
+                closed_at: chrono::Utc::now().to_rfc3339(),
+                pnl_usd,
+                pnl_bps,
+                exit_reason: if pnl_usd > 0.0 { "PROFIT_LOCK_EXIT".to_string() } else { "STOP_OR_FLATTEN".to_string() },
+                is_win: pnl_usd > 0.0,
+            });
+        }
         state.remove(symbol);
         let _ = save_state(state_file_path, state);
         let ok_msg = format!(

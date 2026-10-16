@@ -1506,6 +1506,39 @@ async fn main() {
                                 "🎉 [FAST-SENTINEL] Take Profit for {} (Side: {}) verified flat & zero orders! State cleared, lease released.",
                                 watcher_symbol, pos.side
                             );
+                            if pos.entry_price > 0.0 && pos.amount > 0.0 {
+                                let exit_px = if pos.effective_tp > 0.0 {
+                                    pos.effective_tp
+                                } else if pos.take_profit_price > 0.0 {
+                                    pos.take_profit_price
+                                } else {
+                                    pos.entry_price
+                                };
+                                let pnl_usd = if pos.side == "LONG" {
+                                    (exit_px - pos.entry_price) * pos.amount
+                                } else {
+                                    (pos.entry_price - exit_px) * pos.amount
+                                };
+                                let pnl_bps = if pos.side == "LONG" {
+                                    ((exit_px - pos.entry_price) / pos.entry_price) * 10_000.0
+                                } else {
+                                    ((pos.entry_price - exit_px) / pos.entry_price) * 10_000.0
+                                };
+                                crate::telemetry::append_real_trade_record(&crate::telemetry::RealTradeRecord {
+                                    symbol: watcher_symbol.clone(),
+                                    side: pos.side.clone(),
+                                    engine: pos.engine_type.clone(),
+                                    amount: pos.amount,
+                                    entry_price: pos.entry_price,
+                                    exit_price: exit_px,
+                                    opened_at: pos.opened_at.clone(),
+                                    closed_at: chrono::Utc::now().to_rfc3339(),
+                                    pnl_usd,
+                                    pnl_bps,
+                                    exit_reason: "TAKE_PROFIT".to_string(),
+                                    is_win: pnl_usd >= 0.0,
+                                });
+                            }
                             state_lock.remove(&watcher_symbol);
                             let _ = save_state(&watcher_state_path, &state_lock);
                         }
@@ -2409,6 +2442,8 @@ async fn main() {
                         donchian_dist_lower_pct: dist_low_pct,
                         trend_alignment: align_str.to_string(),
                         active_engine,
+                        account_equity: *cached_equity_loop.read().await,
+                        high_water_mark: *high_water_mark_equity.read().await,
                     };
                     save_telemetry(&symbol_clone, &telemetry_data);
 
