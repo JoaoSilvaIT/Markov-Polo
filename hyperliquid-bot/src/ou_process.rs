@@ -467,55 +467,55 @@ pub fn calculate_features_with_funding(
         _      => 0.025,
     };
 
+    // Consistent Intraday O-U & Drift Horizon (240m = 4h primary, matching the 16x15m HMM lookback):
+    // Evaluating the 4-hour (240m) local horizon first prevents 1-minute ping-ponging between
+    // 16-hour macro bands (when 960m t_half hovers near 118m-122m) and 4-hour intraday bands.
+    let n_total = closes_history.len();
+    let candidate_windows = [
+        240usize.min(n_total),
+        360usize.min(n_total),
+        180usize.min(n_total),
+        n_total,
+    ];
+
     let (mut total_drift_pct, mut is_drifting) =
-        evaluate_ols_drift(closes_history, max_economic_drift);
+        evaluate_ols_drift(&closes_history[n_total - candidate_windows[0]..], max_economic_drift * 0.50);
 
-    // Multiscale Structural-Break-Resilient O-U Estimation:
-    // A single 960m (16-hour) AR(1) + 2-split jackknife is poisoned for up to 12-16 hours whenever
-    // a macro level shift occurred 3-12 hours ago.
-    // If the full window fails stationarity, we evaluate post-break local consolidation windows
-    // from longest to shortest (360m = 6h, 240m = 4h, 180m = 3h) so bands remain stable bar-to-bar.
-    let mut selected_ou: Option<OuParameters> = estimate_ou_parameters(closes_history, 1.0);
-    let full_window_valid = selected_ou.as_ref().map_or(false, |p| {
-        let hl = p.half_life_minutes();
-        let mu_dev = (p.mu - hist_last_price).abs() / hist_last_price;
-        hl >= min_hl && hl <= max_hl && mu_dev <= 0.07 && !is_drifting
-    });
+    let mut selected_ou: Option<OuParameters> = None;
+    let mut best_fallback_hl: Option<(OuParameters, f64, bool)> = None;
+    let mut seen_w = Vec::with_capacity(4);
 
-    if !full_window_valid {
-        let n_total = closes_history.len();
-        let mut best_fallback_hl: Option<(OuParameters, f64, bool)> = None;
-        for &w in &[360usize, 240, 180] {
-            if n_total > w {
-                let sub_slice = &closes_history[n_total - w..];
-                let local_max_drift =
-                    max_economic_drift * ((w as f64 / 960.0).sqrt().clamp(0.40, 1.0));
-                let (sub_drift, sub_drifting) = evaluate_ols_drift(sub_slice, local_max_drift);
-                if let Some(sub_params) = estimate_ou_parameters(sub_slice, 1.0) {
-                    let hl = sub_params.half_life_minutes();
-                    let mu_dev = (sub_params.mu - hist_last_price).abs() / hist_last_price;
-                    if !sub_drifting && hl >= min_hl && hl <= max_hl && mu_dev <= 0.04 {
-                        selected_ou = Some(sub_params);
-                        total_drift_pct = sub_drift;
-                        is_drifting = false;
-                        best_fallback_hl = None;
-                        break;
-                    } else if best_fallback_hl.as_ref().map_or(true, |(prev, _, _)| {
-                        hl >= min_hl && hl < prev.half_life_minutes()
-                    }) {
-                        best_fallback_hl = Some((sub_params, sub_drift, sub_drifting));
-                    }
-                }
+    for &w in &candidate_windows {
+        if w < 100 || seen_w.contains(&w) {
+            continue;
+        }
+        seen_w.push(w);
+        let sub_slice = &closes_history[n_total - w..];
+        let local_max_drift =
+            max_economic_drift * ((w as f64 / 960.0).sqrt().clamp(0.45, 1.0));
+        let (sub_drift, sub_drifting) = evaluate_ols_drift(sub_slice, local_max_drift);
+        if let Some(sub_params) = estimate_ou_parameters(sub_slice, 1.0) {
+            let hl = sub_params.half_life_minutes();
+            let mu_dev = (sub_params.mu - hist_last_price).abs() / hist_last_price;
+            let max_mu_dev = if w <= 360 { 0.045 } else { 0.07 };
+            if !sub_drifting && hl >= min_hl && hl <= max_hl && mu_dev <= max_mu_dev {
+                selected_ou = Some(sub_params);
+                total_drift_pct = sub_drift;
+                is_drifting = false;
+                best_fallback_hl = None;
+                break;
+            } else if best_fallback_hl.as_ref().map_or(true, |(prev, _, _)| {
+                hl >= min_hl && hl < prev.half_life_minutes()
+            }) {
+                best_fallback_hl = Some((sub_params, sub_drift, sub_drifting));
             }
         }
+    }
+    if selected_ou.is_none() {
         if let Some((fb_params, fb_drift, fb_drifting)) = best_fallback_hl {
-            if selected_ou.as_ref().map_or(true, |orig| {
-                orig.half_life_minutes() > max_hl || orig.half_life_minutes() < min_hl
-            }) {
-                selected_ou = Some(fb_params);
-                total_drift_pct = fb_drift;
-                is_drifting = fb_drifting;
-            }
+            selected_ou = Some(fb_params);
+            total_drift_pct = fb_drift;
+            is_drifting = fb_drifting;
         }
     }
 
