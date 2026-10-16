@@ -941,6 +941,7 @@ async fn main() {
                     let fav_px = if is_long { mid_px.max(best_bid) } else { mid_px.min(best_ask) };
 
                     let mut state_dirty = false;
+                    let mut fav_updated = false;
                     let mut active_sl = pos.stop_loss_price;
                     let mut active_max_fav = pos.max_favorable_price;
                     let mut active_max_prog = pos.max_progress;
@@ -949,24 +950,27 @@ async fn main() {
                         if is_long && fav_px > active_max_fav {
                             active_max_fav = fav_px;
                             state_dirty = true;
+                            fav_updated = true;
                         } else if !is_long && (active_max_fav <= 0.0 || fav_px < active_max_fav) {
                             active_max_fav = fav_px;
                             state_dirty = true;
+                            fav_updated = true;
                         }
                     }
 
-                    let tp_target = if pos.effective_tp > 0.0 {
-                        pos.effective_tp
-                    } else {
+                    // Anchor d_0 strictly to initial take_profit_price so One-Way TP repricing never retroactively inflates max_progress
+                    let tp_anchor = if pos.take_profit_price > 0.0 {
                         pos.take_profit_price
+                    } else {
+                        pos.effective_tp
                     };
                     let d_0 = if is_long {
-                        tp_target - pos.entry_price
+                        tp_anchor - pos.entry_price
                     } else {
-                        pos.entry_price - tp_target
+                        pos.entry_price - tp_anchor
                     };
 
-                    if d_0 > 0.0 && tp_target > 0.0 && active_max_fav > 0.0 {
+                    if d_0 > 0.0 && tp_anchor > 0.0 && active_max_fav > 0.0 && (fav_updated || active_max_prog <= 0.0) {
                         let q_peak = if is_long {
                             (active_max_fav - pos.entry_price) / d_0
                         } else {
@@ -1038,7 +1042,7 @@ async fn main() {
 
                     // 1.5s Intra-Bar 20% Giveback Profit-Protection Ratchet
                     let arm_thresh = if pos.engine_type == "EngineB" { 0.70 } else { 0.75 };
-                    if d_0 > 0.0 && tp_target > 0.0 && exec_px > 0.0 && active_max_prog >= arm_thresh {
+                    if d_0 > 0.0 && tp_anchor > 0.0 && exec_px > 0.0 && active_max_prog >= arm_thresh {
                         let q_now = if is_long {
                             (exec_px - pos.entry_price) / d_0
                         } else {
@@ -3031,7 +3035,14 @@ async fn main() {
                                                 pos.max_progress = q_best;
                                             }
                                             let q_be = 0.15;
-                                            if pos.max_progress >= 0.70
+                                            let in_net_profit = if is_long {
+                                                close_price >= pos.entry_price * 1.0008
+                                            } else {
+                                                close_price <= pos.entry_price * 0.9992
+                                            };
+                                            if in_net_profit
+                                                && pos.max_progress >= 0.70
+                                                && q_t >= q_be
                                                 && q_t <= f64::max(q_be, pos.max_progress - 0.20)
                                             {
                                                 giveback_triggered = true;
@@ -3048,7 +3059,7 @@ async fn main() {
                                         }
 
                                         max_allowed_mins = if pos.half_life_minutes > 0.0 {
-                                            (2.0 * pos.half_life_minutes).clamp(30.0, 600.0)
+                                            (3.5 * pos.half_life_minutes).clamp(90.0, 360.0)
                                         } else {
                                             240.0
                                         };
@@ -3089,9 +3100,16 @@ async fn main() {
                                             }
 
                                             // Arm Profit Protection once trade covers >= 75% of target
-                                            // Trigger profit-locked exit if price retraces by 20% giveback
+                                            // Trigger profit-locked exit if price retraces by 20% giveback while still in net profit
                                             let q_be = 0.15; // covers fees + slippage
-                                            if pos.max_progress >= 0.75
+                                            let in_net_profit = if is_long {
+                                                close_price >= pos.entry_price * 1.0008
+                                            } else {
+                                                close_price <= pos.entry_price * 0.9992
+                                            };
+                                            if in_net_profit
+                                                && pos.max_progress >= 0.75
+                                                && q_t >= q_be
                                                 && q_t <= f64::max(q_be, pos.max_progress - 0.20)
                                             {
                                                 giveback_triggered = true;
@@ -3408,11 +3426,17 @@ async fn main() {
                             // BI-DIRECTIONAL REVERSAL-CONFIRMED ENTRY PROTOCOL (Long & Short)
                             // ------------------------------------------------------------------
                             let mut armed_state = load_armed_signal(&arm_path_clone);
-                            let consolidation_vol_ok = z_15.abs() < 2.0 && z_60.abs() < 1.85;
+                            let consolidation_vol_ok = z_15.abs() < 1.85 && z_60.abs() < 1.65;
                             let entry_half_life_ok = is_valid_half_life && half_life_m <= 65.0;
-                            let can_mean_revert_long = z_60 > -1.75 && !(total_drift_pct <= -0.0080 && z_60 <= -1.10);
-                            let can_mean_revert_short = z_60 < 1.75 && !(total_drift_pct >= 0.0080 && z_60 >= 1.10);
-                            let tier2_regime_ok = half_life_m <= 45.0 && z_60.abs() < 1.25 && total_drift_pct.abs() < 0.0065;
+                            let can_mean_revert_long = z_60 > -1.45
+                                && z_15 > -1.60
+                                && total_drift_pct > -0.0100
+                                && !(total_drift_pct <= -0.0060 && z_60 <= -0.70);
+                            let can_mean_revert_short = z_60 < 1.45
+                                && z_15 < 1.60
+                                && total_drift_pct < 0.0100
+                                && !(total_drift_pct >= 0.0060 && z_60 >= 0.70);
+                            let tier2_regime_ok = half_life_m <= 45.0 && z_60.abs() < 1.15 && total_drift_pct.abs() < 0.0060;
                             let is_eligible = !candle_feed_degraded
                                 && !is_candle_gap
                                 && is_consolidation
@@ -3539,8 +3563,8 @@ async fn main() {
 
                                     let is_green_bounce = close_price > hist_last_price;
                                     let bounced_off_low = close_price
-                                        >= armed_state.extreme_price * 1.0005
-                                        || close_price >= dynamic_entry_cap;
+                                        >= armed_state.extreme_price * 1.0006
+                                        && close_price <= dynamic_entry_cap * 1.0010;
                                     let still_below_exit = close_price < dynamic_exit_target;
 
                                     if is_green_bounce && bounced_off_low && still_below_exit {
@@ -3698,8 +3722,8 @@ async fn main() {
 
                                     let is_red_rejection = close_price < hist_last_price;
                                     let rejected_off_high = close_price
-                                        <= armed_state.extreme_price * 0.9995
-                                        || close_price <= dynamic_entry_floor;
+                                        <= armed_state.extreme_price * 0.9994
+                                        && close_price >= dynamic_entry_floor * 0.9990;
                                     let still_above_exit = close_price > dynamic_exit_target;
 
                                     if is_red_rejection && rejected_off_high && still_above_exit {
