@@ -129,10 +129,10 @@ impl FunnelAuditCounters {
     pub fn format_summary(&self) -> String {
         format!(
             "📊 [FUNNEL AUDIT] {} | Total 1m Ticks: {} | Cooldown: {} | Lock Congested: {}\n   \
-             Engine A: Mode Inelig: {} | Vol Inelig: {} | Outside Band: {} | Armed Waiting Bounce: {} | Hurdle Veto: {} | Orders Placed: {}\n   \
+             Engine A: Mode Inelig: {} | Vol Inelig: {} | HL Inelig: {} | Outside Band: {} | Armed Waiting Bounce: {} | Hurdle Veto: {} | Orders Placed: {}\n   \
              Engine B: Mode Inelig: {} | No Breakout: {} | Align Veto: {} | OBI Veto: {} | Orders Placed: {}",
             self.symbol, self.total_1m_ticks, self.shock_cooldown_active, self.portfolio_lock_congested,
-            self.engine_a_mode_ineligible, self.engine_a_volatility_ineligible, self.engine_a_outside_band,
+            self.engine_a_mode_ineligible, self.engine_a_volatility_ineligible, self.engine_a_half_life_ineligible, self.engine_a_outside_band,
             self.engine_a_armed_waiting_bounce, self.engine_a_reversal_hurdle_veto, self.engine_a_orders_placed,
             self.engine_b_mode_ineligible, self.engine_b_no_breakout, self.engine_b_alignment_veto,
             self.engine_b_obi_hurdle_veto, self.engine_b_orders_placed

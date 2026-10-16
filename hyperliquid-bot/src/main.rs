@@ -3636,7 +3636,7 @@ async fn main() {
                                     let is_green_bounce = close_price > hist_last_price;
                                     let bounced_off_low = close_price
                                         >= armed_state.extreme_price * 1.0006
-                                        && close_price <= dynamic_entry_cap * 1.0010;
+                                        && close_price <= dynamic_entry_cap * 1.0025;
                                     let still_below_exit = close_price < dynamic_exit_target;
 
                                     if is_green_bounce && bounced_off_low && still_below_exit {
@@ -3794,7 +3794,7 @@ async fn main() {
                                     let is_red_rejection = close_price < hist_last_price;
                                     let rejected_off_high = close_price
                                         <= armed_state.extreme_price * 0.9994
-                                        && close_price >= dynamic_entry_floor * 0.9990;
+                                        && close_price >= dynamic_entry_floor * 0.9975;
                                     let still_above_exit = close_price > dynamic_exit_target;
 
                                     if is_red_rejection && rejected_off_high && still_above_exit {
