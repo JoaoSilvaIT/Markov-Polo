@@ -450,11 +450,11 @@ pub fn calculate_features_with_funding(
     }
     let hist_last_price = *closes_history.last().unwrap_or(&eval_close);
 
-    // Operating half-life bounds (15m to 120m per Quant Research & Backtest Spec):
-    // - Lower bound (min_hl = 15.0m): filters sub-15m bid-ask bounce while allowing fast intraday consolidation (15m-30m).
+    // Operating half-life bounds (5m to 120m):
+    // - Lower bound (min_hl = 5.0m): filters 1-2m bid-ask bounce while allowing fast intraday consolidation (6m-30m)
+    //   without kicking ETH/AVAX out of MeanReversion when reversion speed accelerates below 15m.
     // - Upper bound (max_hl = 120.0m): ensures mean reversion materializes within the 3.5*t_half horizon without bleeding funding/time-stop fees.
-    // Note: if 0 < hl < min_hl, the series is still stationary (reverting faster than 15m) so thresholds remain populated for active position management.
-    let min_hl = 15.0_f64;
+    let min_hl = 5.0_f64;
     let max_hl = 120.0_f64;
 
     // Asset-specific maximum allowable economic drift over the lookback window:
@@ -472,22 +472,20 @@ pub fn calculate_features_with_funding(
 
     // Multiscale Structural-Break-Resilient O-U Estimation:
     // A single 960m (16-hour) AR(1) + 2-split jackknife is poisoned for up to 12-16 hours whenever
-    // a macro level shift occurred 3-12 hours ago (pooling the pre-shift mean and post-shift mean
-    // forces b -> 1.0 and th_jack < 0 -> 999.0m).
+    // a macro level shift occurred 3-12 hours ago.
     // If the full window fails stationarity, we evaluate post-break local consolidation windows
-    // (240m = 4h, 180m = 3h, 360m = 6h) and adopt the local equilibrium if it is non-drifting
-    // and stationary within [min_hl, max_hl].
+    // from longest to shortest (360m = 6h, 240m = 4h, 180m = 3h) so bands remain stable bar-to-bar.
     let mut selected_ou: Option<OuParameters> = estimate_ou_parameters(closes_history, 1.0);
     let full_window_valid = selected_ou.as_ref().map_or(false, |p| {
         let hl = p.half_life_minutes();
         let mu_dev = (p.mu - hist_last_price).abs() / hist_last_price;
-        hl > 0.0 && hl <= max_hl && mu_dev <= 0.07 && !is_drifting
+        hl >= min_hl && hl <= max_hl && mu_dev <= 0.07 && !is_drifting
     });
 
     if !full_window_valid {
         let n_total = closes_history.len();
         let mut best_fallback_hl: Option<(OuParameters, f64, bool)> = None;
-        for &w in &[240usize, 180, 360] {
+        for &w in &[360usize, 240, 180] {
             if n_total > w {
                 let sub_slice = &closes_history[n_total - w..];
                 let local_max_drift =
@@ -503,7 +501,7 @@ pub fn calculate_features_with_funding(
                         best_fallback_hl = None;
                         break;
                     } else if best_fallback_hl.as_ref().map_or(true, |(prev, _, _)| {
-                        hl > 0.0 && hl < prev.half_life_minutes()
+                        hl >= min_hl && hl < prev.half_life_minutes()
                     }) {
                         best_fallback_hl = Some((sub_params, sub_drift, sub_drifting));
                     }
@@ -512,7 +510,7 @@ pub fn calculate_features_with_funding(
         }
         if let Some((fb_params, fb_drift, fb_drifting)) = best_fallback_hl {
             if selected_ou.as_ref().map_or(true, |orig| {
-                fb_params.half_life_minutes() < orig.half_life_minutes()
+                orig.half_life_minutes() > max_hl || orig.half_life_minutes() < min_hl
             }) {
                 selected_ou = Some(fb_params);
                 total_drift_pct = fb_drift;
