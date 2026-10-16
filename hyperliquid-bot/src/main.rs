@@ -1040,19 +1040,26 @@ async fn main() {
                         }
                     }
 
-                    // 1.5s Intra-Bar 20% Giveback Profit-Protection Ratchet
-                    let arm_thresh = if pos.engine_type == "EngineB" { 0.70 } else { 0.75 };
-                    if d_0 > 0.0 && tp_anchor > 0.0 && exec_px > 0.0 && active_max_prog >= arm_thresh {
+                    // 1.5s Intra-Bar 20% Giveback Profit-Protection Ratchet:
+                    // Only override the resting Maker TP with a Taker Market Close if peak excursion reached >= 35 bps
+                    // AND the protected exit still locks in >= 22 bps gross profit (>= 16 bps net after taker fee).
+                    let arm_thresh = if pos.engine_type == "EngineB" { 0.75 } else { 0.80 };
+                    if d_0 > 0.0
+                        && tp_anchor > 0.0
+                        && exec_px > 0.0
+                        && active_max_prog >= arm_thresh
+                        && ret_fav_pct >= 0.0035
+                    {
                         let q_now = if is_long {
                             (exec_px - pos.entry_price) / d_0
                         } else {
                             (pos.entry_price - exec_px) / d_0
                         };
-                        let q_be = 0.15;
+                        let q_be = 0.40;
                         let in_net_profit = if is_long {
-                            exec_px >= pos.entry_price * 1.0008
+                            exec_px >= pos.entry_price * 1.0022
                         } else {
-                            exec_px <= pos.entry_price * 0.9992
+                            exec_px <= pos.entry_price * 0.9978
                         };
                         if in_net_profit && q_now >= q_be && q_now <= f64::max(q_be, active_max_prog - 0.20) {
                             println!(
@@ -3144,16 +3151,26 @@ async fn main() {
                                                 pos.max_favorable_price = best_bar_px;
                                             }
 
-                                            // Arm Profit Protection once trade covers >= 75% of target
-                                            // Trigger profit-locked exit if price retraces by 20% giveback while still in net profit
-                                            let q_be = 0.15; // covers fees + slippage
-                                            let in_net_profit = if is_long {
-                                                close_price >= pos.entry_price * 1.0008
+                                            // Arm Profit Protection once trade covers >= 80% of target AND peak excursion >= 35 bps
+                                            // Trigger profit-locked exit if price retraces by 20% giveback while still locking >= 22 bps gross profit
+                                            let peak_fav_pct = if pos.entry_price > 0.0 {
+                                                if is_long {
+                                                    (pos.max_favorable_price - pos.entry_price).max(0.0) / pos.entry_price
+                                                } else {
+                                                    (pos.entry_price - pos.max_favorable_price).max(0.0) / pos.entry_price
+                                                }
                                             } else {
-                                                close_price <= pos.entry_price * 0.9992
+                                                0.0
+                                            };
+                                            let q_be = 0.40;
+                                            let in_net_profit = if is_long {
+                                                close_price >= pos.entry_price * 1.0022
+                                            } else {
+                                                close_price <= pos.entry_price * 0.9978
                                             };
                                             if in_net_profit
-                                                && pos.max_progress >= 0.75
+                                                && peak_fav_pct >= 0.0035
+                                                && pos.max_progress >= 0.80
                                                 && q_t >= q_be
                                                 && q_t <= f64::max(q_be, pos.max_progress - 0.20)
                                             {
@@ -3660,11 +3677,12 @@ async fn main() {
                                             let expected_funding_drag_bps = (current_funding_1h * 10_000.0) * (armed_state.half_life_m / 60.0);
                                             let net_edge_bps = raw_edge_bps - expected_funding_drag_bps;
 
-                                            if net_edge_bps < 15.0 {
+                                            let min_edge_hurdle = if is_tier2 { 25.0 } else { 20.0 };
+                                            if net_edge_bps < min_edge_hurdle {
                                                 funnel_counters.engine_a_reversal_hurdle_veto += 1;
                                                 println!(
-                                                    "⚠️ [LONG HURDLE VETO] Carry-adjusted edge too narrow for {}: {:.1} bps (raw: {:.1} bps, funding drag: {:.1} bps < 15 bps).",
-                                                    symbol_clone, net_edge_bps, raw_edge_bps, expected_funding_drag_bps
+                                                    "⚠️ [LONG HURDLE VETO] Carry-adjusted edge too narrow for {}: {:.1} bps (raw: {:.1} bps, funding drag: {:.1} bps < {:.0} bps).",
+                                                    symbol_clone, net_edge_bps, raw_edge_bps, expected_funding_drag_bps, min_edge_hurdle
                                                 );
                                                 armed_state.is_armed = false;
                                                 save_armed_signal(&arm_path_clone, &armed_state);
@@ -3816,11 +3834,12 @@ async fn main() {
                                             let expected_funding_drag_bps = (-current_funding_1h * 10_000.0) * (armed_state.half_life_m / 60.0);
                                             let net_edge_bps = raw_edge_bps - expected_funding_drag_bps;
 
-                                            if net_edge_bps < 15.0 {
+                                            let min_edge_hurdle = if is_tier2 { 25.0 } else { 20.0 };
+                                            if net_edge_bps < min_edge_hurdle {
                                                 funnel_counters.engine_a_reversal_hurdle_veto += 1;
                                                 println!(
-                                                    "⚠️ [SHORT HURDLE VETO] Carry-adjusted edge too narrow for {}: {:.1} bps (raw: {:.1} bps, funding drag: {:.1} bps < 15 bps).",
-                                                    symbol_clone, net_edge_bps, raw_edge_bps, expected_funding_drag_bps
+                                                    "⚠️ [SHORT HURDLE VETO] Carry-adjusted edge too narrow for {}: {:.1} bps (raw: {:.1} bps, funding drag: {:.1} bps < {:.0} bps).",
+                                                    symbol_clone, net_edge_bps, raw_edge_bps, expected_funding_drag_bps, min_edge_hurdle
                                                 );
                                                 armed_state.is_armed = false;
                                                 save_armed_signal(&arm_path_clone, &armed_state);
