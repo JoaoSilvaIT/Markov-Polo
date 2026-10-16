@@ -728,11 +728,15 @@ async fn main() {
                 );
             }
 
-            // Cancel any lingering entry orders on exchange since position is already filled
+            // Cancel only lingering entry orders on exchange since position is already filled;
+            // preserve both the resting Maker TP order and the Exchange-Native Disaster Stop-Market trigger order.
             for o in &symbol_open_orders {
-                let is_tp = state_lock.get(&trading_symbol).map(|p| p.tp_order_id == o.oid.to_string()).unwrap_or(false);
-                if !is_tp {
-                    println!("🧹 [STARTUP RECONCILIATION] Cancelling obsolete resting order {} for filled position on {}.", o.oid, trading_symbol);
+                let is_obsolete_entry = state_lock
+                    .get(&trading_symbol)
+                    .map(|p| !p.order_id.is_empty() && p.order_id == o.oid.to_string())
+                    .unwrap_or(false);
+                if is_obsolete_entry {
+                    println!("🧹 [STARTUP RECONCILIATION] Cancelling obsolete resting entry order {} for filled position on {}.", o.oid, trading_symbol);
                     let _ = cancel_order(&exchange, &trading_symbol, o.oid).await;
                 }
             }
@@ -3488,29 +3492,29 @@ async fn main() {
                             // BI-DIRECTIONAL REVERSAL-CONFIRMED ENTRY PROTOCOL (Long & Short)
                             // ------------------------------------------------------------------
                             let mut armed_state = load_armed_signal(&arm_path_clone);
-                            let local_sma_slice = &rolling_closes[rolling_closes.len().saturating_sub(240)..];
+                            let local_sma_slice = &rolling_closes[rolling_closes.len().saturating_sub(60)..];
                             let local_ou_sma = local_sma_slice.iter().sum::<f64>()
                                 / (local_sma_slice.len().max(1) as f64);
                             let max_mr_drift = match symbol_clone.as_str() {
-                                "BTC" => 0.0140,
-                                "ETH" => 0.0160,
-                                "SOL" => 0.0220,
-                                "AVAX" => 0.0250,
-                                _ => 0.0160,
+                                "BTC" => 0.0090,
+                                "ETH" => 0.0110,
+                                "SOL" => 0.0150,
+                                "AVAX" => 0.0170,
+                                _ => 0.0110,
                             };
                             // Note: touching a 1.50*sigma_eq O-U band (with t_half=25..55m) naturally produces
                             // |Z15| in 1.65..2.30 while |Z60| stays < 1.85 in a true range.
-                            let consolidation_vol_ok = z_15.abs() < 2.40 && z_60.abs() < 1.85;
+                            let consolidation_vol_ok = z_15.abs() < 2.40 && z_60.abs() < 1.65;
                             let entry_half_life_ok = is_valid_half_life && half_life_m <= 85.0;
-                            let can_mean_revert_long = z_60 > -1.75
+                            let can_mean_revert_long = z_60 > -1.10
                                 && z_15 > -2.35
                                 && total_drift_pct > -max_mr_drift
-                                && !(total_drift_pct <= -0.60 * max_mr_drift && z_60 <= -1.10);
-                            let can_mean_revert_short = z_60 < 1.75
+                                && !(total_drift_pct <= -0.0025 && z_60 <= -0.45);
+                            let can_mean_revert_short = z_60 < 1.10
                                 && z_15 < 2.35
                                 && total_drift_pct < max_mr_drift
-                                && !(total_drift_pct >= 0.60 * max_mr_drift && z_60 >= 1.10);
-                            let tier2_regime_ok = half_life_m <= 55.0 && z_60.abs() < 1.35 && total_drift_pct.abs() < (0.60 * max_mr_drift);
+                                && !(total_drift_pct >= 0.0025 && z_60 >= 0.45);
+                            let tier2_regime_ok = half_life_m <= 50.0 && z_60.abs() < 0.85 && total_drift_pct.abs() < 0.0030;
                             let is_eligible = !candle_feed_degraded
                                 && !is_candle_gap
                                 && is_consolidation

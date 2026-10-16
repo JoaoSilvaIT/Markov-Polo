@@ -136,11 +136,18 @@ pub fn estimate_ou_parameters(data: &[f64], dt: f64) -> Option<OuParameters> {
         theta_full
     };
 
-    // Unconditional equilibrium mean in log-space -> convert to price space.
-    // Using the sample log-mean rather than `a_log / (1.0 - b_log)` eliminates the finite-sample
-    // endpoint bias `(Y_n - Y_0) / (n * (1 - b))` that otherwise drags `mu` (and the entry bands)
-    // away from price whenever `Y_n` dips or spikes toward the band boundary.
-    let mu_log = log_data.iter().sum::<f64>() / (log_data.len().max(1) as f64);
+    // Local equilibrium mean in log-space -> convert to price space.
+    // Using the trailing 45m-90m window (scaled to 2.5 * t_half and excluding the final 3 bars
+    // of the active excursion) prevents `mu` from lagging 2-4 hours behind a post-crash recovery
+    // (which otherwise causes false shorts into a rising market) while keeping `mu` invariant
+    // to the immediate 3-bar dip/spike.
+    let n_log = log_data.len();
+    let hl_prelim = (2.0_f64.ln() / theta.max(1e-5)).clamp(15.0, 90.0);
+    let mu_lookback = ((2.5 * hl_prelim).round() as usize).clamp(45, 90).min(n_log);
+    let mu_end = if n_log > 10 { n_log - 3 } else { n_log };
+    let mu_start = mu_end.saturating_sub(mu_lookback);
+    let mu_slice = &log_data[mu_start..mu_end];
+    let mu_log = mu_slice.iter().sum::<f64>() / (mu_slice.len().max(1) as f64);
     let mu = mu_log.exp();
     if !mu.is_finite() || mu <= 0.0 {
         return None;
@@ -473,8 +480,9 @@ pub fn calculate_features_with_funding(
     let n_total = closes_history.len();
     let candidate_windows = [
         240usize.min(n_total),
-        360usize.min(n_total),
         180usize.min(n_total),
+        120usize.min(n_total),
+        360usize.min(n_total),
         n_total,
     ];
 
