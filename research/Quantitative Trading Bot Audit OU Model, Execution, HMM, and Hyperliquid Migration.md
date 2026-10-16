@@ -288,13 +288,13 @@ The best near-term architecture is a single portfolio-risk coordinator plus venu
 
 ## References
 
-1. [order.rs](local-repo-reference)
+1. `src/order.rs` (Local Repository Reference)
 
-2. [main.rs](local-repo-reference)
+2. `src/main.rs` (Local Repository Reference)
 
-3. [ou_process.rs](local-repo-reference)
+3. `src/ou_process.rs` (Local Repository Reference)
 
-4. [hmm.rs](local-repo-reference)
+4. `src/hmm.rs` (Local Repository Reference)
 
 5. [How to Calculate Binance Spot Trading Fees?](https://www.binance.com/en/support/faq/detail/e85d6e703b874674840122196b89780a) - This Page is for general information and educational purposes only. It does not constitute legal ter...
 
