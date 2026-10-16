@@ -2233,7 +2233,12 @@ async fn main() {
                         }
                     }
 
-                    let donchian_channel_opt = calculate_donchian(&rolling_15m_bars[..], donchian_period);
+                    let donchian_ref_bars = if finalized_15m_bar.is_some() && rolling_15m_bars.len() > 1 {
+                        &rolling_15m_bars[..rolling_15m_bars.len() - 1]
+                    } else {
+                        &rolling_15m_bars[..]
+                    };
+                    let donchian_channel_opt = calculate_donchian(donchian_ref_bars, donchian_period);
 
                     let closes_15m_curr: Vec<f64> = rolling_15m_bars.iter().map(|b| b.close).collect();
                     let alignment_curr = check_trend_alignment(&closes_15m_curr);
@@ -2541,7 +2546,12 @@ async fn main() {
                             if is_cluster_blocked {
                                 println!("⏸️ [SHADOW-TREND VETO] Active cluster lease in place. Vetoing Engine B entry to prevent cross-engine conflict.");
                             } else {
-                                let donchian_opt = calculate_donchian(&rolling_15m_bars[..], donchian_period);
+                                let engine_b_donchian_bars = if finalized_15m_bar.is_some() && rolling_15m_bars.len() > 1 {
+                                    &rolling_15m_bars[..rolling_15m_bars.len() - 1]
+                                } else {
+                                    &rolling_15m_bars[..]
+                                };
+                                let donchian_opt = calculate_donchian(engine_b_donchian_bars, donchian_period);
                                 if let Some(ref donchian) = donchian_opt {
                                     let closes_15m: Vec<f64> = rolling_15m_bars.iter().map(|b| b.close).collect();
                                     let alignment = check_trend_alignment(&closes_15m);
@@ -3461,17 +3471,29 @@ async fn main() {
                             // BI-DIRECTIONAL REVERSAL-CONFIRMED ENTRY PROTOCOL (Long & Short)
                             // ------------------------------------------------------------------
                             let mut armed_state = load_armed_signal(&arm_path_clone);
-                            let consolidation_vol_ok = z_15.abs() < 1.85 && z_60.abs() < 1.65;
-                            let entry_half_life_ok = is_valid_half_life && half_life_m <= 65.0;
-                            let can_mean_revert_long = z_60 > -1.45
-                                && z_15 > -1.60
-                                && total_drift_pct > -0.0100
-                                && !(total_drift_pct <= -0.0060 && z_60 <= -0.70);
-                            let can_mean_revert_short = z_60 < 1.45
-                                && z_15 < 1.60
-                                && total_drift_pct < 0.0100
-                                && !(total_drift_pct >= 0.0060 && z_60 >= 0.70);
-                            let tier2_regime_ok = half_life_m <= 45.0 && z_60.abs() < 1.15 && total_drift_pct.abs() < 0.0060;
+                            let local_sma_slice = &rolling_closes[rolling_closes.len().saturating_sub(240)..];
+                            let local_ou_sma = local_sma_slice.iter().sum::<f64>()
+                                / (local_sma_slice.len().max(1) as f64);
+                            let max_mr_drift = match symbol_clone.as_str() {
+                                "BTC" => 0.0140,
+                                "ETH" => 0.0160,
+                                "SOL" => 0.0220,
+                                "AVAX" => 0.0250,
+                                _ => 0.0160,
+                            };
+                            // Note: touching a 1.50*sigma_eq O-U band (with t_half=25..55m) naturally produces
+                            // |Z15| in 1.65..2.30 while |Z60| stays < 1.85 in a true range.
+                            let consolidation_vol_ok = z_15.abs() < 2.40 && z_60.abs() < 1.85;
+                            let entry_half_life_ok = is_valid_half_life && half_life_m <= 85.0;
+                            let can_mean_revert_long = z_60 > -1.75
+                                && z_15 > -2.35
+                                && total_drift_pct > -max_mr_drift
+                                && !(total_drift_pct <= -0.60 * max_mr_drift && z_60 <= -1.10);
+                            let can_mean_revert_short = z_60 < 1.75
+                                && z_15 < 2.35
+                                && total_drift_pct < max_mr_drift
+                                && !(total_drift_pct >= 0.60 * max_mr_drift && z_60 >= 1.10);
+                            let tier2_regime_ok = half_life_m <= 55.0 && z_60.abs() < 1.35 && total_drift_pct.abs() < (0.60 * max_mr_drift);
                             let is_eligible = !candle_feed_degraded
                                 && !is_candle_gap
                                 && is_consolidation
@@ -3568,8 +3590,7 @@ async fn main() {
                                             if let Some(ref th) = thresholds_opt {
                                                 if current_extreme <= th.entry_long {
                                                     armed_state.tier = "TIER_1_NORMAL".to_string();
-                                                    let baseline_arm = rolling_closes.iter().sum::<f64>()
-                                                        / rolling_closes.len() as f64;
+                                                    let baseline_arm = local_ou_sma;
                                                     armed_state.entry_threshold = th.entry_long;
                                                     armed_state.unitless_entry_dev =
                                                         (th.entry_long / baseline_arm).ln();
@@ -3583,8 +3604,7 @@ async fn main() {
                                         save_armed_signal(&arm_path_clone, &armed_state);
                                     }
 
-                                    let live_sma = rolling_closes.iter().sum::<f64>()
-                                        / rolling_closes.len() as f64;
+                                    let live_sma = local_ou_sma;
                                     let dynamic_exit_target = if armed_state.unitless_exit_dev != 0.0 {
                                         live_sma * armed_state.unitless_exit_dev.exp()
                                     } else {
@@ -3640,10 +3660,10 @@ async fn main() {
                                             let expected_funding_drag_bps = (current_funding_1h * 10_000.0) * (armed_state.half_life_m / 60.0);
                                             let net_edge_bps = raw_edge_bps - expected_funding_drag_bps;
 
-                                            if net_edge_bps < 20.0 {
+                                            if net_edge_bps < 15.0 {
                                                 funnel_counters.engine_a_reversal_hurdle_veto += 1;
                                                 println!(
-                                                    "⚠️ [LONG HURDLE VETO] Carry-adjusted edge too narrow for {}: {:.1} bps (raw: {:.1} bps, funding drag: {:.1} bps < 20 bps).",
+                                                    "⚠️ [LONG HURDLE VETO] Carry-adjusted edge too narrow for {}: {:.1} bps (raw: {:.1} bps, funding drag: {:.1} bps < 15 bps).",
                                                     symbol_clone, net_edge_bps, raw_edge_bps, expected_funding_drag_bps
                                                 );
                                                 armed_state.is_armed = false;
@@ -3727,8 +3747,7 @@ async fn main() {
                                             if let Some(ref th) = thresholds_opt {
                                                 if current_extreme >= th.entry_short {
                                                     armed_state.tier = "TIER_1_NORMAL".to_string();
-                                                    let baseline_arm = rolling_closes.iter().sum::<f64>()
-                                                        / rolling_closes.len() as f64;
+                                                    let baseline_arm = local_ou_sma;
                                                     armed_state.entry_threshold = th.entry_short;
                                                     armed_state.unitless_entry_dev =
                                                         (th.entry_short / baseline_arm).ln();
@@ -3742,8 +3761,7 @@ async fn main() {
                                         save_armed_signal(&arm_path_clone, &armed_state);
                                     }
 
-                                    let live_sma = rolling_closes.iter().sum::<f64>()
-                                        / rolling_closes.len() as f64;
+                                    let live_sma = local_ou_sma;
                                     let dynamic_exit_target = if armed_state.unitless_exit_dev != 0.0 {
                                         live_sma * armed_state.unitless_exit_dev.exp()
                                     } else {
@@ -3798,10 +3816,10 @@ async fn main() {
                                             let expected_funding_drag_bps = (-current_funding_1h * 10_000.0) * (armed_state.half_life_m / 60.0);
                                             let net_edge_bps = raw_edge_bps - expected_funding_drag_bps;
 
-                                            if net_edge_bps < 20.0 {
+                                            if net_edge_bps < 15.0 {
                                                 funnel_counters.engine_a_reversal_hurdle_veto += 1;
                                                 println!(
-                                                    "⚠️ [SHORT HURDLE VETO] Carry-adjusted edge too narrow for {}: {:.1} bps (raw: {:.1} bps, funding drag: {:.1} bps < 20 bps).",
+                                                    "⚠️ [SHORT HURDLE VETO] Carry-adjusted edge too narrow for {}: {:.1} bps (raw: {:.1} bps, funding drag: {:.1} bps < 15 bps).",
                                                     symbol_clone, net_edge_bps, raw_edge_bps, expected_funding_drag_bps
                                                 );
                                                 armed_state.is_armed = false;
@@ -3881,8 +3899,7 @@ async fn main() {
                                 if let Some(ref thresholds) = thresholds_opt {
                                     // Check Long Arm: price dipped below Tier 1 (1.50σ) boundary
                                     if (close_price <= thresholds.entry_long || low_price <= thresholds.entry_long) && !is_downside_shock && can_mean_revert_long {
-                                        let baseline_arm = rolling_closes.iter().sum::<f64>()
-                                            / rolling_closes.len() as f64;
+                                        let baseline_arm = local_ou_sma;
                                         let unitless_entry_dev =
                                             (thresholds.entry_long / baseline_arm).ln();
                                         let unitless_exit_dev =
@@ -3907,8 +3924,7 @@ async fn main() {
                                     }
                                     // Check Short Arm: price spiked above Tier 1 (1.50σ) boundary
                                     else if (close_price >= thresholds.entry_short || high_price >= thresholds.entry_short) && !is_upside_shock && can_mean_revert_short {
-                                        let baseline_arm = rolling_closes.iter().sum::<f64>()
-                                            / rolling_closes.len() as f64;
+                                        let baseline_arm = local_ou_sma;
                                         let unitless_entry_dev =
                                             (thresholds.entry_short / baseline_arm).ln();
                                         let unitless_exit_dev =
@@ -3934,8 +3950,7 @@ async fn main() {
                                     // Check Conditional Tier 2: 1.25σ boundary (restricted to clean, fast-reverting low-drift ranges)
                                     else if let Some(ref th125) = thresholds_175_opt {
                                         if (close_price <= th125.entry_long || low_price <= th125.entry_long) && !is_downside_shock && can_mean_revert_long && tier2_regime_ok {
-                                            let baseline_arm = rolling_closes.iter().sum::<f64>()
-                                                / rolling_closes.len() as f64;
+                                            let baseline_arm = local_ou_sma;
                                             let unitless_entry_dev =
                                                 (th125.entry_long / baseline_arm).ln();
                                             let unitless_exit_dev =
@@ -3958,8 +3973,7 @@ async fn main() {
                                                 symbol_clone, close_price, th125.entry_long, low_price
                                             );
                                         } else if (close_price >= th125.entry_short || high_price >= th125.entry_short) && !is_upside_shock && can_mean_revert_short && tier2_regime_ok {
-                                            let baseline_arm = rolling_closes.iter().sum::<f64>()
-                                                / rolling_closes.len() as f64;
+                                            let baseline_arm = local_ou_sma;
                                             let unitless_entry_dev =
                                                 (th125.entry_short / baseline_arm).ln();
                                             let unitless_exit_dev =

@@ -108,7 +108,7 @@ pub fn estimate_ou_parameters(data: &[f64], dt: f64) -> Option<OuParameters> {
     // better-conditioned AR(1) estimates across different price magnitudes.
     let log_data: Vec<f64> = data.iter().map(|&p| p.ln()).collect();
 
-    let (a_log, b_log, sigma_eps_log) = estimate_ar1_raw(&log_data)?;
+    let (_a_log, b_log, sigma_eps_log) = estimate_ar1_raw(&log_data)?;
 
     let theta_full = -b_log.ln() / dt;
 
@@ -136,9 +136,11 @@ pub fn estimate_ou_parameters(data: &[f64], dt: f64) -> Option<OuParameters> {
         theta_full
     };
 
-    // mu in log-space → convert to price space.
-    // mu_log = a / (1 - b) is the long-run log-price mean; exp() gives the price-space equilibrium.
-    let mu_log = a_log / (1.0 - b_log);
+    // Unconditional equilibrium mean in log-space -> convert to price space.
+    // Using the sample log-mean rather than `a_log / (1.0 - b_log)` eliminates the finite-sample
+    // endpoint bias `(Y_n - Y_0) / (n * (1 - b))` that otherwise drags `mu` (and the entry bands)
+    // away from price whenever `Y_n` dips or spikes toward the band boundary.
+    let mu_log = log_data.iter().sum::<f64>() / (log_data.len().max(1) as f64);
     let mu = mu_log.exp();
     if !mu.is_finite() || mu <= 0.0 {
         return None;
@@ -258,7 +260,13 @@ pub fn calculate_mad_sigma(returns: &[f64]) -> f64 {
     } else {
         abs_devs[mid]
     };
-    (1.4826 * med_dev).max(1e-5)
+    // Guard against discrete-tick zero collapse (e.g. AVAX $0.01 ticks where >=50% of 1m bars have r=0)
+    // by computing the 80%-trimmed Mean Absolute Deviation (excluding top 20% tail outliers).
+    let trim_len = ((abs_devs.len() as f64 * 0.80).ceil() as usize).clamp(1, abs_devs.len());
+    let trimmed_mean_dev = abs_devs[..trim_len].iter().sum::<f64>() / (trim_len as f64);
+    let trimmed_sigma = 1.2533 * trimmed_mean_dev;
+
+    (1.4826 * med_dev).max(0.75 * trimmed_sigma).max(1e-5)
 }
 
 /// Computes the directional expected edge in basis points between entry and exit price:
@@ -863,6 +871,59 @@ mod tests {
             (th.exit_long - 99.80).abs() < 0.50,
             "Equilibrium mu should anchor to post-break level (~99.80), got {:.2}",
             th.exit_long
+        );
+    }
+
+    #[test]
+    fn test_end_to_end_post_break_consolidation_arm_and_bounce_no_catch22() {
+        // End-to-end simulation of the full Engine A pipeline after a structural level shift:
+        // 1. 720m around $2450, then 240m consolidating around $2410.
+        let mut history = Vec::with_capacity(960);
+        for i in 0..720 {
+            history.push(2450.0 + (i as f64 * 0.23).sin() * 6.0);
+        }
+        for i in 0..233 {
+            history.push(2410.0 + (i as f64 * 0.23).sin() * 6.0);
+        }
+        // Hold near equilibrium mean ($2410) for 6 bars, then dip smoothly over 9 bars to the lower 1.50*sigma band (~$2399.80)
+        let step_dips = [
+            2410.2, 2409.9, 2410.1, 2409.8, 2410.0, 2409.5,
+            2408.2, 2406.8, 2405.4, 2404.0, 2402.8, 2401.7, 2400.8, 2400.1, 2399.6,
+        ];
+        for &px in &step_dips {
+            history.push(px);
+        }
+        let dip_px = *history.last().unwrap();
+
+        let feat_dip = calculate_features(&history, dip_px, "ETH").expect("Dip features");
+        assert!(feat_dip.is_stationary && feat_dip.is_valid_half_life);
+        let th = feat_dip.thresholds_opt.expect("Thresholds at dip");
+        assert!(
+            dip_px <= th.entry_long,
+            "Dip price {:.2} should touch/breach entry_long {:.2}",
+            dip_px,
+            th.entry_long
+        );
+        // Verify no Catch-22 between Z15/Z60 and Engine A eligibility gates at the band touch
+        let consolidation_vol_ok = feat_dip.z_15.abs() < 2.40 && feat_dip.z_60.abs() < 1.85;
+        let can_mean_revert_long = feat_dip.z_60 > -1.75
+            && feat_dip.z_15 > -2.35
+            && feat_dip.total_drift_pct > -0.0160;
+        assert!(
+            consolidation_vol_ok && can_mean_revert_long,
+            "Band touch must not self-veto on Z15/Z60 (z15={:.2}, z60={:.2}, drift={:.4})",
+            feat_dip.z_15,
+            feat_dip.z_60,
+            feat_dip.total_drift_pct
+        );
+
+        // 3. Next 1m bar: +8 bps green bounce off the dip low
+        let bounce_px = dip_px * 1.0008;
+        let edge_bps = calculate_net_edge_bps(bounce_px, th.exit_long);
+        assert!(
+            edge_bps >= 15.0,
+            "Post-bounce net edge to equilibrium mu must clear 15 bps hurdle, got {:.1} bps",
+            edge_bps
         );
     }
 }
