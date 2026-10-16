@@ -369,10 +369,17 @@ impl RegimeController {
                     } else {
                         3
                     };
-                    self.last_reason = format!(
-                        "Awaiting regime confirmation (Trend streak: {}/{}, Consolidation streak: {}/{})",
-                        self.trend_streak, required_t_dwell, self.consolidation_streak, required_c_dwell
-                    );
+                    if p_consolidation >= 0.65 && self.consolidation_streak >= required_c_dwell && (!is_ou_stationary || !is_half_life_valid) {
+                        self.last_reason = format!(
+                            "Consolidation dwell met ({}/{}), awaiting stationary O-U half-life (15m-120m)",
+                            self.consolidation_streak, required_c_dwell
+                        );
+                    } else {
+                        self.last_reason = format!(
+                            "Awaiting regime confirmation (Trend streak: {}/{}, Consolidation streak: {}/{})",
+                            self.trend_streak, required_t_dwell, self.consolidation_streak, required_c_dwell
+                        );
+                    }
                 }
             }
 

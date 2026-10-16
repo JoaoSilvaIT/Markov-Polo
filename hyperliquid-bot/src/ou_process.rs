@@ -379,6 +379,57 @@ pub fn calculate_features(closes_history: &[f64], eval_close: f64, symbol: &str)
     calculate_features_with_funding(closes_history, eval_close, symbol, 0.0)
 }
 
+/// Evaluates Scale-Invariant Log-Price OLS Slope Drift Test with Student's t-statistic (Two-Pass Centered).
+/// Returns `(total_drift_pct, is_drifting)`.
+fn evaluate_ols_drift(slice: &[f64], max_economic_drift: f64) -> (f64, bool) {
+    let valid_lps: Vec<(f64, f64)> = slice
+        .iter()
+        .enumerate()
+        .filter(|(_, &p)| p > 0.0 && p.is_finite())
+        .map(|(i, &p)| (i as f64, p.ln()))
+        .collect();
+    let n_drift = valid_lps.len() as f64;
+    if n_drift < 10.0 {
+        return (0.0, false);
+    }
+    let mean_i = valid_lps.iter().map(|(i, _)| *i).sum::<f64>() / n_drift;
+    let mean_lp = valid_lps.iter().map(|(_, lp)| *lp).sum::<f64>() / n_drift;
+
+    let mut ss_xx = 0.0_f64;
+    let mut ss_xy = 0.0_f64;
+    for &(idx, lp) in &valid_lps {
+        let di = idx - mean_i;
+        let dlp = lp - mean_lp;
+        ss_xx += di * di;
+        ss_xy += di * dlp;
+    }
+    let (slope_log, intercept_log) = if ss_xx > 1e-12 {
+        let slope = ss_xy / ss_xx;
+        let intercept = mean_lp - slope * mean_i;
+        (slope, intercept)
+    } else {
+        (0.0, mean_lp)
+    };
+
+    let mut sum_sq_residuals = 0.0_f64;
+    for &(idx, lp) in &valid_lps {
+        let y_hat = intercept_log + slope_log * idx;
+        sum_sq_residuals += (lp - y_hat).powi(2);
+    }
+    let df = (n_drift - 2.0).max(1.0);
+    let s_err_sq = sum_sq_residuals / df;
+    let se_slope = (s_err_sq / ss_xx.max(1e-12)).sqrt();
+    let t_stat_slope = if se_slope > 1e-12 {
+        slope_log / se_slope
+    } else {
+        0.0
+    };
+
+    let total_drift_pct = slope_log * n_drift;
+    let is_drifting = t_stat_slope.abs() >= 2.58 && total_drift_pct.abs() > max_economic_drift;
+    (total_drift_pct, is_drifting)
+}
+
 /// Evaluates stochastic O-U, drift, and Z-score features incorporating Hyperliquid hourly funding rate carry drift.
 pub fn calculate_features_with_funding(
     closes_history: &[f64],
@@ -393,15 +444,77 @@ pub fn calculate_features_with_funding(
 
     // Operating half-life bounds (15m to 120m per Quant Research & Backtest Spec):
     // - Lower bound (min_hl = 15.0m): filters sub-15m bid-ask bounce while allowing fast intraday consolidation (15m-30m).
-    // - Upper bound (max_hl = 120.0m): ensures mean reversion materializes within the 2*t_half horizon without bleeding funding/time-stop fees.
+    // - Upper bound (max_hl = 120.0m): ensures mean reversion materializes within the 3.5*t_half horizon without bleeding funding/time-stop fees.
     // Note: if 0 < hl < min_hl, the series is still stationary (reverting faster than 15m) so thresholds remain populated for active position management.
-    let _n_bars = closes_history.len() as f64;
     let min_hl = 15.0_f64;
     let max_hl = 120.0_f64;
 
-    // O-U Parameter Estimation with Phillips & Yu Jackknife bias correction (log-price space)
+    // Asset-specific maximum allowable economic drift over the lookback window:
+    // BTC: 2.0%, ETH: 2.5%, SOL: 4.0%, AVAX: 5.0%, Default: 2.5%
+    let max_economic_drift = match symbol.to_uppercase().as_str() {
+        "BTC"  => 0.020,
+        "ETH"  => 0.025,
+        "SOL"  => 0.040,
+        "AVAX" => 0.050,
+        _      => 0.025,
+    };
+
+    let (mut total_drift_pct, mut is_drifting) =
+        evaluate_ols_drift(closes_history, max_economic_drift);
+
+    // Multiscale Structural-Break-Resilient O-U Estimation:
+    // A single 960m (16-hour) AR(1) + 2-split jackknife is poisoned for up to 12-16 hours whenever
+    // a macro level shift occurred 3-12 hours ago (pooling the pre-shift mean and post-shift mean
+    // forces b -> 1.0 and th_jack < 0 -> 999.0m).
+    // If the full window fails stationarity, we evaluate post-break local consolidation windows
+    // (240m = 4h, 180m = 3h, 360m = 6h) and adopt the local equilibrium if it is non-drifting
+    // and stationary within [min_hl, max_hl].
+    let mut selected_ou: Option<OuParameters> = estimate_ou_parameters(closes_history, 1.0);
+    let full_window_valid = selected_ou.as_ref().map_or(false, |p| {
+        let hl = p.half_life_minutes();
+        let mu_dev = (p.mu - hist_last_price).abs() / hist_last_price;
+        hl > 0.0 && hl <= max_hl && mu_dev <= 0.07 && !is_drifting
+    });
+
+    if !full_window_valid {
+        let n_total = closes_history.len();
+        let mut best_fallback_hl: Option<(OuParameters, f64, bool)> = None;
+        for &w in &[240usize, 180, 360] {
+            if n_total > w {
+                let sub_slice = &closes_history[n_total - w..];
+                let local_max_drift =
+                    max_economic_drift * ((w as f64 / 960.0).sqrt().clamp(0.40, 1.0));
+                let (sub_drift, sub_drifting) = evaluate_ols_drift(sub_slice, local_max_drift);
+                if let Some(sub_params) = estimate_ou_parameters(sub_slice, 1.0) {
+                    let hl = sub_params.half_life_minutes();
+                    let mu_dev = (sub_params.mu - hist_last_price).abs() / hist_last_price;
+                    if !sub_drifting && hl >= min_hl && hl <= max_hl && mu_dev <= 0.04 {
+                        selected_ou = Some(sub_params);
+                        total_drift_pct = sub_drift;
+                        is_drifting = false;
+                        best_fallback_hl = None;
+                        break;
+                    } else if best_fallback_hl.as_ref().map_or(true, |(prev, _, _)| {
+                        hl > 0.0 && hl < prev.half_life_minutes()
+                    }) {
+                        best_fallback_hl = Some((sub_params, sub_drift, sub_drifting));
+                    }
+                }
+            }
+        }
+        if let Some((fb_params, fb_drift, fb_drifting)) = best_fallback_hl {
+            if selected_ou.as_ref().map_or(true, |orig| {
+                fb_params.half_life_minutes() < orig.half_life_minutes()
+            }) {
+                selected_ou = Some(fb_params);
+                total_drift_pct = fb_drift;
+                is_drifting = fb_drifting;
+            }
+        }
+    }
+
     let (thresholds_opt, thresholds_175_opt, half_life_m) =
-        if let Some(mut ou_params) = estimate_ou_parameters(closes_history, 1.0) {
+        if let Some(mut ou_params) = selected_ou {
             let hl = ou_params.half_life_minutes();
             let is_stationary_hl = hl > 0.0 && hl <= max_hl;
             // Apply continuous-time hourly funding carry drift adjustment to equilibrium mean mu:
@@ -448,65 +561,6 @@ pub fn calculate_features_with_funding(
         } else {
             (None, None, 999.0)
         };
-
-    // Scale-Invariant Log-Price OLS Slope Drift Test with Student's t-statistic (Two-Pass Centered)
-    let valid_lps: Vec<(f64, f64)> = closes_history
-        .iter()
-        .enumerate()
-        .filter(|(_, &p)| p > 0.0 && p.is_finite())
-        .map(|(i, &p)| (i as f64, p.ln()))
-        .collect();
-    let n_drift = valid_lps.len() as f64;
-    let mean_i = valid_lps.iter().map(|(i, _)| *i).sum::<f64>() / n_drift.max(1.0);
-    let mean_lp = valid_lps.iter().map(|(_, lp)| *lp).sum::<f64>() / n_drift.max(1.0);
-
-    let mut ss_xx = 0.0_f64;
-    let mut ss_xy = 0.0_f64;
-    for &(idx, lp) in &valid_lps {
-        let di = idx - mean_i;
-        let dlp = lp - mean_lp;
-        ss_xx += di * di;
-        ss_xy += di * dlp;
-    }
-    let (slope_log, intercept_log) = if ss_xx > 1e-12 {
-        let slope = ss_xy / ss_xx;
-        let intercept = mean_lp - slope * mean_i;
-        (slope, intercept)
-    } else {
-        (0.0, mean_lp)
-    };
-
-    // Compute residual variance and t-statistic for OLS slope significance (H0: slope == 0)
-    let mut sum_sq_residuals = 0.0_f64;
-    for &(idx, lp) in &valid_lps {
-        let y_hat = intercept_log + slope_log * idx;
-        sum_sq_residuals += (lp - y_hat).powi(2);
-    }
-    let df = (n_drift - 2.0).max(1.0);
-    let s_err_sq = sum_sq_residuals / df;
-    let se_slope = (s_err_sq / ss_xx.max(1e-12)).sqrt();
-    let t_stat_slope = if se_slope > 1e-12 {
-        slope_log / se_slope
-    } else {
-        0.0
-    };
-
-    // Cumulative log-return drift over the lookback window
-    let total_drift_pct = slope_log * n_drift;
-
-    // Asset-specific maximum allowable economic drift over the lookback window:
-    // BTC: 2.0%, ETH: 2.5%, SOL: 4.0%, AVAX: 5.0%, Default: 2.5%
-    let max_economic_drift = match symbol.to_uppercase().as_str() {
-        "BTC"  => 0.020,
-        "ETH"  => 0.025,
-        "SOL"  => 0.040,
-        "AVAX" => 0.050,
-        _      => 0.025,
-    };
-
-    // Series is drifting if slope is statistically significant (|t| >= 2.58, p < 0.01)
-    // AND the economic cumulative drift exceeds asset hurdle
-    let is_drifting = t_stat_slope.abs() >= 2.58 && total_drift_pct.abs() > max_economic_drift;
 
     // Standardized Downside/Upside Shock Calculation with robust MAD
     let n = closes_history.len();
@@ -782,6 +836,34 @@ mod tests {
         assert!(feat.is_valid_half_life, "t_half in 15m-30m band must pass is_valid_half_life");
         assert!(feat.is_consolidation, "Non-drifting stationary series must be valid consolidation");
         assert!(feat.thresholds_opt.is_some(), "Thresholds must be populated for 15m-30m half-life");
+    }
+
+    #[test]
+    fn test_post_structural_break_consolidation_recovers_ou_stationarity() {
+        // Reproduce live market level shift:
+        // First 720m (12h) oscillating around $103.00, then a drop to $99.80 followed by
+        // 240m (4h) of clean stationary mean reversion around $99.80.
+        let mut history = Vec::with_capacity(960);
+        for i in 0..720 {
+            history.push(103.0 + (i as f64 * 0.22).sin() * 0.45);
+        }
+        for i in 0..240 {
+            history.push(99.80 + (i as f64 * 0.22).sin() * 0.45);
+        }
+        let eval_px = *history.last().unwrap();
+        let feat = calculate_features(&history, eval_px, "AVAX").expect("Features should compute");
+        assert!(
+            feat.is_stationary && feat.is_valid_half_life,
+            "Post-break 4h consolidation must recover stationarity (got half_life={:.1}m, is_stationary={})",
+            feat.half_life_m,
+            feat.is_stationary
+        );
+        let th = feat.thresholds_opt.expect("Thresholds must be populated around new equilibrium");
+        assert!(
+            (th.exit_long - 99.80).abs() < 0.50,
+            "Equilibrium mu should anchor to post-break level (~99.80), got {:.2}",
+            th.exit_long
+        );
     }
 }
 
