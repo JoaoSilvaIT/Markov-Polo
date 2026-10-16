@@ -670,16 +670,37 @@ pub fn compute_hmm_posteriors(hmm: &GaussianHMM, closes: &[f64]) -> Option<(f64,
         // a single jump bar followed by flat range has max_bar_share > 0.45.
         let multi_bar_trend_factor = (1.0 - ((max_bar_share - 0.35) / 0.30).clamp(0.0, 1.0)).clamp(0.0, 1.0);
 
+        // Guard against 4-hour (16-bar) trend echo:
+        // If a trend happened 2-4 hours ago but the most recent 60 minutes (4 fifteen-minute bars)
+        // have flattened into a range (low 4-bar ER and low 4-bar drift), damp stale P_T back to P_C.
+        let recent_trend_gate = if m >= 5 && closes[m - 5] > 0.0 {
+            let net_4 = (closes[m - 1] / closes[m - 5]).ln().abs();
+            let mut path_4 = 0.0;
+            for i in (m - 4)..m {
+                if closes[i - 1] > 0.0 {
+                    path_4 += (closes[i] / closes[i - 1]).ln().abs();
+                }
+            }
+            let er_4 = (net_4 / (path_4 + 1e-8)).clamp(0.0, 1.0);
+            let d_4 = net_4 / (base_sigma * 2.0);
+            ((er_4 - 0.22) / 0.28)
+                .max((d_4 - 0.65) / 0.70)
+                .clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+
         // Compensate `d_last` for any 16-bar boxcar `sigma` inflation when evaluating post-shock trend vs range
         let sigma_inflation = (ln_sigma_last - mean_ln_vol).exp().clamp(1.0, 2.5);
         let d_adjusted = d_last * sigma_inflation.sqrt();
+        let active_trend_gate = multi_bar_trend_factor * recent_trend_gate;
         let trend_affinity = (((er_last - 0.24) / 0.22)
             .max((d_adjusted - 1.05) / 0.90)
             .clamp(0.0, 1.0))
-            * multi_bar_trend_factor;
+            * active_trend_gate;
 
-        let p_t = raw_t * multi_bar_trend_factor + reallocated * trend_affinity;
-        let p_c = raw_c + raw_t * (1.0 - multi_bar_trend_factor) + reallocated * (1.0 - trend_affinity);
+        let p_t = raw_t * active_trend_gate + reallocated * trend_affinity;
+        let p_c = raw_c + raw_t * (1.0 - active_trend_gate) + reallocated * (1.0 - trend_affinity);
         let sum = (p_c + p_t + p_s).max(1e-12);
         Some((p_c / sum, p_t / sum, p_s / sum))
     } else {

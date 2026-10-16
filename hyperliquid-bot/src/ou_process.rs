@@ -111,10 +111,14 @@ pub fn estimate_ou_parameters(data: &[f64], dt: f64) -> Option<OuParameters> {
     let (_a_log, b_log, sigma_eps_log) = estimate_ar1_raw(&log_data)?;
 
     let theta_full = -b_log.ln() / dt;
+    let (_, is_monotone_drift) = evaluate_ols_drift(data, 0.005);
 
     // Apply Phillips & Yu (2005) 2-split Jackknife bias correction on log-price AR(1):
     // theta_jack = 2 * theta_full - 0.5 * (theta_1 + theta_2)
-    // This removes the O(1/T) Hurwicz bias that artificially inflates mean-reversion speed.
+    // When the two halves of a non-drifting range have slightly different local sample means,
+    // separate half-sample demeaning can artificially inflate (theta_1 + theta_2) above 2*theta_full,
+    // causing `th_jack` to jump wildly or flip negative on a 1-tick move. For non-drifting series
+    // with b_log < 0.985, floor `th_jack` at `0.60 * theta_full` to preserve bar-to-bar continuity.
     let mid = log_data.len() / 2;
     let theta = if mid >= 4 {
         let part1 = estimate_ar1_raw(&log_data[..=mid]);
@@ -124,10 +128,19 @@ pub fn estimate_ou_parameters(data: &[f64], dt: f64) -> Option<OuParameters> {
             let theta1 = -b1.ln() / dt;
             let theta2 = -b2.ln() / dt;
             let th_jack = 2.0 * theta_full - 0.5 * (theta1 + theta2);
-            if th_jack > 1e-5 {
-                th_jack
+            if is_monotone_drift || b_log >= 0.985 {
+                if th_jack > 1e-5 && !is_monotone_drift {
+                    th_jack
+                } else {
+                    return None;
+                }
             } else {
-                return None;
+                let floored = th_jack.max(0.60 * theta_full);
+                if floored > 1e-5 {
+                    floored
+                } else {
+                    return None;
+                }
             }
         } else {
             return None;
