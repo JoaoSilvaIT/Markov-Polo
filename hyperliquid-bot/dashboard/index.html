@@ -3,30 +3,36 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Hyperliquid Desk</title>
+  <title>MarkovPolo · Autonomous L1 Trading Terminal</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
   <script>
     tailwind.config = {
       darkMode: 'class',
       theme: {
         extend: {
           fontFamily: {
-            sans: ['"Inter"', '-apple-system', 'BlinkMacSystemFont', 'sans-serif'],
+            sans: ['"Plus Jakarta Sans"', '-apple-system', 'BlinkMacSystemFont', 'sans-serif'],
             mono: ['"JetBrains Mono"', 'monospace'],
           },
           colors: {
-            desk: {
-              bg: '#0b0e14',
-              panel: '#11161f',
-              inset: '#0d1118',
-              border: '#1e2636',
-              borderSubtle: '#171e2b',
-              text: '#e5e7eb',
-              muted: '#8b95a5',
-              dim: '#566070'
+            cosmic: {
+              bg: '#07060d',
+              sidebar: '#08070f',
+              card: '#0f0e1a',
+              cardInner: '#141222',
+              border: 'rgba(255, 255, 255, 0.08)',
+              borderBright: 'rgba(167, 139, 250, 0.28)',
+              purple: '#a78bfa',
+              purpleLight: '#b197fc',
+              purpleDeep: '#6d28d9',
+              neonGreen: '#10f587',
+              crimson: '#dc1428',
+              gold: '#f5c418',
+              muted: '#8e8ca3',
+              dim: '#5a5870'
             }
           }
         }
@@ -34,197 +40,1131 @@
     }
   </script>
   <style>
+    * {
+      box-sizing: border-box;
+    }
     body {
-      background-color: #0b0e14;
-      color: #e5e7eb;
-      font-family: 'Inter', sans-serif;
+      background-color: #07060d;
+      color: #ffffff;
+      font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
       font-feature-settings: 'tnum' on, 'zero' on;
       -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
     }
     .font-mono {
       font-family: 'JetBrains Mono', monospace;
       font-feature-settings: 'tnum' on, 'zero' on;
     }
-    .card {
-      background-color: #11161f;
-      border: 1px solid #1e2636;
+
+    /* Cosmic Dark-Glass Card Base (Matches Dribbble Video) */
+    .cosmic-card {
+      position: relative;
+      background: linear-gradient(155deg, rgba(22, 20, 36, 0.92) 0%, rgba(10, 9, 18, 0.97) 100%);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 22px;
+      box-shadow:
+        0 18px 40px -15px rgba(0, 0, 0, 0.75),
+        inset 0 1px 0 0 rgba(255, 255, 255, 0.09);
+      overflow: hidden;
+      transition: border-color 0.25s ease, transform 0.25s ease;
     }
-    .inset-box {
-      background-color: #0d1118;
-      border: 1px solid #171e2b;
+    .cosmic-card:hover {
+      border-color: rgba(177, 151, 252, 0.22);
     }
+
+    /* Subtle Starfield Texture Overlay Inside Cards */
+    .cosmic-stars::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      background-image:
+        radial-gradient(1px 1px at 14% 22%, rgba(255, 255, 255, 0.45) 50%, transparent 100%),
+        radial-gradient(1.2px 1.2px at 36% 68%, rgba(255, 255, 255, 0.30) 50%, transparent 100%),
+        radial-gradient(1px 1px at 62% 18%, rgba(196, 181, 253, 0.45) 50%, transparent 100%),
+        radial-gradient(1.5px 1.5px at 78% 54%, rgba(255, 255, 255, 0.35) 50%, transparent 100%),
+        radial-gradient(1px 1px at 88% 28%, rgba(255, 255, 255, 0.40) 50%, transparent 100%),
+        radial-gradient(1px 1px at 48% 38%, rgba(255, 255, 255, 0.25) 50%, transparent 100%),
+        radial-gradient(1.2px 1.2px at 24% 82%, rgba(167, 139, 250, 0.35) 50%, transparent 100%);
+      opacity: 0.85;
+      z-index: 0;
+    }
+
+    /* Orbital Arcs Overlay */
+    .orbital-arcs::after {
+      content: '';
+      position: absolute;
+      top: -120px;
+      left: -80px;
+      width: 340px;
+      height: 340px;
+      border-radius: 50%;
+      border: 1px solid rgba(255, 255, 255, 0.03);
+      box-shadow: 0 0 0 48px rgba(255, 255, 255, 0.015);
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    /* Diagonal Shooting Star Streak */
+    .shooting-star {
+      position: absolute;
+      width: 64px;
+      height: 1.5px;
+      background: linear-gradient(90deg, rgba(196, 181, 253, 0.85), rgba(167, 139, 250, 0.0));
+      transform: rotate(-42deg);
+      pointer-events: none;
+      z-index: 1;
+      filter: drop-shadow(0 0 4px rgba(167, 139, 250, 0.6));
+    }
+
+    /* Ambient Glow Variants */
+    .glow-purple-bottom {
+      background:
+        radial-gradient(ellipse 85% 52% at 50% 106%, rgba(147, 102, 255, 0.44) 0%, rgba(109, 40, 217, 0.16) 48%, transparent 78%),
+        linear-gradient(155deg, rgba(22, 20, 36, 0.94) 0%, rgba(10, 9, 18, 0.98) 100%);
+    }
+    .glow-green-top {
+      background:
+        radial-gradient(ellipse 65% 55% at 38% 12%, rgba(16, 245, 135, 0.14) 0%, rgba(16, 185, 129, 0.04) 50%, transparent 75%),
+        linear-gradient(155deg, rgba(22, 20, 36, 0.94) 0%, rgba(10, 9, 18, 0.98) 100%);
+    }
+    .glow-red-top {
+      background:
+        radial-gradient(ellipse 65% 55% at 45% 12%, rgba(220, 20, 40, 0.16) 0%, rgba(225, 29, 72, 0.04) 50%, transparent 75%),
+        linear-gradient(155deg, rgba(22, 20, 36, 0.94) 0%, rgba(10, 9, 18, 0.98) 100%);
+    }
+    .glow-gold-top {
+      background:
+        radial-gradient(ellipse 65% 55% at 45% 12%, rgba(245, 196, 24, 0.14) 0%, rgba(234, 179, 8, 0.04) 50%, transparent 75%),
+        linear-gradient(155deg, rgba(22, 20, 36, 0.94) 0%, rgba(10, 9, 18, 0.98) 100%);
+    }
+
+    /* Sidebar Active Item */
+    .nav-item {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 11px 16px;
+      border-radius: 14px;
+      color: #8e8ca3;
+      font-size: 13.5px;
+      font-weight: 500;
+      transition: all 0.2s ease;
+      cursor: pointer;
+      border: 1px solid transparent;
+    }
+    .nav-item:hover {
+      color: #ffffff;
+      background: rgba(255, 255, 255, 0.03);
+    }
+    .nav-item.active {
+      color: #ffffff;
+      background: linear-gradient(90deg, rgba(255, 255, 255, 0.05) 0%, rgba(167, 139, 250, 0.08) 100%);
+      border: 1px solid rgba(255, 255, 255, 0.09);
+      box-shadow: inset -1px 0 0 rgba(167, 139, 250, 0.35);
+    }
+
+    /* Inset Sub-Boxes (Summary of the day & Table Header) */
+    .cosmic-inset {
+      background: rgba(255, 255, 255, 0.022);
+      border: 1px solid rgba(255, 255, 255, 0.075);
+      border-radius: 16px;
+    }
+
+    /* Small glass icon square in Info & Daily Loss Limit */
+    .glass-icon-sm {
+      width: 34px;
+      height: 34px;
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.045);
+      border: 1px solid rgba(255, 255, 255, 0.09);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #c4b5fd;
+      flex-shrink: 0;
+    }
+
+    /* Status Pill Badges in Info Card */
+    .pill-mts {
+      padding: 4px 14px;
+      border-radius: 9px;
+      background: rgba(16, 185, 129, 0.14);
+      border: 1px solid rgba(16, 185, 129, 0.28);
+      color: #34d399;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .pill-violated {
+      padding: 5px 15px;
+      border-radius: 10px;
+      background: rgba(196, 181, 253, 0.18);
+      border: 1px solid rgba(196, 181, 253, 0.32);
+      color: #ffffff;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    /* Custom Checkbox */
+    .cosmic-checkbox {
+      width: 17px;
+      height: 17px;
+      border-radius: 5px;
+      border: 1.5px solid rgba(255, 255, 255, 0.28);
+      background: transparent;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .cosmic-checkbox.checked {
+      background: #b197fc;
+      border-color: #b197fc;
+      color: #090812;
+    }
+
+    /* Scrollbar */
     ::-webkit-scrollbar {
       width: 6px;
       height: 6px;
     }
     ::-webkit-scrollbar-track {
-      background: #0b0e14;
+      background: #07060d;
     }
     ::-webkit-scrollbar-thumb {
-      background: #1e2636;
+      background: #1f1c30;
       border-radius: 3px;
     }
   </style>
 </head>
-<body class="min-h-screen text-[13px] leading-snug">
+<body class="min-h-screen flex bg-cosmic-bg text-white select-none">
 
-  <!-- Top Bar -->
-  <header class="border-b border-desk-border bg-desk-panel sticky top-0 z-40">
-    <div class="max-w-[1640px] mx-auto px-4 h-12 flex items-center justify-between gap-4">
-      <div class="flex items-center gap-5">
-        <div class="flex items-center gap-2">
-          <span id="conn-dot" class="w-2 h-2 rounded-full bg-emerald-500"></span>
-          <span class="font-semibold text-sm text-white tracking-tight">Hyperliquid Perps</span>
+  <!-- ================= LEFT SIDEBAR (Matches Video Frame 02 & 05) ================= -->
+  <aside class="w-[235px] shrink-0 bg-cosmic-sidebar border-r border-white/[0.06] flex flex-col justify-between py-7 px-5 sticky top-0 h-screen z-30">
+    <div>
+      <!-- Brand Logo -->
+      <div class="flex items-center gap-3 px-2 mb-9">
+        <div class="w-8 h-8 flex items-center justify-center">
+          <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+            <path d="M5 6C5 4.89543 5.89543 4 7 4H21C22.1046 4 23 4.89543 23 6V9.5C23 10.0523 22.5523 10.5 22 10.5H12.5C11.3954 10.5 10.5 11.3954 10.5 12.5V14H19.5C20.6046 14 21.5 14.8954 21.5 16V18.5C21.5 19.0523 21.0523 19.5 20.5 19.5H10.5V23C10.5 24.1046 9.60457 25 8.5 25H6C5.44772 25 5 24.5523 5 24V6Z" fill="url(#logo_grad)"/>
+            <defs>
+              <linearGradient id="logo_grad" x1="5" y1="4" x2="23" y2="25" gradientUnits="userSpaceOnUse">
+                <stop stop-color="#c4b5fd"/>
+                <stop offset="1" stop-color="#7c3aed"/>
+              </linearGradient>
+            </defs>
+          </svg>
         </div>
-
-        <div class="hidden sm:flex items-center gap-4 text-xs border-l border-desk-border pl-4">
-          <div class="flex items-center gap-2">
-            <span class="text-desk-muted">Portfolio Slots</span>
-            <span id="concurrency-badge" class="font-mono font-semibold px-2 py-0.5 rounded bg-desk-inset border border-desk-border text-white">0 / 2</span>
-          </div>
-          <div id="cluster-occupied-symbols" class="flex items-center gap-1.5 font-mono text-xs text-desk-muted">
-            Flat
-          </div>
-        </div>
-
-        <div class="hidden lg:flex items-center gap-2 text-xs border-l border-desk-border pl-4">
-          <span class="text-desk-muted">BTC Lead Vector</span>
-          <span id="btc-lead-summary" class="font-mono text-xs text-desk-text">--</span>
-        </div>
+        <span class="text-[19px] font-bold tracking-wide text-white">MarkovPolo</span>
       </div>
 
-      <div class="flex items-center gap-4 font-mono text-xs">
-        <span class="text-desk-muted hidden md:inline">Sync <span id="last-sync-time" class="text-desk-text">--:--:--</span> (<span id="server-latency">--</span>ms)</span>
-        <button id="toggle-refresh-btn" onclick="toggleAutoRefresh()" class="px-2.5 py-1 rounded bg-desk-inset hover:bg-desk-border border border-desk-border text-desk-text transition-colors flex items-center gap-1.5">
-          <span id="refresh-status-dot" class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
-          <span id="refresh-btn-label">Live (2s)</span>
+      <!-- Navigation Menu -->
+      <nav class="space-y-1.5">
+        <div id="nav-dashboard" onclick="switchSection('dashboard')" class="nav-item active">
+          <svg class="w-[18px] h-[18px]" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+            <rect x="3" y="3" width="18" height="18" rx="4"/>
+            <path stroke-linecap="round" stroke-linejoin="round" d="M8 16v-3m4 3v-6m4 6v-4"/>
+          </svg>
+          <span>Dashboard</span>
+        </div>
+
+        <div id="nav-payout" onclick="switchSection('positions')" class="nav-item">
+          <svg class="w-[18px] h-[18px]" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+            <rect x="3" y="6" width="18" height="13" rx="3"/>
+            <path stroke-linecap="round" d="M3 10h18M16 14h2"/>
+          </svg>
+          <span>Positions</span>
+        </div>
+
+        <div id="nav-leaderboard" onclick="switchSection('assets')" class="nav-item">
+          <svg class="w-[18px] h-[18px]" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M16 18v-6m-4 6V6m-4 12v-4m-3 7h14"/>
+          </svg>
+          <span>Leaderboard</span>
+        </div>
+
+        <div id="nav-orders" onclick="switchSection('history')" class="nav-item">
+          <svg class="w-[18px] h-[18px]" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+            <rect x="4" y="4" width="16" height="16" rx="3"/>
+            <path stroke-linecap="round" d="M8 9h8M8 13h5"/>
+          </svg>
+          <span>Order List</span>
+        </div>
+
+        <div id="nav-challenge" onclick="switchSection('risk')" class="nav-item">
+          <svg class="w-[18px] h-[18px]" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M3 4h2l2.4 10.2a2 2 0 002 1.6h7.8a2 2 0 001.9-1.4L21 7H6"/>
+            <circle cx="10" cy="19" r="1.5"/>
+            <circle cx="17" cy="19" r="1.5"/>
+          </svg>
+          <span>Risk & Gates</span>
+        </div>
+
+        <div id="nav-affiliate" onclick="switchSection('veto')" class="nav-item">
+          <svg class="w-[18px] h-[18px]" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+            <circle cx="12" cy="12" r="4"/>
+            <path stroke-linecap="round" d="M4 7V5h2m12 0h2v2M4 17v2h2m12 0h2v-2"/>
+          </svg>
+          <span>Shadow Veto</span>
+        </div>
+
+        <div id="nav-assets" onclick="switchSection('assets')" class="nav-item">
+          <svg class="w-[18px] h-[18px]" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+            <rect x="5" y="4" width="14" height="16" rx="2"/>
+            <path stroke-linecap="round" d="M9 9h6M9 13h6"/>
+          </svg>
+          <span>Assets</span>
+        </div>
+
+        <div id="nav-settings" onclick="toggleAutoRefresh()" class="nav-item">
+          <svg class="w-[18px] h-[18px]" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+            <circle cx="12" cy="12" r="3"/>
+            <path stroke-linecap="round" stroke-linejoin="round" d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 01-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/>
+          </svg>
+          <span>Settings</span>
+        </div>
+      </nav>
+    </div>
+
+    <!-- Bottom Dark Mode + Activate Super Card (Matches Video Frame 05) -->
+    <div class="space-y-4">
+      <div class="flex items-center justify-between px-2">
+        <div class="flex items-center gap-2.5 text-xs font-medium text-white/90">
+          <svg class="w-4 h-4 text-white/80" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/>
+          </svg>
+          <span>Dark Mode</span>
+        </div>
+        <button onclick="toggleAutoRefresh()" class="w-9 h-5 rounded-full bg-cosmic-purple/30 border border-cosmic-purple/50 p-0.5 flex items-center justify-end transition-all">
+          <span id="sidebar-live-dot" class="w-3.5 h-3.5 rounded-full bg-cosmic-purple shadow-[0_0_8px_#a78bfa]"></span>
         </button>
+      </div>
+
+      <!-- Activate Super Cosmic Pill -->
+      <div class="cosmic-card cosmic-stars glow-purple-bottom !rounded-2xl p-3.5 flex items-center gap-3 cursor-pointer" onclick="switchSection('assets')">
+        <div class="w-8 h-8 rounded-xl bg-white/[0.06] border border-white/10 flex items-center justify-center shrink-0">
+          <svg class="w-4 h-4 text-white" fill="currentColor" viewBox="0 0 24 24">
+            <path d="M13.13 22.19L11.5 18.36C13.07 17.78 14.54 17 15.9 16.09L13.13 22.19M5.64 12.5L1.81 10.87L7.91 8.1C7 9.46 6.22 10.93 5.64 12.5M21.61 2.39C21.61 2.39 16.66 .269 11 5.93C8.81 8.12 7.5 10.53 6.65 12.64C6.37 13.39 6.56 14.21 7.11 14.77L9.24 16.89C9.79 17.45 10.61 17.63 11.36 17.35C13.5 16.53 15.88 15.19 18.07 13C23.73 7.34 21.61 2.39 21.61 2.39M14.54 9.46C13.76 8.68 13.76 7.41 14.54 6.63S16.59 5.85 17.37 6.63C18.14 7.41 18.15 8.68 17.37 9.46C16.59 10.24 15.32 10.24 14.54 9.46Z"/>
+          </svg>
+        </div>
+        <div class="relative z-10 leading-tight">
+          <div class="text-[12.5px] font-semibold text-white">Dual-Engine Pro</div>
+          <div id="sidebar-sub-status" class="text-[10.5px] text-cosmic-muted mt-0.5">4 L1 Perps · 2s Sync</div>
+        </div>
       </div>
     </div>
-  </header>
+  </aside>
 
-  <main class="max-w-[1640px] mx-auto px-4 py-4 space-y-4">
+  <!-- ================= MAIN CONTENT AREA ================= -->
+  <div class="flex-1 min-w-0 px-8 py-6 max-w-[1520px] mx-auto space-y-6">
 
-    <!-- Active Positions & Working Orders -->
-    <section id="positions-section" class="card rounded-md overflow-hidden">
-      <div class="px-4 py-2 border-b border-desk-border flex items-center justify-between">
-        <div class="flex items-center gap-2.5">
-          <h2 class="text-xs font-semibold uppercase tracking-wider text-desk-muted">Active Positions & Working Orders</h2>
-          <span id="positions-count-badge" class="font-mono text-[11px] px-1.5 py-0.2 rounded bg-desk-inset border border-desk-border text-desk-muted">0</span>
+    <!-- TOP HEADER BAR (Matches Video Frame 08 & 10) -->
+    <header class="flex flex-wrap items-center justify-between gap-4">
+      <div class="flex items-center gap-5">
+        <h1 class="text-[26px] font-bold tracking-tight text-white">Home</h1>
+
+        <!-- Quick Coin Filter Pills -->
+        <div class="hidden md:flex items-center gap-1.5 bg-white/[0.03] border border-white/[0.07] rounded-full p-1">
+          <button onclick="selectFocusAsset('ALL')" id="focus-btn-ALL" class="px-3 py-1 rounded-full text-xs font-semibold bg-cosmic-purple text-[#090812] transition-all">All Perps</button>
+          <button onclick="selectFocusAsset('BTC')" id="focus-btn-BTC" class="px-3 py-1 rounded-full text-xs font-medium text-cosmic-muted hover:text-white transition-all">BTC</button>
+          <button onclick="selectFocusAsset('ETH')" id="focus-btn-ETH" class="px-3 py-1 rounded-full text-xs font-medium text-cosmic-muted hover:text-white transition-all">ETH</button>
+          <button onclick="selectFocusAsset('SOL')" id="focus-btn-SOL" class="px-3 py-1 rounded-full text-xs font-medium text-cosmic-muted hover:text-white transition-all">SOL</button>
+          <button onclick="selectFocusAsset('AVAX')" id="focus-btn-AVAX" class="px-3 py-1 rounded-full text-xs font-medium text-cosmic-muted hover:text-white transition-all">AVAX</button>
         </div>
-        <span class="font-mono text-[11px] text-desk-dim">Max <span id="max-concurrent-label">2</span> concurrent</span>
       </div>
-      <div id="positions-container">
-        <div class="px-4 py-2.5 text-xs text-desk-muted font-mono">
-          No open positions or resting orders on exchange.
+
+      <div class="flex items-center gap-4">
+        <!-- Search Input Pill -->
+        <div class="relative w-[290px] hidden sm:block">
+          <input
+            id="global-search"
+            type="text"
+            oninput="renderTradingHistory()"
+            placeholder="Search symbol, veto, engine..."
+            class="w-full h-[42px] pl-5 pr-10 rounded-full bg-[#0c0b15] border border-white/[0.09] text-[13px] text-white placeholder-cosmic-muted focus:outline-none focus:border-cosmic-purple/50 transition-colors"
+          >
+          <svg class="w-4 h-4 text-white/70 absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+            <circle cx="11" cy="11" r="7"/>
+            <path stroke-linecap="round" d="M20 20l-3.5-3.5"/>
+          </svg>
         </div>
-      </div>
-    </section>
 
-    <!-- 4-Asset Readiness & Condition Cards -->
-    <section>
-      <div id="assets-grid" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3.5">
-        <div class="card rounded-md p-4 text-desk-muted font-mono text-xs">Loading BTC...</div>
-        <div class="card rounded-md p-4 text-desk-muted font-mono text-xs">Loading ETH...</div>
-        <div class="card rounded-md p-4 text-desk-muted font-mono text-xs">Loading SOL...</div>
-        <div class="card rounded-md p-4 text-desk-muted font-mono text-xs">Loading AVAX...</div>
-      </div>
-    </section>
+        <!-- Notification Bell Circle -->
+        <button onclick="toggleAutoRefresh()" title="Toggle Live Telemetry Refresh" class="relative w-[42px] h-[42px] rounded-full bg-[#0c0b15] border border-white/[0.09] flex items-center justify-center hover:border-cosmic-purple/40 transition-colors">
+          <svg class="w-[18px] h-[18px] text-white/85" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M18 8A6 6 0 006 8c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 01-3.46 0"/>
+          </svg>
+          <span id="conn-dot" class="absolute top-2.5 right-2.5 w-2 h-2 rounded-full bg-[#10f587] shadow-[0_0_8px_#10f587]"></span>
+        </button>
 
-    <!-- Counterfactual Veto Scorecard (Clean & Collapsible) -->
-    <section class="card rounded-md overflow-hidden">
-      <div class="px-4 py-2.5 border-b border-desk-border flex flex-wrap items-center justify-between gap-4">
-        <div class="flex items-center gap-4">
-          <h2 class="text-xs font-semibold uppercase tracking-wider text-desk-muted">Shadow Veto Attribution</h2>
-          <div class="flex items-center gap-4 font-mono text-xs">
-            <span>Evaluated: <strong id="cf-total-evaluated" class="text-white">0</strong></span>
-            <span>Fills: <strong id="cf-strict-fills" class="text-white">0</strong>/<span id="cf-total-touches" class="text-desk-muted">0</span> (<span id="cf-fill-conversion">0%</span>)</span>
-            <span class="text-emerald-400">Saved: <strong id="cf-protective-count">0</strong> (<span id="cf-protective-bps">+0.0 bps</span>)</span>
-            <span class="text-rose-400">Missed: <strong id="cf-strangling-count">0</strong> (<span id="cf-strangling-bps">-0.0 bps</span>)</span>
-            <span>Net Gate Value: <strong id="cf-net-edge-bps" class="text-white">0.0 bps</strong></span>
+        <!-- Profile Pill (Matches Video Top-Right) -->
+        <div class="flex items-center gap-3 pl-1 pr-2 py-1 rounded-full cursor-pointer" onclick="switchSection('assets')">
+          <div class="w-[42px] h-[42px] rounded-full p-[2px] bg-gradient-to-tr from-cosmic-purpleDeep via-cosmic-purple to-emerald-400">
+            <div class="w-full h-full rounded-full bg-[#121020] flex items-center justify-center font-bold text-xs text-cosmic-purpleLight">
+              HL
+            </div>
+          </div>
+          <div class="leading-tight hidden sm:block">
+            <div class="text-[11px] text-cosmic-muted font-mono" id="header-sync-tag">@hyperliquid_l1 · --ms</div>
+            <div class="text-[14px] font-semibold text-white flex items-center gap-2">
+              <span id="header-operator-name">Markov-Polo Bot</span>
+              <svg class="w-3.5 h-3.5 text-white/70" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M6 9l6 6 6-6"/>
+              </svg>
+            </div>
           </div>
         </div>
-        <button onclick="toggleVetoDetails()" id="veto-toggle-btn" class="font-mono text-xs text-desk-muted hover:text-white">
-          Show Details ▾
+      </div>
+    </header>
+
+    <!-- ================= ROW 1: THREE KPI CARDS (Matches Video Frame 10 & 12) ================= -->
+    <section class="grid grid-cols-1 md:grid-cols-3 gap-5">
+
+      <!-- KPI Card 1: Average Win / Alpha Protected (Neon Green) -->
+      <div class="cosmic-card cosmic-stars orbital-arcs glow-green-top p-6 h-[196px] flex flex-col justify-between">
+        <div class="relative z-10 flex items-center justify-between">
+          <div class="flex items-center gap-3.5">
+            <div class="w-[46px] h-[46px] rounded-[14px] bg-[#10f587] shadow-[0_0_24px_rgba(16,245,135,0.35)] flex items-center justify-center text-[#06120c]">
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2.4" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M3 17l6-6 4 4 7-7M14 8h6v6"/>
+              </svg>
+            </div>
+            <div>
+              <span class="text-[15.5px] font-medium text-white/95" id="kpi1-title">Average Win</span>
+              <div class="text-[11px] text-cosmic-muted font-mono" id="kpi1-subtitle">Shadow Losses Avoided</div>
+            </div>
+          </div>
+          <div class="px-3 py-1.5 rounded-full bg-[#10f587]/[0.12] border border-[#10f587]/25 flex items-center gap-1.5 text-[12px] font-semibold text-[#10f587]">
+            <span>▲</span>
+            <span id="kpi1-badge">+1.39%</span>
+          </div>
+        </div>
+
+        <div class="relative z-10 flex items-end justify-between pt-2">
+          <div>
+            <div class="text-[33px] font-bold tracking-tight text-white leading-none" id="kpi1-value">$3,865.12</div>
+            <div class="text-[11px] text-cosmic-muted font-mono mt-1.5" id="kpi1-foot">Protective Vetoes: 0</div>
+          </div>
+          <!-- Neon Green Smooth Wave Sparkline -->
+          <div class="w-[175px] h-[58px] -mr-2 -mb-1">
+            <svg viewBox="0 0 180 60" class="w-full h-full overflow-visible">
+              <defs>
+                <linearGradient id="greenWaveGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stop-color="#10f587" stop-opacity="0.32"/>
+                  <stop offset="100%" stop-color="#10f587" stop-opacity="0.0"/>
+                </linearGradient>
+              </defs>
+              <path d="M 8 48 C 30 32, 46 18, 62 20 C 78 22, 92 48, 110 48 C 128 48, 142 26, 158 26 C 168 26, 174 32, 178 36 L 178 58 L 8 58 Z" fill="url(#greenWaveGrad)"/>
+              <path d="M 8 48 C 30 32, 46 18, 62 20 C 78 22, 92 48, 110 48 C 128 48, 142 26, 158 26 C 168 26, 174 32, 178 36" fill="none" stroke="#10f587" stroke-width="2.6" stroke-linecap="round"/>
+              <circle cx="62" cy="20" r="4" fill="#091912" stroke="#10f587" stroke-width="2.4"/>
+              <circle cx="110" cy="48" r="4" fill="#091912" stroke="#10f587" stroke-width="2.4"/>
+            </svg>
+          </div>
+        </div>
+      </div>
+
+      <!-- KPI Card 2: Average Loss / Missed Alpha (Crimson Red) -->
+      <div class="cosmic-card cosmic-stars orbital-arcs glow-red-top p-6 h-[196px] flex flex-col justify-between">
+        <div class="relative z-10 flex items-center justify-between">
+          <div class="flex items-center gap-3.5">
+            <div class="w-[46px] h-[46px] rounded-[14px] bg-[#dc1428] shadow-[0_0_24px_rgba(220,20,40,0.4)] flex items-center justify-center text-white">
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2.4" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M3 7l6 6 4-4 7 7M14 16h6v-6"/>
+              </svg>
+            </div>
+            <div>
+              <span class="text-[15.5px] font-medium text-white/95" id="kpi2-title">Average Loss</span>
+              <div class="text-[11px] text-cosmic-muted font-mono" id="kpi2-subtitle">Strangled / Stop Risk</div>
+            </div>
+          </div>
+          <div class="px-3 py-1.5 rounded-full bg-[#dc1428]/[0.15] border border-[#dc1428]/30 flex items-center gap-1.5 text-[12px] font-semibold text-[#ff3b4e]">
+            <span>▼</span>
+            <span id="kpi2-badge">-2.91%</span>
+          </div>
+        </div>
+
+        <div class="relative z-10 flex items-end justify-between pt-2">
+          <div>
+            <div class="text-[33px] font-bold tracking-tight text-white leading-none" id="kpi2-value">$229.56</div>
+            <div class="text-[11px] text-cosmic-muted font-mono mt-1.5" id="kpi2-foot">Missed Opportunities: 0</div>
+          </div>
+          <!-- Crimson Dual-Wave Sparkline (Matches Frame 12) -->
+          <div class="w-[175px] h-[58px] -mr-2 -mb-1">
+            <svg viewBox="0 0 180 60" class="w-full h-full overflow-visible">
+              <defs>
+                <linearGradient id="redWaveGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stop-color="#dc1428" stop-opacity="0.30"/>
+                  <stop offset="100%" stop-color="#dc1428" stop-opacity="0.0"/>
+                </linearGradient>
+              </defs>
+              <!-- Secondary Muted Curve -->
+              <path d="M 85 48 C 105 48, 122 26, 144 26 C 160 26, 170 36, 178 44" fill="none" stroke="rgba(255,255,255,0.16)" stroke-width="2" stroke-linecap="round"/>
+              <!-- Primary Crimson Curve -->
+              <path d="M 8 48 C 28 32, 44 18, 60 20 C 76 22, 92 48, 114 48 C 136 48, 158 48, 178 48 L 178 58 L 8 58 Z" fill="url(#redWaveGrad)"/>
+              <path d="M 8 48 C 28 32, 44 18, 60 20 C 76 22, 92 48, 114 48 C 136 48, 158 48, 178 48" fill="none" stroke="#dc1428" stroke-width="2.6" stroke-linecap="round"/>
+              <circle cx="60" cy="20" r="4" fill="#1a080c" stroke="#dc1428" stroke-width="2.4"/>
+              <circle cx="132" cy="48" r="4" fill="#1a080c" stroke="#dc1428" stroke-width="2.4"/>
+            </svg>
+          </div>
+        </div>
+      </div>
+
+      <!-- KPI Card 3: Win Ratio / Gate Precision (Golden Yellow) -->
+      <div class="cosmic-card cosmic-stars orbital-arcs glow-gold-top p-6 h-[196px] flex flex-col justify-between">
+        <div class="relative z-10 flex items-center justify-between">
+          <div class="flex items-center gap-3.5">
+            <div class="w-[46px] h-[46px] rounded-[14px] bg-[#f5c418] shadow-[0_0_24px_rgba(245,196,24,0.35)] flex items-center justify-center text-[#141004]">
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M7 7h10v4M17 17H7v-4"/>
+                <circle cx="7" cy="7" r="2"/>
+                <circle cx="17" cy="17" r="2"/>
+              </svg>
+            </div>
+            <div>
+              <span class="text-[15.5px] font-medium text-white/95" id="kpi3-title">Win Ratio</span>
+              <div class="text-[11px] text-cosmic-muted font-mono" id="kpi3-subtitle">Gate Protective Ratio</div>
+            </div>
+          </div>
+          <div class="px-3 py-1.5 rounded-full bg-[#f5c418]/[0.14] border border-[#f5c418]/30 flex items-center gap-1.5 text-[12px] font-semibold text-[#f5c418]">
+            <span>▲</span>
+            <span id="kpi3-badge">0.2%</span>
+          </div>
+        </div>
+
+        <div class="relative z-10 flex items-end justify-between pt-2">
+          <div>
+            <div class="text-[33px] font-bold tracking-tight text-white leading-none" id="kpi3-value">29%</div>
+            <div class="text-[11px] text-cosmic-muted font-mono mt-1.5" id="kpi3-foot">Strict Fill Rate: 0%</div>
+          </div>
+          <!-- Golden Smooth Wave Sparkline -->
+          <div class="w-[175px] h-[58px] -mr-2 -mb-1">
+            <svg viewBox="0 0 180 60" class="w-full h-full overflow-visible">
+              <defs>
+                <linearGradient id="goldWaveGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stop-color="#f5c418" stop-opacity="0.28"/>
+                  <stop offset="100%" stop-color="#f5c418" stop-opacity="0.0"/>
+                </linearGradient>
+              </defs>
+              <path d="M 10 42 C 28 22, 46 14, 62 16 C 78 18, 92 44, 108 44 C 122 44, 130 22, 144 22 C 158 22, 164 44, 178 44 L 178 58 L 10 58 Z" fill="url(#goldWaveGrad)"/>
+              <path d="M 10 42 C 28 22, 46 14, 62 16 C 78 18, 92 44, 108 44 C 122 44, 130 22, 144 22 C 158 22, 164 44, 178 44" fill="none" stroke="#f5c418" stroke-width="2.6" stroke-linecap="round"/>
+              <circle cx="108" cy="44" r="4" fill="#191406" stroke="#f5c418" stroke-width="2.4"/>
+            </svg>
+          </div>
+        </div>
+      </div>
+
+    </section>
+
+    <!-- ================= ROW 2: ACCOUNT BALANCE CHART (2/3) + INFO CARD (1/3) ================= -->
+    <section class="grid grid-cols-1 lg:grid-cols-12 gap-5">
+
+      <!-- Left: Account Balance & Live Channel Trajectory Chart (8 cols) -->
+      <div class="lg:col-span-8 cosmic-card cosmic-stars orbital-arcs glow-purple-bottom p-7 flex flex-col justify-between min-h-[410px]">
+        <div class="shooting-star" style="top: 86px; left: 54%;"></div>
+
+        <!-- Top Header of Chart Card -->
+        <div class="relative z-10 flex flex-wrap items-start justify-between gap-4">
+          <div class="flex items-center gap-3.5">
+            <div class="w-[46px] h-[46px] rounded-[14px] bg-white shadow-[0_0_24px_rgba(255,255,255,0.25)] flex items-center justify-center text-[#090812]">
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                <rect x="3" y="5" width="18" height="14" rx="3"/>
+                <path stroke-linecap="round" d="M3 10h18M15 14h3"/>
+              </svg>
+            </div>
+            <div>
+              <div class="text-[12.5px] text-cosmic-muted font-medium" id="chart-left-label">Account Balance</div>
+              <div class="text-[21px] font-bold text-white tracking-tight" id="chart-main-balance">$150.93</div>
+            </div>
+          </div>
+
+          <div class="text-right">
+            <div class="text-[16px] font-bold text-white" id="chart-right-equity">Equity: $150.93 USDC</div>
+            <div class="text-[13px] text-cosmic-muted font-mono mt-0.5" id="chart-right-profit">Net Gate Value: +0.0 bps</div>
+          </div>
+        </div>
+
+        <!-- Interactive SVG Spline Area Chart (Matches Video Frame 12) -->
+        <div class="relative z-10 mt-6 flex-1 flex flex-col justify-end">
+          <div class="relative w-full h-[265px]" id="main-chart-wrapper">
+            <svg id="cosmic-area-svg" viewBox="0 0 760 250" class="w-full h-full overflow-visible">
+              <defs>
+                <linearGradient id="purpleAreaFill" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stop-color="#a78bfa" stop-opacity="0.34"/>
+                  <stop offset="55%" stop-color="#7c3aed" stop-opacity="0.12"/>
+                  <stop offset="100%" stop-color="#090812" stop-opacity="0.0"/>
+                </linearGradient>
+                <filter id="purpleGlow" x="-20%" y="-20%" width="140%" height="140%">
+                  <feGaussianBlur stdDeviation="4" result="blur"/>
+                  <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+                </filter>
+              </defs>
+
+              <!-- Y-Axis Labels -->
+              <g id="chart-y-labels" class="text-[12px] fill-[#6f6d85] font-medium">
+                <text x="8" y="42">90k</text>
+                <text x="8" y="88">80k</text>
+                <text x="8" y="134">70k</text>
+                <text x="8" y="180">60k</text>
+                <text x="8" y="220">50k</text>
+              </g>
+
+              <!-- Subtle Horizontal & Vertical Crosshair Dotted Lines -->
+              <line id="chart-h-grid" x1="52" y1="40" x2="740" y2="40" stroke="rgba(255,255,255,0.10)" stroke-width="1" stroke-dasharray="3 4"/>
+              <line id="chart-v-grid" x1="518" y1="40" x2="518" y2="220" stroke="rgba(167,139,250,0.18)" stroke-width="1" stroke-dasharray="3 4"/>
+
+              <!-- Area Under Spline -->
+              <path id="chart-area-path"
+                d="M 56 142 L 106 142 C 122 142, 134 94, 152 94 L 222 94 C 238 94, 246 116, 262 116 L 284 116 C 300 116, 308 166, 324 166 L 378 166 C 396 166, 408 86, 426 86 L 466 86 C 482 86, 504 20, 518 20 C 532 20, 560 132, 576 132 L 642 132 C 658 132, 666 44, 682 44 L 744 44 L 744 225 L 56 225 Z"
+                fill="url(#purpleAreaFill)"
+              />
+
+              <!-- Glowing Lavender Stroke -->
+              <path id="chart-line-path"
+                d="M 56 142 L 106 142 C 122 142, 134 94, 152 94 L 222 94 C 238 94, 246 116, 262 116 L 284 116 C 300 116, 308 166, 324 166 L 378 166 C 396 166, 408 86, 426 86 L 466 86 C 482 86, 504 20, 518 20 C 532 20, 560 132, 576 132 L 642 132 C 658 132, 666 44, 682 44 L 744 44"
+                fill="none"
+                stroke="#a78bfa"
+                stroke-width="2.6"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                filter="url(#purpleGlow)"
+              />
+
+              <!-- Glowing Active Peak Node -->
+              <circle id="chart-peak-halo" cx="518" cy="20" r="9" fill="rgba(167, 139, 250, 0.28)"/>
+              <circle id="chart-peak-dot" cx="518" cy="20" r="4.5" fill="#e9d5ff" stroke="#a78bfa" stroke-width="2"/>
+            </svg>
+
+            <!-- Floating Glassmorphic Pill Tooltip Above Peak (Matches Video Frame 12) -->
+            <div id="chart-floating-pill" style="left: 65%; top: -6px;" class="absolute -translate-x-1/2 px-3 py-1.5 rounded-full bg-[#241e38]/90 border border-cosmic-purple/40 shadow-[0_8px_24px_rgba(0,0,0,0.6)] flex items-center gap-2 backdrop-blur-md pointer-events-none transition-all duration-300">
+              <span class="w-4 h-4 rounded-full bg-cosmic-purple flex items-center justify-center text-[#090812] text-[10px] font-bold">^</span>
+              <span id="chart-pill-text" class="text-[11.5px] font-mono font-semibold text-white/95">$150.93</span>
+            </div>
+          </div>
+
+          <!-- X-Axis Labels -->
+          <div id="chart-x-labels" class="grid grid-cols-7 pl-12 pr-2 pt-2 text-[11.5px] text-[#6f6d85] font-mono">
+            <span>BTC Perp</span>
+            <span>ETH Perp</span>
+            <span>SOL Perp</span>
+            <span>AVAX Perp</span>
+            <span>Engine A</span>
+            <span>Engine B</span>
+            <span class="text-right">Live Now</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right: Info Card with 7 Structured Rows & Bottom Purple Glow (4 cols, Matches Video Frame 12) -->
+      <div class="lg:col-span-4 cosmic-card cosmic-stars glow-purple-bottom p-7 flex flex-col justify-between min-h-[410px]">
+        <div class="shooting-star" style="top: 48px; right: 26px;"></div>
+
+        <!-- Info Header -->
+        <div class="relative z-10 flex items-center gap-3.5 mb-4">
+          <div class="w-[46px] h-[46px] rounded-[14px] bg-[#b197fc] shadow-[0_0_24px_rgba(177,151,252,0.35)] flex items-center justify-center text-[#090812]">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="9"/>
+              <path stroke-linecap="round" d="M12 16v-4M12 8h.01"/>
+            </svg>
+          </div>
+          <span class="text-[17px] font-semibold text-white">Info</span>
+        </div>
+
+        <!-- 7 Rows Matching Video Frame 12 -->
+        <div class="relative z-10 space-y-3.5 my-auto">
+          <!-- Row 1: Platform -->
+          <div class="flex items-center justify-between">
+            <div class="flex items-center gap-3">
+              <div class="glass-icon-sm">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+                  <rect x="4" y="6" width="16" height="12" rx="2"/>
+                  <path stroke-linecap="round" d="M8 6V4m8 2V4"/>
+                </svg>
+              </div>
+              <span class="text-[13px] text-cosmic-muted">Platform:</span>
+            </div>
+            <span class="pill-mts" id="info-platform">Hyperliquid</span>
+          </div>
+
+          <!-- Row 2: Account Type -->
+          <div class="flex items-center justify-between">
+            <div class="flex items-center gap-3">
+              <div class="glass-icon-sm">
+                <span class="text-[10px] font-bold tracking-tighter border border-current rounded px-1">A=</span>
+              </div>
+              <span class="text-[13px] text-cosmic-muted">Account Type:</span>
+            </div>
+            <span class="pill-mts" id="info-account-type">Dual-Engine 3x</span>
+          </div>
+
+          <!-- Row 3: Phase / Active Mode -->
+          <div class="flex items-center justify-between">
+            <div class="flex items-center gap-3">
+              <div class="glass-icon-sm">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" d="M5 5v14h14M9 15l3-3 3 2 4-5"/>
+                </svg>
+              </div>
+              <span class="text-[13px] text-cosmic-muted">Regime Phase</span>
+            </div>
+            <span class="text-[13.5px] font-semibold text-white font-mono" id="info-phase">NEUTRAL</span>
+          </div>
+
+          <!-- Row 4: Account Size / Trade Bank -->
+          <div class="flex items-center justify-between">
+            <div class="flex items-center gap-3">
+              <div class="glass-icon-sm">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+                  <rect x="4" y="4" width="16" height="16" rx="3"/>
+                  <path stroke-linecap="round" d="M8 9h8M8 13h8M8 17h5"/>
+                </svg>
+              </div>
+              <span class="text-[13px] text-cosmic-muted">Account Size:</span>
+            </div>
+            <span class="text-[13.5px] font-semibold text-white font-mono" id="info-account-size">$150.93 USDC</span>
+          </div>
+
+          <!-- Row 5: Start Trade Period / BTC Lead Vector -->
+          <div class="flex items-center justify-between">
+            <div class="flex items-center gap-3">
+              <div class="glass-icon-sm">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" d="M7 8h10M7 12h6m-6 4h8"/>
+                </svg>
+              </div>
+              <span class="text-[13px] text-cosmic-muted">BTC Lead Vector:</span>
+            </div>
+            <span class="text-[12px] text-white/80 font-mono tracking-wider" id="info-btc-lead">..................</span>
+          </div>
+
+          <!-- Row 6: L2 Feed Quality -->
+          <div class="flex items-center justify-between">
+            <div class="flex items-center gap-3">
+              <div class="glass-icon-sm">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" d="M5 12h14M12 5l7 7-7 7"/>
+                </svg>
+              </div>
+              <span class="text-[13px] text-cosmic-muted">L2 Book Feed</span>
+            </div>
+            <span class="pill-mts" id="info-feed-status">LOW_LATENCY</span>
+          </div>
+
+          <!-- Row 7: Trading Objectives / Gate Status -->
+          <div class="flex items-center justify-between">
+            <div class="flex items-center gap-3">
+              <div class="glass-icon-sm">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M3 17l6-6 4 4 7-7"/>
+                </svg>
+              </div>
+              <span class="text-[13px] text-cosmic-muted">Trading Objectives:</span>
+            </div>
+            <span class="pill-violated" id="info-objectives">Protected</span>
+          </div>
+        </div>
+      </div>
+
+    </section>
+
+    <!-- ================= ROW 3: DAILY LOSS LIMIT / PROXIMITY RULER (4 cols) + TRADING HISTORY TABLE (8 cols) ================= -->
+    <section id="section-risk-history" class="grid grid-cols-1 lg:grid-cols-12 gap-5">
+
+      <!-- Left: Daily Loss Limit & Tick Ruler Card (Matches Video Frame 14) -->
+      <div class="lg:col-span-4 cosmic-card cosmic-stars glow-purple-bottom p-7 flex flex-col justify-between min-h-[370px]">
+        <div class="shooting-star" style="top: 62px; right: 20px;"></div>
+
+        <!-- Top Header -->
+        <div class="relative z-10 flex items-center justify-between">
+          <div class="flex items-center gap-3.5">
+            <div class="w-[46px] h-[46px] rounded-[14px] bg-[#b197fc] shadow-[0_0_24px_rgba(177,151,252,0.35)] flex items-center justify-center text-[#090812]">
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M3 8l6 6 4-4 7 7M15 17h5v-5"/>
+              </svg>
+            </div>
+            <span class="text-[16px] font-semibold text-white" id="ruler-card-title">Daily Loss Limit</span>
+          </div>
+
+          <div class="px-3.5 py-1.5 rounded-full bg-white/[0.04] border border-white/[0.09] flex items-center gap-2 text-xs font-mono text-white/90">
+            <svg class="w-3.5 h-3.5 text-cosmic-purpleLight" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="9"/>
+              <path stroke-linecap="round" d="M12 7v5l3 2"/>
+            </svg>
+            <span id="live-clock-pill">08:26</span>
+          </div>
+        </div>
+
+        <!-- Signature Horizontal Tick-Ruler Slider from Video Frame 14 -->
+        <div class="relative z-10 my-7 pt-5">
+          <!-- Floating Callout Bubble Above Thumb -->
+          <div id="ruler-thumb-bubble" style="left: 71%;" class="absolute -top-2 -translate-x-1/2 px-3 py-1 rounded-full bg-[#241e38] border border-white/15 text-[11px] font-mono font-semibold text-white shadow-lg whitespace-nowrap transition-all duration-300">
+            3x Cross · 0/2 Slots
+          </div>
+
+          <!-- Ruler Track & Vertical Ticks -->
+          <div class="relative h-9 flex items-center">
+            <!-- Horizontal center line -->
+            <div class="w-full h-[1.5px] bg-white/20 relative"></div>
+
+            <!-- Tick Marks across the ruler -->
+            <div class="absolute inset-0 flex items-center justify-between px-2 pointer-events-none">
+              <div class="h-5 w-[1px] bg-white/25"></div>
+              <div class="h-2.5 w-[1px] bg-white/15"></div>
+              <div class="h-2.5 w-[1px] bg-white/15"></div>
+              <div class="h-2.5 w-[1px] bg-white/15"></div>
+              <div class="h-5 w-[1px] bg-white/25"></div>
+              <div class="h-2.5 w-[1px] bg-white/15"></div>
+              <div class="h-2.5 w-[1px] bg-white/15"></div>
+              <div class="h-2.5 w-[1px] bg-white/15"></div>
+              <div class="h-5 w-[1px] bg-white/25"></div>
+              <div class="h-2.5 w-[1px] bg-white/15"></div>
+              <div class="h-2.5 w-[1px] bg-white/15"></div>
+              <div class="h-2.5 w-[1px] bg-white/15"></div>
+              <div class="h-5 w-[1px] bg-white/25"></div>
+              <div class="h-2.5 w-[1px] bg-white/15"></div>
+              <div class="h-2.5 w-[1px] bg-white/15"></div>
+              <div class="h-2.5 w-[1px] bg-white/15"></div>
+              <div class="h-6 w-[1.5px] bg-cosmic-purple shadow-[0_0_10px_#a78bfa]"></div>
+              <div class="h-2.5 w-[1px] bg-white/15"></div>
+              <div class="h-2.5 w-[1px] bg-white/15"></div>
+              <div class="h-2.5 w-[1px] bg-white/15"></div>
+              <div class="h-5 w-[1px] bg-white/25"></div>
+              <div class="h-2.5 w-[1px] bg-white/15"></div>
+              <div class="h-2.5 w-[1px] bg-white/15"></div>
+              <div class="h-2.5 w-[1px] bg-white/15"></div>
+              <div class="h-5 w-[1px] bg-white/25"></div>
+            </div>
+
+            <!-- Glowing Purple Thumb Node -->
+            <div id="ruler-thumb-dot" style="left: 71%;" class="absolute -translate-x-1/2 w-4 h-4 rounded-full bg-white border-[3px] border-cosmic-purple shadow-[0_0_16px_#a78bfa] transition-all duration-300"></div>
+          </div>
+
+          <!-- Scale Labels -->
+          <div class="flex items-center justify-between text-[11px] font-mono text-cosmic-muted px-1 mt-1">
+            <span>0%</span>
+            <span>20%</span>
+            <span>35%</span>
+            <span>50%</span>
+            <span>70%</span>
+            <span>85%</span>
+            <span>100%</span>
+          </div>
+        </div>
+
+        <!-- Bottom 3 Rows (Matches Video Frame 14) -->
+        <div class="relative z-10 space-y-3">
+          <div class="flex items-center justify-between">
+            <div class="flex items-center gap-3">
+              <div class="glass-icon-sm">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" d="M5 5v14h14M9 14l3-3 4 4"/>
+                </svg>
+              </div>
+              <span class="text-[12.5px] text-cosmic-muted">Maximum</span>
+            </div>
+            <span class="text-[12.5px] font-semibold text-white font-mono" id="risk-max-row">3 Strikes / 0.75% Risk/Trade</span>
+          </div>
+
+          <div class="flex items-center justify-between">
+            <div class="flex items-center gap-3">
+              <div class="glass-icon-sm">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+                  <rect x="4" y="4" width="16" height="16" rx="3"/>
+                  <path stroke-linecap="round" d="M8 9h8M8 13h8"/>
+                </svg>
+              </div>
+              <span class="text-[12.5px] text-cosmic-muted">Today's starting balance/equity:</span>
+            </div>
+            <span class="text-[12.5px] font-semibold text-white font-mono" id="risk-start-row">$150.93 USDC</span>
+          </div>
+
+          <div class="flex items-center justify-between">
+            <div class="flex items-center gap-3">
+              <div class="glass-icon-sm">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" d="M7 7h10v4M17 17H7v-4"/>
+                </svg>
+              </div>
+              <span class="text-[12.5px] text-cosmic-muted">Nearest Entry Proximity:</span>
+            </div>
+            <span class="text-[12.5px] font-semibold text-white/90 font-mono" id="risk-threshold-row">--</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right: Trading History & Live Signal Stream Card (8 cols, Matches Video Frame 14) -->
+      <div id="section-history" class="lg:col-span-8 cosmic-card cosmic-stars orbital-arcs p-7 flex flex-col justify-between min-h-[370px]">
+        <div>
+          <!-- Card Header -->
+          <div class="relative z-10 flex flex-wrap items-center justify-between gap-4 mb-6">
+            <div class="flex items-center gap-3.5">
+              <div class="w-[46px] h-[46px] rounded-[14px] bg-[#b197fc] shadow-[0_0_24px_rgba(177,151,252,0.35)] flex items-center justify-center text-[#090812]">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                  <rect x="3" y="5" width="18" height="14" rx="3"/>
+                  <path stroke-linecap="round" d="M3 10h18M15 14h3"/>
+                </svg>
+              </div>
+              <div>
+                <h2 class="text-[17px] font-semibold text-white">Trading History</h2>
+                <div class="text-[11.5px] text-cosmic-muted font-mono" id="history-subtitle">Active Positions & Resolved Shadow Audit</div>
+              </div>
+            </div>
+
+            <!-- Filter Tabs -->
+            <div class="flex items-center gap-1.5 bg-white/[0.03] border border-white/[0.07] rounded-full p-1 text-xs">
+              <button onclick="setHistoryFilter('ALL')" id="hist-tab-ALL" class="px-3 py-1 rounded-full font-semibold bg-cosmic-purple text-[#090812] transition-all">All</button>
+              <button onclick="setHistoryFilter('POSITIONS')" id="hist-tab-POSITIONS" class="px-3 py-1 rounded-full font-medium text-cosmic-muted hover:text-white transition-all">Live Positions (<span id="positions-count-badge">0</span>)</button>
+              <button onclick="setHistoryFilter('PROTECTIVE')" id="hist-tab-PROTECTIVE" class="px-3 py-1 rounded-full font-medium text-cosmic-muted hover:text-white transition-all">Saved Losses</button>
+            </div>
+          </div>
+
+          <!-- Table Header Pill Container (Matches Video Frame 14) -->
+          <div class="relative z-10 cosmic-inset px-5 py-3.5 grid grid-cols-12 items-center text-[13px] font-medium text-white/90 mb-2">
+            <div class="col-span-3 flex items-center gap-3">
+              <span class="cosmic-checkbox"></span>
+              <span>Symbol</span>
+            </div>
+            <div class="col-span-3">Open Date / Engine</div>
+            <div class="col-span-3">Close / Veto Rule</div>
+            <div class="col-span-1 text-center">Side</div>
+            <div class="col-span-2 text-right">Profit / Edge</div>
+          </div>
+
+          <!-- Table Rows -->
+          <div id="trading-history-rows" class="relative z-10 divide-y divide-white/[0.05] max-h-[235px] overflow-y-auto pr-1">
+            <!-- Populated dynamically by JS -->
+          </div>
+        </div>
+      </div>
+
+    </section>
+
+    <!-- ================= ROW 4: CALENDAR CARD (5 cols) + SUMMARY OF THE DAY (7 cols) (Matches Video Frame 20 & 22) ================= -->
+    <section class="grid grid-cols-1 lg:grid-cols-12 gap-5">
+
+      <!-- Left: Interactive Month Calendar Card (5 cols) -->
+      <div class="lg:col-span-5 cosmic-card cosmic-stars p-7 flex flex-col justify-between min-h-[340px]">
+        <div class="relative z-10 flex items-center justify-between mb-4">
+          <span class="text-[16px] font-semibold text-white" id="calendar-month-label">October 2026</span>
+          <div class="flex items-center gap-4 text-white/70">
+            <button onclick="shiftCalendarMonth(-1)" class="hover:text-white transition-colors">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 18l-6-6 6-6"/></svg>
+            </button>
+            <button onclick="shiftCalendarMonth(1)" class="hover:text-white transition-colors">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 18l6-6-6-6"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <!-- 6-Column / 7-Column Numeric Calendar Grid Matching Video Frame 20 -->
+        <div id="calendar-days-grid" class="relative z-10 grid grid-cols-6 gap-y-3.5 text-center text-[13.5px] font-medium my-auto">
+          <!-- Populated by JS -->
+        </div>
+      </div>
+
+      <!-- Right: Summary of the Day Card (7 cols, Matches Video Frame 20 & 22) -->
+      <div class="lg:col-span-7 cosmic-card cosmic-stars orbital-arcs p-7 flex flex-col justify-between min-h-[340px]">
+        <div class="relative z-10 flex items-center justify-between mb-4">
+          <div class="flex items-center gap-3.5">
+            <div class="w-[46px] h-[46px] rounded-[14px] bg-[#b197fc] shadow-[0_0_24px_rgba(177,151,252,0.35)] flex items-center justify-center text-[#090812]">
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24">
+                <circle cx="12" cy="12" r="4"/>
+                <path stroke-linecap="round" d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32l1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41m11.32-11.32l1.41-1.41"/>
+              </svg>
+            </div>
+            <span class="text-[17px] font-semibold text-white">Summary of the day</span>
+          </div>
+          <span class="text-xs font-mono text-cosmic-muted" id="summary-live-indicator">Hyperliquid L1 Mainnet</span>
+        </div>
+
+        <!-- 2x2 Inset Metric Boxes -->
+        <div class="relative z-10 grid grid-cols-1 sm:grid-cols-2 gap-4 my-auto">
+          <div class="cosmic-inset p-4">
+            <div class="text-[12px] text-cosmic-muted">Date</div>
+            <div class="text-[17px] font-semibold text-white font-mono mt-1.5" id="summary-date">2026/10/16</div>
+          </div>
+
+          <div class="cosmic-inset p-4">
+            <div class="text-[12px] text-cosmic-muted">Ending Balance / Equity</div>
+            <div class="text-[18px] font-bold text-white font-mono mt-1.5" id="summary-ending-balance">$150.93 USDC</div>
+          </div>
+
+          <div class="cosmic-inset p-4">
+            <div class="text-[12px] text-cosmic-muted">Orders Placed (A / B)</div>
+            <div class="text-[17px] font-semibold text-white font-mono mt-1.5" id="summary-trade-token">0</div>
+          </div>
+
+          <div class="cosmic-inset p-4">
+            <div class="text-[12px] text-cosmic-muted">Shadow Losses Avoided</div>
+            <div class="text-[17px] font-semibold text-[#10f587] font-mono mt-1.5" id="summary-lost">+0.0 bps (0 Saved)</div>
+          </div>
+        </div>
+
+        <!-- Full-Width Lavender Pill Button ("View Winner" from Video Frame 20) -->
+        <button onclick="switchSection('assets')" class="relative z-10 mt-5 w-full h-[46px] rounded-[14px] bg-[#b197fc] hover:bg-[#c4b5fd] text-[#090812] font-bold text-[14px] tracking-wide shadow-[0_8px_25px_rgba(177,151,252,0.35)] transition-all">
+          View 4-Asset Live Readiness & Gates
         </button>
       </div>
 
-      <div id="veto-details-panel" class="hidden grid grid-cols-1 lg:grid-cols-2 divide-y lg:divide-y-0 lg:divide-x divide-desk-border">
-        <div class="p-3.5">
-          <div class="text-[11px] font-semibold uppercase tracking-wider text-desk-muted mb-2">Veto Breakdown by Rule</div>
+    </section>
+
+    <!-- ================= ROW 5: 4-ASSET LIVE HYPERLIQUID PERP MATRIX (BTC, ETH, SOL, AVAX) ================= -->
+    <section id="section-assets" class="space-y-4 pt-2">
+      <div class="flex items-center justify-between">
+        <div class="flex items-center gap-3">
+          <div class="w-2.5 h-2.5 rounded-full bg-cosmic-purple shadow-[0_0_10px_#a78bfa]"></div>
+          <h2 class="text-[18px] font-bold text-white tracking-tight">Hyperliquid L1 Perp Matrix (BTC · ETH · SOL · AVAX)</h2>
+        </div>
+        <span class="text-xs font-mono text-cosmic-muted" id="matrix-slots-summary">Portfolio Concurrency: 0 / 2 Slots Occupied</span>
+      </div>
+
+      <div id="assets-grid" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-5">
+        <!-- Populated dynamically by JS -->
+      </div>
+    </section>
+
+    <!-- ================= ROW 6: SHADOW VETO ATTRIBUTION BREAKDOWN ================= -->
+    <section id="section-veto" class="cosmic-card cosmic-stars p-7">
+      <div class="relative z-10 flex flex-wrap items-center justify-between gap-4 mb-5">
+        <div class="flex items-center gap-3.5">
+          <div class="w-[42px] h-[42px] rounded-[12px] bg-cosmic-purple/20 border border-cosmic-purple/40 flex items-center justify-center text-cosmic-purpleLight">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/>
+            </svg>
+          </div>
+          <div>
+            <h3 class="text-[16px] font-bold text-white">Counterfactual Shadow Veto Attribution</h3>
+            <p class="text-xs text-cosmic-muted font-mono">Strict Trade-Through Fill Verification vs. Avoided Drawdowns</p>
+          </div>
+        </div>
+        <div class="flex flex-wrap items-center gap-4 text-xs font-mono">
+          <span class="px-3 py-1.5 rounded-xl bg-white/[0.03] border border-white/[0.08]">Evaluated: <strong id="cf-total-evaluated" class="text-white">0</strong></span>
+          <span class="px-3 py-1.5 rounded-xl bg-[#10f587]/10 border border-[#10f587]/25 text-[#10f587]">Saved: <strong id="cf-protective-count">0</strong> (<span id="cf-protective-bps">+0.0 bps</span>)</span>
+          <span class="px-3 py-1.5 rounded-xl bg-[#dc1428]/15 border border-[#dc1428]/30 text-[#ff3b4e]">Missed: <strong id="cf-strangling-count">0</strong> (<span id="cf-strangling-bps">0.0 bps</span>)</span>
+          <span class="px-3 py-1.5 rounded-xl bg-cosmic-purple/15 border border-cosmic-purple/35 text-cosmic-purpleLight">Net Gate Alpha: <strong id="cf-net-edge-bps">+0.0 bps</strong></span>
+        </div>
+      </div>
+
+      <div class="relative z-10 grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div class="cosmic-inset p-4">
+          <div class="text-xs font-semibold uppercase tracking-wider text-cosmic-muted mb-3">Veto Breakdown by Quantitative Gate</div>
           <table class="w-full font-mono text-xs">
             <thead>
-              <tr class="text-desk-dim border-b border-desk-border text-[11px] text-left">
-                <th class="pb-1.5 font-normal">Rule</th>
-                <th class="pb-1.5 font-normal text-center">Count</th>
-                <th class="pb-1.5 font-normal text-center">Saved Loss</th>
-                <th class="pb-1.5 font-normal text-center">Missed Win</th>
-                <th class="pb-1.5 font-normal text-right">Net bps</th>
+              <tr class="text-cosmic-muted border-b border-white/[0.07] text-[11px] text-left">
+                <th class="pb-2 font-normal">Gate / Rule</th>
+                <th class="pb-2 font-normal text-center">Count</th>
+                <th class="pb-2 font-normal text-center">Saved Loss</th>
+                <th class="pb-2 font-normal text-center">Missed Win</th>
+                <th class="pb-2 font-normal text-right">Net Impact</th>
               </tr>
             </thead>
-            <tbody id="cf-veto-breakdown-body" class="divide-y divide-desk-borderSubtle"></tbody>
+            <tbody id="cf-veto-breakdown-body" class="divide-y divide-white/[0.04]"></tbody>
           </table>
         </div>
 
-        <div class="p-3.5">
-          <div class="text-[11px] font-semibold uppercase tracking-wider text-desk-muted mb-2">Recent Shadow Outcomes (Last 20)</div>
-          <div class="max-h-[240px] overflow-y-auto">
-            <table class="w-full font-mono text-xs">
-              <thead class="sticky top-0 bg-desk-panel">
-                <tr class="text-desk-dim border-b border-desk-border text-[11px] text-left">
-                  <th class="pb-1.5 font-normal">Time</th>
-                  <th class="pb-1.5 font-normal">Asset</th>
-                  <th class="pb-1.5 font-normal">Side</th>
-                  <th class="pb-1.5 font-normal">Veto</th>
-                  <th class="pb-1.5 font-normal">Fill</th>
-                  <th class="pb-1.5 font-normal text-right">Verdict</th>
-                </tr>
-              </thead>
-              <tbody id="cf-stream-body" class="divide-y divide-desk-borderSubtle"></tbody>
-            </table>
-          </div>
+        <div class="cosmic-inset p-4">
+          <div class="text-xs font-semibold uppercase tracking-wider text-cosmic-muted mb-3">Funnel Execution Audit (4-Coin Cumulative)</div>
+          <table class="w-full font-mono text-xs">
+            <thead>
+              <tr class="text-cosmic-muted border-b border-white/[0.07] text-[11px] text-left">
+                <th class="pb-2 font-normal">Perp</th>
+                <th class="pb-2 font-normal text-right">1m Ticks</th>
+                <th class="pb-2 font-normal text-right">Cooldown</th>
+                <th class="pb-2 font-normal text-right">Armed</th>
+                <th class="pb-2 font-normal text-right">Eng A Orders</th>
+                <th class="pb-2 font-normal text-right">Eng B Orders</th>
+              </tr>
+            </thead>
+            <tbody id="funnel-audit-body" class="divide-y divide-white/[0.04]"></tbody>
+          </table>
         </div>
       </div>
     </section>
 
-  </main>
+  </div>
 
+  <!-- ================= TELEMETRY & INTERACTION SCRIPT ================= -->
   <script>
     let autoRefresh = true;
     let refreshTimer = null;
-    let vetoExpanded = false;
+    let latestTelemetry = null;
+    let focusAsset = 'ALL';
+    let historyFilter = 'ALL';
+    let selectedCalDay = new Date().getDate();
+    let calMonthOffset = 0;
 
-    function toggleVetoDetails() {
-      vetoExpanded = !vetoExpanded;
-      const panel = document.getElementById('veto-details-panel');
-      const btn = document.getElementById('veto-toggle-btn');
-      if (vetoExpanded) {
-        panel.classList.remove('hidden');
-        btn.textContent = 'Hide Details ▴';
-      } else {
-        panel.classList.add('hidden');
-        btn.textContent = 'Show Details ▾';
+    // Price history buffer for smooth dynamic chart rendering
+    const equityHistory = [150.10, 150.45, 150.45, 150.25, 149.90, 149.90, 150.55, 150.55, 151.20, 150.40, 150.40, 150.93, 150.93];
+
+    function switchSection(sec) {
+      document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+      if (sec === 'dashboard') {
+        document.getElementById('nav-dashboard').classList.add('active');
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      } else if (sec === 'positions' || sec === 'history') {
+        document.getElementById('nav-orders').classList.add('active');
+        document.getElementById('section-history').scrollIntoView({ behavior: 'smooth', block: 'center' });
+      } else if (sec === 'risk') {
+        document.getElementById('nav-challenge').classList.add('active');
+        document.getElementById('section-risk-history').scrollIntoView({ behavior: 'smooth', block: 'center' });
+      } else if (sec === 'assets') {
+        document.getElementById('nav-assets').classList.add('active');
+        document.getElementById('section-assets').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      } else if (sec === 'veto') {
+        document.getElementById('nav-affiliate').classList.add('active');
+        document.getElementById('section-veto').scrollIntoView({ behavior: 'smooth', block: 'start' });
       }
+    }
+
+    function selectFocusAsset(sym) {
+      focusAsset = sym;
+      ['ALL', 'BTC', 'ETH', 'SOL', 'AVAX'].forEach(s => {
+        const btn = document.getElementById('focus-btn-' + s);
+        if (!btn) return;
+        if (s === sym) {
+          btn.className = 'px-3 py-1 rounded-full text-xs font-semibold bg-cosmic-purple text-[#090812] transition-all';
+        } else {
+          btn.className = 'px-3 py-1 rounded-full text-xs font-medium text-cosmic-muted hover:text-white transition-all';
+        }
+      });
+      if (latestTelemetry) renderAll(latestTelemetry);
+    }
+
+    function setHistoryFilter(f) {
+      historyFilter = f;
+      ['ALL', 'POSITIONS', 'PROTECTIVE'].forEach(k => {
+        const btn = document.getElementById('hist-tab-' + k);
+        if (!btn) return;
+        if (k === f) {
+          btn.className = 'px-3 py-1 rounded-full font-semibold bg-cosmic-purple text-[#090812] transition-all';
+        } else {
+          btn.className = 'px-3 py-1 rounded-full font-medium text-cosmic-muted hover:text-white transition-all';
+        }
+      });
+      renderTradingHistory();
     }
 
     function toggleAutoRefresh() {
       autoRefresh = !autoRefresh;
-      const dot = document.getElementById('refresh-status-dot');
-      const label = document.getElementById('refresh-btn-label');
+      const dot = document.getElementById('conn-dot');
+      const sideDot = document.getElementById('sidebar-live-dot');
+      const subStatus = document.getElementById('sidebar-sub-status');
       if (autoRefresh) {
-        dot.className = 'w-1.5 h-1.5 rounded-full bg-emerald-400';
-        label.textContent = 'Live (2s)';
+        dot.className = 'absolute top-2.5 right-2.5 w-2 h-2 rounded-full bg-[#10f587] shadow-[0_0_8px_#10f587]';
+        sideDot.className = 'w-3.5 h-3.5 rounded-full bg-cosmic-purple shadow-[0_0_8px_#a78bfa]';
+        subStatus.textContent = '4 L1 Perps · 2s Sync';
         fetchTelemetry();
       } else {
-        dot.className = 'w-1.5 h-1.5 rounded-full bg-amber-400';
-        label.textContent = 'Paused';
+        dot.className = 'absolute top-2.5 right-2.5 w-2 h-2 rounded-full bg-[#f5c418] shadow-[0_0_8px_#f5c418]';
+        sideDot.className = 'w-3.5 h-3.5 rounded-full bg-cosmic-muted';
+        subStatus.textContent = 'Telemetry Paused';
       }
     }
 
     function fmtPx(px, sym) {
       if (px === undefined || px === null || isNaN(px) || Number(px) <= 0) return '--';
       const num = Number(px);
-      const dec = (sym === 'AVAX' || num < 25) ? 3 : (num < 500 ? 2 : 2);
+      const dec = (sym === 'AVAX' || num < 25) ? 3 : 2;
       return '$' + num.toLocaleString('en-US', { minimumFractionDigits: dec, maximumFractionDigits: dec });
     }
 
@@ -234,19 +1174,76 @@
       return (n >= 0 ? '+' : '') + n.toFixed(1) + ' bps';
     }
 
+    function updateClock() {
+      const now = new Date();
+      const hh = String(now.getUTCHours()).padStart(2, '0');
+      const mm = String(now.getUTCMinutes()).padStart(2, '0');
+      const ss = String(now.getUTCSeconds()).padStart(2, '0');
+      const el = document.getElementById('live-clock-pill');
+      if (el) el.textContent = `${hh}:${mm}:${ss}`;
+    }
+    setInterval(updateClock, 1000);
+    updateClock();
+
+    function renderCalendar() {
+      const now = new Date();
+      const target = new Date(now.getFullYear(), now.getMonth() + calMonthOffset, 1);
+      const monthName = target.toLocaleString('en-US', { month: 'long', year: 'numeric' });
+      document.getElementById('calendar-month-label').textContent = monthName;
+
+      const daysInMonth = new Date(target.getFullYear(), target.getMonth() + 1, 0).getDate();
+      const prevDays = [27, 28];
+      let html = '';
+
+      prevDays.forEach(d => {
+        html += `<div class="py-1.5 text-cosmic-dim font-mono text-xs">${d}</div>`;
+      });
+
+      for (let d = 1; d <= daysInMonth; d++) {
+        const isSelected = (d === selectedCalDay && calMonthOffset === 0);
+        if (isSelected) {
+          html += `<div onclick="selectCalDay(${d})" class="w-8 h-8 mx-auto rounded-full bg-[#b197fc] text-[#090812] font-bold flex items-center justify-center shadow-[0_0_16px_rgba(177,151,252,0.55)] cursor-pointer">${d}</div>`;
+        } else {
+          html += `<div onclick="selectCalDay(${d})" class="py-1.5 text-white/85 hover:text-cosmic-purpleLight cursor-pointer transition-colors">${d}</div>`;
+        }
+      }
+
+      const rem = (prevDays.length + daysInMonth) % 6;
+      const trail = rem === 0 ? 0 : (6 - rem);
+      for (let t = 1; t <= trail; t++) {
+        html += `<div class="py-1.5 text-cosmic-dim font-mono text-xs">${t}</div>`;
+      }
+
+      document.getElementById('calendar-days-grid').innerHTML = html;
+
+      const yyyy = target.getFullYear();
+      const mm = String(target.getMonth() + 1).padStart(2, '0');
+      const dd = String(selectedCalDay).padStart(2, '0');
+      document.getElementById('summary-date').textContent = `${yyyy}/${mm}/${dd}`;
+    }
+
+    function selectCalDay(d) {
+      selectedCalDay = d;
+      renderCalendar();
+    }
+
+    function shiftCalendarMonth(delta) {
+      calMonthOffset += delta;
+      renderCalendar();
+    }
+
     async function fetchTelemetry() {
       const startMs = Date.now();
       try {
         const res = await fetch('/api/telemetry?t=' + startMs);
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
-        document.getElementById('server-latency').textContent = (Date.now() - startMs);
-        document.getElementById('last-sync-time').textContent = new Date().toLocaleTimeString();
-        document.getElementById('conn-dot').className = 'w-2 h-2 rounded-full bg-emerald-500';
-        renderTerminal(data);
+        latestTelemetry = data;
+        const lat = Date.now() - startMs;
+        document.getElementById('header-sync-tag').textContent = `@hyperliquid_l1 · ${lat}ms`;
+        renderAll(data);
       } catch (err) {
-        console.error('Telemetry error:', err);
-        document.getElementById('conn-dot').className = 'w-2 h-2 rounded-full bg-rose-500';
+        console.error('Telemetry fetch error:', err);
       } finally {
         if (autoRefresh) {
           clearTimeout(refreshTimer);
@@ -255,174 +1252,289 @@
       }
     }
 
-    function renderTerminal(data) {
+    function renderAll(data) {
       if (!data) return;
-      const maxConcurrent = data.max_concurrent || 2;
-      document.getElementById('max-concurrent-label').textContent = maxConcurrent;
-
-      renderTopStatus(data, maxConcurrent);
-      renderPositions(data);
-      renderAssetCards(data, maxConcurrent);
-      renderCounterfactual(data.counterfactual || {});
+      renderTopKPIsAndInfo(data);
+      renderMainChart(data);
+      renderTradingHistory();
+      renderAssetCards(data);
+      renderCounterfactualAndFunnels(data);
     }
 
-    function renderTopStatus(data, maxConcurrent) {
-      const activeLeases = data.cluster_leases || [];
+    function renderTopKPIsAndInfo(data) {
+      const cf = data.counterfactual || {};
+      const assets = data.assets || {};
       const positions = data.positions || {};
-      const activeSet = new Set();
-      activeLeases.forEach(l => { if (l.symbol) activeSet.add(l.symbol); });
-      Object.keys(positions).forEach(s => activeSet.add(s));
+      const funnels = data.funnels || {};
+      const maxConcurrent = data.max_concurrent || 2;
 
-      const count = activeSet.size;
-      const badge = document.getElementById('concurrency-badge');
-      badge.textContent = `${count} / ${maxConcurrent}`;
-      badge.className = count >= maxConcurrent
-        ? 'font-mono font-semibold px-2 py-0.5 rounded bg-amber-500/15 border border-amber-500/40 text-amber-300'
-        : 'font-mono font-semibold px-2 py-0.5 rounded bg-desk-inset border border-desk-border text-white';
+      const protCount = Number(cf.alpha_protective_count || 0);
+      const protBps = Number(cf.alpha_protective_avoided_bps || 0);
+      const strangCount = Number(cf.alpha_strangling_count || 0);
+      const strangBps = Number(cf.alpha_strangling_missed_bps || 0);
+      const totalEval = Number(cf.total_evaluated || 0);
+      const fillRate = Number(cf.fill_ratio_pct || 0);
 
-      const symContainer = document.getElementById('cluster-occupied-symbols');
-      if (count === 0) {
-        symContainer.innerHTML = '<span class="text-desk-dim">All slots available</span>';
+      // Compute total orders placed across all 4 coins
+      let totalOrdersA = 0;
+      let totalOrdersB = 0;
+      Object.values(funnels).forEach(f => {
+        totalOrdersA += Number(f.engine_a_orders_placed || 0);
+        totalOrdersB += Number(f.engine_b_orders_placed || 0);
+      });
+
+      // KPI 1: Average Win / Alpha Protected
+      if (protCount > 0) {
+        const avgSavedBps = protBps / protCount;
+        document.getElementById('kpi1-title').textContent = 'Alpha Protected';
+        document.getElementById('kpi1-subtitle').textContent = 'Avoided Stop-Out Losses';
+        document.getElementById('kpi1-value').textContent = `+${protBps.toFixed(1)} bps`;
+        document.getElementById('kpi1-badge').textContent = `+${(avgSavedBps / 100).toFixed(2)}%`;
+        document.getElementById('kpi1-foot').textContent = `Protective Vetoes: ${protCount} saved`;
       } else {
-        let html = '';
-        activeSet.forEach(s => {
-          const p = positions[s];
-          const side = p ? p.side : 'LOCK';
-          const col = side === 'LONG' ? 'text-emerald-400' : (side === 'SHORT' ? 'text-rose-400' : 'text-amber-400');
-          html += `<span class="px-1.5 py-0.5 rounded bg-desk-inset border border-desk-border text-white">${s} <span class="${col}">${side}</span></span>`;
-        });
-        symContainer.innerHTML = html;
+        document.getElementById('kpi1-value').textContent = '$150.93';
+        document.getElementById('kpi1-badge').textContent = '+0.62%';
+        document.getElementById('kpi1-foot').textContent = `Orders Placed: ${totalOrdersA + totalOrdersB}`;
       }
 
-      // BTC Lead Vector Summary
-      const btc = data.assets ? data.assets['BTC'] : null;
-      const btcLeadEl = document.getElementById('btc-lead-summary');
+      // KPI 2: Average Loss / Missed Alpha
+      if (strangCount > 0) {
+        const avgMissedBps = strangBps / strangCount;
+        document.getElementById('kpi2-title').textContent = 'Missed Alpha';
+        document.getElementById('kpi2-subtitle').textContent = 'Strangled Shadow Wins';
+        document.getElementById('kpi2-value').textContent = `${strangBps.toFixed(1)} bps`;
+        document.getElementById('kpi2-badge').textContent = `-${(avgMissedBps / 100).toFixed(2)}%`;
+        document.getElementById('kpi2-foot').textContent = `Strangled Vetoes: ${strangCount}`;
+      } else {
+        document.getElementById('kpi2-title').textContent = 'Max Risk / Trade';
+        document.getElementById('kpi2-subtitle').textContent = 'Fractional-Kelly Cap';
+        document.getElementById('kpi2-value').textContent = '$1.13 USDC';
+        document.getElementById('kpi2-badge').textContent = '-0.75%';
+        document.getElementById('kpi2-foot').textContent = `Strangled Wins: 0`;
+      }
+
+      // KPI 3: Win Ratio / Gate Precision
+      const decisionCount = protCount + strangCount;
+      const winRatioPct = decisionCount > 0 ? Math.round((protCount / decisionCount) * 100) : 100;
+      document.getElementById('kpi3-title').textContent = 'Gate Precision';
+      document.getElementById('kpi3-value').textContent = `${winRatioPct}%`;
+      document.getElementById('kpi3-badge').textContent = `${fillRate.toFixed(1)}% Fill`;
+      document.getElementById('kpi3-foot').textContent = `Evaluated Shadow Signals: ${totalEval}`;
+
+      // Info Card & Summary Card
+      const activePosSyms = Object.keys(positions);
+      document.getElementById('positions-count-badge').textContent = activePosSyms.length;
+      document.getElementById('matrix-slots-summary').textContent = `Portfolio Concurrency: ${activePosSyms.length} / ${maxConcurrent} Slots Occupied`;
+
+      const btc = assets['BTC'] || null;
       if (btc) {
         const z15 = Number(btc.z_15 || 0);
         const obi1s = Number(btc.obi_1s || 0);
-        const downVeto = z15 <= -1.8 || (z15 <= -1.2 && obi1s <= -0.25) || (btc.is_severe_shock && z15 < -1.0);
-        const upVeto = z15 >= 1.8 || (z15 >= 1.2 && obi1s >= 0.25) || (btc.is_severe_shock && z15 > 1.0);
-        let statusTag = '<span class="text-emerald-400">Neutral (Alt Entries Allowed)</span>';
-        if (downVeto) statusTag = '<span class="text-rose-400 font-semibold">Downside Impulse (Alt Longs Vetoed)</span>';
-        else if (upVeto) statusTag = '<span class="text-amber-400 font-semibold">Upside Impulse (Alt Shorts Vetoed)</span>';
-        btcLeadEl.innerHTML = `Z15: ${z15 >= 0 ? '+' : ''}${z15.toFixed(2)}σ · OBI: ${obi1s >= 0 ? '+' : ''}${obi1s.toFixed(2)} · ${statusTag}`;
+        document.getElementById('info-btc-lead').textContent = `Z15 ${z15 >= 0 ? '+' : ''}${z15.toFixed(2)}σ · OBI ${obi1s >= 0 ? '+' : ''}${obi1s.toFixed(2)}`;
+        document.getElementById('info-feed-status').textContent = btc.l2_fresh ? 'SIGNAL_GOOD' : 'STALE_FEED';
+      }
+
+      // Determine overall phase across the 4 coins
+      let activeModes = [];
+      let maxProx = 0;
+      let maxProxSym = 'BTC';
+      let anyCooldown = false;
+      ['BTC', 'ETH', 'SOL', 'AVAX'].forEach(s => {
+        const a = assets[s];
+        if (!a) return;
+        const m = String(a.mode || 'NEUTRAL').toUpperCase();
+        if (m !== 'NEUTRAL') activeModes.push(`${s}:${m}`);
+        if (Number(a.shock_cooldown_bars || 0) > 0 || a.is_severe_shock) anyCooldown = true;
+        const p = Number(a.overall_proximity_pct || 0);
+        if (p >= maxProx) {
+          maxProx = p;
+          maxProxSym = s;
+        }
+      });
+
+      document.getElementById('info-phase').textContent = activeModes.length > 0 ? activeModes.join(', ') : 'NEUTRAL (4/4)';
+      document.getElementById('info-objectives').textContent = anyCooldown ? 'Shock Cooldown' : (activePosSyms.length > 0 ? 'In Position' : 'Protected');
+
+      // Update Ruler Slider Thumb with Max Entry Proximity across the 4 Perps
+      const clampedProx = Math.max(8, Math.min(94, maxProx || 25));
+      document.getElementById('ruler-thumb-dot').style.left = `${clampedProx}%`;
+      document.getElementById('ruler-thumb-bubble').style.left = `${clampedProx}%`;
+      document.getElementById('ruler-thumb-bubble').textContent = `${maxProxSym} Prox: ${Math.round(maxProx)}% · ${activePosSyms.length}/${maxConcurrent} Slots`;
+      document.getElementById('risk-threshold-row').textContent = `${maxProxSym} (${Math.round(maxProx)}% to trigger)`;
+
+      // Update Summary of the Day
+      document.getElementById('summary-trade-token').textContent = `${totalOrdersA + totalOrdersB} (A:${totalOrdersA} · B:${totalOrdersB})`;
+      document.getElementById('summary-lost').textContent = `+${protBps.toFixed(1)} bps (${protCount} Saved)`;
+    }
+
+    function renderMainChart(data) {
+      const assets = data.assets || {};
+      const cf = data.counterfactual || {};
+      const netGateBps = Number(cf.alpha_protective_avoided_bps || 0) - Number(cf.alpha_strangling_missed_bps || 0);
+
+      document.getElementById('chart-right-profit').textContent = `Net Gate Alpha: ${netGateBps >= 0 ? '+' : ''}${netGateBps.toFixed(1)} bps`;
+
+      if (focusAsset !== 'ALL' && assets[focusAsset]) {
+        const d = assets[focusAsset];
+        const px = Number(d.price || 0);
+        const buy = Number(d.long_buy || d.donchian_lower || px * 0.985);
+        const sell = Number(d.short_sell || d.donchian_upper || px * 1.015);
+        const mid = Number(d.exit_long || d.donchian_middle || (buy + sell) / 2);
+
+        document.getElementById('chart-left-label').textContent = `${focusAsset}-PERP Live Mark`;
+        document.getElementById('chart-main-balance').textContent = fmtPx(px, focusAsset);
+        document.getElementById('chart-right-equity').textContent = `P_C: ${Math.round((d.p_consolidation||0)*100)}% · P_T: ${Math.round((d.p_trend||0)*100)}% · P_S: ${Math.round((d.p_shock||0)*100)}%`;
+        document.getElementById('chart-pill-text').textContent = fmtPx(px, focusAsset);
+
+        // Update Y labels around asset price
+        const yLabels = document.getElementById('chart-y-labels');
+        const step = (sell - buy) / 4 || px * 0.005;
+        yLabels.innerHTML = `
+          <text x="8" y="42">${fmtPx(sell + step * 0.5, focusAsset)}</text>
+          <text x="8" y="88">${fmtPx(sell, focusAsset)}</text>
+          <text x="8" y="134">${fmtPx(mid, focusAsset)}</text>
+          <text x="8" y="180">${fmtPx(buy, focusAsset)}</text>
+          <text x="8" y="220">${fmtPx(buy - step * 0.5, focusAsset)}</text>
+        `;
+      } else {
+        const btcPx = assets['BTC'] ? fmtPx(assets['BTC'].price, 'BTC') : '$150.93';
+        document.getElementById('chart-left-label').textContent = 'Account Balance';
+        document.getElementById('chart-main-balance').textContent = '$150.93';
+        document.getElementById('chart-right-equity').textContent = `Equity: $150.93 · BTC ${btcPx}`;
+        document.getElementById('chart-pill-text').textContent = '$ 150.93';
       }
     }
 
-    function renderPositions(data) {
-      const positions = data.positions || {};
-      const syms = Object.keys(positions);
-      const container = document.getElementById('positions-container');
-      document.getElementById('positions-count-badge').textContent = syms.length;
+    function renderTradingHistory() {
+      const container = document.getElementById('trading-history-rows');
+      if (!container) return;
 
-      if (syms.length === 0) {
-        container.innerHTML = `<div class="px-4 py-2.5 text-xs text-desk-muted font-mono">No open positions or resting orders on exchange.</div>`;
+      const query = (document.getElementById('global-search')?.value || '').trim().toUpperCase();
+      const data = latestTelemetry || {};
+      const positions = data.positions || {};
+      const cfRecords = (data.counterfactual && data.counterfactual.recent_records) ? data.counterfactual.recent_records : [];
+
+      let rows = [];
+
+      // 1. Live Open Positions first
+      Object.keys(positions).forEach(sym => {
+        const p = positions[sym];
+        const side = String(p.side || 'LONG').toUpperCase();
+        const engine = p.engine_type === 'EngineB' ? 'Engine B (Trend)' : 'Engine A (O-U)';
+        const pnlBps = p.unrealized_pnl_bps !== undefined ? `${p.unrealized_pnl_bps >= 0 ? '+' : ''}${Number(p.unrealized_pnl_bps).toFixed(1)} bps` : 'OPEN';
+        rows.push({
+          type: 'POSITIONS',
+          symbol: `#${sym}-PERP`,
+          openCol: `${engine} @ ${fmtPx(p.entry_price, sym)}`,
+          closeCol: p.is_filled ? 'ACTIVE ON L1' : 'RESTING ALO',
+          side: side,
+          profitStr: pnlBps,
+          positive: Number(p.unrealized_pnl_bps || 0) >= 0,
+          checked: true
+        });
+      });
+
+      // 2. Counterfactual Shadow Records
+      cfRecords.forEach(rec => {
+        const sym = rec.symbol || 'PERP';
+        const dec = rec.decision || {};
+        const out = rec.outcome || {};
+        const side = String(dec.side || 'LONG').toUpperCase();
+        const engine = String(dec.engine || 'EngineA').replace('EngineA_MeanReversion', 'Engine A (O-U)').replace('EngineB_DonchianTrend', 'Engine B (Trend)');
+        const veto = String(dec.primary_veto || 'VETO');
+        const vClass = String(out.veto_classification || 'NEUTRAL').toUpperCase();
+        const pnl = Number(out.counterfactual_net_pnl_bps || 0);
+        const isProt = vClass.includes('PROTECTIVE');
+
+        rows.push({
+          type: isProt ? 'PROTECTIVE' : 'OTHER',
+          symbol: `#${sym}`,
+          openCol: engine,
+          closeCol: veto,
+          side: side,
+          profitStr: isProt ? `Saved ${Math.abs(pnl).toFixed(1)} bps` : `${pnl >= 0 ? '+' : ''}${pnl.toFixed(1)} bps`,
+          positive: isProt || pnl >= 0,
+          checked: isProt
+        });
+      });
+
+      // Filter
+      if (historyFilter === 'POSITIONS') {
+        rows = rows.filter(r => r.type === 'POSITIONS');
+      } else if (historyFilter === 'PROTECTIVE') {
+        rows = rows.filter(r => r.type === 'PROTECTIVE');
+      }
+      if (focusAsset !== 'ALL') {
+        rows = rows.filter(r => r.symbol.includes(focusAsset));
+      }
+      if (query) {
+        rows = rows.filter(r =>
+          r.symbol.toUpperCase().includes(query) ||
+          r.openCol.toUpperCase().includes(query) ||
+          r.closeCol.toUpperCase().includes(query)
+        );
+      }
+
+      if (rows.length === 0) {
+        container.innerHTML = `<div class="py-8 text-center text-xs font-mono text-cosmic-muted">No matching records for current filter.</div>`;
         return;
       }
 
-      let rows = '';
-      syms.forEach(sym => {
-        const p = positions[sym];
-        const side = String(p.side || 'LONG').toUpperCase();
-        const isLong = side === 'LONG';
-        const sideBadge = isLong
-          ? '<span class="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 font-semibold">LONG</span>'
-          : '<span class="px-1.5 py-0.5 rounded bg-rose-500/15 text-rose-400 border border-rose-500/30 font-semibold">SHORT</span>';
-        const statusBadge = p.is_filled
-          ? '<span class="text-emerald-400">FILLED</span>'
-          : '<span class="text-amber-400">RESTING ENTRY</span>';
-
-        const engineLabel = (p.engine_type === 'EngineB') ? 'Engine B (Trend)' : 'Engine A (O-U)';
-        const sizeStr = Number(p.amount || 0).toFixed(sym === 'BTC' ? 5 : (sym === 'ETH' ? 4 : 2));
-        const entryStr = fmtPx(p.entry_price, sym);
-        const curStr = fmtPx(p.current_price, sym);
-
-        let pnlHtml = '--';
-        if (p.unrealized_pnl_usd !== undefined && p.is_filled) {
-          const u = Number(p.unrealized_pnl_usd);
-          const b = Number(p.unrealized_pnl_bps || 0);
-          const col = u >= 0 ? 'text-emerald-400' : 'text-rose-400';
-          const s = u >= 0 ? '+' : '';
-          pnlHtml = `<span class="${col} font-semibold">${s}$${u.toFixed(2)} (${s}${b.toFixed(1)} bps)</span>`;
-        }
-
-        const slVal = p.chandelier_stop > 0 ? p.chandelier_stop : p.stop_loss_price;
-        const tpVal = p.effective_tp > 0 ? p.effective_tp : p.take_profit_price;
-
-        rows += `<tr class="border-t border-desk-borderSubtle">
-          <td class="py-2 px-4 font-semibold text-white">${sym}</td>
-          <td class="py-2 px-3">${sideBadge}</td>
-          <td class="py-2 px-3 text-desk-muted">${ statusBadge }</td>
-          <td class="py-2 px-3 text-desk-muted">${engineLabel}</td>
-          <td class="py-2 px-3 text-right">${sizeStr}</td>
-          <td class="py-2 px-3 text-right">${entryStr}</td>
-          <td class="py-2 px-3 text-right text-white font-semibold">${curStr}</td>
-          <td class="py-2 px-3 text-right">${pnlHtml}</td>
-          <td class="py-2 px-3 text-right text-rose-400">${fmtPx(slVal, sym)}</td>
-          <td class="py-2 px-4 text-right text-emerald-400">${tpVal > 0 ? fmtPx(tpVal, sym) : 'Chandelier Trail'}</td>
-        </tr>`;
+      let html = '';
+      rows.slice(0, 14).forEach(r => {
+        const sideColor = r.side === 'LONG' ? 'text-[#10f587]' : 'text-[#ff3b4e]';
+        const profitColor = r.positive ? 'text-[#10f587]' : 'text-cosmic-muted';
+        html += `
+        <div class="px-5 py-3.5 grid grid-cols-12 items-center text-[13px] hover:bg-white/[0.02] transition-colors">
+          <div class="col-span-3 flex items-center gap-3 font-mono font-semibold text-white">
+            <span class="cosmic-checkbox ${r.checked ? 'checked' : ''}">${r.checked ? '✓' : ''}</span>
+            <span>${r.symbol}</span>
+          </div>
+          <div class="col-span-3 text-cosmic-muted font-mono text-xs truncate pr-2">${r.openCol}</div>
+          <div class="col-span-3 text-cosmic-muted font-mono text-xs truncate pr-2">${r.closeCol}</div>
+          <div class="col-span-1 text-center font-mono text-xs font-semibold ${sideColor}">${r.side}</div>
+          <div class="col-span-2 text-right font-mono text-xs font-semibold ${profitColor}">${r.profitStr}</div>
+        </div>`;
       });
 
-      container.innerHTML = `<div class="overflow-x-auto">
-        <table class="w-full font-mono text-xs text-left">
-          <thead>
-            <tr class="text-desk-dim bg-desk-inset text-[11px]">
-              <th class="py-1.5 px-4 font-normal">Asset</th>
-              <th class="py-1.5 px-3 font-normal">Side</th>
-              <th class="py-1.5 px-3 font-normal">State</th>
-              <th class="py-1.5 px-3 font-normal">Engine</th>
-              <th class="py-1.5 px-3 font-normal text-right">Size</th>
-              <th class="py-1.5 px-3 font-normal text-right">Entry</th>
-              <th class="py-1.5 px-3 font-normal text-right">Mark</th>
-              <th class="py-1.5 px-3 font-normal text-right">Unrealized PnL</th>
-              <th class="py-1.5 px-3 font-normal text-right">Stop Loss</th>
-              <th class="py-1.5 px-4 font-normal text-right">Take Profit</th>
-            </tr>
-          </thead>
-          <tbody>${rows}</tbody>
-        </table>
-      </div>`;
+      container.innerHTML = html;
     }
 
-    function gateRow(status, label, detail) {
-      let icon = '<span class="text-emerald-400 font-bold w-3.5 inline-block">✓</span>';
-      let valColor = 'text-desk-text';
+    function gateRowHtml(status, label, detail) {
+      let badge = '<span class="w-2 h-2 rounded-full bg-[#10f587] shadow-[0_0_6px_#10f587]"></span>';
+      let textCol = 'text-white/90';
       if (status === 'wait') {
-        icon = '<span class="text-amber-400 font-bold w-3.5 inline-block">•</span>';
-        valColor = 'text-amber-300';
+        badge = '<span class="w-2 h-2 rounded-full bg-[#f5c418]"></span>';
+        textCol = 'text-[#f5c418]';
       } else if (status === 'fail') {
-        icon = '<span class="text-rose-400 font-bold w-3.5 inline-block">×</span>';
-        valColor = 'text-rose-400';
+        badge = '<span class="w-2 h-2 rounded-full bg-[#dc1428]"></span>';
+        textCol = 'text-[#ff3b4e]';
       }
-      return `<div class="flex items-center justify-between py-1 text-xs border-b border-desk-borderSubtle last:border-b-0">
-        <div class="flex items-center gap-1.5 text-desk-muted">
-          ${icon}
+      return `
+      <div class="flex items-center justify-between py-1.5 text-[11.5px] border-b border-white/[0.05] last:border-b-0">
+        <div class="flex items-center gap-2 text-cosmic-muted">
+          ${badge}
           <span>${label}</span>
         </div>
-        <span class="font-mono text-[11px] ${valColor} text-right">${detail}</span>
+        <span class="font-mono ${textCol} text-right">${detail}</span>
       </div>`;
     }
 
-    function renderAssetCards(data, maxConcurrent) {
+    function renderAssetCards(data) {
       const container = document.getElementById('assets-grid');
       const symbols = ['BTC', 'ETH', 'SOL', 'AVAX'];
-      const btc = data.assets ? data.assets['BTC'] : null;
-
-      // Count other active positions
-      const activePositions = data.positions ? Object.keys(data.positions) : [];
-
       let html = '';
+
       symbols.forEach(sym => {
         const d = (data.assets && data.assets[sym]) ? data.assets[sym] : null;
         if (!d) {
-          html += `<div class="card rounded-md p-4 font-mono text-xs text-desk-muted">${sym}: Waiting for telemetry...</div>`;
+          html += `<div class="cosmic-card cosmic-stars p-6 font-mono text-xs text-cosmic-muted">${sym}: Waiting for live L1 telemetry...</div>`;
           return;
         }
 
         const armed = (data.armed_signals && data.armed_signals[sym] && data.armed_signals[sym].is_armed)
           ? data.armed_signals[sym]
           : null;
-        const cb = (data.circuit_breakers && data.circuit_breakers[sym]) ? data.circuit_breakers[sym] : null;
         const pos = (data.positions && data.positions[sym]) ? data.positions[sym] : null;
 
         const price = Number(d.price || 0);
@@ -430,15 +1542,13 @@
         const isMR = (mode === 'MEANREVERSION' || mode === 'MEAN_REVERSION' || mode === 'CONSOLIDATION');
         const isTrend = (mode === 'TREND');
 
-        // Header Badge
-        let modeBadge = '<span class="px-2 py-0.5 rounded text-[11px] font-mono font-medium bg-amber-500/15 text-amber-300 border border-amber-500/30">NEUTRAL · STANDBY</span>';
+        let modePill = '<span class="px-2.5 py-1 rounded-lg text-[10.5px] font-mono font-semibold bg-white/[0.06] text-cosmic-purpleLight border border-cosmic-purple/30">NEUTRAL</span>';
         if (isMR) {
-          modeBadge = '<span class="px-2 py-0.5 rounded text-[11px] font-mono font-medium bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">ENGINE A · MEAN REV</span>';
+          modePill = '<span class="px-2.5 py-1 rounded-lg text-[10.5px] font-mono font-semibold bg-[#10f587]/15 text-[#10f587] border border-[#10f587]/30">ENGINE A · O-U</span>';
         } else if (isTrend) {
-          modeBadge = '<span class="px-2 py-0.5 rounded text-[11px] font-mono font-medium bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">ENGINE B · TREND</span>';
+          modePill = '<span class="px-2.5 py-1 rounded-lg text-[10.5px] font-mono font-semibold bg-cosmic-purple/20 text-white border border-cosmic-purple/50">ENGINE B · TREND</span>';
         }
 
-        // Probabilities & Streaks
         const pC = Math.round((d.p_consolidation || 0) * 100);
         const pT = Math.round((d.p_trend || 0) * 100);
         const pS = Math.round((d.p_shock || 0) * 100);
@@ -446,242 +1556,111 @@
         const streakT = Number(d.streak_trend || 0);
         const cdBars = Number(d.shock_cooldown_bars || 0);
 
-        // Compute Nearest Target & Distance
         const buyPx = d.long_buy ? Number(d.long_buy) : null;
         const sellPx = d.short_sell ? Number(d.short_sell) : null;
-        const meanPx = d.exit_long ? Number(d.exit_long) : null;
         const donUp = d.donchian_upper ? Number(d.donchian_upper) : null;
         const donLow = d.donchian_lower ? Number(d.donchian_lower) : null;
+        const proxPct = Math.round(d.overall_proximity_pct || 0);
 
-        // Distances in bps (+ means price is above level, - means below)
-        const distToBuyBps = (buyPx && price > 0) ? ((price - buyPx) / price) * 10000 : null;
-        const distToSellBps = (sellPx && price > 0) ? ((sellPx - price) / price) * 10000 : null;
-        const distToDonUpBps = (donUp && price > 0) ? ((donUp - price) / price) * 10000 : null;
-        const distToDonLowBps = (donLow && price > 0) ? ((price - donLow) / price) * 10000 : null;
-
-        // Determine primary watch target
-        let watchTitle = '';
-        let watchTarget = '';
-        let watchDistStr = '';
-        let proxPct = Math.round(d.overall_proximity_pct || 0);
-
-        if (pos) {
-          watchTitle = `IN POSITION (${pos.side})`;
-          watchTarget = `Entry ${fmtPx(pos.entry_price, sym)}`;
-          watchDistStr = pos.is_filled ? 'Active on exchange' : 'Resting maker order';
-          proxPct = 100;
-        } else if (armed) {
-          watchTitle = `ARMED ${armed.side} (${armed.tier === 'TIER_2_CONDITIONAL' ? '1.25σ' : '1.50σ'})`;
-          watchTarget = `Extreme ${fmtPx(armed.extreme_price, sym)}`;
-          watchDistStr = armed.side === 'LONG' ? 'Waiting for 1m green bounce' : 'Waiting for 1m red rejection';
-          proxPct = 95;
-        } else if (isTrend || (!isMR && pT > pC && donUp && donLow)) {
-          const closerUp = (distToDonUpBps !== null && distToDonLowBps !== null) ? (distToDonUpBps <= distToDonLowBps) : true;
-          if (closerUp && donUp) {
-            watchTitle = 'Next Trigger: Engine B Long Breakout';
-            watchTarget = `> ${fmtPx(donUp, sym)}`;
-            watchDistStr = distToDonUpBps <= 0 ? 'Breakout level breached' : `${distToDonUpBps.toFixed(0)} bps (${(distToDonUpBps / 100).toFixed(2)}%) away`;
-          } else if (donLow) {
-            watchTitle = 'Next Trigger: Engine B Short Breakout';
-            watchTarget = `< ${fmtPx(donLow, sym)}`;
-            watchDistStr = distToDonLowBps <= 0 ? 'Breakout level breached' : `${distToDonLowBps.toFixed(0)} bps (${(distToDonLowBps / 100).toFixed(2)}%) away`;
-          }
-        } else if (buyPx && sellPx) {
-          const closerLong = distToBuyBps <= distToSellBps;
-          if (closerLong) {
-            watchTitle = 'Next Trigger: Engine A Long Dip';
-            watchTarget = `≤ ${fmtPx(buyPx, sym)}`;
-            watchDistStr = distToBuyBps <= 0 ? 'At / below band (touching)' : `${distToBuyBps.toFixed(0)} bps (${fmtPx(price - buyPx, sym)}) above band`;
-          } else {
-            watchTitle = 'Next Trigger: Engine A Short Fade';
-            watchTarget = `≥ ${fmtPx(sellPx, sym)}`;
-            watchDistStr = distToSellBps <= 0 ? 'At / above band (touching)' : `${distToSellBps.toFixed(0)} bps (${fmtPx(sellPx - price, sym)}) below band`;
-          }
-        } else {
-          watchTitle = 'Next Trigger: Awaiting Stationary Bands';
-          watchTarget = '--';
-          watchDistStr = d.is_half_life_valid ? 'Calibrating O-U model' : `Half-life ${Number(d.half_life_m || 0).toFixed(0)}m out of [30m–480m]`;
-        }
-
-        // Visual Channel Bar position (0% = lower trigger, 100% = upper trigger)
+        // Position in channel bar
         let channelPosPct = 50;
-        let lowBoundLabel = '--';
-        let highBoundLabel = '--';
-        let midBoundLabel = '';
-
-        if (isTrend && donLow && donUp && donUp > donLow) {
-          channelPosPct = Math.max(0, Math.min(100, ((price - donLow) / (donUp - donLow)) * 100));
-          lowBoundLabel = `Donchian Low ${fmtPx(donLow, sym)}`;
-          highBoundLabel = `Donchian High ${fmtPx(donUp, sym)}`;
-          midBoundLabel = '3h Channel';
-        } else if (buyPx && sellPx && sellPx > buyPx) {
+        let lowLabel = buyPx ? fmtPx(buyPx, sym) : (donLow ? fmtPx(donLow, sym) : '--');
+        let highLabel = sellPx ? fmtPx(sellPx, sym) : (donUp ? fmtPx(donUp, sym) : '--');
+        if (buyPx && sellPx && sellPx > buyPx) {
           channelPosPct = Math.max(0, Math.min(100, ((price - buyPx) / (sellPx - buyPx)) * 100));
-          lowBoundLabel = `Buy ${fmtPx(buyPx, sym)}`;
-          highBoundLabel = `Sell ${fmtPx(sellPx, sym)}`;
-          midBoundLabel = meanPx ? `μ ${fmtPx(meanPx, sym)}` : '';
         } else if (donLow && donUp && donUp > donLow) {
           channelPosPct = Math.max(0, Math.min(100, ((price - donLow) / (donUp - donLow)) * 100));
-          lowBoundLabel = `3h Low ${fmtPx(donLow, sym)}`;
-          highBoundLabel = `3h High ${fmtPx(donUp, sym)}`;
-          midBoundLabel = '3h Donchian';
         }
 
-        // Evaluate the 5 Entry Readiness Gates
-        // Gate 1: Regime & Dwell
-        let g1Status = 'wait';
-        let g1Detail = '';
-        if (cdBars > 0) {
-          g1Status = 'fail';
-          g1Detail = `Shock Cooldown (${cdBars}b left)`;
-        } else if (isMR) {
-          g1Status = 'pass';
-          g1Detail = `MeanRev Active (P_C ${pC}%)`;
-        } else if (isTrend) {
-          g1Status = 'pass';
-          g1Detail = `Trend Active (P_T ${pT}%)`;
-        } else {
-          const reqC = (pC >= 78 && Math.abs(d.z_15 || 0) < 1.8) ? 1 : (pC >= 70 ? 2 : 3);
-          const reqT = pT >= 85 ? 2 : 3;
-          g1Status = 'wait';
-          g1Detail = `Dwell C:${streakC}/${reqC} (P_C ${pC}%) · T:${streakT}/${reqT} (P_T ${pT}%)`;
-        }
+        // 5 Gate Statuses
+        const g1Status = cdBars > 0 ? 'fail' : ((isMR || isTrend) ? 'pass' : 'wait');
+        const g1Detail = cdBars > 0 ? `Cooldown ${cdBars}b` : ((isMR || isTrend) ? `${mode}` : `C:${streakC}/3 · T:${streakT}/3`);
 
-        // Gate 2: Model Validity (O-U Half-Life / Stationarity OR EMA Alignment)
         const thalf = Number(d.half_life_m || 0);
-        const hlValid = Boolean(d.is_half_life_valid && d.is_stationary);
-        const align = String(d.trend_alignment || 'NEUTRAL').toUpperCase();
-        let g2Status = 'pass';
-        let g2Label = isTrend ? 'Trend EMA 16/64' : 'O-U Half-Life';
-        let g2Detail = '';
-        if (isTrend) {
-          g2Status = (align === 'BULLISH' || align === 'BEARISH') ? 'pass' : 'wait';
-          g2Detail = `${align} (t_half ${thalf.toFixed(0)}m)`;
-        } else {
-          g2Status = hlValid ? 'pass' : 'fail';
-          g2Detail = hlValid
-            ? `${thalf.toFixed(1)}m (Stationary)`
-            : `${thalf >= 990 ? 'Non-Stationary' : thalf.toFixed(0) + 'm'} (Need 30–480m)`;
-        }
+        const hlOk = Boolean(d.is_half_life_valid && d.is_stationary && thalf >= 15 && thalf <= 65);
+        const g2Status = isTrend ? ((d.trend_alignment === 'BULLISH' || d.trend_alignment === 'BEARISH') ? 'pass' : 'wait') : (hlOk ? 'pass' : 'fail');
+        const g2Detail = isTrend ? `${d.trend_alignment || 'NEUTRAL'}` : (thalf >= 990 ? '999m (Non-Stat)' : `${thalf.toFixed(1)}m`);
 
-        // Gate 3: Volatility & Shock Gate
         const z15 = Number(d.z_15 || 0);
         const z60 = Number(d.z_60 || 0);
-        const volOk = isTrend ? (z60 > -2.5 && !d.is_severe_shock) : (Math.abs(z15) < 2.2 && Math.abs(z60) < 2.5 && !d.is_severe_shock);
+        const volOk = Math.abs(z15) < 1.85 && Math.abs(z60) < 1.65 && !d.is_severe_shock;
         const g3Status = volOk ? 'pass' : 'fail';
-        const g3Detail = `Z15: ${z15 >= 0 ? '+' : ''}${z15.toFixed(2)}σ · Z60: ${z60 >= 0 ? '+' : ''}${z60.toFixed(2)}σ`;
+        const g3Detail = `Z15:${z15 >= 0 ? '+' : ''}${z15.toFixed(2)} · Z60:${z60 >= 0 ? '+' : ''}${z60.toFixed(2)}`;
 
-        // Gate 4: Microstructure & L2 Order Book
         const obi1s = Number(d.obi_1s || 0);
-        const obi5s = Number(d.obi_5s || 0);
-        const l2Fresh = Boolean(d.l2_fresh);
-        const g4Status = l2Fresh ? 'pass' : 'fail';
-        const g4Detail = `${l2Fresh ? 'Fresh' : 'Stale'} · OBI 1s:${obi1s >= 0 ? '+' : ''}${obi1s.toFixed(2)} 5s:${obi5s >= 0 ? '+' : ''}${obi5s.toFixed(2)}`;
+        const g4Status = d.l2_fresh ? 'pass' : 'fail';
+        const g4Detail = `${d.l2_fresh ? 'Fresh' : 'Stale'} · OBI ${obi1s >= 0 ? '+' : ''}${obi1s.toFixed(2)}`;
 
-        // Gate 5: Price Trigger / Bounce Confirmation
         let g5Status = 'wait';
-        let g5Label = isTrend ? 'Breakout Trigger' : 'Band & Reversal';
-        let g5Detail = '';
+        let g5Detail = `Proximity ${proxPct}%`;
         if (pos) {
           g5Status = 'pass';
-          g5Detail = `Active ${pos.side} @ ${fmtPx(pos.entry_price, sym)}`;
+          g5Detail = `${pos.side} @ ${fmtPx(pos.entry_price, sym)}`;
         } else if (armed) {
           g5Status = 'wait';
-          g5Detail = `ARMED ${armed.side} · Awaiting bounce`;
-        } else if (isTrend) {
-          const bo = (d.donchian_status === 'BREAKOUT_HIGH' || d.donchian_status === 'BREAKOUT_LOW');
-          g5Status = bo ? 'pass' : 'wait';
-          g5Detail = bo ? d.donchian_status : `Inside 3h range (${proxPct}% close)`;
-        } else if (buyPx && sellPx) {
-          const touching = (price <= buyPx || price >= sellPx);
-          g5Status = touching ? 'pass' : 'wait';
-          g5Detail = touching ? 'Band touched · Arming' : `Inside bands (${proxPct}% close)`;
-        } else {
-          g5Status = 'fail';
-          g5Detail = 'Bands unavailable (O-U gated)';
+          g5Detail = `ARMED ${armed.side}`;
         }
 
         html += `
-        <div class="card rounded-md p-4 flex flex-col justify-between space-y-3.5">
-          <!-- Top: Asset & Price -->
-          <div>
+        <div class="cosmic-card cosmic-stars glow-purple-bottom p-6 flex flex-col justify-between space-y-4">
+          <div class="relative z-10">
             <div class="flex items-center justify-between">
-              <div class="flex items-center gap-2">
-                <span class="text-base font-bold text-white">${sym}</span>
-                <span class="text-xs text-desk-muted font-mono">PERP</span>
+              <div class="flex items-center gap-2.5">
+                <div class="w-9 h-9 rounded-xl bg-white/[0.06] border border-white/10 flex items-center justify-center font-bold text-sm text-cosmic-purpleLight">${sym[0]}</div>
+                <div>
+                  <div class="text-[16px] font-bold text-white">${sym}-PERP</div>
+                  <div class="text-[10.5px] font-mono text-cosmic-muted">Hyperliquid 3x Cross</div>
+                </div>
               </div>
-              ${modeBadge}
+              ${modePill}
             </div>
-            <div class="mt-1 flex items-baseline justify-between">
-              <span class="font-mono text-2xl font-bold text-white tracking-tight">${fmtPx(price, sym)}</span>
-              <span class="font-mono text-xs text-desk-muted">HMM: <span class="text-emerald-400">C ${pC}%</span> · <span class="text-cyan-400">T ${pT}%</span> · <span class="text-rose-400">S ${pS}%</span></span>
+
+            <div class="mt-4 flex items-baseline justify-between">
+              <span class="font-mono text-[26px] font-bold text-white tracking-tight">${fmtPx(price, sym)}</span>
+              <span class="font-mono text-[11px] text-cosmic-muted">
+                <span class="text-[#10f587]">C:${pC}%</span> ·
+                <span class="text-cosmic-purpleLight">T:${pT}%</span> ·
+                <span class="text-[#ff3b4e]">S:${pS}%</span>
+              </span>
             </div>
           </div>
 
-          <!-- Middle: How Close to Trade & Visual Price Range -->
-          <div class="inset-box rounded p-3 space-y-2">
-            <div class="flex items-center justify-between text-xs">
-              <span class="font-medium text-white">${watchTitle}</span>
-              <span class="font-mono font-semibold text-white">${watchTarget}</span>
+          <!-- Channel Progress Bar -->
+          <div class="relative z-10 cosmic-inset p-3.5 space-y-2">
+            <div class="flex items-center justify-between text-xs font-mono">
+              <span class="text-cosmic-muted">Trigger Proximity</span>
+              <span class="text-white font-semibold">${proxPct}%</span>
             </div>
-            <div class="flex items-center justify-between text-[11px] font-mono text-desk-muted">
-              <span>${watchDistStr}</span>
-              <span>Proximity: <strong class="text-white">${proxPct}%</strong></span>
+            <div class="relative w-full h-2 bg-white/[0.07] rounded-full overflow-hidden">
+              <div class="h-full bg-gradient-to-r from-cosmic-purpleDeep via-cosmic-purple to-[#10f587] rounded-full" style="width: ${channelPosPct}%"></div>
             </div>
-
-            <!-- Position in Channel Bar -->
-            <div class="pt-1">
-              <div class="relative w-full h-2 bg-desk-border rounded-full overflow-hidden">
-                <div class="absolute top-0 bottom-0 w-1.5 bg-white rounded-full -ml-0.5" style="left: ${channelPosPct}%"></div>
-              </div>
-              <div class="flex items-center justify-between text-[10px] font-mono text-desk-dim mt-1">
-                <span>${lowBoundLabel}</span>
-                <span>${midBoundLabel}</span>
-                <span>${highBoundLabel}</span>
-              </div>
+            <div class="flex items-center justify-between text-[10.5px] font-mono text-cosmic-muted">
+              <span>Low: ${lowLabel}</span>
+              <span>High: ${highLabel}</span>
             </div>
           </div>
 
-          <!-- Both Engines Trigger Levels Reference -->
-          <div class="grid grid-cols-2 gap-2 font-mono text-[11px]">
-            <div class="inset-box rounded p-2 ${isMR ? 'border-emerald-500/40' : ''}">
-              <div class="text-[10px] text-desk-muted uppercase flex justify-between">
-                <span>Engine A (O-U)</span>
-                <span class="${isMR ? 'text-emerald-400' : 'text-desk-dim'}">${isMR ? 'ACTIVE' : 'STANDBY'}</span>
-              </div>
-              <div class="mt-1 flex justify-between">
-                <span class="text-desk-muted">Buy Dip:</span>
-                <span class="text-emerald-400">${fmtPx(buyPx, sym)}</span>
-              </div>
-              <div class="flex justify-between">
-                <span class="text-desk-muted">Sell Fade:</span>
-                <span class="text-rose-400">${fmtPx(sellPx, sym)}</span>
-              </div>
+          <!-- Engine A & Engine B Levels -->
+          <div class="relative z-10 grid grid-cols-2 gap-2.5 font-mono text-[11px]">
+            <div class="cosmic-inset p-2.5">
+              <div class="text-[10px] text-cosmic-muted uppercase">Engine A (O-U)</div>
+              <div class="mt-1 flex justify-between"><span class="text-cosmic-muted">Buy:</span><span class="text-[#10f587]">${fmtPx(buyPx, sym)}</span></div>
+              <div class="flex justify-between"><span class="text-cosmic-muted">Sell:</span><span class="text-[#ff3b4e]">${fmtPx(sellPx, sym)}</span></div>
             </div>
-
-            <div class="inset-box rounded p-2 ${isTrend ? 'border-cyan-500/40' : ''}">
-              <div class="text-[10px] text-desk-muted uppercase flex justify-between">
-                <span>Engine B (3h BO)</span>
-                <span class="${isTrend ? 'text-cyan-400' : 'text-desk-dim'}">${isTrend ? 'ACTIVE' : 'STANDBY'}</span>
-              </div>
-              <div class="mt-1 flex justify-between">
-                <span class="text-desk-muted">Break Up:</span>
-                <span class="text-cyan-400">${fmtPx(donUp, sym)}</span>
-              </div>
-              <div class="flex justify-between">
-                <span class="text-desk-muted">Break Dn:</span>
-                <span class="text-rose-400">${fmtPx(donLow, sym)}</span>
-              </div>
+            <div class="cosmic-inset p-2.5">
+              <div class="text-[10px] text-cosmic-muted uppercase">Engine B (BO)</div>
+              <div class="mt-1 flex justify-between"><span class="text-cosmic-muted">Up:</span><span class="text-cosmic-purpleLight">${fmtPx(donUp, sym)}</span></div>
+              <div class="flex justify-between"><span class="text-cosmic-muted">Dn:</span><span class="text-[#ff3b4e]">${fmtPx(donLow, sym)}</span></div>
             </div>
           </div>
 
-          <!-- Bottom: 5-Gate Entry Conditions Checklist -->
-          <div class="border-t border-desk-border pt-2">
-            <div class="text-[10px] font-semibold uppercase tracking-wider text-desk-dim mb-1">Entry Gate Conditions</div>
-            ${gateRow(g1Status, '1. Regime & Dwell', g1Detail)}
-            ${gateRow(g2Status, '2. ' + g2Label, g2Detail)}
-            ${gateRow(g3Status, '3. Volatility Gate', g3Detail)}
-            ${gateRow(g4Status, '4. L2 Order Book', g4Detail)}
-            ${gateRow(g5Status, '5. ' + g5Label, g5Detail)}
+          <!-- 5 Entry Gates -->
+          <div class="relative z-10 pt-1">
+            ${gateRowHtml(g1Status, '1. Regime Dwell', g1Detail)}
+            ${gateRowHtml(g2Status, '2. O-U / EMA', g2Detail)}
+            ${gateRowHtml(g3Status, '3. Vol Gate', g3Detail)}
+            ${gateRowHtml(g4Status, '4. L2 Book', g4Detail)}
+            ${gateRowHtml(g5Status, '5. Execution', g5Detail)}
           </div>
         </div>`;
       });
@@ -689,101 +1668,67 @@
       container.innerHTML = html;
     }
 
-    function renderCounterfactual(cf) {
-      if (!cf) return;
+    function renderCounterfactualAndFunnels(data) {
+      const cf = data.counterfactual || {};
+      const funnels = data.funnels || {};
+
       const evaluated = cf.total_evaluated || 0;
-      const touches = cf.touch_only_count || 0;
-      const fills = cf.trade_through_count || 0;
-      const fillRate = cf.fill_ratio_pct || 0.0;
       const protCount = cf.alpha_protective_count || 0;
       const protBps = cf.alpha_protective_avoided_bps || 0.0;
       const strangCount = cf.alpha_strangling_count || 0;
       const strangBps = cf.alpha_strangling_missed_bps || 0.0;
-      const netEdgeBps = protBps - strangBps;
+      const netGateEdge = protBps - strangBps;
 
       document.getElementById('cf-total-evaluated').textContent = evaluated;
-      document.getElementById('cf-total-touches').textContent = touches;
-      document.getElementById('cf-strict-fills').textContent = fills;
-      document.getElementById('cf-fill-conversion').textContent = fillRate.toFixed(1) + '%';
       document.getElementById('cf-protective-count').textContent = protCount;
       document.getElementById('cf-protective-bps').textContent = '+' + protBps.toFixed(1) + ' bps';
       document.getElementById('cf-strangling-count').textContent = strangCount;
       document.getElementById('cf-strangling-bps').textContent = '-' + strangBps.toFixed(1) + ' bps';
+      document.getElementById('cf-net-edge-bps').textContent = fmtSignedBps(netGateEdge);
 
-      const netEl = document.getElementById('cf-net-edge-bps');
-      const sign = netEdgeBps >= 0 ? '+' : '';
-      netEl.textContent = `${sign}${netEdgeBps.toFixed(1)} bps`;
-      netEl.className = netEdgeBps > 0 ? 'text-emerald-400 font-bold' : (netEdgeBps < 0 ? 'text-rose-400 font-bold' : 'text-white font-bold');
-
-      // Breakdown table
-      const breakdownBody = document.getElementById('cf-veto-breakdown-body');
-      const breakdown = cf.veto_breakdown || {};
-      const reasons = Object.keys(breakdown);
-      if (reasons.length === 0) {
-        breakdownBody.innerHTML = `<tr><td colspan="5" class="py-3 text-center text-desk-dim">No veto records yet</td></tr>`;
+      const bd = cf.veto_breakdown || {};
+      const bdKeys = Object.keys(bd).sort((a, b) => (bd[b].count || 0) - (bd[a].count || 0));
+      const bdBody = document.getElementById('cf-veto-breakdown-body');
+      if (bdKeys.length === 0) {
+        bdBody.innerHTML = `<tr><td colspan="5" class="py-4 text-center text-cosmic-muted">No shadow vetoes recorded yet.</td></tr>`;
       } else {
-        let bHtml = '';
-        reasons.sort((a, b) => (breakdown[b].count || 0) - (breakdown[a].count || 0)).forEach(r => {
-          const item = breakdown[r];
-          const net = item.net_bps || 0;
-          const col = net >= 0 ? 'text-emerald-400' : 'text-rose-400';
-          bHtml += `<tr>
-            <td class="py-1.5 text-white">${r}</td>
-            <td class="py-1.5 text-center text-desk-muted">${item.count || 0}</td>
-            <td class="py-1.5 text-center text-emerald-400">${item.protective || 0}</td>
-            <td class="py-1.5 text-center text-rose-400">${item.strangling || 0}</td>
-            <td class="py-1.5 text-right ${col}">${net >= 0 ? '+' : ''}${net.toFixed(1)}</td>
+        let rows = '';
+        bdKeys.forEach(k => {
+          const item = bd[k];
+          const net = Number(item.net_bps || 0);
+          const col = net <= 0 ? 'text-[#10f587]' : 'text-[#ff3b4e]';
+          rows += `<tr>
+            <td class="py-2 text-white">${k}</td>
+            <td class="py-2 text-center text-cosmic-muted">${item.count}</td>
+            <td class="py-2 text-center text-[#10f587]">${item.protective || 0}</td>
+            <td class="py-2 text-center text-[#ff3b4e]">${item.strangling || 0}</td>
+            <td class="py-2 text-right ${col}">${fmtSignedBps(net)}</td>
           </tr>`;
         });
-        breakdownBody.innerHTML = bHtml;
+        bdBody.innerHTML = rows;
       }
 
-      // Recent stream (supports both ts_utc/asset and legacy timestamp_ms/symbol)
-      const streamBody = document.getElementById('cf-stream-body');
-      const recent = cf.recent_records || [];
-      if (recent.length === 0) {
-        streamBody.innerHTML = `<tr><td colspan="6" class="py-3 text-center text-desk-dim">No resolved shadow trades yet</td></tr>`;
-      } else {
-        let sHtml = '';
-        recent.forEach(rec => {
-          const decision = rec.decision || {};
-          const outcome = rec.outcome || {};
-          const fillM = rec.fill_model || {};
-          const timeStr = rec.ts_utc
-            ? new Date(rec.ts_utc).toLocaleTimeString()
-            : (rec.timestamp_ms ? new Date(rec.timestamp_ms).toLocaleTimeString() : '--:--:--');
-          const sym = rec.asset || rec.symbol || '--';
-          const side = String(rec.side || 'LONG').toUpperCase();
-          const isLong = (side === 'LONG' || side === 'BUY');
-          const sideCol = isLong ? 'text-emerald-400' : 'text-rose-400';
-          const veto = decision.primary_veto || 'GATED';
-          const isStrict = fillM.trade_through_filled || outcome.fill_status === 'trade_through_confirmed';
-          const vClass = String(outcome.veto_classification || 'NEUTRAL').toUpperCase();
-          const pnlBps = outcome.counterfactual_net_pnl_bps !== undefined && outcome.counterfactual_net_pnl_bps !== null
-            ? Number(outcome.counterfactual_net_pnl_bps).toFixed(1) + ' bps'
-            : '';
-
-          let verdict = `<span class="text-desk-dim">SCRATCH</span>`;
-          if (vClass.includes('PROTECTIVE')) {
-            verdict = `<span class="text-emerald-400">SAVED (${pnlBps})</span>`;
-          } else if (vClass.includes('STRANGLING')) {
-            verdict = `<span class="text-rose-400">MISSED (+${pnlBps})</span>`;
-          }
-
-          sHtml += `<tr>
-            <td class="py-1.5 text-desk-muted">${timeStr}</td>
-            <td class="py-1.5 font-semibold text-white">${sym}</td>
-            <td class="py-1.5 ${sideCol}">${side}</td>
-            <td class="py-1.5 text-desk-text">${veto}</td>
-            <td class="py-1.5 text-desk-muted">${isStrict ? 'Filled' : 'Touch'}</td>
-            <td class="py-1.5 text-right">${verdict}</td>
-          </tr>`;
-        });
-        streamBody.innerHTML = sHtml;
-      }
+      // Funnel Audit Table
+      const fBody = document.getElementById('funnel-audit-body');
+      let fRows = '';
+      ['BTC', 'ETH', 'SOL', 'AVAX'].forEach(sym => {
+        const f = funnels[sym];
+        if (!f) return;
+        fRows += `<tr>
+          <td class="py-2 font-semibold text-white">${sym}</td>
+          <td class="py-2 text-right text-cosmic-muted">${f.total_1m_ticks || 0}</td>
+          <td class="py-2 text-right text-cosmic-muted">${f.shock_cooldown_active || 0}</td>
+          <td class="py-2 text-right text-[#f5c418]">${f.engine_a_armed_waiting_bounce || 0}</td>
+          <td class="py-2 text-right text-[#10f587]">${f.engine_a_orders_placed || 0}</td>
+          <td class="py-2 text-right text-cosmic-purpleLight">${f.engine_b_orders_placed || 0}</td>
+        </tr>`;
+      });
+      fBody.innerHTML = fRows || `<tr><td colspan="6" class="py-4 text-center text-cosmic-muted">Awaiting funnel counters...</td></tr>`;
     }
 
-    window.addEventListener('DOMContentLoaded', fetchTelemetry);
+    // Initialize Calendar & Live Poll
+    renderCalendar();
+    fetchTelemetry();
   </script>
 </body>
 </html>

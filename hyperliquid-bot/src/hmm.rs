@@ -614,10 +614,32 @@ pub fn compute_hmm_posteriors(hmm: &GaussianHMM, closes: &[f64]) -> Option<(f64,
         let std_ln_vol = var_ln_vol.sqrt().max(1e-4);
         let z_ln_vol = (ln_sigma_last - mean_ln_vol) / std_ln_vol;
 
+        // Guard against 4-hour (16-bar) boxcar echo:
+        // A single 15m shock candle inflates the equal-weighted 16-bar `ln_sigma` for 4 full hours
+        // even after the market has calmed down. Gate `z_ln_vol` by the recent 30m (2-bar) RMS
+        // return relative to baseline volatility `mean_ln_vol.exp()`, so `P_S` decays promptly
+        // once two consecutive 15m bars return to normal volatility.
+        let base_sigma = mean_ln_vol.exp().max(1e-8);
+        let m = closes.len();
+        let r_0 = if m >= 2 && closes[m - 2] > 0.0 {
+            (closes[m - 1] / closes[m - 2]).ln().abs()
+        } else {
+            0.0
+        };
+        let r_1 = if m >= 3 && closes[m - 3] > 0.0 {
+            (closes[m - 2] / closes[m - 3]).ln().abs()
+        } else {
+            r_0
+        };
+        let recent_rms_ratio = (0.70 * r_0.powi(2) + 0.30 * r_1.powi(2)).sqrt() / base_sigma;
+        let recent_vol_gate = ((recent_rms_ratio - 1.15) / 0.65).clamp(0.0, 1.0);
+        let z_ln_vol_effective = z_ln_vol * recent_vol_gate;
+
         // Physical shock gate: prevent State 2 from locking P_S near 100% during calm/normal daytime volatility
-        // when EM splits a non-crash training window into two range clusters + one trend cluster.
+        // or during the 4-hour boxcar tail after a single spike has already subsided.
         let shock_intensity = ((norm_ret_abs - 1.60).max(0.0) / 1.00)
-            .max((z_ln_vol - 1.00).max(0.0) / 0.85)
+            .max(((r_0 / base_sigma) - 1.75).max(0.0) / 1.00)
+            .max((z_ln_vol_effective - 1.00).max(0.0) / 0.85)
             .clamp(0.0, 1.0);
 
         let raw_c = post[0];
@@ -626,12 +648,38 @@ pub fn compute_hmm_posteriors(hmm: &GaussianHMM, closes: &[f64]) -> Option<(f64,
 
         let p_s = raw_s * shock_intensity;
         let reallocated = raw_s * (1.0 - shock_intensity);
-        let trend_affinity = ((er_last - 0.24) / 0.22)
-            .max((d_last - 1.05) / 0.90)
-            .clamp(0.0, 1.0);
+        // Check if the 16-bar path length is dominated by a single outlier jump bar rather than a multi-bar trend
+        let lookback_start = m.saturating_sub(17);
+        let mut path_len_16 = 0.0;
+        let mut max_bar_16 = 0.0_f64;
+        for i in (lookback_start + 1)..m {
+            if closes[i - 1] > 0.0 {
+                let r_abs = (closes[i] / closes[i - 1]).ln().abs();
+                path_len_16 += r_abs;
+                if r_abs > max_bar_16 {
+                    max_bar_16 = r_abs;
+                }
+            }
+        }
+        let max_bar_share = if path_len_16 > 1e-8 {
+            max_bar_16 / path_len_16
+        } else {
+            0.0
+        };
+        // A true 16-bar trend spreads movement across bars (max_bar_share ~ 0.08-0.25);
+        // a single jump bar followed by flat range has max_bar_share > 0.45.
+        let multi_bar_trend_factor = (1.0 - ((max_bar_share - 0.35) / 0.30).clamp(0.0, 1.0)).clamp(0.0, 1.0);
 
-        let p_t = raw_t + reallocated * trend_affinity;
-        let p_c = raw_c + reallocated * (1.0 - trend_affinity);
+        // Compensate `d_last` for any 16-bar boxcar `sigma` inflation when evaluating post-shock trend vs range
+        let sigma_inflation = (ln_sigma_last - mean_ln_vol).exp().clamp(1.0, 2.5);
+        let d_adjusted = d_last * sigma_inflation.sqrt();
+        let trend_affinity = (((er_last - 0.24) / 0.22)
+            .max((d_adjusted - 1.05) / 0.90)
+            .clamp(0.0, 1.0))
+            * multi_bar_trend_factor;
+
+        let p_t = raw_t * multi_bar_trend_factor + reallocated * trend_affinity;
+        let p_c = raw_c + raw_t * (1.0 - multi_bar_trend_factor) + reallocated * (1.0 - trend_affinity);
         let sum = (p_c + p_t + p_s).max(1e-12);
         Some((p_c / sum, p_t / sum, p_s / sum))
     } else {
@@ -731,6 +779,56 @@ mod tests {
             "Calm/moderate range must yield high P_C ({:.3}) and low P_S ({:.3})",
             p_c_range,
             p_s_range
+        );
+    }
+
+    #[test]
+    fn test_hmm_post_shock_boxcar_recovery() {
+        let mut closes = Vec::new();
+        let mut p = 100.0;
+        // 120 bars of calm range, 120 bars of steady trend, 60 bars of volatile shock
+        for i in 0..300 {
+            if i < 120 {
+                p += 0.05 * (i as f64 * 0.8).sin();
+            } else if i < 240 {
+                p += 0.35 + 0.05 * (i as f64 * 0.4).cos();
+            } else {
+                p += 1.40 * (i as f64 * 1.7).sin();
+            }
+            closes.push(p);
+        }
+        let hmm = train_hmm_offline(&closes).expect("HMM should train");
+
+        // Build a 100-bar live evaluation window:
+        // 90 bars of normal consolidation, 1 massive V-shock spike bar, followed by 3 calm consolidation bars (45m)
+        let mut live_closes = Vec::new();
+        let mut lp = 100.0;
+        for i in 0..90 {
+            lp += 0.06 * (i as f64 * 0.9).sin();
+            live_closes.push(lp);
+        }
+        // Single 15m shock bar (+2.5% jump)
+        lp *= 1.025;
+        live_closes.push(lp);
+        // Right on the shock bar, P_S should be elevated
+        let (_, _, p_s_on_shock) = compute_hmm_posteriors(&hmm, &live_closes).unwrap();
+        assert!(
+            p_s_on_shock > 0.50,
+            "On the shock bar itself, P_S should be elevated: {:.3}",
+            p_s_on_shock
+        );
+
+        // Now add 3 calm 15m bars (45 minutes of quiet consolidation after the spike)
+        for i in 0..3 {
+            lp += 0.03 * ((i as f64 + 1.0) * 1.1).sin();
+            live_closes.push(lp);
+        }
+        let (p_c_after, _, p_s_after) = compute_hmm_posteriors(&hmm, &live_closes).unwrap();
+        assert!(
+            p_s_after < 0.20 && p_c_after > 0.65,
+            "After 3 calm 15m bars post-shock, 16-bar boxcar echo must not lock P_S near 100% (got P_C={:.3}, P_S={:.3})",
+            p_c_after,
+            p_s_after
         );
     }
 }

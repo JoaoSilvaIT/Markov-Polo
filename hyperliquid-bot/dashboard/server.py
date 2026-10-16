@@ -50,6 +50,7 @@ def get_telemetry_data():
         "cluster_leases": [],
         "cluster_lease": None,
         "circuit_breakers": {},
+        "funnels": {},
     }
 
     valid_dirs = [d for d in SEARCH_DIRS if os.path.isdir(d)]
@@ -84,6 +85,15 @@ def get_telemetry_data():
                 try:
                     with open(path, "r", encoding="utf-8") as f:
                         results["controllers"][sym] = json.load(f)
+                except Exception:
+                    pass
+        for path in glob.glob(os.path.join(d, "hl_funnel_*.json")):
+            base = os.path.basename(path)
+            sym = base.replace("hl_funnel_", "").replace(".json", "")
+            if sym not in results["funnels"]:
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        results["funnels"][sym] = json.load(f)
                 except Exception:
                     pass
 
