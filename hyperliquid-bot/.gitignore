@@ -6,3 +6,4 @@ target/
 !hl_portfolio_cluster.lock
 *.log
 *.jsonl
+.env*
