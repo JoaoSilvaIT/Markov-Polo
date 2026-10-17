@@ -86,14 +86,23 @@ def get_cached_hl_exchange_data(wallet_addr):
     _HL_CACHE["last_fetch_s"] = now_s
     try:
         ch = fetch_hl_info({"type": "clearinghouseState", "user": wallet_addr})
+        perp_val = 0.0
         if isinstance(ch, dict):
             margin = ch.get("marginSummary") or ch.get("crossMarginSummary") or {}
-            acct_val = float(margin.get("accountValue", 0.0) or 0.0)
-            if acct_val > 0.0:
-                _HL_CACHE["account_equity"] = acct_val
+            perp_val = float(margin.get("accountValue", 0.0) or 0.0)
             withdrawable = float(ch.get("withdrawable", 0.0) or 0.0)
             if withdrawable > 0.0:
                 _HL_CACHE["withdrawable"] = withdrawable
+        spot_val = 0.0
+        spot_ch = fetch_hl_info({"type": "spotClearinghouseState", "user": wallet_addr})
+        if isinstance(spot_ch, dict):
+            for b in spot_ch.get("balances", []):
+                if str(b.get("coin", "")).upper() == "USDC":
+                    total = float(b.get("total", 0.0) or 0.0)
+                    hold = float(b.get("hold", 0.0) or 0.0)
+                    spot_val += max(0.0, total - hold)
+        if perp_val + spot_val > 0.0:
+            _HL_CACHE["account_equity"] = round(perp_val + spot_val, 4)
     except Exception:
         pass
 
