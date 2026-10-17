@@ -1684,12 +1684,12 @@ async fn main() {
             println!("📡 [L2 + USER WEBSOCKET] Subscribed to continuous L2Book, ActiveAssetCtx, OrderUpdates & UserFills for {}.", symbol_bg);
 
             loop {
-                let msg_res = tokio::time::timeout(Duration::from_secs(30), l2_receiver.recv()).await;
+                let msg_res = tokio::time::timeout(Duration::from_secs(60), l2_receiver.recv()).await;
                 let msg = match msg_res {
                     Ok(Some(m)) => m,
                     Ok(None) => break,
                     Err(_) => {
-                        eprintln!("⚠️ [L2 WEBSOCKET WATCHDOG] No L2 book update received for 30s on {}. Stalled connection detected! Reconnecting...", symbol_bg);
+                        eprintln!("⚠️ [L2 WEBSOCKET WATCHDOG] No L2 book update received for 60s on {}. Stalled connection detected! Reconnecting...", symbol_bg);
                         break;
                     }
                 };
@@ -1797,7 +1797,7 @@ async fn main() {
         println!("📡 [WEBSOCKET] Successfully subscribed to 1m candles for {}.", trading_symbol);
 
         loop {
-            let recv_res = tokio::time::timeout(Duration::from_secs(90), receiver.recv()).await;
+            let recv_res = tokio::time::timeout(Duration::from_secs(150), receiver.recv()).await;
             let msg = match recv_res {
                 Ok(Some(m)) => m,
                 Ok(None) => {
@@ -1805,7 +1805,7 @@ async fn main() {
                     break;
                 }
                 Err(_) => {
-                    eprintln!("⚠️ [WEBSOCKET WATCHDOG] No 1m candle received for 90s on {}. Stalled connection detected! Reconnecting WebSocket...", trading_symbol);
+                    eprintln!("⚠️ [WEBSOCKET WATCHDOG] No 1m candle received for 150s on {}. Stalled connection detected! Reconnecting WebSocket...", trading_symbol);
                     break;
                 }
             };
@@ -2554,51 +2554,50 @@ async fn main() {
                             active_shadow.is_some()
                         };
                         if !has_active_trade {
-                            if is_cluster_blocked {
-                                println!("⏸️ [SHADOW-TREND VETO] Active cluster lease in place. Vetoing Engine B entry to prevent cross-engine conflict.");
+                            let engine_b_donchian_bars = if finalized_15m_bar.is_some() && rolling_15m_bars.len() > 1 {
+                                &rolling_15m_bars[..rolling_15m_bars.len() - 1]
                             } else {
-                                let engine_b_donchian_bars = if finalized_15m_bar.is_some() && rolling_15m_bars.len() > 1 {
-                                    &rolling_15m_bars[..rolling_15m_bars.len() - 1]
-                                } else {
-                                    &rolling_15m_bars[..]
-                                };
-                                let donchian_opt = calculate_donchian(engine_b_donchian_bars, donchian_period);
-                                if let Some(ref donchian) = donchian_opt {
-                                    let closes_15m: Vec<f64> = rolling_15m_bars.iter().map(|b| b.close).collect();
-                                    let alignment = check_trend_alignment(&closes_15m);
-                                    let has_donchian_breakout_1m = close_price > donchian.upper || close_price < donchian.lower;
-                                    let forming_15m_high = current_15m_bar
-                                        .as_ref()
-                                        .or(finalized_15m_bar.as_ref())
-                                        .map(|b| b.high)
-                                        .unwrap_or(high_price);
-                                    let forming_15m_low = current_15m_bar
-                                        .as_ref()
-                                        .or(finalized_15m_bar.as_ref())
-                                        .map(|b| b.low)
-                                        .unwrap_or(low_price);
-                                    // Engine B Execution: Trend Regime confirmed by 15m candle close.
-                                    // Entry requires a fresh 1m expansion close near the forming 15m extreme AND unexhausted macro Z-score (|Z60| < 2.5, |Z15| < 3.0).
-                                    let is_long_breakout = !candle_feed_degraded
-                                        && !is_candle_gap
-                                        && !is_upside_shock
-                                        && z_60 < 2.5
-                                        && z_15 < 3.0
-                                        && close_price > donchian.upper
-                                        && close_price >= open_price
-                                        && close_price >= forming_15m_high * 0.9992
-                                        && alignment == TrendAlignment::Bullish;
-                                    let is_short_breakout = !candle_feed_degraded
-                                        && !is_candle_gap
-                                        && !is_downside_shock
-                                        && z_60 > -2.5
-                                        && z_15 > -3.0
-                                        && close_price < donchian.lower
-                                        && close_price <= open_price
-                                        && close_price <= forming_15m_low * 1.0008
-                                        && alignment == TrendAlignment::Bearish;
+                                &rolling_15m_bars[..]
+                            };
+                            let donchian_opt = calculate_donchian(engine_b_donchian_bars, donchian_period);
+                            if let Some(ref donchian) = donchian_opt {
+                                let closes_15m: Vec<f64> = rolling_15m_bars.iter().map(|b| b.close).collect();
+                                let alignment = check_trend_alignment(&closes_15m);
+                                let has_donchian_breakout_1m = close_price > donchian.upper || close_price < donchian.lower;
+                                let forming_15m_high = current_15m_bar
+                                    .as_ref()
+                                    .or(finalized_15m_bar.as_ref())
+                                    .map(|b| b.high)
+                                    .unwrap_or(high_price);
+                                let forming_15m_low = current_15m_bar
+                                    .as_ref()
+                                    .or(finalized_15m_bar.as_ref())
+                                    .map(|b| b.low)
+                                    .unwrap_or(low_price);
+                                // Engine B Execution: Trend Regime confirmed by 15m candle close.
+                                // Entry requires a fresh 1m expansion close near the forming 15m extreme AND unexhausted macro Z-score (|Z60| < 2.5, |Z15| < 3.0).
+                                let is_long_breakout = !candle_feed_degraded
+                                    && !is_candle_gap
+                                    && !is_upside_shock
+                                    && z_60 < 2.5
+                                    && z_15 < 3.0
+                                    && close_price > donchian.upper
+                                    && close_price >= open_price
+                                    && close_price >= forming_15m_high * 0.9992
+                                    && alignment == TrendAlignment::Bullish;
+                                let is_short_breakout = !candle_feed_degraded
+                                    && !is_candle_gap
+                                    && !is_downside_shock
+                                    && z_60 > -2.5
+                                    && z_15 > -3.0
+                                    && close_price < donchian.lower
+                                    && close_price <= open_price
+                                    && close_price <= forming_15m_low * 1.0008
+                                    && alignment == TrendAlignment::Bearish;
 
-                                    if is_long_breakout || is_short_breakout {
+                                if (is_long_breakout || is_short_breakout) && is_cluster_blocked {
+                                    println!("⏸️ [SHADOW-TREND VETO] Active cluster lease in place. Vetoing Engine B entry to prevent cross-engine conflict.");
+                                } else if is_long_breakout || is_short_breakout {
                                         let side = if is_long_breakout { Side::Long } else { Side::Short };
                                         let atr_opt = calculate_atr(&rolling_15m_bars, 20);
 
@@ -2850,7 +2849,6 @@ async fn main() {
                                     } else {
                                         funnel_counters.engine_b_no_breakout += 1;
                                     }
-                                }
                             }
                         }
                     } else {
@@ -3196,8 +3194,9 @@ async fn main() {
                                                     let live_mu = th.exit_long;
                                                     let tick_sz = effective_tick_size(live_mu, sz_decimals);
                                                     let eps_shave = (live_mu * 0.0005).max(2.0 * tick_sz);
-                                                    let b_cand = quantize_price(live_mu - eps_shave, sz_decimals);
-                                                    let p_min = pos.entry_price * 1.0020;
+                                                    let p_min = quantize_price(pos.entry_price * 1.0010, sz_decimals);
+                                                    let raw_cand = (live_mu - eps_shave).max(p_min);
+                                                    let b_cand = quantize_price(raw_cand, sz_decimals);
 
                                                     if b_cand <= pos.effective_tp - delta_reprice
                                                         && b_cand < quantize_price(pos.effective_tp, sz_decimals)
@@ -3218,7 +3217,7 @@ async fn main() {
                                                             pos.reprice_count += 1;
                                                             pos.candidate_lower_count = 0;
                                                         }
-                                                    } else if b_cand > pos.effective_tp {
+                                                    } else if live_mu - eps_shave > pos.effective_tp {
                                                         pos.candidate_lower_count = 0;
                                                     }
                                                 } else {
@@ -3226,8 +3225,9 @@ async fn main() {
                                                     let live_mu = th.exit_short;
                                                     let tick_sz = effective_tick_size(live_mu, sz_decimals);
                                                     let eps_shave = (live_mu * 0.0005).max(2.0 * tick_sz);
-                                                    let b_cand = quantize_price(live_mu + eps_shave, sz_decimals);
-                                                    let p_max = pos.entry_price * 0.9980;
+                                                    let p_max = quantize_price(pos.entry_price * 0.9990, sz_decimals);
+                                                    let raw_cand = (live_mu + eps_shave).min(p_max);
+                                                    let b_cand = quantize_price(raw_cand, sz_decimals);
 
                                                     if b_cand >= pos.effective_tp + delta_reprice
                                                         && b_cand > quantize_price(pos.effective_tp, sz_decimals)
@@ -3248,7 +3248,7 @@ async fn main() {
                                                             pos.reprice_count += 1;
                                                             pos.candidate_lower_count = 0;
                                                         }
-                                                    } else if b_cand < pos.effective_tp {
+                                                    } else if live_mu + eps_shave < pos.effective_tp {
                                                         pos.candidate_lower_count = 0;
                                                     }
                                                 }
@@ -3457,6 +3457,16 @@ async fn main() {
                                 )
                                 .await;
                             } else if time_stop_triggered {
+                                let ts_profitable = state_lock
+                                    .get(&symbol_clone)
+                                    .map(|p| {
+                                        if p.side == "LONG" {
+                                            close_price >= p.entry_price * 1.0005
+                                        } else {
+                                            close_price <= p.entry_price * 0.9995
+                                        }
+                                    })
+                                    .unwrap_or(false);
                                 println!(
                                     "⏱️ [TIME-STOP] {} reached max hold {:.1}m >= limit {:.1}m. Flattening.",
                                     symbol_clone, elapsed_mins, max_allowed_mins
@@ -3474,7 +3484,12 @@ async fn main() {
                                 .await;
                                 drop(state_lock);
                                 let mut cb_lock = cb_clone.lock().await;
-                                let tripped = cb_lock.record_time_stop();
+                                let tripped = if ts_profitable {
+                                    cb_lock.record_win();
+                                    false
+                                } else {
+                                    cb_lock.record_time_stop()
+                                };
                                 save_circuit_breaker(&cb_path_clone, &cb_lock);
                                 drop(cb_lock);
 
@@ -3613,8 +3628,12 @@ async fn main() {
                                                     armed_state.tier = "TIER_1_NORMAL".to_string();
                                                     let baseline_arm = local_ou_sma;
                                                     armed_state.entry_threshold = th.entry_long;
+                                                    armed_state.exit_threshold = th.exit_long;
+                                                    armed_state.half_life_m = half_life_m;
                                                     armed_state.unitless_entry_dev =
                                                         (th.entry_long / baseline_arm).ln();
+                                                    armed_state.unitless_exit_dev =
+                                                        (th.exit_long / baseline_arm).ln();
                                                     println!(
                                                         "⏫ [TIER UPGRADED] {} reached Tier 1 hurdle (${:.2} <= ${:.2}). Upgraded to TIER_1_NORMAL (full size).",
                                                         symbol_clone, current_extreme, th.entry_long
@@ -3626,15 +3645,25 @@ async fn main() {
                                     }
 
                                     let live_sma = local_ou_sma;
-                                    let dynamic_exit_target = if armed_state.unitless_exit_dev != 0.0 {
+                                    let dynamic_exit_target = if let Some(ref th) = thresholds_opt {
+                                        th.exit_long
+                                    } else if armed_state.unitless_exit_dev != 0.0 {
                                         live_sma * armed_state.unitless_exit_dev.exp()
                                     } else {
                                         armed_state.exit_threshold
                                     };
-                                    let dynamic_entry_cap = if armed_state.unitless_entry_dev != 0.0 {
-                                        live_sma * armed_state.unitless_entry_dev.exp()
+                                    let dynamic_entry_cap = if armed_state.tier == "TIER_2_CONDITIONAL" {
+                                        thresholds_175_opt
+                                            .as_ref()
+                                            .map(|th| th.entry_long)
+                                            .unwrap_or(armed_state.entry_threshold)
+                                            .max(armed_state.entry_threshold)
                                     } else {
-                                        armed_state.entry_threshold
+                                        thresholds_opt
+                                            .as_ref()
+                                            .map(|th| th.entry_long)
+                                            .unwrap_or(armed_state.entry_threshold)
+                                            .max(armed_state.entry_threshold)
                                     };
 
                                     let is_green_bounce = close_price > hist_last_price;
@@ -3681,7 +3710,7 @@ async fn main() {
                                             let expected_funding_drag_bps = (current_funding_1h * 10_000.0) * (armed_state.half_life_m / 60.0);
                                             let net_edge_bps = raw_edge_bps - expected_funding_drag_bps;
 
-                                            let min_edge_hurdle = if is_tier2 { 25.0 } else { 20.0 };
+                                            let min_edge_hurdle = if is_tier2 { 16.0 } else { 14.0 };
                                             if net_edge_bps < min_edge_hurdle {
                                                 funnel_counters.engine_a_reversal_hurdle_veto += 1;
                                                 println!(
@@ -3771,8 +3800,12 @@ async fn main() {
                                                     armed_state.tier = "TIER_1_NORMAL".to_string();
                                                     let baseline_arm = local_ou_sma;
                                                     armed_state.entry_threshold = th.entry_short;
+                                                    armed_state.exit_threshold = th.exit_short;
+                                                    armed_state.half_life_m = half_life_m;
                                                     armed_state.unitless_entry_dev =
                                                         (th.entry_short / baseline_arm).ln();
+                                                    armed_state.unitless_exit_dev =
+                                                        (th.exit_short / baseline_arm).ln();
                                                     println!(
                                                         "⏫ [TIER UPGRADED] {} reached Tier 1 hurdle (${:.2} >= ${:.2}). Upgraded to TIER_1_NORMAL (full size).",
                                                         symbol_clone, current_extreme, th.entry_short
@@ -3784,15 +3817,25 @@ async fn main() {
                                     }
 
                                     let live_sma = local_ou_sma;
-                                    let dynamic_exit_target = if armed_state.unitless_exit_dev != 0.0 {
+                                    let dynamic_exit_target = if let Some(ref th) = thresholds_opt {
+                                        th.exit_short
+                                    } else if armed_state.unitless_exit_dev != 0.0 {
                                         live_sma * armed_state.unitless_exit_dev.exp()
                                     } else {
                                         armed_state.exit_threshold
                                     };
-                                    let dynamic_entry_floor = if armed_state.unitless_entry_dev != 0.0 {
-                                        live_sma * armed_state.unitless_entry_dev.exp()
+                                    let dynamic_entry_floor = if armed_state.tier == "TIER_2_CONDITIONAL" {
+                                        thresholds_175_opt
+                                            .as_ref()
+                                            .map(|th| th.entry_short)
+                                            .unwrap_or(armed_state.entry_threshold)
+                                            .min(armed_state.entry_threshold)
                                     } else {
-                                        armed_state.entry_threshold
+                                        thresholds_opt
+                                            .as_ref()
+                                            .map(|th| th.entry_short)
+                                            .unwrap_or(armed_state.entry_threshold)
+                                            .min(armed_state.entry_threshold)
                                     };
 
                                     let is_red_rejection = close_price < hist_last_price;
@@ -3838,7 +3881,7 @@ async fn main() {
                                             let expected_funding_drag_bps = (-current_funding_1h * 10_000.0) * (armed_state.half_life_m / 60.0);
                                             let net_edge_bps = raw_edge_bps - expected_funding_drag_bps;
 
-                                            let min_edge_hurdle = if is_tier2 { 25.0 } else { 20.0 };
+                                            let min_edge_hurdle = if is_tier2 { 16.0 } else { 14.0 };
                                             if net_edge_bps < min_edge_hurdle {
                                                 funnel_counters.engine_a_reversal_hurdle_veto += 1;
                                                 println!(

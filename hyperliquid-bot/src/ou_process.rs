@@ -111,14 +111,14 @@ pub fn estimate_ou_parameters(data: &[f64], dt: f64) -> Option<OuParameters> {
     let (_a_log, b_log, sigma_eps_log) = estimate_ar1_raw(&log_data)?;
 
     let theta_full = -b_log.ln() / dt;
-    let (_, is_monotone_drift) = evaluate_ols_drift(data, 0.005);
+    let (_, is_monotone_drift) = evaluate_ols_drift(data, 0.025);
 
     // Apply Phillips & Yu (2005) 2-split Jackknife bias correction on log-price AR(1):
     // theta_jack = 2 * theta_full - 0.5 * (theta_1 + theta_2)
     // When the two halves of a non-drifting range have slightly different local sample means,
     // separate half-sample demeaning can artificially inflate (theta_1 + theta_2) above 2*theta_full,
     // causing `th_jack` to jump wildly or flip negative on a 1-tick move. For non-drifting series
-    // with b_log < 0.985, floor `th_jack` at `0.60 * theta_full` to preserve bar-to-bar continuity.
+    // with b_log < 0.994 (t_half < ~115m), floor `th_jack` at `0.60 * theta_full` to preserve bar-to-bar continuity.
     let mid = log_data.len() / 2;
     let theta = if mid >= 4 {
         let part1 = estimate_ar1_raw(&log_data[..=mid]);
@@ -128,7 +128,7 @@ pub fn estimate_ou_parameters(data: &[f64], dt: f64) -> Option<OuParameters> {
             let theta1 = -b1.ln() / dt;
             let theta2 = -b2.ln() / dt;
             let th_jack = 2.0 * theta_full - 0.5 * (theta1 + theta2);
-            if is_monotone_drift || b_log >= 0.985 {
+            if is_monotone_drift || b_log >= 0.994 {
                 if th_jack > 1e-5 && !is_monotone_drift {
                     th_jack
                 } else {
@@ -183,7 +183,8 @@ pub fn estimate_ou_parameters(data: &[f64], dt: f64) -> Option<OuParameters> {
 #[allow(dead_code)]
 pub fn calculate_thresholds_at_sigma(params: &OuParameters, transaction_cost: f64, num_sigma: f64) -> OptimalThresholds {
     let sigma_eq = (params.sigma * params.sigma / (2.0 * params.theta)).sqrt();
-    let min_required_profit = transaction_cost * 2.5;
+    let min_mult = if num_sigma >= 1.40 { 4.2 } else { 3.6 };
+    let min_required_profit = transaction_cost * min_mult;
     let deviation = (num_sigma * sigma_eq).max(min_required_profit);
     OptimalThresholds {
         entry_long: params.mu - deviation,
@@ -213,7 +214,8 @@ pub fn calculate_carry_adjusted_thresholds(
     max_sigma: f64,
 ) -> OptimalThresholds {
     let sigma_eq = (params.sigma * params.sigma / (2.0 * params.theta)).sqrt();
-    let min_required_profit = transaction_cost * 2.5;
+    let min_mult = if base_sigma >= 1.40 { 4.2 } else { 3.6 };
+    let min_required_profit = transaction_cost * min_mult;
 
     let (sigma_long, sigma_short) = if hourly_funding_rate.is_finite()
         && hourly_funding_rate.abs() > 1e-7
@@ -943,6 +945,44 @@ mod tests {
             edge_bps >= 15.0,
             "Post-bounce net edge to equilibrium mu must clear 15 bps hurdle, got {:.1} bps",
             edge_bps
+        );
+    }
+
+    #[test]
+    fn test_mild_intraday_drift_does_not_collapse_ou_to_999m() {
+        // Simulate AVAX oscillating in a range with ~0.75% drift over 240m (above the old 0.50% cliff)
+        let mut history = Vec::with_capacity(240);
+        for i in 0..240 {
+            let trend_component = -0.0075 * (i as f64 / 240.0);
+            let osc = (i as f64 * 0.35).sin() * 0.003;
+            history.push(10.0 * (1.0 + trend_component + osc));
+        }
+        let last_px = *history.last().unwrap();
+        let feat = calculate_features(&history, last_px, "AVAX").expect("AVAX features");
+        assert!(
+            feat.half_life_m < 120.0 && feat.is_valid_half_life,
+            "0.75% 4h drift on AVAX must not collapse O-U to 999m (got t_half={:.1}m)",
+            feat.half_life_m
+        );
+        assert!(feat.thresholds_opt.is_some(), "Thresholds must remain populated");
+    }
+
+    #[test]
+    fn test_low_vol_band_floor_leaves_sufficient_post_bounce_edge() {
+        let params = OuParameters {
+            theta: 0.05, // fast reversion
+            mu: 100.0,
+            sigma: 0.02, // very quiet volatility
+        };
+        let tx_cost = 100.0 * 0.0005; // 5 bps
+        let th_t1 = calculate_carry_adjusted_thresholds(&params, tx_cost, 1.50, 0.0, 1.30, 1.75);
+        // After a 6 bps green bounce off entry_long, remaining edge to mu must clear 14.0 bps
+        let bounce_px = th_t1.entry_long * 1.0006;
+        let edge_t1 = calculate_net_edge_bps(bounce_px, th_t1.exit_long);
+        assert!(
+            edge_t1 >= 14.0,
+            "Tier 1 post-bounce edge must clear 14.0 bps hurdle, got {:.2} bps",
+            edge_t1
         );
     }
 }

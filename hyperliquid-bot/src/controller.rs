@@ -398,7 +398,7 @@ impl RegimeController {
             }
 
             ControllerMode::MeanReversion => {
-                // MeanReversion -> Neutral if volatility exceeds gate, trend rises, consolidation drops, or O-U breaks
+                // MeanReversion -> Neutral (or directly to Trend if a confirmed 15m Donchian breakout + P_T >= 80% fires)
                 if z_15.abs() >= 2.2
                     || z_60.abs() >= 2.5
                     || p_trend >= 0.65
@@ -406,14 +406,25 @@ impl RegimeController {
                     || !is_ou_stationary
                     || !is_half_life_valid
                 {
-                    self.current_mode = ControllerMode::Neutral;
                     self.consolidation_streak = 0;
                     self.last_transition_time = Utc::now().to_rfc3339();
-                    self.last_reason = format!(
-                        "Consolidation invalidated (Z15={:.2}, Z60={:.2}, P_T={:.2}, P_C={:.2}, stationary={}, hl_valid={}) -> Neutral",
-                        z_15, z_60, p_trend, p_consolidation, is_ou_stationary, is_half_life_valid
-                    );
                     self.epoch += 1;
+
+                    let valid_trend_breakout = has_breakout && p_trend >= 0.80 && self.trend_streak >= 1 && !is_severe_shock;
+                    if valid_trend_breakout {
+                        self.current_mode = ControllerMode::Trend;
+                        self.last_reason = format!(
+                            "Trend confirmed: P_T={:.1}% (streak {} bars) + Donchian breakout",
+                            p_trend * 100.0,
+                            self.trend_streak
+                        );
+                    } else {
+                        self.current_mode = ControllerMode::Neutral;
+                        self.last_reason = format!(
+                            "Consolidation invalidated (Z15={:.2}, Z60={:.2}, P_T={:.2}, P_C={:.2}, stationary={}, hl_valid={}) -> Neutral",
+                            z_15, z_60, p_trend, p_consolidation, is_ou_stationary, is_half_life_valid
+                        );
+                    }
                 }
             }
         }
@@ -980,5 +991,18 @@ mod tests {
         let (gate_a, gate_b) = controller.inspect_gates(0.05, 0.92, 3.0, 3.5, true, false, false, BASE_TIME_MS);
         assert!(gate_a.contains("BLOCKED(Vol")); // Engine A properly protected!
         assert_eq!(gate_b, "ELIGIBLE"); // Engine B is ready!
+    }
+
+    #[test]
+    fn test_mean_reversion_promotes_directly_to_trend_on_confirmed_15m_breakout() {
+        let mut controller = RegimeController::default();
+        // Establish MeanReversion mode
+        controller.evaluate_15m_bar(BASE_TIME_MS, 0.95, 0.05, 0.1, 0.1, false, true, true, false);
+        assert_eq!(controller.current_mode, ControllerMode::MeanReversion);
+
+        // Next 15m bar closes with P_T = 1.00 and Donchian breakout = true (like ETH at $2431.20)
+        let mode = controller.evaluate_15m_bar(BASE_TIME_MS + 900_000, 0.0, 1.0, 0.20, 0.46, true, true, true, false);
+        assert_eq!(mode, ControllerMode::Trend, "Confirmed 15m Donchian breakout with P_T >= 80% must promote directly to Trend");
+        assert_eq!(controller.trend_streak, 1);
     }
 }
