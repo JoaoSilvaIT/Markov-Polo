@@ -142,6 +142,11 @@ pub fn estimate_ou_parameters(data: &[f64], dt: f64) -> Option<OuParameters> {
                     return None;
                 }
             }
+        } else if !is_monotone_drift && b_log < 0.988 && (part1.is_some() || part2.is_some()) {
+            // If the full window is clearly mean-reverting (b_log < 0.988, t_half < 57m) and one
+            // half-window is stationary while the other half-window hovers near b=1.0 due to an older move,
+            // preserve continuity at 0.60 * theta_full instead of flickering to None on a 1-tick change.
+            (0.60 * theta_full).max(1e-5)
         } else {
             return None;
         }
@@ -505,9 +510,11 @@ pub fn calculate_features_with_funding(
         evaluate_ols_drift(&closes_history[n_total - candidate_windows[0]..], max_economic_drift * 0.50);
 
     let mut selected_ou: Option<OuParameters> = None;
+    let mut best_tradeable_ou: Option<(OuParameters, f64)> = None;
     let mut best_secondary_ou: Option<(OuParameters, f64)> = None;
     let mut best_fallback_hl: Option<(OuParameters, f64, bool)> = None;
     let mut seen_w = Vec::with_capacity(4);
+    let clean_max_hl = 48.0_f64;
     let tradeable_max_hl = 85.0_f64;
 
     for &w in &candidate_windows {
@@ -523,13 +530,18 @@ pub fn calculate_features_with_funding(
             let hl = sub_params.half_life_minutes();
             let mu_dev = (sub_params.mu - hist_last_price).abs() / hist_last_price;
             let max_mu_dev = if w <= 360 { 0.045 } else { 0.07 };
-            if !sub_drifting && hl >= min_hl && hl <= tradeable_max_hl && mu_dev <= max_mu_dev {
+            if !sub_drifting && hl >= min_hl && hl <= clean_max_hl && sub_drift.abs() <= 0.0055 && mu_dev <= max_mu_dev {
                 selected_ou = Some(sub_params);
                 total_drift_pct = sub_drift;
                 is_drifting = false;
+                best_tradeable_ou = None;
                 best_secondary_ou = None;
                 best_fallback_hl = None;
                 break;
+            } else if !sub_drifting && hl >= min_hl && hl <= tradeable_max_hl && mu_dev <= max_mu_dev {
+                if best_tradeable_ou.is_none() {
+                    best_tradeable_ou = Some((sub_params, sub_drift));
+                }
             } else if !sub_drifting && hl > tradeable_max_hl && hl <= max_hl && mu_dev <= max_mu_dev {
                 if best_secondary_ou.is_none() {
                     best_secondary_ou = Some((sub_params, sub_drift));
@@ -542,7 +554,11 @@ pub fn calculate_features_with_funding(
         }
     }
     if selected_ou.is_none() {
-        if let Some((sec_params, sec_drift)) = best_secondary_ou {
+        if let Some((tr_params, tr_drift)) = best_tradeable_ou {
+            selected_ou = Some(tr_params);
+            total_drift_pct = tr_drift;
+            is_drifting = false;
+        } else if let Some((sec_params, sec_drift)) = best_secondary_ou {
             selected_ou = Some(sec_params);
             total_drift_pct = sec_drift;
             is_drifting = false;
