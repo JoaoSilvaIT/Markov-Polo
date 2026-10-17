@@ -3517,19 +3517,19 @@ async fn main() {
                                 "AVAX" => 0.0170,
                                 _ => 0.0110,
                             };
-                            // Note: touching a 1.50*sigma_eq O-U band (with t_half=25..55m) naturally produces
-                            // |Z15| in 1.65..2.30 while |Z60| stays < 1.85 in a true range.
-                            let consolidation_vol_ok = z_15.abs() < 2.40 && z_60.abs() < 1.65;
+                            // Note: touching a 1.50*sigma_eq O-U band (with t_half=15..55m) naturally produces
+                            // |Z15| in 1.30..2.35 and |Z60| in 1.10..1.85 in a true consolidation range.
+                            let consolidation_vol_ok = z_15.abs() < 2.45 && z_60.abs() < 1.95;
                             let entry_half_life_ok = is_valid_half_life && half_life_m <= 85.0;
-                            let can_mean_revert_long = z_60 > -1.10
-                                && z_15 > -2.35
+                            let can_mean_revert_long = z_60 > -1.90
+                                && z_15 > -2.40
                                 && total_drift_pct > -max_mr_drift
-                                && !(total_drift_pct <= -0.0025 && z_60 <= -0.45);
-                            let can_mean_revert_short = z_60 < 1.10
-                                && z_15 < 2.35
+                                && !(total_drift_pct <= -0.0065 && z_60 <= -1.45);
+                            let can_mean_revert_short = z_60 < 1.90
+                                && z_15 < 2.40
                                 && total_drift_pct < max_mr_drift
-                                && !(total_drift_pct >= 0.0025 && z_60 >= 0.45);
-                            let tier2_regime_ok = half_life_m <= 50.0 && z_60.abs() < 0.85 && total_drift_pct.abs() < 0.0030;
+                                && !(total_drift_pct >= 0.0065 && z_60 >= 1.45);
+                            let tier2_regime_ok = half_life_m <= 55.0 && z_60.abs() < 1.50 && total_drift_pct.abs() < 0.0055;
                             let is_eligible = !candle_feed_degraded
                                 && !is_candle_gap
                                 && is_consolidation
@@ -4062,10 +4062,30 @@ async fn main() {
                                                 symbol_clone, close_price, th125.entry_short, high_price
                                             );
                                         } else {
+                                            if close_price <= thresholds.entry_long || low_price <= thresholds.entry_long {
+                                                println!(
+                                                    "⏸️ [LONG BAND VETO] {} touched ${:.2} <= ${:.2}, but vetoed (can_mr_long: {}, shock: {}, Z15: {:.2}, Z60: {:.2}, Drift: {:.2}%).",
+                                                    symbol_clone, close_price, thresholds.entry_long, can_mean_revert_long, is_downside_shock, z_15, z_60, total_drift_pct * 100.0
+                                                );
+                                            } else if close_price >= thresholds.entry_short || high_price >= thresholds.entry_short {
+                                                println!(
+                                                    "⏸️ [SHORT BAND VETO] {} touched ${:.2} >= ${:.2}, but vetoed (can_mr_short: {}, shock: {}, Z15: {:.2}, Z60: {:.2}, Drift: {:.2}%).",
+                                                    symbol_clone, close_price, thresholds.entry_short, can_mean_revert_short, is_upside_shock, z_15, z_60, total_drift_pct * 100.0
+                                                );
+                                            }
                                             funnel_counters.engine_a_outside_band += 1;
                                         }
                                     } else {
                                         funnel_counters.engine_a_outside_band += 1;
+                                    }
+                                }
+                            } else if controller.current_mode == ControllerMode::MeanReversion {
+                                if let Some(ref thresholds) = thresholds_opt {
+                                    if close_price <= thresholds.entry_long || close_price >= thresholds.entry_short {
+                                        println!(
+                                            "⏸️ [BAND TOUCH GATED] {} at ${:.2} (Band: [${:.2}, ${:.2}]) gated (vol_ok: {}, hl_ok: {}, cb_paused: {}, cluster_blocked: {}, Z15: {:.2}, Z60: {:.2}).",
+                                            symbol_clone, close_price, thresholds.entry_long, thresholds.entry_short, consolidation_vol_ok, entry_half_life_ok, is_cb_paused, is_cluster_blocked, z_15, z_60
+                                        );
                                     }
                                 }
                             }
