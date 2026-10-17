@@ -3546,18 +3546,18 @@ async fn main() {
                                 _ => 0.0110,
                             };
                             // Note: touching a 1.50*sigma_eq O-U band (with t_half=15..55m) naturally produces
-                            // |Z15| in 1.30..2.35 and |Z60| in 1.10..1.85 in a true consolidation range.
-                            let consolidation_vol_ok = z_15.abs() < 2.45 && z_60.abs() < 1.95;
+                            // |Z15| in 1.30..2.35 and |Z60| up to 2.40 (especially 60m after a V-bottom/top).
+                            let consolidation_vol_ok = z_15.abs() < 2.45 && z_60.abs() < 2.50;
                             let entry_half_life_ok = is_valid_half_life && half_life_m <= 85.0;
-                            let can_mean_revert_long = z_60 > -1.90
+                            let can_mean_revert_long = z_60 > -2.45
                                 && z_15 > -2.40
                                 && total_drift_pct > -max_mr_drift
-                                && !(total_drift_pct <= -0.0065 && z_60 <= -1.45);
-                            let can_mean_revert_short = z_60 < 1.90
+                                && !(total_drift_pct <= -0.0050 && z_60 <= -1.65);
+                            let can_mean_revert_short = z_60 < 2.45
                                 && z_15 < 2.40
                                 && total_drift_pct < max_mr_drift
-                                && !(total_drift_pct >= 0.0065 && z_60 >= 1.45);
-                            let tier2_regime_ok = half_life_m <= 55.0 && z_60.abs() < 1.50 && total_drift_pct.abs() < 0.0055;
+                                && !(total_drift_pct >= 0.0050 && z_60 >= 1.65);
+                            let tier2_regime_ok = half_life_m <= 55.0 && z_60.abs() < 1.85 && total_drift_pct.abs() < 0.0055;
                             let is_eligible = !candle_feed_degraded
                                 && !is_candle_gap
                                 && is_consolidation
@@ -3611,9 +3611,9 @@ async fn main() {
                                 };
 
                                 let directional_bleed_vetoed = if arm_side == "LONG" {
-                                    !can_mean_revert_long
+                                    total_drift_pct <= -max_mr_drift || (total_drift_pct <= -0.0065 && z_60 <= -2.10)
                                 } else {
-                                    !can_mean_revert_short
+                                    total_drift_pct >= max_mr_drift || (total_drift_pct >= 0.0065 && z_60 >= 2.10)
                                 };
 
                                 let thesis_invalidated = !is_consolidation
