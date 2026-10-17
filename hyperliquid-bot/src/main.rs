@@ -1152,6 +1152,12 @@ async fn main() {
                 let mut is_truly_dead = false;
                 let mut reported_status = "UNKNOWN".to_string();
 
+                let order_age_secs = if let Ok(opened_dt) = chrono::DateTime::parse_from_rfc3339(&pos.opened_at) {
+                    (chrono::Utc::now() - opened_dt.with_timezone(&chrono::Utc)).num_seconds()
+                } else {
+                    10
+                };
+
                 if !pos.order_id.is_empty() && !pos.is_filled {
                     if let Ok(oid) = pos.order_id.parse::<u64>() {
                         let open_orders = match watcher_info.open_orders(user_address).await {
@@ -1167,9 +1173,38 @@ async fn main() {
                         let is_resting = open_orders.iter().any(|o| o.oid == oid);
 
                         if is_resting {
-                            // If partially filled while still resting, cancel remainder so inventory is fixed and protected
                             if pos_exists {
-                                let _ = cancel_order(&watcher_exchange, &watcher_symbol, oid).await;
+                                // Partially filled while still resting: allow up to 90s for the full Maker order to fill
+                                // unless >=95% filled or price has already bounced >=12 bps away from our entry limit.
+                                let fill_ratio = if pos.amount > 0.0 {
+                                    current_szi.abs() / pos.amount
+                                } else {
+                                    1.0
+                                };
+                                let (best_bid_now, best_ask_now) = {
+                                    let guard = watcher_obi.read().await;
+                                    (guard.best_bid, guard.best_ask)
+                                };
+                                let moved_away_in_favor = if pos.side == "LONG" {
+                                    best_bid_now > 0.0 && best_bid_now >= pos.entry_price * 1.0012
+                                } else {
+                                    best_ask_now > 0.0 && best_ask_now <= pos.entry_price * 0.9988
+                                };
+
+                                if fill_ratio >= 0.95 || order_age_secs >= 90 || moved_away_in_favor {
+                                    println!(
+                                        "ℹ️ [FAST-SENTINEL PARTIAL FILL FINALIZED] {} filled {:.1}% ({:.4}/{:.4}) after {}s. Cancelling remaining entry order to place TP.",
+                                        watcher_symbol,
+                                        fill_ratio * 100.0,
+                                        current_szi.abs(),
+                                        pos.amount,
+                                        order_age_secs
+                                    );
+                                    let _ = cancel_order(&watcher_exchange, &watcher_symbol, oid).await;
+                                } else {
+                                    // Keep resting so the remaining Maker size can fill; L2 stop-loss above already guards current_szi
+                                    is_filled = false;
+                                }
                             } else {
                                 // Toxic-OBI Queue Protection: cancel resting maker entry if book depth collapses against order
                                 let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
@@ -1207,12 +1242,6 @@ async fn main() {
                                 }
                             }
                         } else if !pos_exists {
-                            let order_age_secs = if let Ok(opened_dt) = chrono::DateTime::parse_from_rfc3339(&pos.opened_at) {
-                                (chrono::Utc::now() - opened_dt.with_timezone(&chrono::Utc)).num_seconds()
-                            } else {
-                                10
-                            };
-
                             if let Ok(order_status) = watcher_info.query_order_by_oid(user_address, oid).await {
                                 reported_status = if let Some(ref o) = order_status.order {
                                     o.status.to_uppercase()
@@ -1285,15 +1314,12 @@ async fn main() {
                         pos.take_profit_price
                     };
                     let tp_price = quantize_price(raw_tp, watcher_sz_decimals);
-                    println!(
-                        "🟢 [FAST-SENTINEL] Position Active for {} (Side: {})! Placing Take Profit Limit order at ${:.2}",
-                        watcher_symbol, pos.side, tp_price
-                    );
-
-                    // Long position -> TP Sell (is_buy = false, reduce_only = true)
-                    // Short position -> TP Buy (is_buy = true, reduce_only = true)
                     let tp_is_buy = pos.side == "SHORT";
                     let tp_amount = if current_szi.abs() > 0.0 { current_szi.abs() } else { pos.amount };
+                    println!(
+                        "🟢 [FAST-SENTINEL] Position Active for {} (Side: {}, Size: {:.4} / ${:.2})! Placing Take Profit Limit order at ${:.2}",
+                        watcher_symbol, pos.side, tp_amount, tp_amount * pos.entry_price, tp_price
+                    );
 
                     if let Err(e) = crate::state::assert_current_lease(&watcher_symbol, &pos.lease_owner_uuid, pos.lease_fencing_token) {
                         eprintln!("❌ [FAST-SENTINEL] TP order boundary fencing assertion failed for {}: {}", watcher_symbol, e);
@@ -3187,14 +3213,16 @@ async fn main() {
                                                     .max(0.10 * d_0)
                                                     .max(0.03);
                                                 let now_ms = chrono::Utc::now().timestamp_millis();
+                                                let min_hold_before_ratchet = (0.85 * pos.half_life_minutes).clamp(25.0, 45.0);
+                                                let hold_ok = elapsed_mins >= min_hold_before_ratchet;
                                                 let cooldown_ok =
-                                                    (now_ms - pos.last_reprice_time) >= 180_000;
+                                                    hold_ok && (now_ms - pos.last_reprice_time) >= 900_000;
 
                                                 if is_long {
                                                     let live_mu = th.exit_long;
                                                     let tick_sz = effective_tick_size(live_mu, sz_decimals);
                                                     let eps_shave = (live_mu * 0.0005).max(2.0 * tick_sz);
-                                                    let p_min = quantize_price(pos.entry_price * 1.0010, sz_decimals);
+                                                    let p_min = quantize_price(pos.entry_price * 1.0018, sz_decimals);
                                                     let raw_cand = (live_mu - eps_shave).max(p_min);
                                                     let b_cand = quantize_price(raw_cand, sz_decimals);
 
@@ -3205,7 +3233,7 @@ async fn main() {
                                                         pos.candidate_lower_count += 1;
                                                         if pos.candidate_lower_count >= 3
                                                             && cooldown_ok
-                                                            && pos.reprice_count < 3
+                                                            && pos.reprice_count < 2
                                                         {
                                                             should_reprice = true;
                                                             new_reprice_target = b_cand;
@@ -3225,7 +3253,7 @@ async fn main() {
                                                     let live_mu = th.exit_short;
                                                     let tick_sz = effective_tick_size(live_mu, sz_decimals);
                                                     let eps_shave = (live_mu * 0.0005).max(2.0 * tick_sz);
-                                                    let p_max = quantize_price(pos.entry_price * 0.9990, sz_decimals);
+                                                    let p_max = quantize_price(pos.entry_price * 0.9982, sz_decimals);
                                                     let raw_cand = (live_mu + eps_shave).min(p_max);
                                                     let b_cand = quantize_price(raw_cand, sz_decimals);
 
@@ -3236,7 +3264,7 @@ async fn main() {
                                                         pos.candidate_lower_count += 1;
                                                         if pos.candidate_lower_count >= 3
                                                             && cooldown_ok
-                                                            && pos.reprice_count < 3
+                                                            && pos.reprice_count < 2
                                                         {
                                                             should_reprice = true;
                                                             new_reprice_target = b_cand;
