@@ -505,8 +505,10 @@ pub fn calculate_features_with_funding(
         evaluate_ols_drift(&closes_history[n_total - candidate_windows[0]..], max_economic_drift * 0.50);
 
     let mut selected_ou: Option<OuParameters> = None;
+    let mut best_secondary_ou: Option<(OuParameters, f64)> = None;
     let mut best_fallback_hl: Option<(OuParameters, f64, bool)> = None;
     let mut seen_w = Vec::with_capacity(4);
+    let tradeable_max_hl = 85.0_f64;
 
     for &w in &candidate_windows {
         if w < 100 || seen_w.contains(&w) {
@@ -521,12 +523,17 @@ pub fn calculate_features_with_funding(
             let hl = sub_params.half_life_minutes();
             let mu_dev = (sub_params.mu - hist_last_price).abs() / hist_last_price;
             let max_mu_dev = if w <= 360 { 0.045 } else { 0.07 };
-            if !sub_drifting && hl >= min_hl && hl <= max_hl && mu_dev <= max_mu_dev {
+            if !sub_drifting && hl >= min_hl && hl <= tradeable_max_hl && mu_dev <= max_mu_dev {
                 selected_ou = Some(sub_params);
                 total_drift_pct = sub_drift;
                 is_drifting = false;
+                best_secondary_ou = None;
                 best_fallback_hl = None;
                 break;
+            } else if !sub_drifting && hl > tradeable_max_hl && hl <= max_hl && mu_dev <= max_mu_dev {
+                if best_secondary_ou.is_none() {
+                    best_secondary_ou = Some((sub_params, sub_drift));
+                }
             } else if best_fallback_hl.as_ref().map_or(true, |(prev, _, _)| {
                 hl >= min_hl && hl < prev.half_life_minutes()
             }) {
@@ -535,7 +542,11 @@ pub fn calculate_features_with_funding(
         }
     }
     if selected_ou.is_none() {
-        if let Some((fb_params, fb_drift, fb_drifting)) = best_fallback_hl {
+        if let Some((sec_params, sec_drift)) = best_secondary_ou {
+            selected_ou = Some(sec_params);
+            total_drift_pct = sec_drift;
+            is_drifting = false;
+        } else if let Some((fb_params, fb_drift, fb_drifting)) = best_fallback_hl {
             selected_ou = Some(fb_params);
             total_drift_pct = fb_drift;
             is_drifting = fb_drifting;

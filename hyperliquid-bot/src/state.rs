@@ -282,8 +282,9 @@ impl CircuitBreaker {
     pub fn record_time_stop(&mut self) -> bool {
         self.consecutive_time_stops += 1;
         if self.consecutive_time_stops >= 3 {
-            let pause_dt = chrono::Utc::now() + chrono::Duration::hours(24);
+            let pause_dt = chrono::Utc::now() + chrono::Duration::minutes(90);
             self.paused_until = Some(pause_dt.to_rfc3339());
+            self.consecutive_time_stops = 0;
             return true;
         }
         false
@@ -303,10 +304,24 @@ pub fn load_circuit_breaker(file_path: &str) -> CircuitBreaker {
     if !std::path::Path::new(file_path).exists() {
         return CircuitBreaker::default();
     }
-    fs::read_to_string(file_path)
+    let mut cb: CircuitBreaker = fs::read_to_string(file_path)
         .ok()
         .and_then(|c| serde_json::from_str(&c).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    if let Some(ref ts) = cb.paused_until {
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+            let now = chrono::Utc::now();
+            let pause_utc = dt.with_timezone(&chrono::Utc);
+            // Clear expired pauses OR legacy 24-hour pauses (>95m in future) from prior builds
+            if now >= pause_utc || pause_utc > now + chrono::Duration::minutes(95) {
+                cb.paused_until = None;
+                cb.consecutive_time_stops = 0;
+                save_circuit_breaker(file_path, &cb);
+            }
+        }
+    }
+    cb
 }
 
 pub fn save_circuit_breaker(file_path: &str, cb: &CircuitBreaker) {

@@ -384,16 +384,33 @@ impl RegimeController {
             }
 
             ControllerMode::Trend => {
-                // Trend -> Neutral if trend probability decays below 0.55
+                // Trend -> Neutral (or directly to MeanReversion if high-confidence P_C >= 78% + O-U valid is met)
                 if p_trend < 0.55 {
-                    self.current_mode = ControllerMode::Neutral;
                     self.trend_streak = 0;
                     self.last_transition_time = Utc::now().to_rfc3339();
-                    self.last_reason = format!(
-                        "Trend momentum decayed (P_T={:.2} < 0.55) -> Neutral buffer",
-                        p_trend
-                    );
                     self.epoch += 1;
+
+                    let valid_fast_consolidation = p_consolidation >= 0.78
+                        && z_15.abs() < 1.8
+                        && z_60.abs() < 2.2
+                        && self.consolidation_streak >= 1
+                        && is_ou_stationary
+                        && is_half_life_valid
+                        && !is_severe_shock;
+                    if valid_fast_consolidation {
+                        self.current_mode = ControllerMode::MeanReversion;
+                        self.last_reason = format!(
+                            "Consolidation confirmed: P_C={:.1}% (streak {} bars) + O-U valid",
+                            p_consolidation * 100.0,
+                            self.consolidation_streak
+                        );
+                    } else {
+                        self.current_mode = ControllerMode::Neutral;
+                        self.last_reason = format!(
+                            "Trend momentum decayed (P_T={:.2} < 0.55) -> Neutral buffer",
+                            p_trend
+                        );
+                    }
                 }
             }
 
