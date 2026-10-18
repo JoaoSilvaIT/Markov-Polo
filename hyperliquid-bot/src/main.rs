@@ -3648,19 +3648,18 @@ async fn main() {
                                 "AVAX" => 0.0170,
                                 _ => 0.0110,
                             };
-                            // Note: touching a 1.50*sigma_eq O-U band (with t_half=15..55m) naturally produces
-                            // |Z15| in 1.30..2.35 and |Z60| up to 2.40 (especially 60m after a V-bottom/top).
-                            let consolidation_vol_ok = z_15.abs() < 2.45 && z_60.abs() < 2.50;
+                            // Block entries when 60m momentum |Z60| >= 1.75 (such as post-crash V-bounces or waterfall dumps).
+                            let consolidation_vol_ok = z_15.abs() < 2.15 && z_60.abs() < 1.80;
                             let entry_half_life_ok = is_valid_half_life && half_life_m <= 85.0;
-                            let can_mean_revert_long = z_60 > -2.45
-                                && z_15 > -2.40
+                            let can_mean_revert_long = z_60 > -1.75
+                                && z_15 > -2.10
                                 && total_drift_pct > -max_mr_drift
-                                && !(total_drift_pct <= -0.0050 && z_60 <= -1.65);
-                            let can_mean_revert_short = z_60 < 2.45
-                                && z_15 < 2.40
+                                && !(total_drift_pct <= -0.0045 && z_60 <= -1.35);
+                            let can_mean_revert_short = z_60 < 1.75
+                                && z_15 < 2.10
                                 && total_drift_pct < max_mr_drift
-                                && !(total_drift_pct >= 0.0050 && z_60 >= 1.65);
-                            let tier2_regime_ok = half_life_m <= 55.0 && z_60.abs() < 1.85 && total_drift_pct.abs() < 0.0055;
+                                && !(total_drift_pct >= 0.0045 && z_60 >= 1.35);
+                            let tier2_regime_ok = half_life_m <= 50.0 && z_60.abs() < 1.40 && total_drift_pct.abs() < 0.0050;
                             let is_eligible = !candle_feed_degraded
                                 && !is_candle_gap
                                 && is_consolidation
@@ -3714,9 +3713,9 @@ async fn main() {
                                 };
 
                                 let directional_bleed_vetoed = if arm_side == "LONG" {
-                                    total_drift_pct <= -max_mr_drift || (total_drift_pct <= -0.0065 && z_60 <= -2.10)
+                                    !can_mean_revert_long
                                 } else {
-                                    total_drift_pct >= max_mr_drift || (total_drift_pct >= 0.0065 && z_60 >= 2.10)
+                                    !can_mean_revert_short
                                 };
 
                                 let thesis_invalidated = !is_consolidation

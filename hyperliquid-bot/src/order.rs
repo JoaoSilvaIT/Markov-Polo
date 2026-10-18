@@ -134,10 +134,10 @@ pub async fn place_ou_maker_entry(
         ));
     }
 
-    // Deterministic O-U Stop Loss: 2.2x target distance, clamped to [48 bps, 68 bps] from entry
-    // so normal range noise (15-30 bps) never wicks out the trade while worst-case stop is tightly bounded.
+    // Deterministic O-U Stop Loss: 1.8x target distance, strictly clamped to [40 bps, 52 bps] from entry (~$0.28-$0.36 max loss on $70)
+    // so normal range noise (15-25 bps) does not wick out the trade while a single stop can NEVER cost $1.00+.
     let edge_dist = (post_only_price - target_tp_quantized).abs();
-    let sl_dist = (2.2 * edge_dist).clamp(post_only_price * 0.0048, post_only_price * 0.0068);
+    let sl_dist = (1.8 * edge_dist).clamp(post_only_price * 0.0040, post_only_price * 0.0052);
     let raw_sl = if is_buy {
         post_only_price - sl_dist
     } else {
