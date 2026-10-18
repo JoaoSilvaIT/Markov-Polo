@@ -588,10 +588,13 @@ pub async fn emergency_flatten(
     }
 
     // 3. Reconcile open orders on exchange: cancel any sibling orders and confirm entry order is no longer resting
-    let open_orders = info
-        .open_orders(wallet_address)
-        .await
-        .map_err(|e| format!("Failed to query open_orders in emergency_flatten: {}", e))?;
+    let open_orders = tokio::time::timeout(
+        tokio::time::Duration::from_secs(10),
+        info.open_orders(wallet_address),
+    )
+    .await
+    .map_err(|_| "Timed out querying open_orders in emergency_flatten".to_string())?
+    .map_err(|e| format!("Failed to query open_orders in emergency_flatten: {}", e))?;
     for sym_ord in open_orders.iter().filter(|o| o.coin == symbol) {
         let _ = cancel_order(exchange, symbol, sym_ord.oid).await;
     }
@@ -600,10 +603,13 @@ pub async fn emergency_flatten(
             if open_orders.iter().any(|o| o.oid == entry_oid) {
                 tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
                 let _ = cancel_order(exchange, symbol, entry_oid).await;
-                let post_cancel_orders = info
-                    .open_orders(wallet_address)
-                    .await
-                    .map_err(|e| format!("Failed to query post-cancel open_orders: {}", e))?;
+                let post_cancel_orders = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(10),
+                    info.open_orders(wallet_address),
+                )
+                .await
+                .map_err(|_| "Timed out querying post-cancel open_orders".to_string())?
+                .map_err(|e| format!("Failed to query post-cancel open_orders: {}", e))?;
                 if post_cancel_orders.iter().any(|o| o.oid == entry_oid) {
                     let err = format!(
                         "Emergency flatten failed: entry order {} still active on exchange. Retaining state and lease.",
@@ -644,10 +650,13 @@ pub async fn emergency_flatten(
 
     // 5. Final multi-step verification: position == 0 AND no orders remain for symbol
     let (mut final_szi, _) = get_user_position(info, wallet_address, symbol).await?;
-    let mut final_orders = info
-        .open_orders(wallet_address)
-        .await
-        .map_err(|e| format!("Failed to query final open_orders: {}", e))?;
+    let mut final_orders = tokio::time::timeout(
+        tokio::time::Duration::from_secs(10),
+        info.open_orders(wallet_address),
+    )
+    .await
+    .map_err(|_| "Timed out querying final open_orders".to_string())?
+    .map_err(|e| format!("Failed to query final open_orders: {}", e))?;
     for rem in final_orders.iter().filter(|o| o.coin == symbol) {
         let _ = cancel_order(exchange, symbol, rem.oid).await;
     }
@@ -656,7 +665,12 @@ pub async fn emergency_flatten(
         if let Ok((recheck_szi, _)) = get_user_position(info, wallet_address, symbol).await {
             final_szi = recheck_szi;
         }
-        if let Ok(recheck_orders) = info.open_orders(wallet_address).await {
+        if let Ok(Ok(recheck_orders)) = tokio::time::timeout(
+            tokio::time::Duration::from_secs(10),
+            info.open_orders(wallet_address),
+        )
+        .await
+        {
             final_orders = recheck_orders;
         }
     }
@@ -699,13 +713,9 @@ pub async fn emergency_flatten(
         );
         if (pos.is_filled || szi.abs() > eps) && pos.entry_price > 0.0 && pos.amount > 0.0 {
             let mut exit_px = pos.entry_price;
-            if let Ok(l2) = info.l2_snapshot(symbol.to_string()).await {
-                if l2.levels.len() >= 2 && !l2.levels[0].is_empty() && !l2.levels[1].is_empty() {
-                    let bid = l2.levels[0][0].px.parse::<f64>().unwrap_or(0.0);
-                    let ask = l2.levels[1][0].px.parse::<f64>().unwrap_or(0.0);
-                    if bid > 0.0 && ask > 0.0 {
-                        exit_px = if pos.side == "LONG" { bid } else { ask };
-                    }
+            if let Ok((bid, ask)) = fetch_book_ticker(info, symbol).await {
+                if bid > 0.0 && ask > 0.0 {
+                    exit_px = if pos.side == "LONG" { bid } else { ask };
                 }
             }
             let pnl_usd = if pos.side == "LONG" {

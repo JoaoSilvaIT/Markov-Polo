@@ -62,10 +62,13 @@ async fn backfill_missing_1m_candles(
     if start_ms >= end_ms {
         return Ok(0);
     }
-    let mut candles = info_client
-        .candles_snapshot(coin.to_string(), "1m".to_string(), start_ms, end_ms)
-        .await
-        .map_err(|e| format!("REST candles_snapshot error: {}", e))?;
+    let mut candles = tokio::time::timeout(
+        Duration::from_secs(10),
+        info_client.candles_snapshot(coin.to_string(), "1m".to_string(), start_ms, end_ms),
+    )
+    .await
+    .map_err(|_| format!("Timeout fetching candles_snapshot for {}", coin))?
+    .map_err(|e| format!("REST candles_snapshot error: {}", e))?;
 
     // 1. Sort strictly by time_open
     candles.sort_by_key(|c| c.time_open);
@@ -901,7 +904,7 @@ async fn main() {
             };
 
             // Cross-reference user position on live exchange (Fail-Closed)
-            let (current_szi, _) = match get_user_position(&watcher_info, user_address, &watcher_symbol).await {
+            let (mut current_szi, _) = match get_user_position(&watcher_info, user_address, &watcher_symbol).await {
                 Ok(res) => res,
                 Err(e) => {
                     eprintln!(
@@ -1160,12 +1163,24 @@ async fn main() {
 
                 if !pos.order_id.is_empty() && !pos.is_filled {
                     if let Ok(oid) = pos.order_id.parse::<u64>() {
-                        let open_orders = match watcher_info.open_orders(user_address).await {
-                            Ok(o) => o,
-                            Err(e) => {
+                        let open_orders = match tokio::time::timeout(
+                            Duration::from_secs(10),
+                            watcher_info.open_orders(user_address),
+                        )
+                        .await
+                        {
+                            Ok(Ok(o)) => o,
+                            Ok(Err(e)) => {
                                 eprintln!(
                                     "⚠️ [FAST-SENTINEL] API failure querying open_orders for {}: {}. Retaining state (fail-closed).",
                                     watcher_symbol, e
+                                );
+                                continue;
+                            }
+                            Err(_) => {
+                                eprintln!(
+                                    "⚠️ [FAST-SENTINEL] Timeout querying open_orders for {}. Retaining state (fail-closed).",
+                                    watcher_symbol
                                 );
                                 continue;
                             }
@@ -1201,6 +1216,11 @@ async fn main() {
                                         order_age_secs
                                     );
                                     let _ = cancel_order(&watcher_exchange, &watcher_symbol, oid).await;
+                                    if let Ok((fresh_szi, _)) = get_user_position(&watcher_info, user_address, &watcher_symbol).await {
+                                        if fresh_szi.abs() > current_szi.abs() {
+                                            current_szi = fresh_szi;
+                                        }
+                                    }
                                 } else {
                                     // Keep resting so the remaining Maker size can fill; L2 stop-loss above already guards current_szi
                                     is_filled = false;
@@ -1241,8 +1261,21 @@ async fn main() {
                                     reported_status = "BTC_IMPULSE_ABORT".to_string();
                                 }
                             }
+                        } else if pos_exists {
+                            // Entry order is no longer resting and position exists: refresh current_szi in case a final partial fill
+                            // completed in the milliseconds between the initial user_state query and open_orders query.
+                            if let Ok((fresh_szi, _)) = get_user_position(&watcher_info, user_address, &watcher_symbol).await {
+                                if fresh_szi.abs() > current_szi.abs() {
+                                    current_szi = fresh_szi;
+                                }
+                            }
                         } else if !pos_exists {
-                            if let Ok(order_status) = watcher_info.query_order_by_oid(user_address, oid).await {
+                            if let Ok(Ok(order_status)) = tokio::time::timeout(
+                                Duration::from_secs(10),
+                                watcher_info.query_order_by_oid(user_address, oid),
+                            )
+                            .await
+                            {
                                 reported_status = if let Some(ref o) = order_status.order {
                                     o.status.to_uppercase()
                                 } else {
@@ -1404,12 +1437,24 @@ async fn main() {
 
                     // Reconcile open orders and position before cleaning up state
                     let eps = 1e-5;
-                    let verify_orders = match watcher_info.open_orders(user_address).await {
-                        Ok(orders) => orders,
-                        Err(e) => {
+                    let verify_orders = match tokio::time::timeout(
+                        Duration::from_secs(10),
+                        watcher_info.open_orders(user_address),
+                    )
+                    .await
+                    {
+                        Ok(Ok(orders)) => orders,
+                        Ok(Err(e)) => {
                             eprintln!(
                                 "⚠️ [FAST-SENTINEL] Failed to verify open_orders before cleanup for {}: {}. Retaining state.",
                                 watcher_symbol, e
+                            );
+                            continue;
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "⚠️ [FAST-SENTINEL] Timeout verifying open_orders before cleanup for {}. Retaining state.",
+                                watcher_symbol
                             );
                             continue;
                         }
@@ -1462,7 +1507,12 @@ async fn main() {
                 let mut is_tp_dead = false;
 
                 if let Ok(tp_oid) = pos.tp_order_id.parse::<u64>() {
-                    if let Ok(order_status) = watcher_info.query_order_by_oid(user_address, tp_oid).await {
+                    if let Ok(Ok(order_status)) = tokio::time::timeout(
+                        Duration::from_secs(10),
+                        watcher_info.query_order_by_oid(user_address, tp_oid),
+                    )
+                    .await
+                    {
                         let inner_status = if let Some(ref o) = order_status.order {
                             o.status.to_uppercase()
                         } else {
@@ -1490,12 +1540,24 @@ async fn main() {
                 }
 
                 if is_tp_filled || is_flat {
-                    let final_orders = match watcher_info.open_orders(user_address).await {
-                        Ok(orders) => orders,
-                        Err(e) => {
+                    let final_orders = match tokio::time::timeout(
+                        Duration::from_secs(10),
+                        watcher_info.open_orders(user_address),
+                    )
+                    .await
+                    {
+                        Ok(Ok(orders)) => orders,
+                        Ok(Err(e)) => {
                             eprintln!(
                                 "⚠️ [FAST-SENTINEL] Failed to query open_orders on TP close for {}: {}. Retaining state.",
                                 watcher_symbol, e
+                            );
+                            continue;
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "⚠️ [FAST-SENTINEL] Timeout querying open_orders on TP close for {}. Retaining state.",
+                                watcher_symbol
                             );
                             continue;
                         }
@@ -2951,10 +3013,58 @@ async fn main() {
                     let mut state_lock = state_clone.lock().await;
                     let has_position = state_lock.contains_key(&symbol_clone);
 
-                    let consolidation_vol_ok = z_15.abs() < 2.2 && z_60.abs() < 2.5;
+                    let consolidation_vol_ok = z_15.abs() < 2.45 && z_60.abs() < 2.50;
                     let mr_invalidated = !consolidation_vol_ok || controller.current_mode != ControllerMode::MeanReversion;
 
                     if has_position {
+                        // Failsafe Exchange Reconciliation: if local state still shows `!pos.is_filled`,
+                        // check Hyperliquid before treating the position as an unfilled resting entry.
+                        let needs_fill_check = state_lock
+                            .get(&symbol_clone)
+                            .map(|p| !p.is_filled)
+                            .unwrap_or(false);
+                        if needs_fill_check {
+                            if let Ok((live_szi, _)) = get_user_position(&info_clone, user_address, &symbol_clone).await {
+                                if live_szi.abs() > 1e-5 {
+                                    let mut need_fallback_tp = None;
+                                    if let Some(p) = state_lock.get_mut(&symbol_clone) {
+                                        p.is_filled = true;
+                                        p.amount = live_szi.abs();
+                                        p.opened_at = chrono::Utc::now().to_rfc3339();
+                                        if p.tp_order_id.is_empty() && p.take_profit_price > 0.0 {
+                                            let raw_tp = if p.effective_tp > 0.0 { p.effective_tp } else { p.take_profit_price };
+                                            need_fallback_tp = Some((p.side == "SHORT", quantize_price(raw_tp, sz_decimals), p.amount));
+                                        }
+                                    }
+                                    let _ = crate::state::save_state(&state_path_clone, &state_lock);
+                                    sentinel_notify.notify_one();
+
+                                    if let Some((tp_is_buy, tp_px, tp_amt)) = need_fallback_tp {
+                                        println!(
+                                            "🟢 [1M-FAILSAFE TP] Position Active for {} (Size: {:.4})! Placing Take Profit Limit order at ${:.2}",
+                                            symbol_clone, tp_amt, tp_px
+                                        );
+                                        if let Ok(tp_oid) = place_post_only_order(
+                                            &exchange_clone,
+                                            &symbol_clone,
+                                            tp_is_buy,
+                                            tp_px,
+                                            tp_amt,
+                                            true,
+                                            Some(uuid::Uuid::new_v4()),
+                                        )
+                                        .await
+                                        {
+                                            if let Some(p) = state_lock.get_mut(&symbol_clone) {
+                                                p.tp_order_id = tp_oid.to_string();
+                                            }
+                                            let _ = crate::state::save_state(&state_path_clone, &state_lock);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         if let Some(pos) = state_lock.get(&symbol_clone) {
                             if !pos.is_filled {
                                 if pos.engine_type == "EngineA" && mr_invalidated {
@@ -3467,11 +3577,22 @@ async fn main() {
                             } else if pos_engine_type == "EngineA"
                                 && (live_feat.is_drifting
                                     || controller.current_mode == ControllerMode::Trend
-                                    || half_life_m >= 480.0)
+                                    || half_life_m >= 480.0
+                                    || {
+                                        let pos_is_long = state_lock
+                                            .get(&symbol_clone)
+                                            .map(|p| p.side == "LONG")
+                                            .unwrap_or(true);
+                                        if pos_is_long {
+                                            z_15 <= -2.75 && z_60 <= -2.45
+                                        } else {
+                                            z_15 >= 2.75 && z_60 >= 2.45
+                                        }
+                                    })
                             {
                                 println!(
-                                    "🚨 [INVALIDATION] Regime shift detected for {} (drifting: {}, mode: {}, t_half: {:.1}m). Flattening.",
-                                    symbol_clone, live_feat.is_drifting, controller.current_mode, half_life_m
+                                    "🚨 [INVALIDATION] Regime shift detected for {} (drifting: {}, mode: {}, t_half: {:.1}m, Z15: {:.2}, Z60: {:.2}). Flattening.",
+                                    symbol_clone, live_feat.is_drifting, controller.current_mode, half_life_m, z_15, z_60
                                 );
                                 let _ = execute_emergency_flatten_with_retry(
                                     &state_path_clone,

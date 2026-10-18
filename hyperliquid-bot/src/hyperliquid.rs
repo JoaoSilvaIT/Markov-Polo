@@ -4,12 +4,15 @@ use hyperliquid_rust_sdk::{
     ExchangeClient, ExchangeDataStatus, ExchangeResponseStatus, InfoClient,
 };
 use std::collections::HashMap;
+use std::time::Duration;
+
+const HL_REST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Fetches the best bid and best ask from the L2 order book
 pub async fn fetch_book_ticker(info: &InfoClient, coin: &str) -> Result<(f64, f64), String> {
-    let l2 = info
-        .l2_snapshot(coin.to_string())
+    let l2 = tokio::time::timeout(HL_REST_TIMEOUT, info.l2_snapshot(coin.to_string()))
         .await
+        .map_err(|_| format!("Timeout fetching L2 snapshot for {}", coin))?
         .map_err(|e| format!("Failed to fetch L2 snapshot for {}: {}", coin, e))?;
 
     if l2.levels.len() < 2 || l2.levels[0].is_empty() || l2.levels[1].is_empty() {
@@ -130,9 +133,9 @@ pub async fn place_post_only_order(
         }),
     };
 
-    let res = exchange
-        .order(order_req, None)
+    let res = tokio::time::timeout(HL_REST_TIMEOUT, exchange.order(order_req, None))
         .await
+        .map_err(|_| format!("Order submission timed out after 10s for {}", coin))?
         .map_err(|e| format!("Order submission failed: {}", e))?;
 
     match res {
@@ -191,9 +194,9 @@ pub async fn place_disaster_stop_trigger_order(
         }),
     };
 
-    let res = exchange
-        .order(order_req, None)
+    let res = tokio::time::timeout(HL_REST_TIMEOUT, exchange.order(order_req, None))
         .await
+        .map_err(|_| format!("Disaster stop trigger submission timed out after 10s for {}", coin))?
         .map_err(|e| format!("Disaster stop trigger submission failed: {}", e))?;
 
     match res {
@@ -238,9 +241,9 @@ pub async fn cancel_order(exchange: &ExchangeClient, coin: &str, oid: u64) -> Re
         asset: coin.to_string(),
         oid,
     };
-    let res = exchange
-        .cancel(req, None)
+    let res = tokio::time::timeout(HL_REST_TIMEOUT, exchange.cancel(req, None))
         .await
+        .map_err(|_| format!("Cancel timed out after 10s for {} oid {}", coin, oid))?
         .map_err(|e| format!("Cancel failed: {}", e))?;
 
     match res {
@@ -289,9 +292,9 @@ pub async fn close_market_position(
         }),
     };
 
-    let res = exchange
-        .order(order_req, None)
+    let res = tokio::time::timeout(HL_REST_TIMEOUT, exchange.order(order_req, None))
         .await
+        .map_err(|_| format!("Market close submission timed out after 10s for {}", coin))?
         .map_err(|e| format!("Market close submission failed: {}", e))?;
 
     match res {
@@ -325,9 +328,9 @@ pub async fn get_user_position(
     address: H160,
     coin: &str,
 ) -> Result<(f64, Option<f64>), String> {
-    let state = info
-        .user_state(address)
+    let state = tokio::time::timeout(HL_REST_TIMEOUT, info.user_state(address))
         .await
+        .map_err(|_| format!("Timed out querying user_state for {}", coin))?
         .map_err(|e| format!("Failed to get user state: {}", e))?;
 
     for p in state.asset_positions {
@@ -346,9 +349,9 @@ pub async fn get_account_value(
     address: H160,
 ) -> Result<f64, String> {
     // 1. Clearinghouse perp account value is mandatory (fail-closed if perp state RPC fails)
-    let state = info
-        .user_state(address)
+    let state = tokio::time::timeout(HL_REST_TIMEOUT, info.user_state(address))
         .await
+        .map_err(|_| "Timed out querying user_state for account_value".to_string())?
         .map_err(|e| format!("Failed to query user_state: {}", e))?;
     let perp_val = state
         .margin_summary
@@ -358,7 +361,9 @@ pub async fn get_account_value(
 
     // 2. Query unencumbered spot token balances (total - hold) for Unified Account setups
     let mut free_spot_usdc = 0.0;
-    if let Ok(token_balances) = info.user_token_balances(address).await {
+    if let Ok(Ok(token_balances)) =
+        tokio::time::timeout(HL_REST_TIMEOUT, info.user_token_balances(address)).await
+    {
         for b in token_balances.balances {
             if b.coin == "USDC" {
                 let total = b.total.parse::<f64>().unwrap_or(0.0);
