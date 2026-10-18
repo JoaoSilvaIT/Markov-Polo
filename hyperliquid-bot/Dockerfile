@@ -1,6 +1,9 @@
 FROM rust:slim-bookworm AS builder
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
+ENV CARGO_PROFILE_RELEASE_LTO=thin \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
+    CARGO_PROFILE_RELEASE_STRIP=symbols
 COPY Cargo.toml Cargo.lock ./
 # Pre-build dummy source to cache heavy dependency crates (ethers, SDK, ndarray)
 RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release

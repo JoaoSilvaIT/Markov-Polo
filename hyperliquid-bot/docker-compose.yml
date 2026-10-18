@@ -1,3 +1,16 @@
+x-bot-env: &bot-env
+  HL_LEVERAGE: ${HL_LEVERAGE:-3}
+  HL_IS_CROSS: ${HL_IS_CROSS:-true}
+  HL_TREND_ENGINE_MODE: ${HL_TREND_ENGINE_MODE:-live}
+  HL_PORTFOLIO_SYMBOLS: ${HL_PORTFOLIO_SYMBOLS:-BTC,ETH,SOL,AVAX}
+  HL_MAX_CONCURRENT_POSITIONS: ${HL_MAX_CONCURRENT_POSITIONS:-2}
+  HL_DONCHIAN_PERIOD: ${HL_DONCHIAN_PERIOD:-12}
+  HL_CHANDELIER_ATR_MULT: ${HL_CHANDELIER_ATR_MULT:-2.0}
+  HL_SIZING_MODE: ${HL_SIZING_MODE:-dynamic}
+  HL_EQUITY_FRACTION: ${HL_EQUITY_FRACTION:-0.25}
+  HL_TREND_RISK_FRACTION: ${HL_TREND_RISK_FRACTION:-1.0}
+  HL_MAX_POSITION_SIZE_USDC: ${HL_MAX_POSITION_SIZE_USDC:-500.0}
+
 x-bot-common: &bot-common
   image: hyperliquid-bot:latest
   build:
@@ -6,6 +19,14 @@ x-bot-common: &bot-common
   init: true
   restart: unless-stopped
   stop_grace_period: 15s
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=16m
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  pids_limit: 128
   mem_limit: 256m
   memswap_limit: 256m
   cpus: "1.0"
@@ -32,86 +53,54 @@ services:
     <<: *bot-common
     container_name: hl_bot_btc
     environment:
-      - HL_TRADING_SYMBOL=BTC
-      - HL_LEVERAGE=${HL_LEVERAGE:-3}
-      - HL_IS_CROSS=${HL_IS_CROSS:-true}
-      - HL_TREND_ENGINE_MODE=${HL_TREND_ENGINE_MODE:-live}
-      - HL_PORTFOLIO_SYMBOLS=${HL_PORTFOLIO_SYMBOLS:-BTC,ETH,SOL,AVAX}
-      - HL_MAX_CONCURRENT_POSITIONS=${HL_MAX_CONCURRENT_POSITIONS:-2}
-      - HL_DONCHIAN_PERIOD=${HL_DONCHIAN_PERIOD:-12}
-      - HL_CHANDELIER_ATR_MULT=${HL_CHANDELIER_ATR_MULT:-2.0}
-      - HL_SIZING_MODE=${HL_SIZING_MODE:-dynamic}
-      - HL_EQUITY_FRACTION=${HL_EQUITY_FRACTION:-0.25}
-      - HL_TREND_RISK_FRACTION=${HL_TREND_RISK_FRACTION:-1.0}
-      - HL_MAX_POSITION_SIZE_USDC=${HL_MAX_POSITION_SIZE_USDC:-500.0}
+      <<: *bot-env
+      HL_TRADING_SYMBOL: BTC
 
   hl_bot_eth:
     <<: *bot-common
     container_name: hl_bot_eth
     environment:
-      - HL_TRADING_SYMBOL=ETH
-      - HL_LEVERAGE=${HL_LEVERAGE:-3}
-      - HL_IS_CROSS=${HL_IS_CROSS:-true}
-      - HL_TREND_ENGINE_MODE=${HL_TREND_ENGINE_MODE:-live}
-      - HL_PORTFOLIO_SYMBOLS=${HL_PORTFOLIO_SYMBOLS:-BTC,ETH,SOL,AVAX}
-      - HL_MAX_CONCURRENT_POSITIONS=${HL_MAX_CONCURRENT_POSITIONS:-2}
-      - HL_DONCHIAN_PERIOD=${HL_DONCHIAN_PERIOD:-12}
-      - HL_CHANDELIER_ATR_MULT=${HL_CHANDELIER_ATR_MULT:-2.0}
-      - HL_SIZING_MODE=${HL_SIZING_MODE:-dynamic}
-      - HL_EQUITY_FRACTION=${HL_EQUITY_FRACTION:-0.25}
-      - HL_TREND_RISK_FRACTION=${HL_TREND_RISK_FRACTION:-1.0}
-      - HL_MAX_POSITION_SIZE_USDC=${HL_MAX_POSITION_SIZE_USDC:-500.0}
+      <<: *bot-env
+      HL_TRADING_SYMBOL: ETH
 
   hl_bot_sol:
     <<: *bot-common
     container_name: hl_bot_sol
     environment:
-      - HL_TRADING_SYMBOL=SOL
-      - HL_LEVERAGE=${HL_LEVERAGE:-3}
-      - HL_IS_CROSS=${HL_IS_CROSS:-true}
-      - HL_TREND_ENGINE_MODE=${HL_TREND_ENGINE_MODE:-live}
-      - HL_PORTFOLIO_SYMBOLS=${HL_PORTFOLIO_SYMBOLS:-BTC,ETH,SOL,AVAX}
-      - HL_MAX_CONCURRENT_POSITIONS=${HL_MAX_CONCURRENT_POSITIONS:-2}
-      - HL_DONCHIAN_PERIOD=${HL_DONCHIAN_PERIOD:-12}
-      - HL_CHANDELIER_ATR_MULT=${HL_CHANDELIER_ATR_MULT:-2.0}
-      - HL_SIZING_MODE=${HL_SIZING_MODE:-dynamic}
-      - HL_EQUITY_FRACTION=${HL_EQUITY_FRACTION:-0.25}
-      - HL_TREND_RISK_FRACTION=${HL_TREND_RISK_FRACTION:-1.0}
-      - HL_MAX_POSITION_SIZE_USDC=${HL_MAX_POSITION_SIZE_USDC:-500.0}
+      <<: *bot-env
+      HL_TRADING_SYMBOL: SOL
 
   hl_bot_avax:
     <<: *bot-common
     container_name: hl_bot_avax
     environment:
-      - HL_TRADING_SYMBOL=AVAX
-      - HL_LEVERAGE=${HL_LEVERAGE:-3}
-      - HL_IS_CROSS=${HL_IS_CROSS:-true}
-      - HL_TREND_ENGINE_MODE=${HL_TREND_ENGINE_MODE:-live}
-      - HL_PORTFOLIO_SYMBOLS=${HL_PORTFOLIO_SYMBOLS:-BTC,ETH,SOL,AVAX}
-      - HL_MAX_CONCURRENT_POSITIONS=${HL_MAX_CONCURRENT_POSITIONS:-2}
-      - HL_DONCHIAN_PERIOD=${HL_DONCHIAN_PERIOD:-12}
-      - HL_CHANDELIER_ATR_MULT=${HL_CHANDELIER_ATR_MULT:-2.0}
-      - HL_SIZING_MODE=${HL_SIZING_MODE:-dynamic}
-      - HL_EQUITY_FRACTION=${HL_EQUITY_FRACTION:-0.25}
-      - HL_TREND_RISK_FRACTION=${HL_TREND_RISK_FRACTION:-1.0}
-      - HL_MAX_POSITION_SIZE_USDC=${HL_MAX_POSITION_SIZE_USDC:-500.0}
+      <<: *bot-env
+      HL_TRADING_SYMBOL: AVAX
 
   hl_dashboard:
     image: python:3.11-alpine
     container_name: hl_dashboard
     init: true
     restart: unless-stopped
-    env_file:
-      - path: .env
-        required: false
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 64
+    mem_limit: 128m
+    memswap_limit: 128m
+    cpus: "0.5"
     ports:
-      - "${DASHBOARD_PORT:-8088}:8088"
+      - "${DASHBOARD_BIND_IP:-0.0.0.0}:${DASHBOARD_PORT:-8088}:8088"
     environment:
-      - DASHBOARD_PORT=${DASHBOARD_PORT:-8088}
-      - HL_MAX_CONCURRENT_POSITIONS=${HL_MAX_CONCURRENT_POSITIONS:-2}
-      - HL_WALLET_ADDRESS=${HL_WALLET_ADDRESS:-}
-      - HL_IS_MAINNET=${HL_IS_MAINNET:-true}
-      - PYTHONUNBUFFERED=1
+      DASHBOARD_PORT: ${DASHBOARD_PORT:-8088}
+      HL_MAX_CONCURRENT_POSITIONS: ${HL_MAX_CONCURRENT_POSITIONS:-2}
+      HL_WALLET_ADDRESS: ${HL_WALLET_ADDRESS:-}
+      HL_IS_MAINNET: ${HL_IS_MAINNET:-true}
+      PYTHONUNBUFFERED: "1"
     volumes:
       - ./dashboard:/app/dashboard:ro
       - ./hl_bot_data:/app/data:ro
