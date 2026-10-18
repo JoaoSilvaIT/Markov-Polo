@@ -134,9 +134,10 @@ pub async fn place_ou_maker_entry(
         ));
     }
 
-    // Structural Catastrophe Stop Loss: 2.0x expected target edge (min 1.5% from entry)
+    // Deterministic O-U Stop Loss: 2.2x target distance, clamped to [48 bps, 68 bps] from entry
+    // so normal range noise (15-30 bps) never wicks out the trade while worst-case stop is tightly bounded.
     let edge_dist = (post_only_price - target_tp_quantized).abs();
-    let sl_dist = (2.0 * edge_dist).max(post_only_price * 0.015);
+    let sl_dist = (2.2 * edge_dist).clamp(post_only_price * 0.0048, post_only_price * 0.0068);
     let raw_sl = if is_buy {
         post_only_price - sl_dist
     } else {

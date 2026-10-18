@@ -3249,7 +3249,7 @@ async fn main() {
                                         }
 
                                         max_allowed_mins = if pos.half_life_minutes > 0.0 {
-                                            (3.5 * pos.half_life_minutes).clamp(90.0, 360.0)
+                                            (4.5 * pos.half_life_minutes).clamp(180.0, 360.0)
                                         } else {
                                             240.0
                                         };
@@ -3513,8 +3513,22 @@ async fn main() {
                                     );
                                 }
                             } else if entry_ttl_expired {
+                                // Double-check exchange position before flattening an expired resting entry:
+                                // if it already filled on Hyperliquid, promote it and place TP instead of dumping at market!
+                                if let Ok((live_szi, _)) = get_user_position(&info_clone, user_address, &symbol_clone).await {
+                                    if live_szi.abs() > 1e-5 {
+                                        if let Some(p) = state_lock.get_mut(&symbol_clone) {
+                                            p.is_filled = true;
+                                            p.amount = live_szi.abs();
+                                            p.opened_at = chrono::Utc::now().to_rfc3339();
+                                        }
+                                        let _ = crate::state::save_state(&state_path_clone, &state_lock);
+                                        sentinel_notify.notify_one();
+                                        continue;
+                                    }
+                                }
                                 println!(
-                                    "⏱️ [ENTRY TTL EXPIRED] Resting order for {} unfilled after {:.1}m. Flattening.",
+                                    "⏱️ [ENTRY TTL EXPIRED] Resting order for {} unfilled after {:.1}m. Cancelling unfilled entry.",
                                     symbol_clone, elapsed_mins
                                 );
                                 let _ = execute_emergency_flatten_with_retry(
@@ -3557,42 +3571,10 @@ async fn main() {
                                     discord_clone.clone(),
                                 )
                                 .await;
-                            } else if (pos_engine_type == "EngineA" && (is_downside_shock || is_upside_shock))
-                                || (pos_engine_type == "EngineB" && is_downside_shock) {
+                            } else if pos_engine_type == "EngineB" && is_downside_shock {
                                 println!(
                                     "🚨 [SHOCK VETO ON POSITION] Severe adverse shock on {} (Z15: {:.2}, Z60: {:.2}, Engine: {})! Flattening.",
                                     symbol_clone, z_15, z_60, pos_engine_type
-                                );
-                                let _ = execute_emergency_flatten_with_retry(
-                                    &state_path_clone,
-                                    &exchange_clone,
-                                    &info_clone,
-                                    user_address,
-                                    &mut state_lock,
-                                    &symbol_clone,
-                                    sz_decimals,
-                                    discord_clone.clone(),
-                                )
-                                .await;
-                            } else if pos_engine_type == "EngineA"
-                                && (live_feat.is_drifting
-                                    || controller.current_mode == ControllerMode::Trend
-                                    || half_life_m >= 480.0
-                                    || {
-                                        let pos_is_long = state_lock
-                                            .get(&symbol_clone)
-                                            .map(|p| p.side == "LONG")
-                                            .unwrap_or(true);
-                                        if pos_is_long {
-                                            z_15 <= -2.75 && z_60 <= -2.45
-                                        } else {
-                                            z_15 >= 2.75 && z_60 >= 2.45
-                                        }
-                                    })
-                            {
-                                println!(
-                                    "🚨 [INVALIDATION] Regime shift detected for {} (drifting: {}, mode: {}, t_half: {:.1}m, Z15: {:.2}, Z60: {:.2}). Flattening.",
-                                    symbol_clone, live_feat.is_drifting, controller.current_mode, half_life_m, z_15, z_60
                                 );
                                 let _ = execute_emergency_flatten_with_retry(
                                     &state_path_clone,
