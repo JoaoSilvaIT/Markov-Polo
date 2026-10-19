@@ -3319,38 +3319,41 @@ async fn main() {
                                             // One-Way Adaptive Ratchet (Causal Live Mean Tracking)
                                             // -------------------------------------------------------------
                                             if let Some(ref th) = thresholds_opt {
-                                                let delta_reprice = (pos.entry_price * 0.0005)
-                                                    .max(0.10 * d_0)
-                                                    .max(0.03);
+                                                let entry_tick = effective_tick_size(pos.entry_price, sz_decimals);
+                                                let delta_reprice = (pos.entry_price * 0.0004)
+                                                    .max(0.08 * d_0)
+                                                    .max(2.0 * entry_tick);
                                                 let now_ms = chrono::Utc::now().timestamp_millis();
-                                                let min_hold_before_ratchet = (0.85 * pos.half_life_minutes).clamp(25.0, 45.0);
+                                                let min_hold_before_ratchet = (0.85 * pos.half_life_minutes).clamp(20.0, 40.0);
                                                 let hold_ok = elapsed_mins >= min_hold_before_ratchet;
                                                 let cooldown_ok =
-                                                    hold_ok && (now_ms - pos.last_reprice_time) >= 900_000;
+                                                    hold_ok && (now_ms - pos.last_reprice_time) >= 600_000;
 
                                                 if is_long {
                                                     let live_mu = th.exit_long;
                                                     let tick_sz = effective_tick_size(live_mu, sz_decimals);
-                                                    let eps_shave = (live_mu * 0.0005).max(2.0 * tick_sz);
-                                                    let p_min = quantize_price(pos.entry_price * 1.0018, sz_decimals);
+                                                    let eps_shave = (1.5 * tick_sz).max(live_mu * 0.0002);
+                                                    let p_min = quantize_price(pos.entry_price * 1.0012, sz_decimals);
                                                     let raw_cand = (live_mu - eps_shave).max(p_min);
                                                     let b_cand = quantize_price(raw_cand, sz_decimals);
+                                                    let already_past_live_mean = close_price >= live_mu && close_price >= p_min;
 
                                                     if b_cand <= pos.effective_tp - delta_reprice
                                                         && b_cand < quantize_price(pos.effective_tp, sz_decimals)
                                                         && b_cand >= p_min
                                                     {
                                                         pos.candidate_lower_count += 1;
-                                                        if pos.candidate_lower_count >= 3
+                                                        let req_bars = if already_past_live_mean { 1 } else { 3 };
+                                                        if pos.candidate_lower_count >= req_bars
                                                             && cooldown_ok
                                                             && pos.reprice_count < 2
                                                         {
                                                             should_reprice = true;
-                                                            new_reprice_target = b_cand;
+                                                            new_reprice_target = b_cand.max(quantize_price(close_price, sz_decimals));
                                                             reprice_qty = pos.amount;
                                                             reprice_is_buy = false; // TP for Long is Sell
                                                             old_tp_order_id = pos.tp_order_id.clone();
-                                                            pos.effective_tp = b_cand;
+                                                            pos.effective_tp = new_reprice_target;
                                                             pos.last_reprice_time = now_ms;
                                                             pos.reprice_count += 1;
                                                             pos.candidate_lower_count = 0;
@@ -3362,26 +3365,28 @@ async fn main() {
                                                     // SHORT position
                                                     let live_mu = th.exit_short;
                                                     let tick_sz = effective_tick_size(live_mu, sz_decimals);
-                                                    let eps_shave = (live_mu * 0.0005).max(2.0 * tick_sz);
-                                                    let p_max = quantize_price(pos.entry_price * 0.9982, sz_decimals);
+                                                    let eps_shave = (1.5 * tick_sz).max(live_mu * 0.0002);
+                                                    let p_max = quantize_price(pos.entry_price * 0.9988, sz_decimals);
                                                     let raw_cand = (live_mu + eps_shave).min(p_max);
                                                     let b_cand = quantize_price(raw_cand, sz_decimals);
+                                                    let already_past_live_mean = close_price <= live_mu && close_price <= p_max;
 
                                                     if b_cand >= pos.effective_tp + delta_reprice
                                                         && b_cand > quantize_price(pos.effective_tp, sz_decimals)
                                                         && b_cand <= p_max
                                                     {
                                                         pos.candidate_lower_count += 1;
-                                                        if pos.candidate_lower_count >= 3
+                                                        let req_bars = if already_past_live_mean { 1 } else { 3 };
+                                                        if pos.candidate_lower_count >= req_bars
                                                             && cooldown_ok
                                                             && pos.reprice_count < 2
                                                         {
                                                             should_reprice = true;
-                                                            new_reprice_target = b_cand;
+                                                            new_reprice_target = b_cand.min(quantize_price(close_price, sz_decimals));
                                                             reprice_qty = pos.amount;
                                                             reprice_is_buy = true; // TP for Short is Buy
                                                             old_tp_order_id = pos.tp_order_id.clone();
-                                                            pos.effective_tp = b_cand;
+                                                            pos.effective_tp = new_reprice_target;
                                                             pos.last_reprice_time = now_ms;
                                                             pos.reprice_count += 1;
                                                             pos.candidate_lower_count = 0;

@@ -252,7 +252,7 @@ pub async fn place_ou_maker_entry(
     };
 
     let final_edge_dist = (current_price - target_tp_quantized).abs();
-    let final_sl_dist = (2.0 * final_edge_dist).max(current_price * 0.015);
+    let final_sl_dist = (1.20 * final_edge_dist).clamp(current_price * 0.0032, current_price * 0.0040);
     let stop_loss_price = quantize_price(
         if is_buy {
             current_price - final_sl_dist
