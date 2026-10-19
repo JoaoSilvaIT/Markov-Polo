@@ -107,14 +107,11 @@ pub async fn place_ou_maker_entry(
         ));
     }
 
-    // Epsilon Shave + Avellaneda-Stoikov Inventory Skew:
-    // Tick-aware front-run (5 bps + 4 bps, floored in ticks and capped at 25% of gross target distance)
-    // to aggressively exit inventory, accelerate fill probability, and free cluster lock faster.
+    // Minimal Tick-Aware Shave (max 8% of gross target distance, ~1-2 ticks)
+    // Preserves >=92% of the O-U target edge so winning trades earn full +22 to +32 bps instead of being shaved down to ~12 bps.
     let tick_sz = effective_tick_size(target_mu, sz_decimals);
     let gross_dist = (target_mu - post_only_price).abs();
-    let base_shave = (target_mu * 0.0005).max(2.0 * tick_sz);
-    let as_inventory_skew = (target_mu * 0.0004).max(1.5 * tick_sz);
-    let total_shave = (base_shave + as_inventory_skew).min(0.25 * gross_dist);
+    let total_shave = (1.5 * tick_sz).min(0.08 * gross_dist);
     let target_tp = if is_buy {
         target_mu - total_shave
     } else {
@@ -134,10 +131,10 @@ pub async fn place_ou_maker_entry(
         ));
     }
 
-    // Deterministic O-U Stop Loss: 1.8x target distance, strictly clamped to [40 bps, 52 bps] from entry (~$0.28-$0.36 max loss on $70)
-    // so normal range noise (15-25 bps) does not wick out the trade while a single stop can NEVER cost $1.00+.
+    // Symmetric ~1.2x Risk/Reward O-U Stop Loss: strictly clamped to [32 bps, 40 bps] from entry (~$0.22-$0.28 max loss on $70)
+    // so a single stop-loss is covered by ~1.3 winning trades (never 5-6 winning trades).
     let edge_dist = (post_only_price - target_tp_quantized).abs();
-    let sl_dist = (1.8 * edge_dist).clamp(post_only_price * 0.0040, post_only_price * 0.0052);
+    let sl_dist = (1.20 * edge_dist).clamp(post_only_price * 0.0032, post_only_price * 0.0040);
     let raw_sl = if is_buy {
         post_only_price - sl_dist
     } else {

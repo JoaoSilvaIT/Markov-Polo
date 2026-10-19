@@ -8,8 +8,8 @@ COPY Cargo.toml Cargo.lock ./
 # Pre-build dummy source to cache heavy dependency crates (ethers, SDK, ndarray)
 RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release
 COPY src/ ./src/
-# Touch main to force rebuild of project binary
-RUN touch src/main.rs && cargo build --release
+# Force clean rebuild of project binary across all modules while keeping cached third-party crates
+RUN rm -rf target/release/deps/hyperliquid_bot* target/release/hyperliquid-bot && touch src/*.rs && cargo build --release
 
 # Stage 2: Minimal Runtime (~20MB)
 FROM debian:bookworm-slim

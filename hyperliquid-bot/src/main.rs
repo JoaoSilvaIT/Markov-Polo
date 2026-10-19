@@ -3798,8 +3798,8 @@ async fn main() {
 
                                     let is_green_bounce = close_price > hist_last_price;
                                     let bounced_off_low = close_price
-                                        >= armed_state.extreme_price * 1.0006
-                                        && close_price <= dynamic_entry_cap * 1.0025;
+                                        >= armed_state.extreme_price * 1.0005
+                                        && close_price <= dynamic_entry_cap * 1.0012;
                                     let still_below_exit = close_price < dynamic_exit_target;
 
                                     if is_green_bounce && bounced_off_low && still_below_exit {
@@ -3832,7 +3832,7 @@ async fn main() {
                                                 symbol_clone, cur_min_utc, current_funding_1h * 10_000.0
                                             );
                                         } else {
-                                            let entry_limit_price = close_price;
+                                            let entry_limit_price = close_price.min(dynamic_entry_cap * 1.0005);
                                             let raw_edge_bps = calculate_net_edge_bps(
                                                 entry_limit_price,
                                                 dynamic_exit_target,
@@ -3840,7 +3840,7 @@ async fn main() {
                                             let expected_funding_drag_bps = (current_funding_1h * 10_000.0) * (armed_state.half_life_m / 60.0);
                                             let net_edge_bps = raw_edge_bps - expected_funding_drag_bps;
 
-                                            let min_edge_hurdle = if is_tier2 { 16.0 } else { 14.0 };
+                                            let min_edge_hurdle = if is_tier2 { 22.0 } else { 20.0 };
                                             if net_edge_bps < min_edge_hurdle {
                                                 funnel_counters.engine_a_reversal_hurdle_veto += 1;
                                                 println!(
@@ -3970,8 +3970,8 @@ async fn main() {
 
                                     let is_red_rejection = close_price < hist_last_price;
                                     let rejected_off_high = close_price
-                                        <= armed_state.extreme_price * 0.9994
-                                        && close_price >= dynamic_entry_floor * 0.9975;
+                                        <= armed_state.extreme_price * 0.9995
+                                        && close_price >= dynamic_entry_floor * 0.9988;
                                     let still_above_exit = close_price > dynamic_exit_target;
 
                                     if is_red_rejection && rejected_off_high && still_above_exit {
@@ -4004,14 +4004,14 @@ async fn main() {
                                                 symbol_clone, cur_min_utc, current_funding_1h * 10_000.0
                                             );
                                         } else {
-                                            let entry_limit_price = close_price;
+                                            let entry_limit_price = close_price.max(dynamic_entry_floor * 0.9995);
                                             // For Short: edge is entry_limit_price down to dynamic_exit_target
                                             let raw_edge_bps = calculate_directional_edge_bps(entry_limit_price, dynamic_exit_target, false);
                                             // Short receives positive funding and pays negative funding
                                             let expected_funding_drag_bps = (-current_funding_1h * 10_000.0) * (armed_state.half_life_m / 60.0);
                                             let net_edge_bps = raw_edge_bps - expected_funding_drag_bps;
 
-                                            let min_edge_hurdle = if is_tier2 { 16.0 } else { 14.0 };
+                                            let min_edge_hurdle = if is_tier2 { 22.0 } else { 20.0 };
                                             if net_edge_bps < min_edge_hurdle {
                                                 funnel_counters.engine_a_reversal_hurdle_veto += 1;
                                                 println!(

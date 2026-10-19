@@ -188,7 +188,7 @@ pub fn estimate_ou_parameters(data: &[f64], dt: f64) -> Option<OuParameters> {
 #[allow(dead_code)]
 pub fn calculate_thresholds_at_sigma(params: &OuParameters, transaction_cost: f64, num_sigma: f64) -> OptimalThresholds {
     let sigma_eq = (params.sigma * params.sigma / (2.0 * params.theta)).sqrt();
-    let min_mult = if num_sigma >= 1.40 { 4.2 } else { 3.6 };
+    let min_mult = if num_sigma >= 1.40 { 5.4 } else { 4.6 };
     let min_required_profit = transaction_cost * min_mult;
     let deviation = (num_sigma * sigma_eq).max(min_required_profit);
     OptimalThresholds {
@@ -219,7 +219,7 @@ pub fn calculate_carry_adjusted_thresholds(
     max_sigma: f64,
 ) -> OptimalThresholds {
     let sigma_eq = (params.sigma * params.sigma / (2.0 * params.theta)).sqrt();
-    let min_mult = if base_sigma >= 1.40 { 4.2 } else { 3.6 };
+    let min_mult = if base_sigma >= 1.40 { 5.4 } else { 4.6 };
     let min_required_profit = transaction_cost * min_mult;
 
     let (sigma_long, sigma_short) = if hourly_funding_rate.is_finite()
