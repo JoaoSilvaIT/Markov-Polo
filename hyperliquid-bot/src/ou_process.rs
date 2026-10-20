@@ -1176,13 +1176,21 @@ pub fn estimate_ou_5m_kalman(
         return (None, cfg.min_sigma_eq_bps * 1e-4, default_llt);
     }
 
-    // Run 2-state Causal Kalman LLT Filter across the 5-minute log-price history
-    let mut llt = KalmanLltFilter::new(0.0020, 0.25, 0.0625);
+    // Run 2-state Causal Kalman LLT Filters across the 5-minute log-price history:
+    // - `llt_fast` (q_g = 0.25, q_b = 0.0625) tracks fast local waterfall slope velocity and innovation CUSUM.
+    // - `llt_macro` (q_g = 0.05, q_b = 0.004) tracks the slow macro equilibrium level g_t so that
+    //   intraday O-U oscillations (20m-150m half-life) remain intact in y_t = ln(P_t) - g_{t|t-1}.
+    let mut llt_fast = KalmanLltFilter::new(0.0020, 0.25, 0.0625);
+    let mut llt_macro = KalmanLltFilter::new(0.0020, 0.05, 0.004);
     let mut residuals = Vec::with_capacity(closes_5m.len());
     let mut last_llt = default_llt;
+    let mut last_macro_level = 0.0;
     for &px in closes_5m {
-        last_llt = llt.update(px.ln(), 0.45);
-        residuals.push(last_llt.causal_residual);
+        let lp = px.ln();
+        last_llt = llt_fast.update(lp, 0.45);
+        let macro_out = llt_macro.update(lp, 0.45);
+        last_macro_level = macro_out.updated_level;
+        residuals.push(macro_out.causal_residual);
     }
 
     let n_5m = closes_5m.len();
@@ -1217,7 +1225,7 @@ pub fn estimate_ou_5m_kalman(
                         let sigma_eq_raw = sig_eps_r / denom_sq.sqrt();
                         let sigma_eq_eff = sigma_eq_raw.max(cfg.min_sigma_eq_bps * 1e-4);
                         let mu_res = (a_r / (1.0 - b_r)).clamp(-2.0 * sigma_eq_eff, 2.0 * sigma_eq_eff);
-                        let mu_px = (last_llt.updated_level + mu_res).exp();
+                        let mu_px = (last_macro_level + mu_res).exp();
                         if mu_px.is_finite() && mu_px > 0.0 {
                             let sigma_px = mu_px * sigma_eq_eff * (2.0 * th_jack).sqrt();
                             Some((
@@ -1948,5 +1956,24 @@ mod tests {
         // When remaining distance is 80 bps, 0.15 * 80 = 12 bps -> clamped to min(10, 12) = 10 bps, offset = 5 bps
         let off = compute_safe_tp_offset_bps(100.80, 100.0, 0.01).expect("Valid offset");
         assert!((off - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_5m_kalman_recovers_stationarity_after_2pct_jump() {
+        // Simulate 500 minutes around $81,500, then a +2% step jump to $83,130 followed by 220 minutes of consolidation
+        let mut history = Vec::with_capacity(720);
+        for i in 0..500 {
+            history.push(81_500.0 * (1.0 + 0.0045 * ((i as f64) * 0.07).sin()));
+        }
+        for i in 0..220 {
+            history.push(83_130.0 * (1.0 + 0.0045 * ((i as f64) * 0.07).sin()));
+        }
+        let eval_px = *history.last().unwrap();
+        let feat = calculate_features(&history, eval_px, "BTC").expect("BTC features");
+        assert!(
+            feat.is_stationary && feat.is_valid_half_life,
+            "5m Kalman LLT must recover valid half-life after a 2% step shift (got t_half={:.1}m)",
+            feat.half_life_m
+        );
     }
 }

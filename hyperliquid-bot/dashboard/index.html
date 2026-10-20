@@ -1293,11 +1293,15 @@
 
       document.getElementById('info-open-pos').textContent = `${activePosSyms.length} / ${maxConcurrent} Active`;
 
-      // Check circuit breakers
+      // Check circuit breakers (only active if paused_until is in the future)
       const cbs = data.circuit_breakers || {};
       let anyPaused = false;
+      const nowMs = Date.now();
       Object.values(cbs).forEach(cb => {
-        if (cb && cb.paused_until) anyPaused = true;
+        if (cb && cb.paused_until) {
+          const pauseMs = new Date(cb.paused_until).getTime();
+          if (Number.isFinite(pauseMs) && pauseMs > nowMs) anyPaused = true;
+        }
       });
       document.getElementById('info-objectives').textContent = anyPaused ? 'Paused (3 Strikes)' : 'Active';
 
