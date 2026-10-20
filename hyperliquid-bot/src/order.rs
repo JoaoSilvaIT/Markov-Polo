@@ -107,11 +107,14 @@ pub async fn place_ou_maker_entry(
         ));
     }
 
-    // Minimal Tick-Aware Shave (max 8% of gross target distance, ~1-2 ticks)
-    // Preserves >=92% of the O-U target edge so winning trades earn full +22 to +32 bps instead of being shaved down to ~12 bps.
+    // Practical Front-Running Offset (\epsilon_t) per `OU Exit Management and Maker Execution Review.md`:
+    // \epsilon_t = clip(max(2 * tickSize, 5 bps * P_t), 2 bps * P_t, min(10 bps * P_t, 0.15 * D_rem))
     let tick_sz = effective_tick_size(target_mu, sz_decimals);
     let gross_dist = (target_mu - post_only_price).abs();
-    let total_shave = (1.5 * tick_sz).min(0.08 * gross_dist);
+    let eps_base = (target_mu * 0.0005).max(2.0 * tick_sz);
+    let eps_min = (target_mu * 0.0002).max(2.0 * tick_sz);
+    let eps_max = (target_mu * 0.0010).min(0.15 * gross_dist).max(eps_min);
+    let total_shave = eps_base.clamp(eps_min, eps_max);
     let target_tp = if is_buy {
         target_mu - total_shave
     } else {
@@ -131,10 +134,9 @@ pub async fn place_ou_maker_entry(
         ));
     }
 
-    // Symmetric ~1.2x Risk/Reward O-U Stop Loss: strictly clamped to [32 bps, 40 bps] from entry (~$0.22-$0.28 max loss on $70)
-    // so a single stop-loss is covered by ~1.3 winning trades (never 5-6 winning trades).
+    // Structural Catastrophe Stop Loss: 2.0x expected target edge (min 1.5% from entry)
     let edge_dist = (post_only_price - target_tp_quantized).abs();
-    let sl_dist = (1.20 * edge_dist).clamp(post_only_price * 0.0032, post_only_price * 0.0040);
+    let sl_dist = (2.0 * edge_dist).max(post_only_price * 0.015);
     let raw_sl = if is_buy {
         post_only_price - sl_dist
     } else {
@@ -252,7 +254,7 @@ pub async fn place_ou_maker_entry(
     };
 
     let final_edge_dist = (current_price - target_tp_quantized).abs();
-    let final_sl_dist = (1.20 * final_edge_dist).clamp(current_price * 0.0032, current_price * 0.0040);
+    let final_sl_dist = (2.0 * final_edge_dist).max(current_price * 0.015);
     let stop_loss_price = quantize_price(
         if is_buy {
             current_price - final_sl_dist
@@ -398,7 +400,7 @@ pub async fn place_trend_breakout_entry(
 
     let stop_loss_price = quantize_price(initial_stop, sz_decimals);
     let k_tp = optimal_engine_b_tp_atr_multiple(symbol);
-    let tp_dist = (k_tp * current_atr).max(post_only_price * 0.0040);
+    let tp_dist = (k_tp * current_atr).max(post_only_price * 0.0045);
     let raw_tp = if is_buy {
         post_only_price + tp_dist
     } else {
