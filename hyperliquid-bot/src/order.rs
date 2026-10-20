@@ -23,6 +23,8 @@ pub async fn place_ou_maker_entry(
     entry_price: f64,
     target_mu: f64,
     half_life_minutes: f64,
+    frozen_sigma_eq_log: f64,
+    entry_ttl_mins: f64,
     position_size_usdc: f64,
     sz_decimals: u32,
     discord_url: Option<String>,
@@ -107,14 +109,20 @@ pub async fn place_ou_maker_entry(
         ));
     }
 
-    // Practical Front-Running Offset (\epsilon_t) per `OU Exit Management and Maker Execution Review.md`:
-    // \epsilon_t = clip(max(2 * tickSize, 5 bps * P_t), 2 bps * P_t, min(10 bps * P_t, 0.15 * D_rem))
+    // Repaired TP Front-Running Offset (\epsilon_t) per `Hyperliquid OU Audit Payoff Geometry...md` (lines 443–448):
+    // L = max(2 * tick_bps, 2.0), U = min(10.0, 0.15 * D_rem_bps); if L > U, skip setup.
     let tick_sz = effective_tick_size(target_mu, sz_decimals);
-    let gross_dist = (target_mu - post_only_price).abs();
-    let eps_base = (target_mu * 0.0005).max(2.0 * tick_sz);
-    let eps_min = (target_mu * 0.0002).max(2.0 * tick_sz);
-    let eps_max = (target_mu * 0.0010).min(0.15 * gross_dist).max(eps_min);
-    let total_shave = eps_base.clamp(eps_min, eps_max);
+    let safe_offset_bps = match crate::ou_process::compute_safe_tp_offset_bps(target_mu, post_only_price, tick_sz) {
+        Some(bps) => bps,
+        None => {
+            let _ = release_cluster_lease_authenticated(symbol, Some(&lease_uuid), Some(fencing_token));
+            return Err(format!(
+                "Remaining distance from ${:.4} to ${:.4} is too narrow for safe TP offset clamp (L > U) on {}",
+                post_only_price, target_mu, symbol
+            ));
+        }
+    };
+    let total_shave = target_mu * (safe_offset_bps * 1e-4);
     let target_tp = if is_buy {
         target_mu - total_shave
     } else {
@@ -134,9 +142,12 @@ pub async fn place_ou_maker_entry(
         ));
     }
 
-    // Structural Catastrophe Stop Loss: 2.0x expected target edge (min 1.5% from entry)
+    // Tier 2 Hard Disaster Stop per Section 4 of `O-U Mean Reversion Audit.md` (line 152):
+    // BTC: 150 bps (1.50%), ETH: 175 bps (1.75%), SOL: 200 bps (2.00%), AVAX: 220 bps (2.20%)
+    let ou_cfg = crate::ou_process::asset_ou_config(symbol);
+    let hard_stop_frac = ou_cfg.hard_disaster_stop_bps * 1e-4;
     let edge_dist = (post_only_price - target_tp_quantized).abs();
-    let sl_dist = (2.0 * edge_dist).max(post_only_price * 0.015);
+    let sl_dist = (2.0 * edge_dist).max(post_only_price * hard_stop_frac);
     let raw_sl = if is_buy {
         post_only_price - sl_dist
     } else {
@@ -254,7 +265,7 @@ pub async fn place_ou_maker_entry(
     };
 
     let final_edge_dist = (current_price - target_tp_quantized).abs();
-    let final_sl_dist = (2.0 * final_edge_dist).max(current_price * 0.015);
+    let final_sl_dist = (2.0 * final_edge_dist).max(current_price * hard_stop_frac);
     let stop_loss_price = quantize_price(
         if is_buy {
             current_price - final_sl_dist
@@ -291,6 +302,12 @@ pub async fn place_ou_maker_entry(
         lease_fencing_token: fencing_token,
         lease_owner_uuid: lease_uuid,
         lifecycle: PositionLifecycle::Active,
+        frozen_center_price: target_mu_quantized,
+        frozen_sigma_eq_log,
+        consecutive_ou_breach_5m_bars: 0,
+        consecutive_shock_bars: 0,
+        breakeven_ratchet_armed: false,
+        entry_ttl_mins,
     };
 
     state.insert(symbol.to_string(), new_state.clone());
@@ -301,12 +318,12 @@ pub async fn place_ou_maker_entry(
     let _ = save_order_intent_atomic(&order_intent);
     clear_order_intent(symbol);
 
-    let max_hold = (2.0 * half_life_minutes).clamp(15.0, 360.0);
+    let max_hold = (3.0 * half_life_minutes).clamp(60.0, 360.0);
     let side_label = if is_buy { "LONG" } else { "SHORT" };
     let side_emoji = if is_buy { "🟢" } else { "🔴" };
 
     let msg = format!(
-        "{} **O-U {} ENTRY SIGNAL (MAKER):** {}\n**Limit Maker {}:** ${:.2} (Best Bid: ${:.2}, Ask: ${:.2})\n**Target Mean (μ):** ${:.2}\n**Take Profit Target:** ${:.2}\n**Hard Stop Loss:** ${:.2}\n**Size:** {:.5} (${:.2})\n**Half-Life:** {:.1}m (Max Hold: {:.1}m)",
+        "{} **O-U {} ENTRY SIGNAL (MAKER):** {}\n**Limit Maker {}:** ${:.2} (Best Bid: ${:.2}, Ask: ${:.2})\n**Target Mean (μ):** ${:.2}\n**Take Profit Target:** ${:.2}\n**Hard Disaster Stop:** ${:.2}\n**Size:** {:.5} (${:.2})\n**Half-Life:** {:.1}m (Max Hold: {:.1}m)",
         side_emoji, side_label, symbol, side_label, current_price, top_bid, top_ask, target_mu_quantized, target_tp_quantized, stop_loss_price, current_amount, position_size_usdc, half_life_minutes, max_hold
     );
     crate::discord::send_alert(discord_url.as_deref(), &msg).await;
@@ -532,6 +549,12 @@ pub async fn place_trend_breakout_entry(
         lease_fencing_token: fencing_token,
         lease_owner_uuid: lease_uuid,
         lifecycle: PositionLifecycle::Active,
+        frozen_center_price: 0.0,
+        frozen_sigma_eq_log: 0.0,
+        consecutive_ou_breach_5m_bars: 0,
+        consecutive_shock_bars: 0,
+        breakeven_ratchet_armed: false,
+        entry_ttl_mins: 5.0,
     };
 
     state.insert(symbol.to_string(), new_state.clone());

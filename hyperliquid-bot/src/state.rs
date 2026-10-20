@@ -104,6 +104,18 @@ pub struct PositionState {
     pub lease_owner_uuid: String,
     #[serde(default = "default_lifecycle")]
     pub lifecycle: PositionLifecycle,
+    #[serde(default)]
+    pub frozen_center_price: f64,
+    #[serde(default)]
+    pub frozen_sigma_eq_log: f64,
+    #[serde(default)]
+    pub consecutive_ou_breach_5m_bars: u32,
+    #[serde(default)]
+    pub consecutive_shock_bars: u32,
+    #[serde(default)]
+    pub breakeven_ratchet_armed: bool,
+    #[serde(default)]
+    pub entry_ttl_mins: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -348,6 +360,12 @@ pub struct ArmedSignal {
     pub extreme_price: f64, // Lowest price for LONG, Highest price for SHORT
     #[serde(default = "default_tier")]
     pub tier: String, // "TIER_1_NORMAL" (1.75σ) or "TIER_2_CONDITIONAL" (1.50σ)
+    #[serde(default)]
+    pub bars_since_extreme: usize,
+    #[serde(default)]
+    pub total_armed_bars: usize,
+    #[serde(default)]
+    pub frozen_sigma_eq_log: f64,
 }
 
 pub fn load_armed_signal(file_path: &str) -> ArmedSignal {
@@ -1169,6 +1187,12 @@ mod tests {
             lease_fencing_token: 0,
             lease_owner_uuid: "".to_string(),
             lifecycle: PositionLifecycle::Active,
+            frozen_center_price: 0.0,
+            frozen_sigma_eq_log: 0.0,
+            consecutive_ou_breach_5m_bars: 0,
+            consecutive_shock_bars: 0,
+            breakeven_ratchet_armed: false,
+            entry_ttl_mins: 0.0,
         };
         assert!(!empty_pos.is_occupied());
 
