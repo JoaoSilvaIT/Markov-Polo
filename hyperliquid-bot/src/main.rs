@@ -3552,10 +3552,22 @@ async fn main() {
                             let mut armed_state = load_armed_signal(&arm_path_clone);
                             let ou_cfg = crate::ou_process::asset_ou_config(&symbol_clone);
                             let consolidation_vol_ok = z_15.abs() < 2.2 && z_60.abs() < 2.5;
+                            // Slow Context Directional Filter per `Overnight OU Strategy Failure Review.md` (lines 76–85):
+                            // Avoid fading a strong multi-hour directional trend (permit Longs only when slow context is neutral/supportive,
+                            // and Shorts only when slow context is neutral/bearish).
+                            let ret_240 = if rolling_closes.len() >= 240 && rolling_closes[rolling_closes.len() - 240] > 0.0 {
+                                (close_price / rolling_closes[rolling_closes.len() - 240]).ln()
+                            } else {
+                                0.0
+                            };
                             let kalman_long_ok = !(live_feat.kalman_drift_veto && live_feat.kalman_slope < 0.0)
-                                && live_feat.cusum_neg < 8.0;
+                                && live_feat.cusum_neg < 8.0
+                                && live_feat.ret_60 > -0.0050
+                                && ret_240 > -0.0060;
                             let kalman_short_ok = !(live_feat.kalman_drift_veto && live_feat.kalman_slope > 0.0)
-                                && live_feat.cusum_pos < 8.0;
+                                && live_feat.cusum_pos < 8.0
+                                && live_feat.ret_60 < 0.0050
+                                && ret_240 < 0.0060;
                             let is_eligible = !candle_feed_degraded
                                 && !is_candle_gap
                                 && is_consolidation
@@ -3733,13 +3745,7 @@ async fn main() {
                                                     frozen_target,
                                                     is_long_arm,
                                                 );
-                                                let tp_offset_bps = crate::ou_process::compute_safe_tp_offset_bps(
-                                                    frozen_target,
-                                                    limit_price,
-                                                    tick_sz,
-                                                )
-                                                .unwrap_or(10.0);
-                                                let net_edge_bps = raw_edge_bps - 3.0 - tp_offset_bps - expected_funding_drag_bps;
+                                                let net_edge_bps = raw_edge_bps - 3.0 - expected_funding_drag_bps;
 
                                                 if net_edge_bps < ou_cfg.min_net_edge_bps {
                                                     funnel_counters.engine_a_reversal_hurdle_veto += 1;
@@ -3836,8 +3842,8 @@ async fn main() {
                                 }
                             } else if is_eligible {
                                 if let Some(ref thresholds) = thresholds_opt {
-                                    // Check Long Arm on 5m carry-adjusted Bertram boundary (a_0^* = 1.65\sigma - 1.75\sigma; Tier 2 1.25\sigma disabled)
-                                    if close_price <= thresholds.entry_long && !is_downside_shock && kalman_long_ok {
+                                    // Check Long Arm on 5m carry-adjusted Bertram boundary (a_0^* = 1.60\sigma - 1.70\sigma; Tier 2 1.25\sigma disabled)
+                                    if (close_price <= thresholds.entry_long || low_price <= thresholds.entry_long) && !is_downside_shock && kalman_long_ok {
                                         let baseline_arm = thresholds.exit_long.max(1e-9);
                                         let unitless_entry_dev =
                                             (thresholds.entry_long / baseline_arm).ln();
@@ -3859,12 +3865,12 @@ async fn main() {
                                         save_armed_signal(&arm_path_clone, &armed_state);
 
                                         println!(
-                                            "🟡 [LONG ARMED - 5M O-U ({:.2}σ)] {} closed beyond lower threshold (${:.2} <= ${:.2}, low: ${:.2}, target: ${:.2}). Awaiting 2-bar 1m confirmation.",
+                                            "🟡 [LONG ARMED - 5M O-U ({:.2}σ)] {} touched lower threshold (${:.2} <= ${:.2}, low: ${:.2}, target: ${:.2}). Awaiting 2-bar 1m confirmation.",
                                             ou_cfg.base_entry_sigma, symbol_clone, close_price, thresholds.entry_long, low_price, thresholds.exit_long
                                         );
                                     }
                                     // Check Short Arm on 5m carry-adjusted Bertram boundary
-                                    else if close_price >= thresholds.entry_short && !is_upside_shock && kalman_short_ok {
+                                    else if (close_price >= thresholds.entry_short || high_price >= thresholds.entry_short) && !is_upside_shock && kalman_short_ok {
                                         let baseline_arm = thresholds.exit_short.max(1e-9);
                                         let unitless_entry_dev =
                                             (thresholds.entry_short / baseline_arm).ln();
@@ -3886,7 +3892,7 @@ async fn main() {
                                         save_armed_signal(&arm_path_clone, &armed_state);
 
                                         println!(
-                                            "🟣 [SHORT ARMED - 5M O-U ({:.2}σ)] {} closed beyond upper threshold (${:.2} >= ${:.2}, high: ${:.2}, target: ${:.2}). Awaiting 2-bar 1m confirmation.",
+                                            "🟣 [SHORT ARMED - 5M O-U ({:.2}σ)] {} touched upper threshold (${:.2} >= ${:.2}, high: ${:.2}, target: ${:.2}). Awaiting 2-bar 1m confirmation.",
                                             ou_cfg.base_entry_sigma, symbol_clone, close_price, thresholds.entry_short, high_price, thresholds.exit_short
                                         );
                                     } else {

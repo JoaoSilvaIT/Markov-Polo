@@ -46,16 +46,16 @@ pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
         "BTC" => AssetOuConfig {
             symbol: "BTC",
             lookback_5m_bars: 144,
-            min_half_life_m: 25.0,
+            min_half_life_m: 15.0,
             max_half_life_m: 150.0,
-            min_sigma_eq_bps: 32.0,
-            base_entry_sigma: 1.65,
-            min_entry_sigma: 1.45,
-            max_entry_sigma: 1.95,
+            min_sigma_eq_bps: 22.0,
+            base_entry_sigma: 1.60,
+            min_entry_sigma: 1.40,
+            max_entry_sigma: 1.90,
             rebound_gamma: 0.35,
-            max_join_consumption_ratio: 0.22,
+            max_join_consumption_ratio: 0.25,
             max_retest_consumption_ratio: 0.50,
-            min_net_edge_bps: 38.0,
+            min_net_edge_bps: 22.0,
             target_notional_cap_usdc: 68.0,
             soft_z_ou_threshold: 2.75,
             soft_z15_shock_threshold: 3.00,
@@ -64,16 +64,16 @@ pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
         "ETH" => AssetOuConfig {
             symbol: "ETH",
             lookback_5m_bars: 144,
-            min_half_life_m: 25.0,
+            min_half_life_m: 15.0,
             max_half_life_m: 150.0,
-            min_sigma_eq_bps: 42.0,
-            base_entry_sigma: 1.65,
-            min_entry_sigma: 1.45,
-            max_entry_sigma: 1.95,
+            min_sigma_eq_bps: 26.0,
+            base_entry_sigma: 1.60,
+            min_entry_sigma: 1.40,
+            max_entry_sigma: 1.90,
             rebound_gamma: 0.35,
-            max_join_consumption_ratio: 0.22,
+            max_join_consumption_ratio: 0.25,
             max_retest_consumption_ratio: 0.50,
-            min_net_edge_bps: 48.0,
+            min_net_edge_bps: 25.0,
             target_notional_cap_usdc: 68.0,
             soft_z_ou_threshold: 2.75,
             soft_z15_shock_threshold: 3.00,
@@ -82,16 +82,16 @@ pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
         "SOL" => AssetOuConfig {
             symbol: "SOL",
             lookback_5m_bars: 120,
-            min_half_life_m: 20.0,
+            min_half_life_m: 15.0,
             max_half_life_m: 135.0,
-            min_sigma_eq_bps: 55.0,
-            base_entry_sigma: 1.70,
-            min_entry_sigma: 1.50,
-            max_entry_sigma: 2.00,
+            min_sigma_eq_bps: 30.0,
+            base_entry_sigma: 1.65,
+            min_entry_sigma: 1.45,
+            max_entry_sigma: 1.95,
             rebound_gamma: 0.30,
-            max_join_consumption_ratio: 0.20,
+            max_join_consumption_ratio: 0.22,
             max_retest_consumption_ratio: 0.45,
-            min_net_edge_bps: 62.0,
+            min_net_edge_bps: 28.0,
             target_notional_cap_usdc: 60.0,
             soft_z_ou_threshold: 2.85,
             soft_z15_shock_threshold: 3.20,
@@ -100,16 +100,16 @@ pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
         "AVAX" => AssetOuConfig {
             symbol: "AVAX",
             lookback_5m_bars: 120,
-            min_half_life_m: 20.0,
+            min_half_life_m: 15.0,
             max_half_life_m: 135.0,
-            min_sigma_eq_bps: 60.0,
-            base_entry_sigma: 1.75,
-            min_entry_sigma: 1.55,
-            max_entry_sigma: 2.05,
+            min_sigma_eq_bps: 34.0,
+            base_entry_sigma: 1.70,
+            min_entry_sigma: 1.50,
+            max_entry_sigma: 2.00,
             rebound_gamma: 0.30,
-            max_join_consumption_ratio: 0.20,
+            max_join_consumption_ratio: 0.22,
             max_retest_consumption_ratio: 0.45,
-            min_net_edge_bps: 68.0,
+            min_net_edge_bps: 32.0,
             target_notional_cap_usdc: 55.0,
             soft_z_ou_threshold: 2.85,
             soft_z15_shock_threshold: 3.20,
@@ -118,16 +118,16 @@ pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
         _ => AssetOuConfig {
             symbol: "ETH",
             lookback_5m_bars: 144,
-            min_half_life_m: 25.0,
+            min_half_life_m: 15.0,
             max_half_life_m: 150.0,
-            min_sigma_eq_bps: 42.0,
-            base_entry_sigma: 1.65,
-            min_entry_sigma: 1.45,
-            max_entry_sigma: 1.95,
+            min_sigma_eq_bps: 26.0,
+            base_entry_sigma: 1.60,
+            min_entry_sigma: 1.40,
+            max_entry_sigma: 1.90,
             rebound_gamma: 0.35,
-            max_join_consumption_ratio: 0.22,
+            max_join_consumption_ratio: 0.25,
             max_retest_consumption_ratio: 0.50,
-            min_net_edge_bps: 48.0,
+            min_net_edge_bps: 25.0,
             target_notional_cap_usdc: 68.0,
             soft_z_ou_threshold: 2.75,
             soft_z15_shock_threshold: 3.00,
@@ -1178,10 +1178,10 @@ pub fn estimate_ou_5m_kalman(
 
     // Run 2-state Causal Kalman LLT Filters across the 5-minute log-price history:
     // - `llt_fast` (q_g = 0.25, q_b = 0.0625) tracks fast local waterfall slope velocity and innovation CUSUM.
-    // - `llt_macro` (q_g = 0.05, q_b = 0.004) tracks the slow macro equilibrium level g_t so that
-    //   intraday O-U oscillations (20m-150m half-life) remain intact in y_t = ln(P_t) - g_{t|t-1}.
+    // - `llt_macro` (q_g = 0.06, q_b = 0.005) tracks the slow macro equilibrium level g_t so that
+    //   intraday O-U oscillations (15m-150m half-life) remain intact in y_t = ln(P_t) - g_{t|t-1}.
     let mut llt_fast = KalmanLltFilter::new(0.0020, 0.25, 0.0625);
-    let mut llt_macro = KalmanLltFilter::new(0.0020, 0.05, 0.004);
+    let mut llt_macro = KalmanLltFilter::new(0.0020, 0.06, 0.005);
     let mut residuals = Vec::with_capacity(closes_5m.len());
     let mut last_llt = default_llt;
     let mut last_macro_level = 0.0;
@@ -1194,23 +1194,21 @@ pub fn estimate_ou_5m_kalman(
     }
 
     let n_5m = closes_5m.len();
-    let w = cfg.lookback_5m_bars.min(n_5m);
-    let slice_5m = &closes_5m[n_5m - w..];
-    let res_slice = &residuals[n_5m - w..];
+    let candidate_windows = [cfg.lookback_5m_bars.min(n_5m), 72usize.min(n_5m)];
+    let sigma_eq_floor_log = cfg.min_sigma_eq_bps * 1e-4;
+    let dt = 5.0;
 
-    // Primary 5m O-U estimation on the 5m log-price window (dt = 5.0 minutes)
-    let ou_opt = if let Some(mut params) = estimate_ou_parameters(slice_5m, 5.0) {
-        let sigma_eq_raw_log = ((params.sigma / params.mu.max(1e-9)).powi(2) / (2.0 * params.theta)).sqrt();
-        let sigma_eq_floor_log = cfg.min_sigma_eq_bps * 1e-4;
-        let sigma_eq_eff_log = sigma_eq_raw_log.max(sigma_eq_floor_log);
-        params.sigma = params.mu * sigma_eq_eff_log * (2.0 * params.theta).sqrt();
-        Some((params, sigma_eq_eff_log))
-    } else if res_slice.len() >= 24 {
-        // Fallback to causal Kalman LLT residual AR(1) if a prior level shift shifted the raw window mean,
-        // provided the Kalman LLT slope is not in an active waterfall drift veto!
-        if !last_llt.drift_veto_active {
+    let mut ou_opt: Option<(OuParameters, f64)> = None;
+
+    // 1. Primary: Fit 5m O-U on the Causal Kalman LLT residual y_t = ln(P_t) - g_{t|t-1}
+    //    (requires valid half-life inside [min_half_life_m, max_half_life_m] and no active waterfall veto).
+    if !last_llt.drift_veto_active {
+        for &w in &candidate_windows {
+            if w < 24 {
+                continue;
+            }
+            let res_slice = &residuals[n_5m - w..];
             if let Some((a_r, b_r, sig_eps_r)) = estimate_ar1_raw(res_slice) {
-                let dt = 5.0;
                 let theta_full = -b_r.ln() / dt;
                 let mid = res_slice.len() / 2;
                 let part1 = estimate_ar1_raw(&res_slice[..mid]);
@@ -1220,40 +1218,54 @@ pub fn estimate_ou_5m_kalman(
                     let th2 = -b2.ln() / dt;
                     let th_jack = 2.0 * theta_full - 0.5 * (th1 + th2);
                     if th_jack > 1e-5 {
-                        let b_jack = (-th_jack * dt).exp();
-                        let denom_sq = (1.0 - b_jack * b_jack).max(1e-12);
-                        let sigma_eq_raw = sig_eps_r / denom_sq.sqrt();
-                        let sigma_eq_eff = sigma_eq_raw.max(cfg.min_sigma_eq_bps * 1e-4);
-                        let mu_res = (a_r / (1.0 - b_r)).clamp(-2.0 * sigma_eq_eff, 2.0 * sigma_eq_eff);
-                        let mu_px = (last_macro_level + mu_res).exp();
-                        if mu_px.is_finite() && mu_px > 0.0 {
-                            let sigma_px = mu_px * sigma_eq_eff * (2.0 * th_jack).sqrt();
-                            Some((
-                                OuParameters {
-                                    theta: th_jack,
-                                    mu: mu_px,
-                                    sigma: sigma_px,
-                                },
-                                sigma_eq_eff,
-                            ))
-                        } else {
-                            None
+                        let hl = 2.0_f64.ln() / th_jack;
+                        if hl >= cfg.min_half_life_m && hl <= cfg.max_half_life_m {
+                            let b_jack = (-th_jack * dt).exp();
+                            let denom_sq = (1.0 - b_jack * b_jack).max(1e-12);
+                            let sigma_eq_raw = sig_eps_r / denom_sq.sqrt();
+                            let sigma_eq_eff = sigma_eq_raw.max(sigma_eq_floor_log);
+                            let mu_res = (a_r / (1.0 - b_r)).clamp(-2.0 * sigma_eq_eff, 2.0 * sigma_eq_eff);
+                            let mu_px = (last_macro_level + mu_res).exp();
+                            if mu_px.is_finite() && mu_px > 0.0 {
+                                let sigma_px = mu_px * sigma_eq_eff * (2.0 * th_jack).sqrt();
+                                ou_opt = Some((
+                                    OuParameters {
+                                        theta: th_jack,
+                                        mu: mu_px,
+                                        sigma: sigma_px,
+                                    },
+                                    sigma_eq_eff,
+                                ));
+                                break;
+                            }
                         }
-                    } else {
-                        None
                     }
-                } else {
-                    None
                 }
-            } else {
-                None
             }
-        } else {
-            None
         }
-    } else {
-        None
-    };
+    }
+
+    // 2. Fallback: Direct 5-minute log-price non-overlapping Phillips-Yu Jackknife O-U
+    //    (only accepted if its half-life also lies within [min_half_life_m, max_half_life_m]).
+    if ou_opt.is_none() {
+        for &w in &candidate_windows {
+            if w < 24 {
+                continue;
+            }
+            let slice_5m = &closes_5m[n_5m - w..];
+            if let Some(mut params) = estimate_ou_parameters(slice_5m, dt) {
+                let hl = params.half_life_minutes();
+                if hl >= cfg.min_half_life_m && hl <= cfg.max_half_life_m {
+                    let sigma_eq_raw_log =
+                        ((params.sigma / params.mu.max(1e-9)).powi(2) / (2.0 * params.theta)).sqrt();
+                    let sigma_eq_eff_log = sigma_eq_raw_log.max(sigma_eq_floor_log);
+                    params.sigma = params.mu * sigma_eq_eff_log * (2.0 * params.theta).sqrt();
+                    ou_opt = Some((params, sigma_eq_eff_log));
+                    break;
+                }
+            }
+        }
+    }
 
     match ou_opt {
         Some((p, sig_eq)) => (Some(p), sig_eq, last_llt),
