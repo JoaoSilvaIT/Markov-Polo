@@ -1208,7 +1208,7 @@ pub fn estimate_ou_5m_kalman(
                 continue;
             }
             let res_slice = &residuals[n_5m - w..];
-            if let Some((a_r, b_r, sig_eps_r)) = estimate_ar1_raw(res_slice) {
+            if let Some((_a_r, b_r, sig_eps_r)) = estimate_ar1_raw(res_slice) {
                 let theta_full = -b_r.ln() / dt;
                 let mid = res_slice.len() / 2;
                 let part1 = estimate_ar1_raw(&res_slice[..mid]);
@@ -1224,8 +1224,7 @@ pub fn estimate_ou_5m_kalman(
                             let denom_sq = (1.0 - b_jack * b_jack).max(1e-12);
                             let sigma_eq_raw = sig_eps_r / denom_sq.sqrt();
                             let sigma_eq_eff = sigma_eq_raw.max(sigma_eq_floor_log);
-                            let mu_res = (a_r / (1.0 - b_r)).clamp(-2.0 * sigma_eq_eff, 2.0 * sigma_eq_eff);
-                            let mu_px = (last_macro_level + mu_res).exp();
+                            let mu_px = last_macro_level.exp();
                             if mu_px.is_finite() && mu_px > 0.0 {
                                 let sigma_px = mu_px * sigma_eq_eff * (2.0 * th_jack).sqrt();
                                 ou_opt = Some((

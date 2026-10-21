@@ -3553,21 +3553,31 @@ async fn main() {
                             let ou_cfg = crate::ou_process::asset_ou_config(&symbol_clone);
                             let consolidation_vol_ok = z_15.abs() < 2.2 && z_60.abs() < 2.5;
                             // Slow Context Directional Filter per `Overnight OU Strategy Failure Review.md` (lines 76–85):
-                            // Avoid fading a strong multi-hour directional trend (permit Longs only when slow context is neutral/supportive,
-                            // and Shorts only when slow context is neutral/bearish).
+                            // Avoid fading a strong multi-hour directional trend (scaled by asset volatility),
+                            // while never disarming an already-armed signal on a normal bottom/top wick unless
+                            // a genuine shock (`is_downside_shock`/`is_upside_shock`) or Kalman LLT waterfall fires.
+                            let max_slow_drift_240 = match symbol_clone.as_str() {
+                                "BTC" => 0.0085,
+                                "ETH" => 0.0110,
+                                "SOL" => 0.0150,
+                                "AVAX" => 0.0180,
+                                _ => 0.0110,
+                            };
                             let ret_240 = if rolling_closes.len() >= 240 && rolling_closes[rolling_closes.len() - 240] > 0.0 {
                                 (close_price / rolling_closes[rolling_closes.len() - 240]).ln()
                             } else {
                                 0.0
                             };
-                            let kalman_long_ok = !(live_feat.kalman_drift_veto && live_feat.kalman_slope < 0.0)
-                                && live_feat.cusum_neg < 8.0
-                                && live_feat.ret_60 > -0.0050
-                                && ret_240 > -0.0060;
-                            let kalman_short_ok = !(live_feat.kalman_drift_veto && live_feat.kalman_slope > 0.0)
-                                && live_feat.cusum_pos < 8.0
-                                && live_feat.ret_60 < 0.0050
-                                && ret_240 < 0.0060;
+                            let kalman_waterfall_down = (live_feat.kalman_drift_veto && live_feat.kalman_slope < 0.0)
+                                || live_feat.cusum_neg >= 8.0;
+                            let kalman_waterfall_up = (live_feat.kalman_drift_veto && live_feat.kalman_slope > 0.0)
+                                || live_feat.cusum_pos >= 8.0;
+                            let kalman_long_ok = !kalman_waterfall_down
+                                && z_60 > -1.90
+                                && ret_240 > -max_slow_drift_240;
+                            let kalman_short_ok = !kalman_waterfall_up
+                                && z_60 < 1.90
+                                && ret_240 < max_slow_drift_240;
                             let is_eligible = !candle_feed_degraded
                                 && !is_candle_gap
                                 && is_consolidation
@@ -3616,9 +3626,9 @@ async fn main() {
                                 }
 
                                 let shock_vetoed = if is_long_arm {
-                                    is_downside_shock || !kalman_long_ok
+                                    is_downside_shock || kalman_waterfall_down
                                 } else {
-                                    is_upside_shock || !kalman_short_ok
+                                    is_upside_shock || kalman_waterfall_up
                                 };
 
                                 let thesis_invalidated = !is_consolidation
