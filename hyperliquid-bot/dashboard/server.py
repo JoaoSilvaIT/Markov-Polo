@@ -20,6 +20,8 @@ MAX_CONCURRENT = int(os.environ.get("HL_MAX_CONCURRENT_POSITIONS", 2))
 WALLET_ADDRESS = os.environ.get("HL_WALLET_ADDRESS", "").strip()
 IS_MAINNET = os.environ.get("HL_IS_MAINNET", "true").strip().lower() != "false"
 HL_INFO_URL = "https://api.hyperliquid.xyz/info" if IS_MAINNET else "https://api.hyperliquid-testnet.xyz/info"
+# Clean-slate cutoff: 2026-10-22 00:00 UTC architecture upgrade (includes only the new 5m O-U trades onwards)
+CLEAN_SLATE_EPOCH_MS = int(os.environ.get("HL_CLEAN_SLATE_EPOCH_MS", "1792600000000"))
 
 SEARCH_DIRS = [
     "/app/data",                      # Docker container mount
@@ -145,8 +147,11 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
 
     real_trades = []
 
-    # 1. Reconstruct closed trades from Hyperliquid L1 `userFills` if available
-    raw_fills = hl_live.get("fills") or []
+    # 1. Reconstruct closed trades from Hyperliquid L1 `userFills` if available (post-clean-slate only)
+    raw_fills = [
+        f for f in (hl_live.get("fills") or [])
+        if int(f.get("time", 0) or 0) >= CLEAN_SLATE_EPOCH_MS
+    ]
     if raw_fills:
         # Sort chronological (oldest first)
         sorted_fills = sorted(raw_fills, key=lambda x: int(x.get("time", 0) or 0))
@@ -235,6 +240,8 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
                         opened_dt = parse_iso_time(rec.get("opened_at"))
                         close_ms = int(closed_dt.timestamp() * 1000) if closed_dt else int(time.time() * 1000)
                         open_ms = int(opened_dt.timestamp() * 1000) if opened_dt else close_ms
+                        if close_ms < CLEAN_SLATE_EPOCH_MS:
+                            continue
 
                         # Deduplicate against exchange fills within 90s on same coin
                         is_dup = any(
@@ -294,22 +301,22 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
     )
     account_balance_usd = round(live_equity - unrealized_pnl_usd, 2)
 
-    # Reconstruct chronological equity curve ending at `live_equity`
+    # Reconstruct chronological equity curve from clean-slate baseline up to `live_equity`
     equity_curve = []
     if real_trades:
         recent_for_curve = real_trades[-12:]
-        running_eq = live_equity
-        pts = [{"label": "Now", "date": fmt_date_slash(int(time.time() * 1000)), "equity": round(running_eq, 2)}]
-        for t in reversed(recent_for_curve):
-            running_eq = running_eq - t["pnl_usd"]
+        start_eq = live_equity - sum(t["pnl_usd"] for t in recent_for_curve)
+        running_eq = start_eq
+        pts = [{"label": "Start", "date": recent_for_curve[0]["open_date"], "equity": round(running_eq, 2)}]
+        for t in recent_for_curve:
+            running_eq = running_eq + t["pnl_usd"]
             pts.append({
-                "label": t["close_date"].split(" ")[0][5:],
+                "label": t["close_date"].split(" ")[-1],
                 "date": t["close_date"],
                 "equity": round(running_eq, 2),
                 "symbol": t["symbol"],
                 "pnl_usd": t["pnl_usd"],
             })
-        pts.reverse()
         equity_curve = pts
     else:
         today_str = fmt_date_slash(int(time.time() * 1000))
@@ -317,6 +324,8 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
             {"label": "Start", "date": today_str, "equity": round(account_balance_usd, 2)},
             {"label": "Live", "date": today_str, "equity": round(live_equity, 2)},
         ]
+
+    high_water_mark = max([live_equity] + [float(p.get("equity", 0.0) or 0.0) for p in equity_curve])
 
     # Daily breakdown for Calendar + "Summary of the day"
     daily_summary = {}
