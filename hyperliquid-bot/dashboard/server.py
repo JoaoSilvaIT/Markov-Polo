@@ -139,7 +139,7 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
         live_equity = float(hl_live["account_equity"])
 
     if live_equity <= 0.0:
-        live_equity = 150.93
+        live_equity = 0.0
     if high_water_mark < live_equity:
         high_water_mark = live_equity
 
@@ -357,13 +357,13 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
 
     today_obj = daily_summary[today_key]
     today_starting_equity = round(live_equity - today_obj["net_pnl_usd"], 2)
-    daily_loss_limit_usd = round(today_starting_equity * 0.05, 2)  # 5% daily drawdown limit (3 strikes)
-    daily_threshold_usd = round(today_starting_equity - daily_loss_limit_usd, 2)
+    daily_loss_limit_usd = round(today_starting_equity * 0.05, 2) if today_starting_equity > 0.0 else 0.0  # 5% daily drawdown limit (3 strikes)
+    daily_threshold_usd = round(today_starting_equity - daily_loss_limit_usd, 2) if today_starting_equity > 0.0 else 0.0
     daily_loss_used_usd = max(0.0, -today_obj["net_pnl_usd"])
     daily_loss_left_usd = round(max(0.0, daily_loss_limit_usd - daily_loss_used_usd), 2)
 
-    starting_equity_total = max(live_equity - net_realized_pnl_usd, 1e-6)
-    total_profit_pct = round(((live_equity - starting_equity_total) / starting_equity_total) * 100.0, 4)
+    starting_equity_total = max(live_equity - net_realized_pnl_usd, 0.0)
+    total_profit_pct = round(((live_equity - starting_equity_total) / starting_equity_total) * 100.0, 4) if starting_equity_total > 0.0 else 0.0
 
     return {
         "account_balance_usd": round(account_balance_usd, 2),

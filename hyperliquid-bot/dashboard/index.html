@@ -572,12 +572,12 @@
             </div>
             <div>
               <div class="text-[12.5px] text-cosmic-muted font-medium" id="chart-left-label">Account Balance</div>
-              <div class="text-[21px] font-bold text-white tracking-tight" id="chart-main-balance">$150.93</div>
+              <div class="text-[21px] font-bold text-white tracking-tight" id="chart-main-balance">$0.00</div>
             </div>
           </div>
 
           <div class="text-right">
-            <div class="text-[16px] font-bold text-white" id="chart-right-equity">Equity: $150.93</div>
+            <div class="text-[16px] font-bold text-white" id="chart-right-equity">Equity: $0.00</div>
             <div class="text-[13px] text-cosmic-muted font-mono mt-0.5" id="chart-right-profit">Profit: 0.0000%</div>
           </div>
         </div>
@@ -600,26 +600,26 @@
 
               <!-- Y-Axis Labels -->
               <g id="chart-y-labels" class="text-[12px] fill-[#6f6d85] font-medium">
-                <text x="4" y="42">$160</text>
-                <text x="4" y="88">$155</text>
-                <text x="4" y="134">$150</text>
-                <text x="4" y="180">$145</text>
-                <text x="4" y="220">$140</text>
+                <text x="4" y="42">$0.00</text>
+                <text x="4" y="88">$0.00</text>
+                <text x="4" y="134">$0.00</text>
+                <text x="4" y="180">$0.00</text>
+                <text x="4" y="220">$0.00</text>
               </g>
 
               <!-- Subtle Horizontal & Vertical Crosshair Dotted Lines -->
-              <line id="chart-h-grid" x1="52" y1="40" x2="740" y2="40" stroke="rgba(255,255,255,0.10)" stroke-width="1" stroke-dasharray="3 4"/>
-              <line id="chart-v-grid" x1="518" y1="40" x2="518" y2="220" stroke="rgba(167,139,250,0.18)" stroke-width="1" stroke-dasharray="3 4"/>
+              <line id="chart-h-grid" x1="52" y1="205" x2="740" y2="205" stroke="rgba(255,255,255,0.10)" stroke-width="1" stroke-dasharray="3 4"/>
+              <line id="chart-v-grid" x1="740" y1="40" x2="740" y2="205" stroke="rgba(167,139,250,0.18)" stroke-width="1" stroke-dasharray="3 4"/>
 
               <!-- Area Under Spline -->
               <path id="chart-area-path"
-                d="M 56 142 L 106 142 C 122 142, 134 94, 152 94 L 222 94 C 238 94, 246 116, 262 116 L 284 116 C 300 116, 308 166, 324 166 L 378 166 C 396 166, 408 86, 426 86 L 466 86 C 482 86, 504 20, 518 20 C 532 20, 560 132, 576 132 L 642 132 C 658 132, 666 44, 682 44 L 744 44 L 744 225 L 56 225 Z"
+                d="M 56 205 L 744 205 L 744 225 L 56 225 Z"
                 fill="url(#purpleAreaFill)"
               />
 
               <!-- Glowing Lavender Stroke -->
               <path id="chart-line-path"
-                d="M 56 142 L 106 142 C 122 142, 134 94, 152 94 L 222 94 C 238 94, 246 116, 262 116 L 284 116 C 300 116, 308 166, 324 166 L 378 166 C 396 166, 408 86, 426 86 L 466 86 C 482 86, 504 20, 518 20 C 532 20, 560 132, 576 132 L 642 132 C 658 132, 666 44, 682 44 L 744 44"
+                d="M 56 205 L 744 205"
                 fill="none"
                 stroke="#a78bfa"
                 stroke-width="2.6"
@@ -629,14 +629,14 @@
               />
 
               <!-- Glowing Active Peak Node -->
-              <circle id="chart-peak-halo" cx="518" cy="20" r="9" fill="rgba(167, 139, 250, 0.28)"/>
-              <circle id="chart-peak-dot" cx="518" cy="20" r="4.5" fill="#e9d5ff" stroke="#a78bfa" stroke-width="2"/>
+              <circle id="chart-peak-halo" cx="744" cy="205" r="9" fill="rgba(167, 139, 250, 0.28)"/>
+              <circle id="chart-peak-dot" cx="744" cy="205" r="4.5" fill="#e9d5ff" stroke="#a78bfa" stroke-width="2"/>
             </svg>
 
             <!-- Floating Glassmorphic Pill Tooltip Above Peak (Matches Video Frame 12) -->
-            <div id="chart-floating-pill" style="left: 68%; top: -6px;" class="absolute -translate-x-1/2 px-3 py-1.5 rounded-full bg-[#241e38]/90 border border-cosmic-purple/40 shadow-[0_8px_24px_rgba(0,0,0,0.6)] flex items-center gap-2 backdrop-blur-md pointer-events-none transition-all duration-300">
+            <div id="chart-floating-pill" style="left: 50%; top: 160px;" class="absolute -translate-x-1/2 px-3 py-1.5 rounded-full bg-[#241e38]/90 border border-cosmic-purple/40 shadow-[0_8px_24px_rgba(0,0,0,0.6)] flex items-center gap-2 backdrop-blur-md pointer-events-none transition-all duration-300">
               <span class="w-4 h-4 rounded-full bg-cosmic-purple flex items-center justify-center text-[#090812] text-[10px] font-bold">^</span>
-              <span id="chart-pill-text" class="text-[11.5px] font-mono font-semibold text-white/95">$ 150.93</span>
+              <span id="chart-pill-text" class="text-[11.5px] font-mono font-semibold text-white/95">$0.00</span>
             </div>
           </div>
 
@@ -719,7 +719,7 @@
               </div>
               <span class="text-[13px] text-cosmic-muted">Account Size:</span>
             </div>
-            <span class="text-[13.5px] font-semibold text-white font-mono" id="info-account-size">$150.93</span>
+            <span class="text-[13.5px] font-semibold text-white font-mono" id="info-account-size">$0.00</span>
           </div>
 
           <!-- Row 5: Net Realized PnL -->
@@ -745,7 +745,7 @@
               </div>
               <span class="text-[13px] text-cosmic-muted">Open Positions:</span>
             </div>
-            <span class="pill-mts" id="info-open-pos">0 / 2 Active</span>
+            <span class="pill-mts" id="info-open-pos">0 / 1 Active</span>
           </div>
 
           <!-- Row 7: Trading Objectives -->
@@ -795,8 +795,8 @@
         <!-- Signature Horizontal Tick-Ruler Slider from Video Frame 14 -->
         <div class="relative z-10 my-7 pt-5">
           <!-- Floating Callout Bubble Above Thumb -->
-          <div id="ruler-thumb-bubble" style="left: 71%;" class="absolute -top-2 -translate-x-1/2 px-3 py-1 rounded-full bg-[#241e38] border border-white/15 text-[11px] font-mono font-semibold text-white shadow-lg whitespace-nowrap transition-all duration-300">
-            $7.55 Left
+          <div id="ruler-thumb-bubble" style="left: 8%;" class="absolute -top-2 -translate-x-1/2 px-3 py-1 rounded-full bg-[#241e38] border border-white/15 text-[11px] font-mono font-semibold text-white shadow-lg whitespace-nowrap transition-all duration-300">
+            $0.00 Left
           </div>
 
           <!-- Ruler Track & Vertical Ticks -->
@@ -832,7 +832,7 @@
             </div>
 
             <!-- Glowing Purple Thumb Node -->
-            <div id="ruler-thumb-dot" style="left: 71%;" class="absolute -translate-x-1/2 w-4 h-4 rounded-full bg-white border-[3px] border-cosmic-purple shadow-[0_0_16px_#a78bfa] transition-all duration-300"></div>
+            <div id="ruler-thumb-dot" style="left: 8%;" class="absolute -translate-x-1/2 w-4 h-4 rounded-full bg-white border-[3px] border-cosmic-purple shadow-[0_0_16px_#a78bfa] transition-all duration-300"></div>
           </div>
 
           <!-- Scale Labels Matching Video Frame 14 -->
@@ -858,7 +858,7 @@
               </div>
               <span class="text-[12.5px] text-cosmic-muted">Maximum</span>
             </div>
-            <span class="text-[12.5px] font-semibold text-white font-mono" id="risk-max-row">$7.55 daily loss</span>
+            <span class="text-[12.5px] font-semibold text-white font-mono" id="risk-max-row">$0.00 daily loss</span>
           </div>
 
           <div class="flex items-center justify-between">
@@ -871,7 +871,7 @@
               </div>
               <span class="text-[12.5px] text-cosmic-muted">Today's starting balance/equity:</span>
             </div>
-            <span class="text-[12.5px] font-semibold text-white font-mono" id="risk-start-row">$150.93</span>
+            <span class="text-[12.5px] font-semibold text-white font-mono" id="risk-start-row">$0.00</span>
           </div>
 
           <div class="flex items-center justify-between">
@@ -883,7 +883,7 @@
               </div>
               <span class="text-[12.5px] text-cosmic-muted">Threshold at:</span>
             </div>
-            <span class="text-[12.5px] font-semibold text-white/90 font-mono" id="risk-threshold-row">$143.38</span>
+            <span class="text-[12.5px] font-semibold text-white/90 font-mono" id="risk-threshold-row">$0.00</span>
           </div>
         </div>
       </div>
@@ -978,12 +978,12 @@
         <div class="relative z-10 grid grid-cols-1 sm:grid-cols-2 gap-4 my-auto">
           <div class="cosmic-inset p-4">
             <div class="text-[12px] text-cosmic-muted">Date</div>
-            <div class="text-[17px] font-semibold text-white font-mono mt-1.5" id="summary-date">2026/10/16</div>
+            <div class="text-[17px] font-semibold text-white font-mono mt-1.5" id="summary-date">--/--/--</div>
           </div>
 
           <div class="cosmic-inset p-4">
             <div class="text-[12px] text-cosmic-muted">Ending Balance</div>
-            <div class="text-[18px] font-bold text-white font-mono mt-1.5" id="summary-ending-balance">$150.93</div>
+            <div class="text-[18px] font-bold text-white font-mono mt-1.5" id="summary-ending-balance">$0.00</div>
           </div>
 
           <div class="cosmic-inset p-4">
@@ -1194,7 +1194,7 @@
       const perf = (latestTelemetry && latestTelemetry.real_performance) ? latestTelemetry.real_performance : {};
       const dailyMap = perf.daily_summary || {};
       const dayObj = dailyMap[dayKey];
-      const liveEq = Number(perf.account_equity_usd || 150.93);
+      const liveEq = Number(perf.account_equity_usd || 0.0);
 
       if (dayObj) {
         document.getElementById('summary-ending-balance').textContent = fmtUsd(dayObj.ending_balance);
@@ -1262,7 +1262,7 @@
       const totalLossUsd = Number(perf.total_loss_usd || 0);
 
       const netRealizedUsd = Number(perf.net_realized_pnl_usd || 0);
-      const liveEquity = Number(perf.account_equity_usd || 150.93);
+      const liveEquity = Number(perf.account_equity_usd || 0.0);
 
       // KPI 1: Average Win (Real Trades)
       document.getElementById('kpi1-value').textContent = fmtUsd(avgWinUsd);
@@ -1307,15 +1307,15 @@
 
       // Daily Loss Limit Card
       const startEq = Number(perf.today_starting_equity_usd || liveEquity);
-      const maxLoss = Number(perf.daily_loss_limit_usd || (startEq * 0.05));
-      const threshEq = Number(perf.daily_threshold_usd || (startEq - maxLoss));
+      const maxLoss = Number(perf.daily_loss_limit_usd !== undefined ? perf.daily_loss_limit_usd : (startEq * 0.05));
+      const threshEq = Number(perf.daily_threshold_usd !== undefined ? perf.daily_threshold_usd : (startEq - maxLoss));
       const leftLoss = Number(perf.daily_loss_left_usd !== undefined ? perf.daily_loss_left_usd : maxLoss);
 
       document.getElementById('risk-max-row').textContent = `${fmtUsd(maxLoss)} daily loss`;
       document.getElementById('risk-start-row').textContent = fmtUsd(startEq);
       document.getElementById('risk-threshold-row').textContent = fmtUsd(threshEq);
 
-      const pctRemaining = maxLoss > 0 ? Math.max(8, Math.min(92, (leftLoss / maxLoss) * 100)) : 75;
+      const pctRemaining = maxLoss > 0 ? Math.max(8, Math.min(92, (leftLoss / maxLoss) * 100)) : 8;
       document.getElementById('ruler-thumb-dot').style.left = `${pctRemaining}%`;
       document.getElementById('ruler-thumb-bubble').style.left = `${pctRemaining}%`;
       document.getElementById('ruler-thumb-bubble').textContent = `${fmtUsd(leftLoss)} Left`;
@@ -1324,8 +1324,8 @@
     function renderEquityChart(data) {
       const perf = data.real_performance || {};
       const assets = data.assets || {};
-      const bal = Number(perf.account_balance_usd || 150.93);
-      const eq = Number(perf.account_equity_usd || 150.93);
+      const bal = Number(perf.account_balance_usd !== undefined ? perf.account_balance_usd : 0.0);
+      const eq = Number(perf.account_equity_usd !== undefined ? perf.account_equity_usd : 0.0);
       const profPct = Number(perf.total_profit_pct || 0);
 
       document.getElementById('chart-left-label').textContent = 'Account Balance';
@@ -1337,12 +1337,19 @@
       // Build SVG path from real equity curve points if available
       const curve = perf.equity_curve || [];
       if (curve.length >= 2) {
-        const vals = curve.map(c => Number(c.equity || eq));
+        const vals = curve.map(c => Number(c.equity !== undefined ? c.equity : eq));
         const minV = Math.min(...vals);
         const maxV = Math.max(...vals);
-        const pad = Math.max((maxV - minV) * 0.35, 1.5);
-        const low = minV - pad;
-        const high = maxV + pad;
+
+        let low, high;
+        if (Math.abs(maxV) < 1e-4 && Math.abs(minV) < 1e-4) {
+          low = 0.0;
+          high = 100.0;
+        } else {
+          const pad = Math.max((maxV - minV) * 0.35, 1.5);
+          low = Math.max(0.0, minV - pad);
+          high = maxV + pad;
+        }
 
         // Y-axis labels
         const yLabels = document.getElementById('chart-y-labels');
