@@ -882,6 +882,7 @@ pub enum InvalidationDecision {
 ///   for K = 2 consecutive completed 5m bars, OR if |Z_15| >= z_shock_limit for 2 bars,
 ///   OR 1-bar Z_OU breach + active Kalman LLT waterfall slope / CUSUM alarm.
 /// - Tier 2 (Hard Crash Stop): Exchange-native Stop-Market order resting at d_hard_bps.
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct TwoTierInvalidationManager {
     pub side: Side,
@@ -1001,7 +1002,8 @@ impl TwoTierInvalidationManager {
         }
 
         let mut updated_tp_price = None;
-        if !self.breakeven_ratchet_armed && self.elapsed_minutes >= 1.8 * self.half_life_minutes {
+        let breakeven_ratchet_mins = (1.8 * self.half_life_minutes).clamp(36.0, 216.0);
+        if !self.breakeven_ratchet_armed && self.elapsed_minutes >= breakeven_ratchet_mins {
             self.breakeven_ratchet_armed = true;
             let round_trip_fee = 2.0 * maker_fee_bps * 1e-4;
             let be_px = match self.side {

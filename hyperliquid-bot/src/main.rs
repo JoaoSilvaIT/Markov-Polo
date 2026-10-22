@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc::unbounded_channel, Mutex, Notify, RwLock};
 
+pub mod backtest;
 mod config;
 mod controller;
 pub mod counterfactual;
@@ -251,6 +252,118 @@ pub async fn execute_emergency_flatten_with_retry(
 
 #[tokio::main]
 async fn main() {
+    let cli_args: Vec<String> = std::env::args().collect();
+    if cli_args.iter().any(|a| a == "--backtest") {
+        println!("🔬 [NAUTILUS-STYLE SIMULATED EXCHANGE BACKTESTER] Starting discrete-event replay...");
+        let info = InfoClient::new(None, Some(BaseUrl::Mainnet))
+            .await
+            .expect("Failed to create InfoClient for backtest");
+        let sz_map = fetch_sz_decimals_map(&info).await;
+        let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let start_ms = now_ms.saturating_sub(2400 * 60 * 1000); // 40 hours (2,400 x 1m bars)
+
+        let mut grand_wins = 0usize;
+        let mut grand_losses = 0usize;
+        let mut grand_net_usd = 0.0;
+        let mut grand_net_bps = 0.0;
+
+        for &sym in &["BTC", "ETH", "SOL", "AVAX"] {
+            let mut bars = crate::backtest::load_historical_bars(sym);
+            if bars.len() < 1200 {
+                println!(
+                    "⏳ [BACKTEST INGESTION] Local NAS history for {} has {} bars; fetching 2,400 1m bars from Hyperliquid REST...",
+                    sym,
+                    bars.len()
+                );
+                if let Ok(mut snaps) = info
+                    .candles_snapshot(sym.to_string(), "1m".to_string(), start_ms, now_ms)
+                    .await
+                {
+                    snaps.sort_by_key(|c| c.time_open);
+                    for c in snaps {
+                        let o = c.open.parse::<f64>().unwrap_or(0.0);
+                        let h = c.high.parse::<f64>().unwrap_or(0.0);
+                        let l = c.low.parse::<f64>().unwrap_or(0.0);
+                        let cl = c.close.parse::<f64>().unwrap_or(0.0);
+                        let v = c.vlm.parse::<f64>().unwrap_or(0.0);
+                        if cl > 0.0 && h >= l && l > 0.0 {
+                            let sz_dec = *sz_map.get(sym).unwrap_or(&2);
+                            let tick = effective_tick_size(cl, sz_dec);
+                            let rec = crate::backtest::HistoricalMarketBarRecord {
+                                symbol: sym.to_string(),
+                                timestamp_ms: c.time_open,
+                                open: o,
+                                high: h,
+                                low: l,
+                                close: cl,
+                                volume: v,
+                                best_bid: cl - 0.5 * tick,
+                                best_ask: cl + 0.5 * tick,
+                                obi_instant: 0.0,
+                                obi_1s: 0.0,
+                                obi_5s: 0.0,
+                                funding_1h: 0.0000125,
+                                open_interest: 0.0,
+                                mark_px: cl,
+                                oracle_px: cl,
+                            };
+                            crate::backtest::append_historical_bar_record(&rec);
+                        }
+                    }
+                    bars = crate::backtest::load_historical_bars(sym);
+                }
+            }
+
+            let sz_dec = *sz_map.get(sym).unwrap_or(&2);
+            let sim_cfg = crate::backtest::SimulatedExchangeConfig {
+                sz_decimals: sz_dec,
+                notional_usdc: 68.0,
+                ..Default::default()
+            };
+            let res = crate::backtest::run_engine_a_backtest(sym, &bars, &sim_cfg);
+            grand_wins += res.wins;
+            grand_losses += res.losses;
+            grand_net_usd += res.net_pnl_usd;
+            grand_net_bps += res.net_pnl_bps;
+
+            println!(
+                "📊 [BACKTEST SUMMARY - {}] Bars: {} | Armed: {} | Submitted: {} | Filled: {} | Win/Loss: {}W/{}L ({:.1}%) | Net PnL: {:+.1} bps (${:+.2}) | PF: {:.2} | Max DD: ${:.2}",
+                sym,
+                res.bars_evaluated,
+                res.signals_armed,
+                res.orders_submitted,
+                res.orders_filled,
+                res.wins,
+                res.losses,
+                res.win_rate_pct,
+                res.net_pnl_bps,
+                res.net_pnl_usd,
+                res.profit_factor,
+                res.max_drawdown_usd
+            );
+            for t in &res.trades {
+                let dt_str = chrono::DateTime::from_timestamp_millis(t.entry_time_ms as i64)
+                    .map(|d| d.format("%m-%d %H:%M").to_string())
+                    .unwrap_or_default();
+                println!(
+                    "   ↳ [{}] {} {:?} ({}) | Entry: ${:.4} -> Exit: ${:.4} | Net: {:+.1} bps (${:+.3}) | MFE: {:.1} / MAE: {:.1} bps | {}",
+                    dt_str, t.symbol, t.side, t.entry_policy, t.entry_px, t.exit_px, t.net_bps, t.net_pnl_usd, t.mfe_bps, t.mae_bps, t.exit_reason
+                );
+            }
+        }
+        let total_tr = grand_wins + grand_losses;
+        let wr = if total_tr > 0 {
+            (grand_wins as f64 / total_tr as f64) * 100.0
+        } else {
+            0.0
+        };
+        println!(
+            "🏆 [PORTFOLIO BACKTEST TOTAL] Trades: {} ({}W / {}L, {:.1}% WR) | Total Net PnL: {:+.1} bps (${:+.2} USDC)",
+            total_tr, grand_wins, grand_losses, wr, grand_net_bps, grand_net_usd
+        );
+        return;
+    }
+
     println!("🚀 [HYPERLIQUID PERP START] Fully Autonomous Deterministic O-U Architecture Initialized.");
 
     let config = Config::from_env();
@@ -2334,13 +2447,15 @@ async fn main() {
                         }
                     };
 
-                    let (l2_instant, l2_1s, l2_5s, l2_fresh) = {
+                    let (l2_instant, l2_1s, l2_5s, l2_fresh, l2_bid_snap, l2_ask_snap) = {
                         let guard = obi_tracker.read().await;
                         (
                             guard.instant_obi,
                             guard.ewma_1s_obi,
                             guard.ewma_5s_obi,
                             guard.is_fresh_and_uncrossed(chrono::Utc::now().timestamp_millis() as u64, 7500),
+                            guard.best_bid,
+                            guard.best_ask,
                         )
                     };
 
@@ -2394,6 +2509,36 @@ async fn main() {
                         high_water_mark: *high_water_mark_equity.read().await,
                     };
                     save_telemetry(&symbol_clone, &telemetry_data);
+
+                    // Continuous NAS Market History Recorder (`hl_history_{symbol}.jsonl`):
+                    // Persists 1m OHLCV + L2 Bid/Ask/OBI + Hourly Funding + Open Interest + Mark/Oracle prices
+                    {
+                        let (oi_snap, mark_snap, oracle_snap) = {
+                            let cg = crowding_tracker.read().await;
+                            (cg.open_interest, cg.mark_px, cg.oracle_px)
+                        };
+                        let tick_rec = effective_tick_size(close_price, sz_decimals);
+                        crate::backtest::append_historical_bar_record(
+                            &crate::backtest::HistoricalMarketBarRecord {
+                                symbol: symbol_clone.clone(),
+                                timestamp_ms: completed_bar.time_open,
+                                open: open_price,
+                                high: high_price,
+                                low: low_price,
+                                close: close_price,
+                                volume: completed_bar.volume,
+                                best_bid: if l2_bid_snap > 0.0 { l2_bid_snap } else { close_price - 0.5 * tick_rec },
+                                best_ask: if l2_ask_snap > 0.0 { l2_ask_snap } else { close_price + 0.5 * tick_rec },
+                                obi_instant: l2_instant,
+                                obi_1s: l2_1s,
+                                obi_5s: l2_5s,
+                                funding_1h: current_funding_1h,
+                                open_interest: oi_snap,
+                                mark_px: if mark_snap > 0.0 { mark_snap } else { close_price },
+                                oracle_px: if oracle_snap > 0.0 { oracle_snap } else { close_price },
+                            },
+                        );
+                    }
 
                     // ------------------------------------------------------------------
                     // ENGINE B SUPERVISOR: Active Shadow Trend Trailing Stop & Exits
