@@ -861,18 +861,27 @@ impl ChandelierExitState {
             return self.current_stop;
         }
 
-        let decay_factor = ((p_trend - 0.55) / (0.85 - 0.55)).clamp(0.0, 1.0);
-        let min_multiplier = (self.base_multiplier * 0.5).max(1.0);
-        let target_multiplier = min_multiplier + (self.base_multiplier - min_multiplier) * decay_factor;
+        // Chandelier ATR Multiplier Compression by P_Trend Decay
+        // Per research: when P_Trend < 0.60, compress multiplier to half the base (e.g., 3.0→1.5, 2.0→1.0)
+        // This tightens the stop during regime decay, front-running mean reversion
+        let effective_multiplier = if p_trend < 0.60 {
+            // Hard compression to half base when regime decay detected
+            (self.base_multiplier * 0.5).max(1.0)
+        } else {
+            // Normal decay formula for P_Trend >= 0.60
+            let decay_factor = ((p_trend - 0.55) / (0.85 - 0.55)).clamp(0.0, 1.0);
+            let min_multiplier = (self.base_multiplier * 0.5).max(1.0);
+            min_multiplier + (self.base_multiplier - min_multiplier) * decay_factor
+        };
 
         if let Some(max_step) = max_contraction_step {
-            if target_multiplier < self.active_multiplier {
-                self.active_multiplier = (self.active_multiplier - max_step).max(target_multiplier);
+            if effective_multiplier < self.active_multiplier {
+                self.active_multiplier = (self.active_multiplier - max_step).max(effective_multiplier);
             } else {
-                self.active_multiplier = (self.active_multiplier + max_step).min(target_multiplier);
+                self.active_multiplier = (self.active_multiplier + max_step).min(effective_multiplier);
             }
         } else {
-            self.active_multiplier = target_multiplier;
+            self.active_multiplier = effective_multiplier;
         }
 
         match self.side {

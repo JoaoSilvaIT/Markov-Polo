@@ -116,6 +116,12 @@ pub struct PositionState {
     pub breakeven_ratchet_armed: bool,
     #[serde(default)]
     pub entry_ttl_mins: f64,
+    #[serde(default)]
+    pub disaster_stop_oid: Option<u64>,
+    #[serde(default)]
+    pub disaster_stop_ratcheted_to_be: bool,
+    #[serde(default)]
+    pub last_fill_check: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1208,6 +1214,9 @@ mod tests {
             consecutive_shock_bars: 0,
             breakeven_ratchet_armed: false,
             entry_ttl_mins: 0.0,
+            disaster_stop_oid: None,
+            disaster_stop_ratcheted_to_be: false,
+            last_fill_check: 0,
         };
         assert!(!empty_pos.is_occupied());
 

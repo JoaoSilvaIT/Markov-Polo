@@ -308,6 +308,9 @@ pub async fn place_ou_maker_entry(
         consecutive_shock_bars: 0,
         breakeven_ratchet_armed: false,
         entry_ttl_mins,
+        disaster_stop_oid: None,
+        disaster_stop_ratcheted_to_be: false,
+        last_fill_check: 0,
     };
 
     state.insert(symbol.to_string(), new_state.clone());
@@ -555,6 +558,9 @@ pub async fn place_trend_breakout_entry(
         consecutive_shock_bars: 0,
         breakeven_ratchet_armed: false,
         entry_ttl_mins: 5.0,
+        disaster_stop_oid: None,
+        disaster_stop_ratcheted_to_be: false,
+        last_fill_check: 0,
     };
 
     state.insert(symbol.to_string(), new_state.clone());

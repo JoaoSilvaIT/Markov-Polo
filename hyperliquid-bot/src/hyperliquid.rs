@@ -224,13 +224,65 @@ pub async fn place_disaster_stop_trigger_order(
 
 /// Asset-specific optimal resting Maker Take-Profit ATR multiple (`k_tp_atr`) for Engine B 15m breakouts,
 /// derived from the 2024–2026 Hyperliquid L1 empirical MFE hazard-rate optimization (`Hyperliquid Intraday Breakout Research.md`).
+/// Research-validated: BTC=1.0, ETH=1.5, SOL=2.0, AVAX=2.5
 pub fn optimal_engine_b_tp_atr_multiple(symbol: &str) -> f64 {
     match symbol.to_uppercase().as_str() {
-        "BTC" => 1.05,
-        "ETH" => 1.15,
-        "SOL" => 1.20,
-        "AVAX" => 1.25,
-        _ => 1.15,
+        "BTC" => 1.0,
+        "ETH" => 1.5,
+        "SOL" => 2.0,
+        "AVAX" => 2.5,
+        _ => 1.5,
+    }
+}
+
+/// One-time ratchet of Exchange-Native Disaster Stop-Market to breakeven (+fee buffer).
+/// Called when intrabar MFE reaches ≥75% of distance to TP (per research: lines 148, 206, 515).
+pub async fn ratchet_disaster_stop_to_breakeven(
+    exchange: &ExchangeClient,
+    coin: &str,
+    is_buy_to_close: bool,
+    trigger_px: f64,
+    sz_decimals: u32,
+    cloid: Option<uuid::Uuid>,
+) -> Result<u64, String> {
+    let clean_trigger = quantize_price(trigger_px, sz_decimals);
+    let order_req = ClientOrderRequest {
+        asset: coin.to_string(),
+        is_buy: is_buy_to_close,
+        reduce_only: true,
+        limit_px: clean_trigger, // worst-price = trigger for market stop
+        sz: 0.0, // size 0 = modify existing trigger order
+        cloid,
+        order_type: ClientOrder::Trigger(ClientTrigger {
+            is_market: true,
+            trigger_px: clean_trigger,
+            tpsl: "sl".to_string(),
+        }),
+    };
+
+    let res = tokio::time::timeout(HL_REST_TIMEOUT, exchange.order(order_req, None))
+        .await
+        .map_err(|_| format!("Disaster stop ratchet timed out after 10s for {}", coin))?
+        .map_err(|e| format!("Disaster stop ratchet failed: {}", e))?;
+
+    match res {
+        ExchangeResponseStatus::Ok(resp) => {
+            if let Some(data) = resp.data {
+                if let Some(first) = data.statuses.first() {
+                    match first {
+                        ExchangeDataStatus::Resting(resting) => Ok(resting.oid),
+                        ExchangeDataStatus::Filled(filled) => Ok(filled.oid),
+                        ExchangeDataStatus::Error(msg) => Err(format!("Exchange rejected disaster stop ratchet: {}", msg)),
+                        other => Err(format!("Unexpected ratchet status: {:?}", other)),
+                    }
+                } else {
+                    Err("Empty ratchet response statuses".to_string())
+                }
+            } else {
+                Err("Missing ratchet response data".to_string())
+            }
+        }
+        ExchangeResponseStatus::Err(e) => Err(format!("Exchange ratchet error: {}", e)),
     }
 }
 

@@ -846,6 +846,9 @@ async fn main() {
                         consecutive_shock_bars: 0,
                         breakeven_ratchet_armed: false,
                         entry_ttl_mins: 3.0,
+                        disaster_stop_oid: None,
+                        disaster_stop_ratcheted_to_be: false,
+                        last_fill_check: 0,
                     },
                 );
             }
@@ -922,6 +925,9 @@ async fn main() {
                                 consecutive_shock_bars: 0,
                                 breakeven_ratchet_armed: false,
                                 entry_ttl_mins: 3.0,
+                                disaster_stop_oid: None,
+                                disaster_stop_ratcheted_to_be: false,
+                                last_fill_check: 0,
                             };
                             state_lock.insert(trading_symbol.clone(), reconstructed);
                             let _ = save_state(&state_file_path, &state_lock);
@@ -1105,6 +1111,66 @@ async fn main() {
             }
 
             // -------------------------------------------------------------
+            // Event-Driven REST Polling (429 mitigation) + Disaster Stop Ratchet
+            // -------------------------------------------------------------
+            let (mut needs_poll, mut do_ratchet, ratchet_params) = {
+                let mut state_lock = watcher_state.lock().await;
+                if let Some(p) = state_lock.get_mut(&watcher_symbol) {
+                    p.last_fill_check = chrono::Utc::now().timestamp_millis() as u64;
+
+                    // Compute needs_poll while holding lock
+                    let np = p.is_filled
+                        || !p.tp_order_id.is_empty()
+                        || p.disaster_stop_oid.is_some()
+                        || p.last_fill_check < chrono::Utc::now().timestamp_millis() as u64 - 30_000;
+
+                    // Check if disaster stop ratchet should trigger
+                    let mut dr = false;
+                    let mut rp = None;
+                    if p.max_progress >= 0.75 && !p.disaster_stop_ratcheted_to_be {
+                        if let Some(oid) = p.disaster_stop_oid {
+                            let is_long = p.side == "LONG";
+                            let be_trigger = if is_long {
+                                p.entry_price * (1.0 + 2.0 * 1.5 * 1e-4)
+                            } else {
+                                p.entry_price * (1.0 - 2.0 * 1.5 * 1e-4)
+                            };
+                            dr = true;
+                            rp = Some((oid, !is_long, be_trigger));
+                            p.disaster_stop_ratcheted_to_be = true; // Mark immediately to avoid duplicate
+                        }
+                    }
+                    (np, dr, rp)
+                } else {
+                    (false, false, None)
+                }
+            };
+
+            // Execute disaster stop ratchet outside lock
+            if do_ratchet {
+                if let Some((oid, is_buy_to_close, be_trigger)) = ratchet_params {
+                    if let Err(e) = crate::hyperliquid::ratchet_disaster_stop_to_breakeven(
+                        &watcher_exchange,
+                        &watcher_symbol,
+                        is_buy_to_close,
+                        be_trigger,
+                        watcher_sz_decimals,
+                        None,
+                    ).await {
+                        eprintln!(
+                            "⚠️ [DISASTER STOP RATCHET] Failed to ratchet {} disaster stop to BE @ ${:.2}: {}",
+                            watcher_symbol, be_trigger, e
+                        );
+                    } else {
+                        println!(
+                            "🛡️ [DISASTER STOP RATCHET] {} disaster stop moved to breakeven @ ${:.2} (MFE ≥ 75%)",
+                            watcher_symbol, be_trigger
+                        );
+                    }
+                }
+            }
+
+            // -------------------------------------------------------------
             // Scenario 1: Entry order pending or position open without resting TP
             // -------------------------------------------------------------
             if pos.tp_order_id.is_empty() {
@@ -1118,7 +1184,13 @@ async fn main() {
                     10
                 };
 
-                if !pos.order_id.is_empty() && !pos.is_filled {
+                // Compute needs_poll for this position (recompute outside lock)
+                let needs_poll = pos.is_filled
+                    || !pos.tp_order_id.is_empty()
+                    || pos.disaster_stop_oid.is_some()
+                    || pos.last_fill_check < chrono::Utc::now().timestamp_millis() as u64 - 30_000;
+
+                if !pos.order_id.is_empty() && !pos.is_filled && needs_poll {
                     if let Ok(oid) = pos.order_id.parse::<u64>() {
                         let open_orders = match tokio::time::timeout(
                             Duration::from_secs(10),
@@ -3217,7 +3289,7 @@ async fn main() {
                                                 pos.max_progress = q_t;
                                             }
                                             let q_be = 0.15;
-                                            if pos.max_progress >= 0.70
+                                            if pos.max_progress >= 0.75
                                                 && q_t <= f64::max(q_be, pos.max_progress - 0.20)
                                             {
                                                 giveback_triggered = true;
