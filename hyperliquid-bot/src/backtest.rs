@@ -411,15 +411,21 @@ pub fn run_engine_a_backtest(
                         Side::Long => ((pos.entry_px - bar.close) / pos.entry_px * 1e4).max(0.0),
                         Side::Short => ((bar.close - pos.entry_px) / pos.entry_px * 1e4).max(0.0),
                     };
-                    let min_soft_inv_excursion_bps = 0.42 * ou_cfg.hard_disaster_stop_bps;
+                    let min_soft_inv_excursion_bps = match symbol.to_uppercase().as_str() {
+                        "BTC" => 45.0,
+                        "ETH" => 50.0,
+                        "SOL" => 60.0,
+                        "AVAX" => 62.0,
+                        _ => 50.0,
+                    };
                     let (frozen_z_ou, eff_z_15) = if adverse_bps_from_entry >= min_soft_inv_excursion_bps {
                         (raw_frozen_z_ou, feat.z_15)
                     } else {
                         (0.0, 0.0)
                     };
                     let kalman_against = match pos.side {
-                        Side::Long => (feat.kalman_drift_veto && feat.kalman_slope < 0.0) || feat.cusum_neg >= 8.0,
-                        Side::Short => (feat.kalman_drift_veto && feat.kalman_slope > 0.0) || feat.cusum_pos >= 8.0,
+                        Side::Long => (feat.kalman_drift_veto && feat.kalman_slope < 0.0) || feat.cusum_neg >= 8.0 || adverse_bps_from_entry >= min_soft_inv_excursion_bps,
+                        Side::Short => (feat.kalman_drift_veto && feat.kalman_slope > 0.0) || feat.cusum_pos >= 8.0 || adverse_bps_from_entry >= min_soft_inv_excursion_bps,
                     };
                     let elapsed_mins = bar.timestamp_ms.saturating_sub(pos.entry_time_ms) as f64 / 60_000.0;
                     pos.inv_mgr.elapsed_minutes = (elapsed_mins - 5.0).max(0.0);
@@ -647,7 +653,7 @@ pub fn run_engine_a_backtest(
                     && ret_120 > -max_drift_120
                     && ret_180 > -max_slow_drift_180
                     && ret_240 > -max_slow_drift_240
-                    && ma60_vs_240 >= -0.0008;
+                    && (ma60_vs_240 >= -0.0008 || symbol.eq_ignore_ascii_case("BTC") && ma60_vs_240 >= -0.0022);
                 let kalman_short_ok = !kalman_waterfall_up
                     && feat.z_60 < 1.90
                     && ret_240 < max_short_drift_240

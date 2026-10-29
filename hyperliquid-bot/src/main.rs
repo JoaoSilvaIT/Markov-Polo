@@ -3352,7 +3352,13 @@ async fn main() {
                                             } else {
                                                 ((close_price - pos.entry_price) / pos.entry_price.max(1e-9) * 1e4).max(0.0)
                                             };
-                                            let min_soft_inv_excursion_bps = 0.42 * ou_cfg.hard_disaster_stop_bps;
+                                            let min_soft_inv_excursion_bps = match symbol_clone.as_str() {
+                                                "BTC" => 45.0,
+                                                "ETH" => 50.0,
+                                                "SOL" => 60.0,
+                                                "AVAX" => 62.0,
+                                                _ => 50.0,
+                                            };
                                             let (frozen_z_ou, eff_z_15) = if adverse_bps_from_entry >= min_soft_inv_excursion_bps {
                                                 (raw_frozen_z_ou, z_15)
                                             } else {
@@ -3361,9 +3367,11 @@ async fn main() {
                                             let kalman_drift_against_pos = if is_long {
                                                 (live_feat.kalman_drift_veto && live_feat.kalman_slope < 0.0)
                                                     || live_feat.cusum_neg >= 8.0
+                                                    || adverse_bps_from_entry >= min_soft_inv_excursion_bps
                                             } else {
                                                 (live_feat.kalman_drift_veto && live_feat.kalman_slope > 0.0)
                                                     || live_feat.cusum_pos >= 8.0
+                                                    || adverse_bps_from_entry >= min_soft_inv_excursion_bps
                                             };
 
                                             let mut inv_mgr = crate::ou_process::TwoTierInvalidationManager {
@@ -3847,7 +3855,7 @@ async fn main() {
                                 && ret_120 > -max_drift_120
                                 && ret_180 > -max_slow_drift_180
                                 && ret_240 > -max_slow_drift_240
-                                && ma60_vs_240 >= -0.0008;
+                                && (ma60_vs_240 >= -0.0008 || (symbol_clone == "BTC" && ma60_vs_240 >= -0.0022));
                             let kalman_short_ok = !kalman_waterfall_up
                                 && z_60 < 1.90
                                 && ret_240 < max_short_drift_240
