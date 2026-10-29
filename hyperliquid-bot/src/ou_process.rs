@@ -994,25 +994,25 @@ impl TwoTierInvalidationManager {
             };
         }
 
-        // 4. Time-Decay Ratchet: tighten Maker TP to fee-adjusted breakeven at 1.8 * t_{1/2},
-        //    and force flatten at min(3.0 * t_{1/2}, 360.0) if mean reversion has stalled.
-        let max_hold_mins = (3.0 * self.half_life_minutes).clamp(60.0, 360.0);
+        // 4. Time-Decay Ratchet: tighten Maker TP to a +12 bps net harvest floor at 2.4 * t_{1/2} (clamped to [75m, 240m]),
+        //    and force flatten at min(3.5 * t_{1/2}, 360.0) (floored at 90m) if mean reversion has stalled.
+        let max_hold_mins = (3.5 * self.half_life_minutes).clamp(90.0, 360.0);
         if self.elapsed_minutes >= max_hold_mins {
             return InvalidationDecision::TriggerTimeDecayExit;
         }
 
         let mut updated_tp_price = None;
-        let breakeven_ratchet_mins = (1.8 * self.half_life_minutes).clamp(36.0, 216.0);
+        let breakeven_ratchet_mins = (2.4 * self.half_life_minutes).clamp(75.0, 240.0);
         if !self.breakeven_ratchet_armed && self.elapsed_minutes >= breakeven_ratchet_mins {
             self.breakeven_ratchet_armed = true;
-            let round_trip_fee = 2.0 * maker_fee_bps * 1e-4;
+            let min_harvest_margin = (2.0 * maker_fee_bps + 12.0) * 1e-4;
             let be_px = match self.side {
                 Side::Long => {
-                    let raw = self.entry_price * (1.0 + round_trip_fee);
+                    let raw = self.entry_price * (1.0 + min_harvest_margin);
                     (raw / tick_size.max(1e-9)).ceil() * tick_size.max(1e-9)
                 }
                 Side::Short => {
-                    let raw = self.entry_price * (1.0 - round_trip_fee);
+                    let raw = self.entry_price * (1.0 - min_harvest_margin);
                     (raw / tick_size.max(1e-9)).floor() * tick_size.max(1e-9)
                 }
             };

@@ -1113,7 +1113,7 @@ async fn main() {
             // -------------------------------------------------------------
             // Event-Driven REST Polling (429 mitigation) + Disaster Stop Ratchet
             // -------------------------------------------------------------
-            let (mut needs_poll, mut do_ratchet, ratchet_params) = {
+            let (_needs_poll, do_ratchet, ratchet_params) = {
                 let mut state_lock = watcher_state.lock().await;
                 if let Some(p) = state_lock.get_mut(&watcher_symbol) {
                     p.last_fill_check = chrono::Utc::now().timestamp_millis() as u64;
@@ -1148,7 +1148,7 @@ async fn main() {
 
             // Execute disaster stop ratchet outside lock
             if do_ratchet {
-                if let Some((oid, is_buy_to_close, be_trigger)) = ratchet_params {
+                if let Some((_oid, is_buy_to_close, be_trigger)) = ratchet_params {
                     if let Err(e) = crate::hyperliquid::ratchet_disaster_stop_to_breakeven(
                         &watcher_exchange,
                         &watcher_symbol,
@@ -1438,6 +1438,13 @@ async fn main() {
                                 .await
                                 {
                                     Ok(sl_oid) => {
+                                        {
+                                            let mut state_lock = watcher_state.lock().await;
+                                            if let Some(p) = state_lock.get_mut(&watcher_symbol) {
+                                                p.disaster_stop_oid = Some(sl_oid);
+                                                let _ = save_state(&watcher_state_path, &state_lock);
+                                            }
+                                        }
                                         println!(
                                             "🛡️ [FAST-SENTINEL] Exchange-Native Disaster Stop-Market Trigger placed on Hyperliquid for {} at ${:.2} (oid: {})",
                                             watcher_symbol, disaster_sl_px, sl_oid
@@ -2833,20 +2840,22 @@ async fn main() {
                                                 let hwm_eq = *high_water_mark_equity.read().await;
                                                 let dd_mult = compute_drawdown_risk_multiplier(live_eq, hwm_eq);
                                                 let eff_trend_risk = 0.0060 * trend_risk_fraction * dd_mult * crowding_mult;
+                                                let ou_cfg_b = crate::ou_process::asset_ou_config(&symbol_clone);
+                                                let max_b_notional = config.max_position_size_usdc.min(ou_cfg_b.target_notional_cap_usdc);
                                                 let trend_notional = if config.sizing_mode == "dynamic" && live_eq > 0.0 {
                                                     calculate_risk_scaled_notional(
                                                         live_eq,
-                                                        trade_bank * trend_risk_fraction * crowding_mult,
+                                                        (trade_bank * trend_risk_fraction * crowding_mult).min(max_b_notional),
                                                         eff_trend_risk,
                                                         close_price,
                                                         initial_sl,
                                                         config.hl_leverage,
                                                         crate::state::max_concurrent_cluster_positions(),
                                                         11.0,
-                                                        config.max_position_size_usdc,
+                                                        max_b_notional,
                                                     )
                                                 } else {
-                                                    (trade_bank * trend_risk_fraction * crowding_mult).max(11.0).min(config.max_position_size_usdc)
+                                                    (trade_bank * trend_risk_fraction * crowding_mult).max(11.0).min(max_b_notional)
                                                 };
                                                 let step_risk_exceeded = exceeds_micro_account_step_risk(
                                                     live_eq,
@@ -3311,7 +3320,7 @@ async fn main() {
                                         } else {
                                             45.0
                                         };
-                                        max_allowed_mins = (3.0 * eff_hl).clamp(60.0, 360.0);
+                                        max_allowed_mins = (3.5 * eff_hl).clamp(90.0, 360.0);
                                         if elapsed_mins >= max_allowed_mins {
                                             time_stop_triggered = true;
                                         }
@@ -3333,10 +3342,21 @@ async fn main() {
                                             } else {
                                                 live_feat.sigma_eq_log.max(ou_cfg.min_sigma_eq_bps * 1e-4)
                                             };
-                                            let frozen_z_ou = if center_anchor > 0.0 && close_price > 0.0 {
+                                            let raw_frozen_z_ou = if center_anchor > 0.0 && close_price > 0.0 {
                                                 (close_price / center_anchor).ln() / sigma_anchor
                                             } else {
                                                 live_feat.z_ou
+                                            };
+                                            let adverse_bps_from_entry = if is_long {
+                                                ((pos.entry_price - close_price) / pos.entry_price.max(1e-9) * 1e4).max(0.0)
+                                            } else {
+                                                ((close_price - pos.entry_price) / pos.entry_price.max(1e-9) * 1e4).max(0.0)
+                                            };
+                                            let min_soft_inv_excursion_bps = 0.42 * ou_cfg.hard_disaster_stop_bps;
+                                            let (frozen_z_ou, eff_z_15) = if adverse_bps_from_entry >= min_soft_inv_excursion_bps {
+                                                (raw_frozen_z_ou, z_15)
+                                            } else {
+                                                (0.0, 0.0)
                                             };
                                             let kalman_drift_against_pos = if is_long {
                                                 (live_feat.kalman_drift_veto && live_feat.kalman_slope < 0.0)
@@ -3362,7 +3382,7 @@ async fn main() {
 
                                             let decision = inv_mgr.on_5m_bar_close(
                                                 frozen_z_ou,
-                                                z_15,
+                                                eff_z_15,
                                                 kalman_drift_against_pos,
                                                 1.5,
                                                 entry_tick,
@@ -3423,10 +3443,12 @@ async fn main() {
                                                 pos.max_favorable_price = close_price;
                                             }
 
-                                            // Arm Profit Protection once trade covers >= 75% of target
+                                            // Arm Profit Protection once trade covers >= min(75% of target, 1.8 * min_net_edge_bps)
                                             // Trigger profit-locked exit if price retraces by 20% giveback
                                             let q_be = 0.15; // covers fees + slippage
-                                            if pos.max_progress >= 0.75
+                                            let abs_arm_bps = 1.8 * ou_cfg.min_net_edge_bps;
+                                            let arm_q_thresh = (abs_arm_bps / (d_0 / pos.entry_price.max(1e-9) * 1e4).max(1e-6)).min(0.75);
+                                            if pos.max_progress >= arm_q_thresh
                                                 && q_t <= f64::max(q_be, pos.max_progress - 0.20)
                                             {
                                                 giveback_triggered = true;
@@ -3773,15 +3795,46 @@ async fn main() {
                             // Avoid fading a strong multi-hour directional trend (scaled by asset volatility),
                             // while never disarming an already-armed signal on a normal bottom/top wick unless
                             // a genuine shock (`is_downside_shock`/`is_upside_shock`) or Kalman LLT waterfall fires.
-                            let max_slow_drift_240 = match symbol_clone.as_str() {
-                                "BTC" => 0.0085,
-                                "ETH" => 0.0110,
-                                "SOL" => 0.0150,
-                                "AVAX" => 0.0180,
-                                _ => 0.0110,
+                            let (max_drift_120, max_slow_drift_180, max_slow_drift_240) =
+                                match symbol_clone.as_str() {
+                                    "BTC" => (0.0025, 0.0025, 0.0030),
+                                    "ETH" => (0.0030, 0.0030, 0.0035),
+                                    "SOL" => (0.0045, 0.0045, 0.0055),
+                                    "AVAX" => (0.0050, 0.0060, 0.0075),
+                                    _ => (0.0030, 0.0030, 0.0035),
+                                };
+                            let max_short_drift_240 = match symbol_clone.as_str() {
+                                "BTC" => 0.0065,
+                                "ETH" => 0.0080,
+                                "SOL" => 0.0100,
+                                "AVAX" => 0.0140,
+                                _ => 0.0080,
                             };
-                            let ret_240 = if rolling_closes.len() >= 240 && rolling_closes[rolling_closes.len() - 240] > 0.0 {
-                                (close_price / rolling_closes[rolling_closes.len() - 240]).ln()
+                            let n_rc_hist = rolling_closes.len();
+                            let ret_120 = if n_rc_hist >= 120 && rolling_closes[n_rc_hist - 120] > 0.0 {
+                                (close_price / rolling_closes[n_rc_hist - 120]).ln()
+                            } else {
+                                0.0
+                            };
+                            let ret_180 = if n_rc_hist >= 180 && rolling_closes[n_rc_hist - 180] > 0.0 {
+                                (close_price / rolling_closes[n_rc_hist - 180]).ln()
+                            } else {
+                                0.0
+                            };
+                            let ret_240 = if n_rc_hist >= 240 && rolling_closes[n_rc_hist - 240] > 0.0 {
+                                (close_price / rolling_closes[n_rc_hist - 240]).ln()
+                            } else {
+                                0.0
+                            };
+                            let ret_720 = if n_rc_hist >= 720 && rolling_closes[n_rc_hist - 720] > 0.0 {
+                                (close_price / rolling_closes[n_rc_hist - 720]).ln()
+                            } else {
+                                0.0
+                            };
+                            let ma60_vs_240 = if n_rc_hist >= 240 {
+                                let ma60 = rolling_closes[n_rc_hist - 60..].iter().sum::<f64>() / 60.0;
+                                let ma240 = rolling_closes[n_rc_hist - 240..].iter().sum::<f64>() / 240.0;
+                                if ma240 > 0.0 { (ma60 / ma240) - 1.0 } else { 0.0 }
                             } else {
                                 0.0
                             };
@@ -3791,10 +3844,14 @@ async fn main() {
                                 || live_feat.cusum_pos >= 8.0;
                             let kalman_long_ok = !kalman_waterfall_down
                                 && z_60 > -1.90
-                                && ret_240 > -max_slow_drift_240;
+                                && ret_120 > -max_drift_120
+                                && ret_180 > -max_slow_drift_180
+                                && ret_240 > -max_slow_drift_240
+                                && ma60_vs_240 >= -0.0008;
                             let kalman_short_ok = !kalman_waterfall_up
                                 && z_60 < 1.90
-                                && ret_240 < max_slow_drift_240;
+                                && ret_240 < max_short_drift_240
+                                && (ma60_vs_240 <= 0.0040 || (ret_720 < -0.0150 && ma60_vs_240 <= 0.0080));
                             let is_eligible = !candle_feed_degraded
                                 && !is_candle_gap
                                 && is_consolidation

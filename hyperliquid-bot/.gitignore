@@ -7,3 +7,5 @@ target/
 *.log
 *.jsonl
 .env*
+hl_bot_data/
+audit_8days*

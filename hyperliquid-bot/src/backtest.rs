@@ -235,12 +235,20 @@ pub fn run_engine_a_backtest(
     let mut gross_wins_usd = 0.0;
     let mut gross_losses_usd = 0.0;
 
-    let max_slow_drift_240 = match symbol.to_uppercase().as_str() {
-        "BTC" => 0.0085,
-        "ETH" => 0.0110,
-        "SOL" => 0.0150,
-        "AVAX" => 0.0180,
-        _ => 0.0110,
+    let (max_drift_120, max_slow_drift_180, max_slow_drift_240) =
+        match symbol.to_uppercase().as_str() {
+            "BTC" => (0.0025, 0.0025, 0.0030),
+            "ETH" => (0.0030, 0.0030, 0.0035),
+            "SOL" => (0.0045, 0.0045, 0.0055),
+            "AVAX" => (0.0050, 0.0060, 0.0075),
+            _ => (0.0030, 0.0030, 0.0035),
+        };
+    let max_short_drift_240 = match symbol.to_uppercase().as_str() {
+        "BTC" => 0.0065,
+        "ETH" => 0.0080,
+        "SOL" => 0.0100,
+        "AVAX" => 0.0140,
+        _ => 0.0080,
     };
 
     for idx in warmup..bars.len() {
@@ -380,13 +388,34 @@ pub fn run_engine_a_backtest(
                 closed_outcome = Some((pos.tp_limit_px, true, "MAKER_TP"));
             }
 
+            // Evaluate 1m Time-Decay Max Hold Stop (matches `src/main.rs` 1m check)
+            let elapsed_mins_1m = bar.timestamp_ms.saturating_sub(pos.entry_time_ms) as f64 / 60_000.0;
+            let max_hold_1m = (3.5 * pos.inv_mgr.half_life_minutes).clamp(90.0, 360.0);
+            if closed_outcome.is_none() && elapsed_mins_1m >= max_hold_1m {
+                let slip = match pos.side {
+                    Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
+                    Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
+                };
+                closed_outcome = Some((bar.close * slip, false, "TIME_DECAY_STOP"));
+            }
+
             // Evaluate 5m Two-Tier Soft Structural Invalidation on completed 5-minute bars
             if closed_outcome.is_none() && (bar.timestamp_ms / 60_000) % 5 == 4 {
                 if let Some(ref feat) = live_feat_opt {
-                    let frozen_z_ou = if pos.frozen_center_px > 0.0 && pos.frozen_sigma_eq_log > 1e-6 {
+                    let raw_frozen_z_ou = if pos.frozen_center_px > 0.0 && pos.frozen_sigma_eq_log > 1e-6 {
                         (bar.close / pos.frozen_center_px).ln() / pos.frozen_sigma_eq_log
                     } else {
                         feat.z_ou
+                    };
+                    let adverse_bps_from_entry = match pos.side {
+                        Side::Long => ((pos.entry_px - bar.close) / pos.entry_px * 1e4).max(0.0),
+                        Side::Short => ((bar.close - pos.entry_px) / pos.entry_px * 1e4).max(0.0),
+                    };
+                    let min_soft_inv_excursion_bps = 0.42 * ou_cfg.hard_disaster_stop_bps;
+                    let (frozen_z_ou, eff_z_15) = if adverse_bps_from_entry >= min_soft_inv_excursion_bps {
+                        (raw_frozen_z_ou, feat.z_15)
+                    } else {
+                        (0.0, 0.0)
                     };
                     let kalman_against = match pos.side {
                         Side::Long => (feat.kalman_drift_veto && feat.kalman_slope < 0.0) || feat.cusum_neg >= 8.0,
@@ -396,7 +425,7 @@ pub fn run_engine_a_backtest(
                     pos.inv_mgr.elapsed_minutes = (elapsed_mins - 5.0).max(0.0);
                     match pos.inv_mgr.on_5m_bar_close(
                         frozen_z_ou,
-                        feat.z_15,
+                        eff_z_15,
                         kalman_against,
                         sim_cfg.maker_fee_bps,
                         tick_sz,
@@ -449,7 +478,14 @@ pub fn run_engine_a_backtest(
                     if q_t > pos.max_progress {
                         pos.max_progress = q_t;
                     }
-                    if pos.max_progress >= 0.75 && q_t <= (pos.max_progress - 0.20).max(0.15) {
+                    let fav_close_bps = match pos.side {
+                        Side::Long => ((bar.close - pos.entry_px) / pos.entry_px * 1e4).max(0.0),
+                        Side::Short => ((pos.entry_px - bar.close) / pos.entry_px * 1e4).max(0.0),
+                    };
+                    let abs_arm_bps = 1.8 * ou_cfg.min_net_edge_bps;
+                    let arm_q_thresh = (abs_arm_bps / (d_0 / pos.entry_px * 1e4).max(1e-6)).min(0.75);
+                    let _ = fav_close_bps;
+                    if pos.max_progress >= arm_q_thresh && q_t <= (pos.max_progress - 0.20).max(0.15) {
                         let slip = match pos.side {
                             Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
                             Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
@@ -574,8 +610,31 @@ pub fn run_engine_a_backtest(
         if open_pos.is_none() && resting_entry.is_none() {
             if let Some(ref feat) = live_feat_opt {
                 let consolidation_vol_ok = feat.z_15.abs() < 2.2 && feat.z_60.abs() < 2.5;
-                let ret_240 = if closes_history.len() >= 240 && closes_history[closes_history.len() - 240] > 0.0 {
-                    (bar.close / closes_history[closes_history.len() - 240]).ln()
+                let n_hist = closes_history.len();
+                let ret_120 = if n_hist >= 120 && closes_history[n_hist - 120] > 0.0 {
+                    (bar.close / closes_history[n_hist - 120]).ln()
+                } else {
+                    0.0
+                };
+                let ret_180 = if n_hist >= 180 && closes_history[n_hist - 180] > 0.0 {
+                    (bar.close / closes_history[n_hist - 180]).ln()
+                } else {
+                    0.0
+                };
+                let ret_240 = if n_hist >= 240 && closes_history[n_hist - 240] > 0.0 {
+                    (bar.close / closes_history[n_hist - 240]).ln()
+                } else {
+                    0.0
+                };
+                let ret_720 = if n_hist >= 720 && closes_history[n_hist - 720] > 0.0 {
+                    (bar.close / closes_history[n_hist - 720]).ln()
+                } else {
+                    0.0
+                };
+                let ma60_vs_240 = if n_hist >= 240 {
+                    let ma60 = closes_history[n_hist - 60..].iter().sum::<f64>() / 60.0;
+                    let ma240 = closes_history[n_hist - 240..].iter().sum::<f64>() / 240.0;
+                    if ma240 > 0.0 { (ma60 / ma240) - 1.0 } else { 0.0 }
                 } else {
                     0.0
                 };
@@ -585,10 +644,14 @@ pub fn run_engine_a_backtest(
                     (feat.kalman_drift_veto && feat.kalman_slope > 0.0) || feat.cusum_pos >= 8.0;
                 let kalman_long_ok = !kalman_waterfall_down
                     && feat.z_60 > -1.90
-                    && ret_240 > -max_slow_drift_240;
+                    && ret_120 > -max_drift_120
+                    && ret_180 > -max_slow_drift_180
+                    && ret_240 > -max_slow_drift_240
+                    && ma60_vs_240 >= -0.0008;
                 let kalman_short_ok = !kalman_waterfall_up
                     && feat.z_60 < 1.90
-                    && ret_240 < max_slow_drift_240;
+                    && ret_240 < max_short_drift_240
+                    && (ma60_vs_240 <= 0.0040 || (ret_720 < -0.0150 && ma60_vs_240 <= 0.0080));
 
                 let is_eligible = feat.is_consolidation && consolidation_vol_ok && feat.is_valid_half_life;
 
