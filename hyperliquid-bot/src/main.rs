@@ -2841,7 +2841,7 @@ async fn main() {
                                                 let dd_mult = compute_drawdown_risk_multiplier(live_eq, hwm_eq);
                                                 let eff_trend_risk = 0.0060 * trend_risk_fraction * dd_mult * crowding_mult;
                                                 let ou_cfg_b = crate::ou_process::asset_ou_config(&symbol_clone);
-                                                let max_b_notional = config.max_position_size_usdc.min(ou_cfg_b.target_notional_cap_usdc);
+                                                let max_b_notional = config.max_position_size_usdc.min(ou_cfg_b.dynamic_notional_cap(live_eq));
                                                 let trend_notional = if config.sizing_mode == "dynamic" && live_eq > 0.0 {
                                                     calculate_risk_scaled_notional(
                                                         live_eq,
@@ -4060,7 +4060,7 @@ async fn main() {
                                                         limit_price + est_sl_dist
                                                     };
                                                     let risk_frac = 0.0075 * dd_mult;
-                                                    let max_asset_notional = config.max_position_size_usdc.min(ou_cfg.target_notional_cap_usdc);
+                                                    let max_asset_notional = config.max_position_size_usdc.min(ou_cfg.dynamic_notional_cap(live_eq));
                                                     let trade_size_usdc = if config.sizing_mode == "dynamic" && live_eq > 0.0 {
                                                         calculate_risk_scaled_notional(
                                                             live_eq,

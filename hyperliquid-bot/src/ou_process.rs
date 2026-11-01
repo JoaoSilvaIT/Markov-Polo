@@ -41,6 +41,23 @@ pub struct AssetOuConfig {
     pub hard_disaster_stop_bps: f64,
 }
 
+impl AssetOuConfig {
+    /// Dynamically scales target notional cap with live account equity.
+    /// Baseline is calibrated to $142.50 USDC equity:
+    /// - BTC / ETH: $68.0 base (scales to ~$240 at $500 equity)
+    /// - SOL: $60.0 base (scales to ~$210 at $500 equity)
+    /// - AVAX: $55.0 base (scales to ~$190 at $500 equity)
+    /// Clamped between 0.35x and 10.0x scale factor to protect margin safety.
+    pub fn dynamic_notional_cap(&self, live_equity: f64) -> f64 {
+        if live_equity.is_finite() && live_equity > 0.0 {
+            let scale = (live_equity / 142.5).clamp(0.35, 10.0);
+            (self.target_notional_cap_usdc * scale).round()
+        } else {
+            self.target_notional_cap_usdc
+        }
+    }
+}
+
 pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
     match symbol.to_uppercase().as_str() {
         "BTC" => AssetOuConfig {

@@ -758,7 +758,7 @@ pub fn run_engine_a_backtest(
                                         };
                                         let notional = sim_cfg
                                             .notional_usdc
-                                            .min(ou_cfg.target_notional_cap_usdc);
+                                            .min(ou_cfg.dynamic_notional_cap(sim_cfg.notional_usdc * 2.1));
                                         let qty = notional / limit_price.max(1e-9);
                                         let policy = if (entry_ttl_mins - 2.0).abs() < 1e-6 {
                                             "JOIN_BOOK"
