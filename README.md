@@ -48,3 +48,20 @@ For full mathematical and operational details, see **[`hyperliquid-bot/README.md
 To run this system with minimal fee friction, link your wallet using referral code **[`JONBOT`](https://app.hyperliquid.xyz/join/JONBOT)** on [Hyperliquid](https://app.hyperliquid.xyz/join/JONBOT). 
 
 This applies a **permanent 4% discount** across all maker, taker, and liquidation fees.
+
+---
+
+## ⚠️ Financial & Trading Risk Disclaimer
+
+This software is provided strictly for educational, research, and technical experimentation purposes. 
+Cryptocurrency perpetual futures and decentralized derivatives trading involve substantial risk of financial loss. 
+Past simulated or real performance is not indicative of future results. 
+The authors and contributors bear absolutely zero responsibility or liability for any financial losses, 
+liquidations, lost profits, system downtime, smart contract bugs, or exchange-side execution anomalies 
+incurred through the use or deployment of this software. Trade at your own risk.
+
+---
+
+## License
+
+This project is licensed under the terms of the [MIT License](LICENSE). Copyright (c) 2026 Joao Silva.
