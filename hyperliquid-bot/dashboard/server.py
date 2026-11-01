@@ -171,16 +171,24 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
             if "Open" in direction:
                 side = "LONG" if "Long" in direction else "SHORT"
                 if coin not in open_tracker:
-                    open_tracker[coin] = {"time": ts_ms, "px": px, "side": side, "fee": fee}
+                    open_tracker[coin] = {"time": ts_ms, "px_sz": px * sz, "sz": sz, "side": side, "fee": fee}
                 else:
+                    open_tracker[coin]["px_sz"] += px * sz
+                    open_tracker[coin]["sz"] += sz
                     open_tracker[coin]["fee"] += fee
             elif "Close" in direction or abs(closed_pnl) > 1e-9:
                 side = "LONG" if "Long" in direction else ("SHORT" if "Short" in direction else (open_tracker.get(coin, {}).get("side", "LONG")))
-                open_info = open_tracker.get(coin, {"time": max(0, ts_ms - 1800_000), "px": px, "side": side, "fee": 0.0})
-                entry_px = float(open_info.get("px") or px)
+                open_info = open_tracker.get(coin, {"time": max(0, ts_ms - 1800_000), "px_sz": px * sz, "sz": sz, "side": side, "fee": 0.0})
+                tot_op_sz = max(float(open_info.get("sz", 0.0) or 0.0), 1e-9)
+                entry_px = float(open_info.get("px_sz", 0.0) or (px * sz)) / tot_op_sz if open_info.get("sz", 0.0) > 0 else px
                 open_ms = int(open_info.get("time") or ts_ms)
                 net_pnl = closed_pnl - fee - float(open_info.get("fee", 0.0) or 0.0)
                 open_info["fee"] = 0.0  # consume open fee once
+                if coin in open_tracker:
+                    open_tracker[coin]["sz"] -= sz
+                    open_tracker[coin]["px_sz"] -= entry_px * sz
+                    if open_tracker[coin]["sz"] <= 1e-5:
+                        del open_tracker[coin]
 
                 # Merge partial fills belonging to the same close order or within 10s on same coin
                 if grouped_closes and grouped_closes[-1]["symbol"] == coin and (
