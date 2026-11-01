@@ -1,5 +1,12 @@
 # Hyperliquid Dual-Engine Perpetuals Trading System
 
+[![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
+[![Hyperliquid L1](https://img.shields.io/badge/Hyperliquid-L1%20Perpetuals-brightgreen.svg)](https://hyperliquid.xyz)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Referral Discount](https://img.shields.io/badge/Hyperliquid%20Referral-Code%20%22JONBOT%22%20(4%25%20Discount)-green)](https://app.hyperliquid.xyz/join/JONBOT)
+
+> 🎁 **Trading on Hyperliquid?** Use referral code **[`JONBOT`](https://app.hyperliquid.xyz/join/JONBOT)** or connect through [**app.hyperliquid.xyz/join/JONBOT**](https://app.hyperliquid.xyz/join/JONBOT) to receive a **lifetime 4% discount** on all trading fees across all perpetual and spot markets.
+
 An autonomous quantitative trading system written in asynchronous Rust (`tokio`) for perpetual futures on the [Hyperliquid L1 DEX](https://hyperliquid.xyz) (`BTC`, `ETH`, `SOL`, `AVAX`).
 
 The system pairs a continuous-time **Ornstein-Uhlenbeck (O-U) mean-reversion engine** with a **Donchian / Chandelier ATR trend-following engine**, arbitrated by a causal **4-feature Gaussian Hidden Markov Model (HMM)** and an exogenous **Funding / Open Interest crowding hazard overlay**.
@@ -84,6 +91,7 @@ Hyperliquid WebSocket Streams (L2Book, 1m Candles, ActiveAssetCtx, OrderUpdates,
 hyperliquid-bot/
 ├── src/
 │   ├── main.rs            # Orchestration, WS consumers, 1m/15m loops, Fast-Sentinel
+│   ├── backtest.rs        # Nautilus-inspired discrete-event matching engine & market recorder
 │   ├── controller.rs      # 3-Mode Regime Controller, asymmetric dwell & cooldown logic
 │   ├── hmm.rs             # 4D Gaussian HMM (Baum-Welch EM, Ledoit-Wolf shrinkage, Viterbi/forward filter)
 │   ├── ou_process.rs      # Log-price O-U estimation, Phillips-Yu jackknife, carry-shifted thresholds
@@ -134,9 +142,15 @@ DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
 DASHBOARD_PORT=8088
 ```
 
-### 2. Run Test Suite & Build Locally
+### 2. Run Test Suite & Discrete-Event Backtester
 ```bash
+# Run unit & property tests (100+ tests passing)
 cargo test
+
+# Run discrete-event backtester across stored 1-minute historical bars
+cargo run --release -- --backtest
+
+# Build release binary
 cargo build --release
 ```
 
@@ -150,3 +164,11 @@ docker compose up -d --build
   ```bash
   docker compose logs -f hl_bot_btc hl_bot_eth hl_bot_sol hl_bot_avax
   ```
+
+---
+
+## 🎁 Hyperliquid Fee Discount
+
+To run this system with minimal fee friction, link your wallet using referral code **[`JONBOT`](https://app.hyperliquid.xyz/join/JONBOT)** on [Hyperliquid](https://app.hyperliquid.xyz/join/JONBOT). 
+
+This applies a **permanent 4% discount** across all maker, taker, and liquidation fees.
