@@ -6,6 +6,8 @@ target/
 !hl_portfolio_cluster.lock
 *.log
 *.jsonl
-.env*
+.env
+.env.*
+!.env.example
 hl_bot_data/
 audit_8days*

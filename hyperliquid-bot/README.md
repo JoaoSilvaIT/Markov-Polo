@@ -106,6 +106,7 @@ hyperliquid-bot/
 ├── dashboard/
 │   ├── server.py          # Zero-dependency multi-threaded Python HTTP telemetry server
 │   └── index.html         # Real-time 4-asset readiness & gate-checklist web terminal
+├── .env.example           # Template environment configuration file
 ├── Dockerfile             # Multi-stage Debian Bookworm build (cached deps + minimal runtime)
 └── docker-compose.yml     # 4-asset cluster + read-only dashboard service (OMV / Linux NAS ready)
 ```
@@ -115,7 +116,13 @@ hyperliquid-bot/
 ## Configuration & Deployment
 
 ### 1. Environment Setup (`.env`)
-Create a `.env` file in `hyperliquid-bot/` using an **API Agent Wallet** (recommended: allows order execution on behalf of your main wallet without withdrawal permissions):
+Copy `.env.example` to `.env` and fill in your **API Agent Wallet** credentials (recommended: allows order execution on behalf of your main wallet without withdrawal permissions):
+
+```bash
+cp .env.example .env
+```
+
+Key variables in `.env`:
 
 ```ini
 HL_PRIVATE_KEY=0x...your_agent_wallet_private_key...
@@ -128,8 +135,8 @@ HL_EQUITY_FRACTION=0.25
 HL_LEVERAGE=3
 HL_IS_CROSS=true
 HL_MAX_CONCURRENT_POSITIONS=2
-HL_MAX_POSITION_SIZE_USDC=500.0
-POSITION_SIZE_USDC=25.0
+HL_MAX_POSITION_SIZE_USDC=350.0
+POSITION_SIZE_USDC=60.0
 
 # Strategy Parameters
 HL_TREND_ENGINE_MODE=live
