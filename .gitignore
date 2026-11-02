@@ -17,3 +17,8 @@ gcp-key.json
 # Rust
 rust-bot/target/
 **/*.rs.bk
+
+# Local Research & Audit Reports (Keep locally, exclude from public GitHub)
+research/
+hyperliquid-bot/INSTITUTIONAL_CODE_AND_QUANT_AUDIT_REPORT.md
+hyperliquid-bot/RESEARCH_PROMPTS_ROADMAP.md

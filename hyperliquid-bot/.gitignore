@@ -11,3 +11,5 @@ target/
 !.env.example
 hl_bot_data/
 audit_8days*
+INSTITUTIONAL_CODE_AND_QUANT_AUDIT_REPORT.md
+RESEARCH_PROMPTS_ROADMAP.md
