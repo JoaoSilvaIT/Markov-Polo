@@ -267,6 +267,8 @@ async fn main() {
         let mut grand_net_usd = 0.0;
         let mut grand_net_bps = 0.0;
 
+        let mut btc_bars_cache = crate::backtest::load_historical_bars("BTC");
+
         for &sym in &["BTC", "ETH", "SOL", "AVAX"] {
             let mut bars = crate::backtest::load_historical_bars(sym);
             if bars.len() < 1200 {
@@ -311,26 +313,36 @@ async fn main() {
                         }
                     }
                     bars = crate::backtest::load_historical_bars(sym);
+                    if sym == "BTC" {
+                        btc_bars_cache = bars.clone();
+                    }
                 }
             }
 
             let sz_dec = *sz_map.get(sym).unwrap_or(&2);
             let sim_cfg = crate::backtest::SimulatedExchangeConfig {
                 sz_decimals: sz_dec,
-                notional_usdc: 68.0,
+                notional_usdc: 133.5,
+                account_equity_usdc: 534.0,
                 ..Default::default()
             };
-            let res = crate::backtest::run_engine_a_backtest(sym, &bars, &sim_cfg);
+            let res = crate::backtest::run_engine_a_backtest_with_btc(
+                sym,
+                &bars,
+                Some(&btc_bars_cache),
+                &sim_cfg,
+            );
             grand_wins += res.wins;
             grand_losses += res.losses;
             grand_net_usd += res.net_pnl_usd;
             grand_net_bps += res.net_pnl_bps;
 
             println!(
-                "📊 [BACKTEST SUMMARY - {}] Bars: {} | Armed: {} | Submitted: {} | Filled: {} | Win/Loss: {}W/{}L ({:.1}%) | Net PnL: {:+.1} bps (${:+.2}) | PF: {:.2} | Max DD: ${:.2}",
+                "📊 [BACKTEST SUMMARY - {}] Bars: {} | Armed: {} | BTC Vetoes: {} | Submitted: {} | Filled: {} | Win/Loss: {}W/{}L ({:.1}%) | Net PnL: {:+.1} bps (${:+.2}) | PF: {:.2} | Max DD: ${:.2}",
                 sym,
                 res.bars_evaluated,
                 res.signals_armed,
+                res.btc_impulse_vetoes,
                 res.orders_submitted,
                 res.orders_filled,
                 res.wins,
@@ -2586,6 +2598,26 @@ async fn main() {
                         active_engine,
                         account_equity: *cached_equity_loop.read().await,
                         high_water_mark: *high_water_mark_equity.read().await,
+                        ret_3m_bps: if rolling_closes.len() >= 4 && rolling_closes[rolling_closes.len() - 4] > 0.0 {
+                            (close_price / rolling_closes[rolling_closes.len() - 4]).ln() * 1e4
+                        } else {
+                            0.0
+                        },
+                        ret_5m_bps: if rolling_closes.len() >= 6 && rolling_closes[rolling_closes.len() - 6] > 0.0 {
+                            (close_price / rolling_closes[rolling_closes.len() - 6]).ln() * 1e4
+                        } else {
+                            0.0
+                        },
+                        ret_15m_bps: if rolling_closes.len() >= 16 && rolling_closes[rolling_closes.len() - 16] > 0.0 {
+                            (close_price / rolling_closes[rolling_closes.len() - 16]).ln() * 1e4
+                        } else {
+                            0.0
+                        },
+                        ret_30m_bps: if rolling_closes.len() >= 31 && rolling_closes[rolling_closes.len() - 31] > 0.0 {
+                            (close_price / rolling_closes[rolling_closes.len() - 31]).ln() * 1e4
+                        } else {
+                            0.0
+                        },
                     };
                     save_telemetry(&symbol_clone, &telemetry_data);
 
@@ -2841,7 +2873,13 @@ async fn main() {
                                                 let dd_mult = compute_drawdown_risk_multiplier(live_eq, hwm_eq);
                                                 let eff_trend_risk = 0.0060 * trend_risk_fraction * dd_mult * crowding_mult;
                                                 let ou_cfg_b = crate::ou_process::asset_ou_config(&symbol_clone);
-                                                let max_b_notional = config.max_position_size_usdc.min(ou_cfg_b.dynamic_notional_cap(live_eq));
+                                                let max_b_notional = config
+                                                    .max_position_size_usdc
+                                                    .min(ou_cfg_b.volatility_adjusted_trend_notional_cap(
+                                                        live_eq,
+                                                        close_price,
+                                                        current_atr,
+                                                    ));
                                                 let trend_notional = if config.sizing_mode == "dynamic" && live_eq > 0.0 {
                                                     calculate_risk_scaled_notional(
                                                         live_eq,
@@ -4022,9 +4060,11 @@ async fn main() {
 
                                             if let Some(veto_reason) = btc_lead_veto {
                                                 println!(
-                                                    "⏸️ [BTC LEAD-LAG VETO] {} {} reversal bounce held: {}. Waiting for BTC stabilization.",
+                                                    "🛡️ [BTC IMPULSE VETO] {} {} reversal bounce disarmed due to adverse BTC impulse: {}.",
                                                     symbol_clone, arm_side, veto_reason
                                                 );
+                                                armed_state.is_armed = false;
+                                                save_armed_signal(&arm_path_clone, &armed_state);
                                             } else if top_of_hour_adverse_funding {
                                                 println!(
                                                     "⏳ [FUNDING BOUNDARY GATE] {} {} entry deferred at minute :{:02} UTC due to adverse hourly funding ({:.2} bps/hr). Holding armed until :00.",
@@ -4059,8 +4099,16 @@ async fn main() {
                                                     } else {
                                                         limit_price + est_sl_dist
                                                     };
+                                                    let frozen_hl = armed_state.half_life_m;
+                                                    let frozen_sig = if armed_state.frozen_sigma_eq_log > 1e-6 {
+                                                        armed_state.frozen_sigma_eq_log
+                                                    } else {
+                                                        live_feat.sigma_eq_log
+                                                    };
                                                     let risk_frac = 0.0075 * dd_mult;
-                                                    let max_asset_notional = config.max_position_size_usdc.min(ou_cfg.dynamic_notional_cap(live_eq));
+                                                    let max_asset_notional = config
+                                                        .max_position_size_usdc
+                                                        .min(ou_cfg.volatility_adjusted_notional_cap(live_eq, frozen_sig));
                                                     let trade_size_usdc = if config.sizing_mode == "dynamic" && live_eq > 0.0 {
                                                         calculate_risk_scaled_notional(
                                                             live_eq,
@@ -4093,12 +4141,6 @@ async fn main() {
                                                         "🟢 [{} 2-BAR REVERSAL CONFIRMED ({})] {} reversed from extreme ${:.2} to ${:.2} (Consumed: {:.1}%, Limit: ${:.2}, Net Edge: {:.1} bps, Size: ${:.2}, TTL: {:.0}m)!",
                                                         arm_side, policy_str, symbol_clone, armed_state.extreme_price, close_price, consumed_ratio * 100.0, limit_price, net_edge_bps, trade_size_usdc, entry_ttl_mins
                                                     );
-                                                    let frozen_hl = armed_state.half_life_m;
-                                                    let frozen_sig = if armed_state.frozen_sigma_eq_log > 1e-6 {
-                                                        armed_state.frozen_sigma_eq_log
-                                                    } else {
-                                                        live_feat.sigma_eq_log
-                                                    };
 
                                                     match place_ou_maker_entry(
                                                         &state_path_clone,

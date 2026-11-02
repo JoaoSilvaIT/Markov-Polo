@@ -56,6 +56,53 @@ impl AssetOuConfig {
             self.target_notional_cap_usdc
         }
     }
+
+    /// Computes the equity- and volatility-adjusted notional ceiling (Inverse Volatility Scaling) for Engine A.
+    /// Automatically contracts maximum position notional when stationary 5m O-U volatility (\sigma_{eq})
+    /// expands above the asset's normal baseline, keeping dollar risk constant across volatility regimes.
+    pub fn volatility_adjusted_notional_cap(
+        &self,
+        live_equity: f64,
+        current_sigma_eq_log: f64,
+    ) -> f64 {
+        let eq_cap = self.dynamic_notional_cap(live_equity);
+        let ref_sigma_bps = self.min_sigma_eq_bps * 1.25;
+        let curr_sigma_bps = (current_sigma_eq_log * 1e4).max(self.min_sigma_eq_bps);
+        if curr_sigma_bps.is_finite() && curr_sigma_bps > 0.0 {
+            let vol_mult = (ref_sigma_bps / curr_sigma_bps).clamp(0.45, 1.05);
+            (eq_cap * vol_mult).round().max(11.0)
+        } else {
+            eq_cap
+        }
+    }
+
+    /// Computes the equity- and ATR-adjusted notional ceiling (Inverse ATR Scaling) for Engine B (15m Trend Breakout).
+    /// Scales down position notional ceiling when 15m Wilder ATR expands during high-volatility storms.
+    pub fn volatility_adjusted_trend_notional_cap(
+        &self,
+        live_equity: f64,
+        close_price: f64,
+        current_atr_15m: f64,
+    ) -> f64 {
+        let eq_cap = self.dynamic_notional_cap(live_equity);
+        if close_price <= 0.0
+            || !close_price.is_finite()
+            || current_atr_15m <= 0.0
+            || !current_atr_15m.is_finite()
+        {
+            return eq_cap;
+        }
+        let atr_bps = (current_atr_15m / close_price) * 1e4;
+        let ref_atr_bps = match self.symbol {
+            "BTC" => 35.0,
+            "ETH" => 45.0,
+            "SOL" => 65.0,
+            "AVAX" => 75.0,
+            _ => 45.0,
+        };
+        let vol_mult = (ref_atr_bps / atr_bps.max(10.0)).clamp(0.45, 1.05);
+        (eq_cap * vol_mult).round().max(11.0)
+    }
 }
 
 pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
@@ -1355,12 +1402,12 @@ pub fn calculate_carry_adjusted_thresholds(
 
 /// Returns the UTC session-conditioned O-U sigma offset:
 pub fn utc_session_sigma_offset(utc_hour: u32, is_weekend: bool) -> f64 {
-    if !is_weekend && (13..17).contains(&utc_hour) {
-        0.10
+    if !is_weekend && (13..15).contains(&utc_hour) {
+        0.00
     } else if is_weekend || utc_hour < 8 {
         -0.05
     } else {
-        0.0
+        -0.05
     }
 }
 
@@ -1520,6 +1567,18 @@ pub fn calculate_features_with_funding(
     symbol: &str,
     hourly_funding_rate: f64,
 ) -> Option<FeatureSnapshot> {
+    calculate_features_with_funding_at(closes_history, eval_close, symbol, hourly_funding_rate, None)
+}
+
+/// Evaluates stochastic 5m O-U features at a specific bar timestamp (`eval_timestamp_ms`)
+/// for deterministic discrete-event backtesting and live bar evaluation.
+pub fn calculate_features_with_funding_at(
+    closes_history: &[f64],
+    eval_close: f64,
+    symbol: &str,
+    hourly_funding_rate: f64,
+    eval_timestamp_ms: Option<u64>,
+) -> Option<FeatureSnapshot> {
     if closes_history.len() < 100 || eval_close <= 0.0 {
         return None;
     }
@@ -1564,9 +1623,11 @@ pub fn calculate_features_with_funding(
                 let tx_cost = hist_last_price * 0.0005;
                 let session_offset = if hourly_funding_rate.abs() > 1e-9 {
                     use chrono::{Datelike, Timelike};
-                    let now_utc = chrono::Utc::now();
-                    let is_weekend = matches!(now_utc.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun);
-                    utc_session_sigma_offset(now_utc.hour(), is_weekend)
+                    let ref_utc = eval_timestamp_ms
+                        .and_then(|ms| chrono::DateTime::from_timestamp_millis(ms as i64))
+                        .unwrap_or_else(chrono::Utc::now);
+                    let is_weekend = matches!(ref_utc.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun);
+                    utc_session_sigma_offset(ref_utc.hour(), is_weekend)
                 } else {
                     0.0
                 };
@@ -2005,5 +2066,27 @@ mod tests {
             "5m Kalman LLT must recover valid half-life after a 2% step shift (got t_half={:.1}m)",
             feat.half_life_m
         );
+    }
+
+    #[test]
+    fn test_volatility_adjusted_notional_caps_contract_under_high_vol() {
+        let sol_cfg = asset_ou_config("SOL");
+        // At $534 equity, base dynamic cap for SOL is ~$225
+        let base_cap = sol_cfg.dynamic_notional_cap(534.0);
+        assert!((base_cap - 225.0).abs() <= 1.0);
+
+        // Normal volatility (32 bps <= 37.5 bps reference) -> full cap (1.0 - 1.05x)
+        let calm_cap = sol_cfg.volatility_adjusted_notional_cap(534.0, 0.0032);
+        assert!(calm_cap >= base_cap);
+
+        // High volatility (75 bps = 2x normal reference) -> contracts cap to ~50% (~$113)
+        let storm_cap = sol_cfg.volatility_adjusted_notional_cap(534.0, 0.0075);
+        assert!((storm_cap - 113.0).abs() <= 2.0);
+
+        // Trend Engine B ATR scaling: SOL at $100 with $0.60 ATR (60 bps <= 65 bps ref) vs $1.30 ATR (130 bps)
+        let trend_calm = sol_cfg.volatility_adjusted_trend_notional_cap(534.0, 100.0, 0.60);
+        let trend_storm = sol_cfg.volatility_adjusted_trend_notional_cap(534.0, 100.0, 1.30);
+        assert!(trend_calm >= base_cap);
+        assert!((trend_storm - 113.0).abs() <= 2.0);
     }
 }

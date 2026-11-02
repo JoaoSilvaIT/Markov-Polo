@@ -62,6 +62,14 @@ pub struct LiveTelemetry {
     pub account_equity: f64,
     #[serde(default)]
     pub high_water_mark: f64,
+    #[serde(default)]
+    pub ret_3m_bps: f64,
+    #[serde(default)]
+    pub ret_5m_bps: f64,
+    #[serde(default)]
+    pub ret_15m_bps: f64,
+    #[serde(default)]
+    pub ret_30m_bps: f64,
 }
 
 pub fn save_telemetry(symbol: &str, telemetry: &LiveTelemetry) {
@@ -187,17 +195,142 @@ pub fn empirical_btc_beta(symbol: &str, is_stress: bool) -> f64 {
     }
 }
 
+/// Causal BTC Impulse Snapshot shared between live cluster supervision and discrete-event backtest replay.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct BtcImpulseSnapshot {
+    pub timestamp_ms: u64,
+    pub ret_3m_bps: f64,
+    pub ret_5m_bps: f64,
+    pub ret_15m_bps: f64,
+    pub ret_30m_bps: f64,
+    pub z_15: f64,
+    pub z_60: f64,
+    pub is_severe_shock: bool,
+    pub obi_instant: f64,
+    pub obi_1s: f64,
+    pub obi_5s: f64,
+}
+
+/// Pure deterministic evaluation of BTC self-impulse and cross-asset lead-lag impulse veto.
+/// Shared identically by live execution (`check_btc_lead_lag_veto`) and `src/backtest.rs`.
+pub fn evaluate_btc_impulse_veto(
+    current_symbol: &str,
+    proposed_is_long: bool,
+    is_trend_engine: bool,
+    btc: &BtcImpulseSnapshot,
+) -> Option<String> {
+    if current_symbol.eq_ignore_ascii_case("BTC") {
+        if is_trend_engine {
+            return None;
+        }
+        // BTC Self-Impulse / Staircase Veto for Engine A (Mean Reversion):
+        // Prevents fading an active 3m/5m shock or a relentless 30m unidirectional breakout staircase.
+        if proposed_is_long {
+            if btc.ret_3m_bps <= -26.0
+                || btc.ret_5m_bps <= -32.0
+                || (btc.ret_30m_bps <= -45.0 && btc.ret_15m_bps <= -12.0 && btc.ret_5m_bps <= -4.0)
+            {
+                return Some(format!(
+                    "BTC Self-Impulse Downside Veto (3m={:+.1}bps, 5m={:+.1}bps, 30m={:+.1}bps)",
+                    btc.ret_3m_bps, btc.ret_5m_bps, btc.ret_30m_bps
+                ));
+            }
+        } else if btc.ret_3m_bps >= 26.0
+            || btc.ret_5m_bps >= 32.0
+            || (btc.ret_30m_bps >= 45.0 && btc.ret_15m_bps >= 12.0 && btc.ret_5m_bps >= 4.0)
+        {
+            return Some(format!(
+                "BTC Self-Impulse Upside Veto (3m={:+.1}bps, 5m={:+.1}bps, 30m={:+.1}bps)",
+                btc.ret_3m_bps, btc.ret_5m_bps, btc.ret_30m_bps
+            ));
+        }
+        return None;
+    }
+
+    let is_stress =
+        btc.is_severe_shock || btc.z_15.abs() >= 2.5 || btc.ret_3m_bps.abs() >= 22.0;
+    let beta = empirical_btc_beta(current_symbol, is_stress);
+    let beta_ret_3m_bps = beta * btc.ret_3m_bps;
+    let beta_ret_5m_bps = beta * btc.ret_5m_bps;
+    // Multiscale BTC OBI composite: 0.50 * inst + 0.30 * 1s + 0.20 * 5s
+    let obi_composite = 0.50 * btc.obi_instant + 0.30 * btc.obi_1s + 0.20 * btc.obi_5s;
+    // Fast 3m/5m return velocity normalized by 12 bps baseline 3m diffusive sigma
+    let fast_ret_bps = if btc.ret_3m_bps.abs() >= (0.85 * btc.ret_5m_bps).abs() {
+        btc.ret_3m_bps
+    } else {
+        0.85 * btc.ret_5m_bps
+    };
+    let z_fast = fast_ret_bps / 12.0;
+    let eff_z_btc = if z_fast * btc.z_15 > 0.0 && z_fast.abs() > btc.z_15.abs() {
+        0.55 * btc.z_15 + 0.45 * z_fast
+    } else {
+        btc.z_15
+    };
+    // Causal Cross-Asset Impulse Score I_{BTC->k}(t) = beta_k * (0.65 * Z_BTC + 0.35 * Z_OBI)
+    let impulse_score = beta * (0.65 * eff_z_btc + 0.35 * (2.5 * obi_composite));
+
+    if is_trend_engine {
+        // Engine B (Trend Breakout): veto altcoin breakout if BTC is actively crashing/surging in opposite direction
+        if proposed_is_long
+            && (btc.z_15 <= -2.0
+                || impulse_score <= -2.2
+                || btc.ret_3m_bps <= -28.0
+                || btc.ret_5m_bps <= -35.0)
+        {
+            return Some(format!(
+                "BTC Lead-Lag Downside Impulse (I={:.2}, BTC Z15={:.2}, 3m={:+.1}bps)",
+                impulse_score, btc.z_15, btc.ret_3m_bps
+            ));
+        } else if !proposed_is_long
+            && (btc.z_15 >= 2.0
+                || impulse_score >= 2.2
+                || btc.ret_3m_bps >= 28.0
+                || btc.ret_5m_bps >= 35.0)
+        {
+            return Some(format!(
+                "BTC Lead-Lag Upside Impulse (I={:.2}, BTC Z15={:.2}, 3m={:+.1}bps)",
+                impulse_score, btc.z_15, btc.ret_3m_bps
+            ));
+        }
+    } else {
+        // Engine A (Mean Reversion): veto catching an altcoin falling knife / squeeze while BTC impulse is adverse
+        if proposed_is_long {
+            if impulse_score <= -1.35
+                || btc.z_15 <= -1.8
+                || beta_ret_3m_bps <= -26.0
+                || beta_ret_5m_bps <= -32.0
+                || (btc.ret_30m_bps <= -45.0 && btc.ret_15m_bps <= -15.0)
+                || (btc.is_severe_shock && btc.z_15 < -1.0)
+            {
+                return Some(format!(
+                    "BTC Lead-Lag Cascade Veto (I={:.2}, beta={:.2}, BTC Z15={:.2}, 3m={:+.1}bps, 5m={:+.1}bps)",
+                    impulse_score, beta, btc.z_15, btc.ret_3m_bps, btc.ret_5m_bps
+                ));
+            }
+        } else if impulse_score >= 1.35
+            || btc.z_15 >= 1.8
+            || beta_ret_3m_bps >= 26.0
+            || beta_ret_5m_bps >= 32.0
+            || (btc.ret_30m_bps >= 45.0 && btc.ret_15m_bps >= 15.0)
+            || (btc.is_severe_shock && btc.z_15 > 1.0)
+        {
+            return Some(format!(
+                "BTC Lead-Lag Squeeze Veto (I={:.2}, beta={:.2}, BTC Z15={:.2}, 3m={:+.1}bps, 5m={:+.1}bps)",
+                impulse_score, beta, btc.z_15, btc.ret_3m_bps, btc.ret_5m_bps
+            ));
+        }
+    }
+    None
+}
+
 /// Evaluates cross-asset BTC lead-lag impulse spillover using the Beta-Scaled Multiscale Impulse Score I_{BTC->k}(t).
-/// Fails open (returns None) if current symbol is BTC or if BTC telemetry is missing/stale (>90s).
+/// Fails open (returns None) if BTC telemetry is missing/stale (>90s).
 pub fn check_btc_lead_lag_veto(
     current_symbol: &str,
     proposed_is_long: bool,
     is_trend_engine: bool,
     now_ms: u64,
 ) -> Option<String> {
-    if current_symbol.eq_ignore_ascii_case("BTC") {
-        return None;
-    }
     let btc_telem: LiveTelemetry = fs::read_to_string("hl_telemetry_BTC.json")
         .ok()
         .and_then(|c| serde_json::from_str(&c).ok())?;
@@ -207,49 +340,20 @@ pub fn check_btc_lead_lag_veto(
         return None;
     }
 
-    let is_stress = btc_telem.is_severe_shock || btc_telem.z_15.abs() >= 2.5;
-    let beta = empirical_btc_beta(current_symbol, is_stress);
-    // Multiscale BTC OBI composite: 0.50 * inst + 0.30 * 1s + 0.20 * 5s
-    let obi_composite = 0.50 * btc_telem.obi_instant + 0.30 * btc_telem.obi_1s + 0.20 * btc_telem.obi_5s;
-    // Causal Cross-Asset Impulse Score I_{BTC->k}(t) = beta_k * (0.65 * Z_BTC + 0.35 * Z_OBI)
-    let impulse_score = beta * (0.65 * btc_telem.z_15 + 0.35 * (2.5 * obi_composite));
-
-    if is_trend_engine {
-        // Engine B (Trend Breakout): veto altcoin breakout if BTC is actively crashing/surging in opposite direction
-        if proposed_is_long && (btc_telem.z_15 <= -2.0 || impulse_score <= -2.2) {
-            return Some(format!(
-                "BTC Lead-Lag Downside Impulse (I={:.2}, BTC Z15={:.2})",
-                impulse_score, btc_telem.z_15
-            ));
-        } else if !proposed_is_long && (btc_telem.z_15 >= 2.0 || impulse_score >= 2.2) {
-            return Some(format!(
-                "BTC Lead-Lag Upside Impulse (I={:.2}, BTC Z15={:.2})",
-                impulse_score, btc_telem.z_15
-            ));
-        }
-    } else {
-        // Engine A (Mean Reversion): veto catching an altcoin falling knife while BTC impulse is adverse
-        if proposed_is_long {
-            if impulse_score <= -1.35
-                || btc_telem.z_15 <= -1.8
-                || (btc_telem.is_severe_shock && btc_telem.z_15 < -1.0)
-            {
-                return Some(format!(
-                    "BTC Lead-Lag Cascade Veto (I={:.2}, beta={:.2}, BTC Z15={:.2}, OBI_1s={:.2})",
-                    impulse_score, beta, btc_telem.z_15, btc_telem.obi_1s
-                ));
-            }
-        } else if impulse_score >= 1.35
-            || btc_telem.z_15 >= 1.8
-            || (btc_telem.is_severe_shock && btc_telem.z_15 > 1.0)
-        {
-            return Some(format!(
-                "BTC Lead-Lag Squeeze Veto (I={:.2}, beta={:.2}, BTC Z15={:.2}, OBI_1s={:.2})",
-                impulse_score, beta, btc_telem.z_15, btc_telem.obi_1s
-            ));
-        }
-    }
-    None
+    let snap = BtcImpulseSnapshot {
+        timestamp_ms: btc_telem.timestamp_ms,
+        ret_3m_bps: btc_telem.ret_3m_bps,
+        ret_5m_bps: btc_telem.ret_5m_bps,
+        ret_15m_bps: btc_telem.ret_15m_bps,
+        ret_30m_bps: btc_telem.ret_30m_bps,
+        z_15: btc_telem.z_15,
+        z_60: btc_telem.z_60,
+        is_severe_shock: btc_telem.is_severe_shock,
+        obi_instant: btc_telem.obi_instant,
+        obi_1s: btc_telem.obi_1s,
+        obi_5s: btc_telem.obi_5s,
+    };
+    evaluate_btc_impulse_veto(current_symbol, proposed_is_long, is_trend_engine, &snap)
 }
 
 /// Persistent ledger record for a completed real exchange trade on Hyperliquid L1.
@@ -387,5 +491,45 @@ mod tests {
         assert_eq!(parsed.symbol, "SOL");
         assert!(parsed.is_win);
         assert!((parsed.pnl_usd - 0.3953).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_btc_impulse_veto_blocks_altcoin_falling_knife_and_self_staircase() {
+        // 1. Calm BTC -> no veto on SOL Long or BTC Short
+        let calm_btc = BtcImpulseSnapshot {
+            timestamp_ms: 1_760_000_000_000,
+            ret_3m_bps: -4.0,
+            ret_5m_bps: -6.0,
+            ret_15m_bps: -8.0,
+            ret_30m_bps: -10.0,
+            z_15: -0.4,
+            z_60: -0.3,
+            is_severe_shock: false,
+            obi_instant: 0.05,
+            obi_1s: 0.05,
+            obi_5s: 0.05,
+        };
+        assert!(evaluate_btc_impulse_veto("SOL", true, false, &calm_btc).is_none());
+        assert!(evaluate_btc_impulse_veto("BTC", false, false, &calm_btc).is_none());
+
+        // 2. Fast 3m BTC dump (-20 bps -> beta-scaled -32 bps on SOL) -> vetoes SOL Long!
+        let dump_btc = BtcImpulseSnapshot {
+            ret_3m_bps: -20.0,
+            ret_5m_bps: -22.0,
+            ..calm_btc
+        };
+        let sol_veto = evaluate_btc_impulse_veto("SOL", true, false, &dump_btc);
+        assert!(sol_veto.is_some());
+
+        // 3. Relentless 30m BTC upside staircase (+55 bps 30m, +16 bps 15m, +8 bps 5m) -> vetoes BTC Short!
+        let staircase_btc = BtcImpulseSnapshot {
+            ret_3m_bps: 6.0,
+            ret_5m_bps: 8.0,
+            ret_15m_bps: 16.0,
+            ret_30m_bps: 55.0,
+            ..calm_btc
+        };
+        let btc_short_veto = evaluate_btc_impulse_veto("BTC", false, false, &staircase_btc);
+        assert!(btc_short_veto.is_some());
     }
 }

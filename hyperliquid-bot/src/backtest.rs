@@ -17,11 +17,12 @@ use std::path::Path;
 
 use crate::hyperliquid::effective_tick_size;
 use crate::ou_process::{
-    asset_ou_config, calculate_directional_edge_bps, calculate_features_with_funding,
-    compute_safe_tp_offset_bps, evaluate_armed_reversal_1m_step, InvalidationDecision,
-    OrderPlacementAction, TwoTierInvalidationManager,
+    asset_ou_config, calculate_directional_edge_bps, calculate_features_with_funding_at,
+    calculate_mad_sigma, compute_safe_tp_offset_bps, evaluate_armed_reversal_1m_step,
+    InvalidationDecision, OrderPlacementAction, TwoTierInvalidationManager,
 };
 use crate::state::Side;
+use crate::telemetry::{evaluate_btc_impulse_veto, BtcImpulseSnapshot};
 
 /// Single 1-minute historical market bar + L2 microstructure + derivatives context record
 /// persisted continuously to `hl_history_{symbol}.jsonl` on the NAS (~1 MB/day across 4 coins).
@@ -99,6 +100,7 @@ pub struct SimulatedExchangeConfig {
     /// Use adaptive intrabar ordering (if close >= open, visit low before high; else visit high before low)
     pub bar_adaptive_high_low_ordering: bool,
     pub notional_usdc: f64,
+    pub account_equity_usdc: f64,
     pub sz_decimals: u32,
 }
 
@@ -111,6 +113,7 @@ impl Default for SimulatedExchangeConfig {
             strict_trade_through_fills: true,
             bar_adaptive_high_low_ordering: true,
             notional_usdc: 60.0,
+            account_equity_usdc: 142.50,
             sz_decimals: 2,
         }
     }
@@ -141,6 +144,7 @@ pub struct BacktestSummary {
     pub symbol: String,
     pub bars_evaluated: usize,
     pub signals_armed: usize,
+    pub btc_impulse_vetoes: usize,
     pub orders_submitted: usize,
     pub orders_filled: usize,
     pub orders_expired_unfilled: usize,
@@ -155,6 +159,77 @@ pub struct BacktestSummary {
     pub profit_factor: f64,
     pub max_drawdown_usd: f64,
     pub trades: Vec<SimulatedTradeResult>,
+}
+
+/// Builds a causal `BtcImpulseSnapshot` at `ts_ms` from the historical BTC 1m bar series.
+/// Uses binary search (`partition_point`) and enforces the same 90-second freshness window as live production.
+pub fn build_historical_btc_impulse_snapshot(
+    btc_bars: &[HistoricalMarketBarRecord],
+    ts_ms: u64,
+) -> Option<BtcImpulseSnapshot> {
+    if btc_bars.is_empty() {
+        return None;
+    }
+    let pos = btc_bars.partition_point(|b| b.timestamp_ms <= ts_ms);
+    if pos == 0 {
+        return None;
+    }
+    let idx = pos - 1;
+    let b = &btc_bars[idx];
+    if ts_ms.saturating_sub(b.timestamp_ms) > 90_000 || b.close <= 0.0 {
+        return None;
+    }
+    let ret_3m_bps = if idx >= 3 && btc_bars[idx - 3].close > 0.0 {
+        (b.close / btc_bars[idx - 3].close).ln() * 1e4
+    } else {
+        0.0
+    };
+    let ret_5m_bps = if idx >= 5 && btc_bars[idx - 5].close > 0.0 {
+        (b.close / btc_bars[idx - 5].close).ln() * 1e4
+    } else {
+        0.0
+    };
+    let ret_15m_bps = if idx >= 15 && btc_bars[idx - 15].close > 0.0 {
+        (b.close / btc_bars[idx - 15].close).ln() * 1e4
+    } else {
+        0.0
+    };
+    let ret_30m_bps = if idx >= 30 && btc_bars[idx - 30].close > 0.0 {
+        (b.close / btc_bars[idx - 30].close).ln() * 1e4
+    } else {
+        0.0
+    };
+
+    let mut z_15 = 0.0;
+    let mut z_60 = 0.0;
+    if idx >= 65 {
+        let start = idx.saturating_sub(180);
+        let mut rets = Vec::with_capacity(idx - start);
+        for k in (start + 1)..=idx {
+            if btc_bars[k - 1].close > 0.0 && btc_bars[k].close > 0.0 {
+                rets.push((btc_bars[k].close / btc_bars[k - 1].close).ln());
+            }
+        }
+        let sigma_mad = calculate_mad_sigma(&rets);
+        let r15 = (b.close / btc_bars[idx - 15].close).ln();
+        let r60 = (b.close / btc_bars[idx - 60].close).ln();
+        z_15 = r15 / (sigma_mad * (15.0_f64).sqrt());
+        z_60 = r60 / (sigma_mad * (60.0_f64).sqrt());
+    }
+
+    Some(BtcImpulseSnapshot {
+        timestamp_ms: b.timestamp_ms,
+        ret_3m_bps,
+        ret_5m_bps,
+        ret_15m_bps,
+        ret_30m_bps,
+        z_15,
+        z_60,
+        is_severe_shock: z_15.abs() >= 2.5 || z_60.abs() >= 2.5,
+        obi_instant: b.obi_instant,
+        obi_1s: b.obi_1s,
+        obi_5s: b.obi_5s,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -203,6 +278,22 @@ pub fn run_engine_a_backtest(
     bars: &[HistoricalMarketBarRecord],
     sim_cfg: &SimulatedExchangeConfig,
 ) -> BacktestSummary {
+    let btc_ref = if symbol.eq_ignore_ascii_case("BTC") {
+        Some(bars)
+    } else {
+        None
+    };
+    run_engine_a_backtest_with_btc(symbol, bars, btc_ref, sim_cfg)
+}
+
+/// Runs a causal, discrete-event simulation of Engine A with synchronized cross-asset BTC impulse veto
+/// and inverse-volatility notional scaling.
+pub fn run_engine_a_backtest_with_btc(
+    symbol: &str,
+    bars: &[HistoricalMarketBarRecord],
+    btc_bars: Option<&[HistoricalMarketBarRecord]>,
+    sim_cfg: &SimulatedExchangeConfig,
+) -> BacktestSummary {
     let mut summary = BacktestSummary {
         symbol: symbol.to_uppercase(),
         ..Default::default()
@@ -210,6 +301,12 @@ pub fn run_engine_a_backtest(
     if bars.len() < 750 {
         return summary;
     }
+
+    let eff_btc_bars = if symbol.eq_ignore_ascii_case("BTC") {
+        Some(bars)
+    } else {
+        btc_bars
+    };
 
     let ou_cfg = asset_ou_config(symbol);
     let warmup = 720usize.min(bars.len().saturating_sub(30));
@@ -306,18 +403,35 @@ pub fn run_engine_a_backtest(
             } else if age_bars >= entry_ord.ttl_bars {
                 summary.orders_expired_unfilled += 1;
             } else {
-                resting_entry = Some(entry_ord);
+                // Fast-Sentinel BTC Impulse Abort on resting unfilled limit order
+                let btc_abort = eff_btc_bars
+                    .and_then(|bb| build_historical_btc_impulse_snapshot(bb, bar.timestamp_ms))
+                    .and_then(|snap| {
+                        evaluate_btc_impulse_veto(
+                            symbol,
+                            entry_ord.side == Side::Long,
+                            false,
+                            &snap,
+                        )
+                    });
+                if btc_abort.is_some() {
+                    summary.btc_impulse_vetoes += 1;
+                    summary.orders_expired_unfilled += 1;
+                } else {
+                    resting_entry = Some(entry_ord);
+                }
             }
         }
 
         // ------------------------------------------------------------------
         // 2. MATCHING ENGINE: Process Open Position (Stops, TPs, Funding, 5m Soft Invalidation)
         // ------------------------------------------------------------------
-        let live_feat_opt = calculate_features_with_funding(
+        let live_feat_opt = calculate_features_with_funding_at(
             &closes_history,
             bar.close,
             symbol,
             bar.funding_1h,
+            Some(bar.timestamp_ms),
         );
 
         if let Some(mut pos) = open_pos.take() {
@@ -731,54 +845,87 @@ pub fn run_engine_a_backtest(
                                 entry_ttl_mins,
                                 ..
                             } => {
-                                is_armed = false;
                                 let is_long = side == Side::Long;
-                                let raw_edge_bps =
-                                    calculate_directional_edge_bps(limit_price, arm_exit_px, is_long);
-                                let net_edge_bps =
-                                    raw_edge_bps - 2.0 * sim_cfg.maker_fee_bps - funding_drag_bps;
+                                let btc_veto = eff_btc_bars
+                                    .and_then(|bb| {
+                                        build_historical_btc_impulse_snapshot(bb, bar.timestamp_ms)
+                                    })
+                                    .and_then(|snap| {
+                                        evaluate_btc_impulse_veto(symbol, is_long, false, &snap)
+                                    });
 
-                                if net_edge_bps >= ou_cfg.min_net_edge_bps {
-                                    if let Some(off_bps) =
-                                        compute_safe_tp_offset_bps(arm_exit_px, limit_price, tick_sz)
-                                    {
-                                        let shave = arm_exit_px * (off_bps * 1e-4);
-                                        let tp_px = if is_long {
-                                            arm_exit_px - shave
-                                        } else {
-                                            arm_exit_px + shave
-                                        };
-                                        let hard_stop_frac = ou_cfg.hard_disaster_stop_bps * 1e-4;
-                                        let sl_dist = (2.0 * (tp_px - limit_price).abs())
-                                            .max(limit_price * hard_stop_frac);
-                                        let hard_sl_px = if is_long {
-                                            limit_price - sl_dist
-                                        } else {
-                                            limit_price + sl_dist
-                                        };
-                                        let notional = sim_cfg
-                                            .notional_usdc
-                                            .min(ou_cfg.dynamic_notional_cap(sim_cfg.notional_usdc * 2.1));
-                                        let qty = notional / limit_price.max(1e-9);
-                                        let policy = if (entry_ttl_mins - 2.0).abs() < 1e-6 {
-                                            "JOIN_BOOK"
-                                        } else {
-                                            "RETEST_LIMIT"
-                                        };
-                                        summary.orders_submitted += 1;
-                                        resting_entry = Some(RestingMakerEntry {
-                                            side,
-                                            limit_px: limit_price,
-                                            qty,
-                                            target_tp_px: tp_px,
-                                            hard_stop_px: hard_sl_px,
-                                            frozen_center_px: arm_exit_px,
-                                            frozen_sigma_eq_log: arm_sigma_eq_log,
-                                            half_life_m: arm_half_life,
-                                            submitted_bar_idx: idx,
-                                            ttl_bars: entry_ttl_mins.round() as usize,
-                                            policy,
-                                        });
+                                if btc_veto.is_some() {
+                                    summary.btc_impulse_vetoes += 1;
+                                    is_armed = false;
+                                } else {
+                                    is_armed = false;
+                                    let raw_edge_bps = calculate_directional_edge_bps(
+                                        limit_price,
+                                        arm_exit_px,
+                                        is_long,
+                                    );
+                                    let net_edge_bps = raw_edge_bps
+                                        - 2.0 * sim_cfg.maker_fee_bps
+                                        - funding_drag_bps;
+
+                                    if net_edge_bps >= ou_cfg.min_net_edge_bps {
+                                        if let Some(off_bps) = compute_safe_tp_offset_bps(
+                                            arm_exit_px,
+                                            limit_price,
+                                            tick_sz,
+                                        ) {
+                                            let shave = arm_exit_px * (off_bps * 1e-4);
+                                            let tp_px = if is_long {
+                                                arm_exit_px - shave
+                                            } else {
+                                                arm_exit_px + shave
+                                            };
+                                            let hard_stop_frac =
+                                                ou_cfg.hard_disaster_stop_bps * 1e-4;
+                                            let sl_dist = (2.0 * (tp_px - limit_price).abs())
+                                                .max(limit_price * hard_stop_frac);
+                                            let hard_sl_px = if is_long {
+                                                limit_price - sl_dist
+                                            } else {
+                                                limit_price + sl_dist
+                                            };
+                                            let vol_adj_cap = ou_cfg
+                                                .volatility_adjusted_notional_cap(
+                                                    sim_cfg.account_equity_usdc,
+                                                    arm_sigma_eq_log,
+                                                );
+                                            let notional = crate::hyperliquid::calculate_risk_scaled_notional(
+                                                sim_cfg.account_equity_usdc,
+                                                sim_cfg.notional_usdc.min(vol_adj_cap),
+                                                0.0075,
+                                                limit_price,
+                                                hard_sl_px,
+                                                3,
+                                                2,
+                                                11.0,
+                                                vol_adj_cap,
+                                            );
+                                            let qty = notional / limit_price.max(1e-9);
+                                            let policy = if (entry_ttl_mins - 2.0).abs() < 1e-6 {
+                                                "JOIN_BOOK"
+                                            } else {
+                                                "RETEST_LIMIT"
+                                            };
+                                            summary.orders_submitted += 1;
+                                            resting_entry = Some(RestingMakerEntry {
+                                                side,
+                                                limit_px: limit_price,
+                                                qty,
+                                                target_tp_px: tp_px,
+                                                hard_stop_px: hard_sl_px,
+                                                frozen_center_px: arm_exit_px,
+                                                frozen_sigma_eq_log: arm_sigma_eq_log,
+                                                half_life_m: arm_half_life,
+                                                submitted_bar_idx: idx,
+                                                ttl_bars: entry_ttl_mins.round() as usize,
+                                                policy,
+                                            });
+                                        }
                                     }
                                 }
                             }
