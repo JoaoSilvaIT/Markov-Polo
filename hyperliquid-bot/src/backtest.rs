@@ -18,10 +18,11 @@ use std::path::Path;
 use crate::hyperliquid::effective_tick_size;
 use crate::ou_process::{
     asset_ou_config, calculate_directional_edge_bps, calculate_features_with_funding_at,
-    calculate_mad_sigma, compute_safe_tp_offset_bps, evaluate_armed_reversal_1m_step,
-    InvalidationDecision, OrderPlacementAction, TwoTierInvalidationManager,
+    calculate_mad_sigma, check_macro_calendar_veto, compute_safe_tp_offset_bps,
+    evaluate_armed_reversal_1m_step, InvalidationDecision, OrderPlacementAction,
+    TwoTierInvalidationManager,
 };
-use crate::state::Side;
+use crate::state::{ClusterCircuitBreaker, Side, DEFAULT_MAX_DAILY_CLUSTER_DD_FRAC};
 use crate::telemetry::{evaluate_btc_impulse_veto, BtcImpulseSnapshot};
 
 /// Single 1-minute historical market bar + L2 microstructure + derivatives context record
@@ -145,6 +146,8 @@ pub struct BacktestSummary {
     pub bars_evaluated: usize,
     pub signals_armed: usize,
     pub btc_impulse_vetoes: usize,
+    pub macro_calendar_vetoes: usize,
+    pub cluster_cb_vetoes: usize,
     pub orders_submitted: usize,
     pub orders_filled: usize,
     pub orders_expired_unfilled: usize,
@@ -331,6 +334,7 @@ pub fn run_engine_a_backtest_with_btc(
     let mut peak_pnl_usd = 0.0;
     let mut gross_wins_usd = 0.0;
     let mut gross_losses_usd = 0.0;
+    let mut cluster_cb = ClusterCircuitBreaker::default();
 
     let (max_drift_120, max_slow_drift_180, max_slow_drift_240) =
         match symbol.to_uppercase().as_str() {
@@ -403,7 +407,8 @@ pub fn run_engine_a_backtest_with_btc(
             } else if age_bars >= entry_ord.ttl_bars {
                 summary.orders_expired_unfilled += 1;
             } else {
-                // Fast-Sentinel BTC Impulse Abort on resting unfilled limit order
+                // Fast-Sentinel BTC Impulse & Macro Calendar Abort on resting unfilled limit order
+                let macro_abort = check_macro_calendar_veto(bar.timestamp_ms);
                 let btc_abort = eff_btc_bars
                     .and_then(|bb| build_historical_btc_impulse_snapshot(bb, bar.timestamp_ms))
                     .and_then(|snap| {
@@ -414,7 +419,10 @@ pub fn run_engine_a_backtest_with_btc(
                             &snap,
                         )
                     });
-                if btc_abort.is_some() {
+                if macro_abort.is_some() {
+                    summary.macro_calendar_vetoes += 1;
+                    summary.orders_expired_unfilled += 1;
+                } else if btc_abort.is_some() {
                     summary.btc_impulse_vetoes += 1;
                     summary.orders_expired_unfilled += 1;
                 } else {
@@ -700,6 +708,12 @@ pub fn run_engine_a_backtest_with_btc(
                 if dd > summary.max_drawdown_usd {
                     summary.max_drawdown_usd = dd;
                 }
+                let _ = cluster_cb.record_cluster_trade(
+                    bar.timestamp_ms,
+                    net_pnl_usd,
+                    sim_cfg.account_equity_usdc + cumulative_pnl_usd,
+                    DEFAULT_MAX_DAILY_CLUSTER_DD_FRAC,
+                );
 
                 summary.trades.push(SimulatedTradeResult {
                     symbol: symbol.to_uppercase(),
@@ -774,13 +788,25 @@ pub fn run_engine_a_backtest_with_btc(
                     && (ma60_vs_240 <= 0.0040 || (ret_720 < -0.0150 && ma60_vs_240 <= 0.0080));
 
                 let is_eligible = feat.is_consolidation && consolidation_vol_ok && feat.is_valid_half_life;
+                let macro_veto = check_macro_calendar_veto(bar.timestamp_ms);
+                let cb_veto = cluster_cb.evaluate_equity_drawdown(
+                    bar.timestamp_ms,
+                    sim_cfg.account_equity_usdc + cumulative_pnl_usd,
+                    DEFAULT_MAX_DAILY_CLUSTER_DD_FRAC,
+                );
 
                 if is_armed {
                     let shock_vetoed = match arm_side {
                         Side::Long => feat.is_downside_shock || kalman_waterfall_down,
                         Side::Short => feat.is_upside_shock || kalman_waterfall_up,
                     };
-                    if !is_eligible || shock_vetoed {
+                    if macro_veto.is_some() {
+                        summary.macro_calendar_vetoes += 1;
+                        is_armed = false;
+                    } else if cb_veto.is_some() {
+                        summary.cluster_cb_vetoes += 1;
+                        is_armed = false;
+                    } else if !is_eligible || shock_vetoed {
                         is_armed = false;
                     } else {
                         let n_rc = closes_history.len();
@@ -933,34 +959,40 @@ pub fn run_engine_a_backtest_with_btc(
                     }
                 } else if is_eligible {
                     if let Some(ref th) = feat.thresholds_opt {
-                        if (bar.close <= th.entry_long || bar.low <= th.entry_long)
+                        let wants_long = (bar.close <= th.entry_long || bar.low <= th.entry_long)
                             && !feat.is_downside_shock
-                            && kalman_long_ok
-                        {
-                            is_armed = true;
-                            arm_side = Side::Long;
-                            arm_entry_px = th.entry_long;
-                            arm_exit_px = th.exit_long;
-                            arm_extreme_px = bar.close.min(bar.low);
-                            arm_bars_since_ext = 0;
-                            arm_total_bars = 0;
-                            arm_half_life = feat.half_life_m;
-                            arm_sigma_eq_log = feat.sigma_eq_log;
-                            summary.signals_armed += 1;
-                        } else if (bar.close >= th.entry_short || bar.high >= th.entry_short)
+                            && kalman_long_ok;
+                        let wants_short = (bar.close >= th.entry_short || bar.high >= th.entry_short)
                             && !feat.is_upside_shock
-                            && kalman_short_ok
-                        {
-                            is_armed = true;
-                            arm_side = Side::Short;
-                            arm_entry_px = th.entry_short;
-                            arm_exit_px = th.exit_short;
-                            arm_extreme_px = bar.close.max(bar.high);
-                            arm_bars_since_ext = 0;
-                            arm_total_bars = 0;
-                            arm_half_life = feat.half_life_m;
-                            arm_sigma_eq_log = feat.sigma_eq_log;
-                            summary.signals_armed += 1;
+                            && kalman_short_ok;
+                        if wants_long || wants_short {
+                            if macro_veto.is_some() {
+                                summary.macro_calendar_vetoes += 1;
+                            } else if cb_veto.is_some() {
+                                summary.cluster_cb_vetoes += 1;
+                            } else if wants_long {
+                                is_armed = true;
+                                arm_side = Side::Long;
+                                arm_entry_px = th.entry_long;
+                                arm_exit_px = th.exit_long;
+                                arm_extreme_px = bar.close.min(bar.low);
+                                arm_bars_since_ext = 0;
+                                arm_total_bars = 0;
+                                arm_half_life = feat.half_life_m;
+                                arm_sigma_eq_log = feat.sigma_eq_log;
+                                summary.signals_armed += 1;
+                            } else {
+                                is_armed = true;
+                                arm_side = Side::Short;
+                                arm_entry_px = th.entry_short;
+                                arm_exit_px = th.exit_short;
+                                arm_extreme_px = bar.close.max(bar.high);
+                                arm_bars_since_ext = 0;
+                                arm_total_bars = 0;
+                                arm_half_life = feat.half_life_m;
+                                arm_sigma_eq_log = feat.sigma_eq_log;
+                                summary.signals_armed += 1;
+                            }
                         }
                     }
                 }
@@ -1054,6 +1086,69 @@ mod tests {
         assert!(
             res.signals_armed >= 1,
             "Expected at least 1 armed signal on oscillating series"
+        );
+    }
+
+    #[test]
+    fn test_backtest_macro_calendar_shield_blocks_fomc_entry() {
+        use chrono::{TimeZone, Utc};
+        // Anchor bar 720 (start of evaluation window) at 2026-11-04 18:45:00 UTC
+        // so bars 720..795 span the entire [18:45 UTC, 20:00 UTC] Nov 4, 2026 FOMC blackout window!
+        let fomc_blackout_start = Utc
+            .with_ymd_and_hms(2026, 11, 4, 18, 45, 0)
+            .unwrap()
+            .timestamp_millis() as u64;
+        let base_ts = fomc_blackout_start - 720 * 60_000;
+
+        let mut bars = Vec::with_capacity(795);
+        let mut log_dev = 0.0_f64;
+        let mut rng_state = 0x1234_5678_9ABC_DEF0u64;
+        for i in 0..795 {
+            rng_state ^= rng_state >> 12;
+            rng_state ^= rng_state << 25;
+            rng_state ^= rng_state >> 27;
+            let u = ((rng_state.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64) / ((1u64 << 53) as f64);
+            let z_innov = (u - 0.5) * 3.4641016;
+            log_dev = 0.98 * log_dev + 0.0012 * z_innov;
+
+            if i == 780 {
+                log_dev = -0.0095;
+            } else if i == 781 {
+                log_dev = -0.0085;
+            } else if i == 782 {
+                log_dev = -0.0070;
+            }
+
+            let px = 2500.0 * log_dev.exp();
+            bars.push(HistoricalMarketBarRecord {
+                symbol: "ETH".to_string(),
+                timestamp_ms: base_ts + (i as u64) * 60_000,
+                open: px,
+                high: px * 1.0008,
+                low: px * 0.9992,
+                close: px,
+                volume: 100.0,
+                best_bid: px - 0.10,
+                best_ask: px + 0.10,
+                obi_instant: 0.05,
+                obi_1s: 0.05,
+                obi_5s: 0.05,
+                funding_1h: 0.0000125,
+                open_interest: 50_000.0,
+                mark_px: px,
+                oracle_px: px,
+            });
+        }
+
+        let cfg = SimulatedExchangeConfig {
+            sz_decimals: 4,
+            notional_usdc: 68.0,
+            ..Default::default()
+        };
+        let res = run_engine_a_backtest("ETH", &bars, &cfg);
+        assert!(
+            res.macro_calendar_vetoes >= 1 && res.signals_armed == 0,
+            "Expected FOMC macro calendar shield to veto all excursions during 18:45-20:00 UTC"
         );
     }
 }

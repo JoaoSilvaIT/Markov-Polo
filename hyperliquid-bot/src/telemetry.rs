@@ -373,7 +373,8 @@ pub struct RealTradeRecord {
     pub is_win: bool,
 }
 
-/// Atomically appends a completed real trade to `hl_real_trades.jsonl` with cross-process flock + fsync.
+/// Atomically appends a completed real trade to `hl_real_trades.jsonl` with cross-process flock + fsync,
+/// and updates the cluster-wide cross-margin circuit breaker state.
 pub fn append_real_trade_record(record: &RealTradeRecord) {
     let lock_path = "hl_real_trades.jsonl.lock";
     let _guard = crate::state::FlockGuard::acquire(lock_path);
@@ -389,6 +390,8 @@ pub fn append_real_trade_record(record: &RealTradeRecord) {
             crate::state::sync_parent_dir("hl_real_trades.jsonl");
         }
     }
+    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let _ = crate::state::record_cluster_trade_outcome(now_ms, record.pnl_usd, 0.0);
 }
 
 #[cfg(test)]

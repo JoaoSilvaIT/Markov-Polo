@@ -363,6 +363,179 @@ pub fn save_circuit_breaker(file_path: &str, cb: &CircuitBreaker) {
     }
 }
 
+pub const CLUSTER_CB_FILE: &str = "hl_cluster_circuit_breaker.json";
+pub const CLUSTER_CB_LOCK_FILE: &str = "hl_cluster_circuit_breaker.lock";
+pub const DEFAULT_MAX_DAILY_CLUSTER_DD_FRAC: f64 = 0.0275; // 2.75% daily cross-margin drawdown cap
+
+/// Cross-Margin Rolling 24h / Daily Cluster Drawdown & Consecutive Stop-Out Circuit Breaker.
+/// Protects the shared 3x Cross-Margin collateral pool across BTC, ETH, SOL, and AVAX.
+/// Uses strictly deterministic timestamp inputs (`now_ms`) with zero wall-clock leakage.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ClusterCircuitBreaker {
+    pub utc_day_index: u64,
+    pub daily_reference_equity: f64,
+    pub daily_realized_pnl_usd: f64,
+    pub cluster_consecutive_losses: u32,
+    pub last_loss_ts_ms: u64,
+    pub locked_until_ts_ms: u64,
+    pub lockout_reason: String,
+}
+
+impl ClusterCircuitBreaker {
+    pub fn sync_utc_day(&mut self, now_ms: u64, current_equity: f64) {
+        let day_idx = now_ms / 86_400_000;
+        let eq = if current_equity.is_finite() && current_equity > 0.0 {
+            current_equity
+        } else {
+            self.daily_reference_equity.max(142.50)
+        };
+        if day_idx != self.utc_day_index {
+            self.utc_day_index = day_idx;
+            self.daily_reference_equity = eq;
+            self.daily_realized_pnl_usd = 0.0;
+            if now_ms >= self.locked_until_ts_ms {
+                self.locked_until_ts_ms = 0;
+                self.lockout_reason.clear();
+            }
+        } else if eq > self.daily_reference_equity {
+            self.daily_reference_equity = eq;
+        }
+    }
+
+    pub fn is_locked(&self, now_ms: u64) -> Option<String> {
+        if now_ms < self.locked_until_ts_ms {
+            Some(self.lockout_reason.clone())
+        } else {
+            None
+        }
+    }
+
+    pub fn evaluate_equity_drawdown(
+        &mut self,
+        now_ms: u64,
+        current_equity: f64,
+        max_daily_dd_frac: f64,
+    ) -> Option<String> {
+        self.sync_utc_day(now_ms, current_equity);
+        if let Some(reason) = self.is_locked(now_ms) {
+            return Some(reason);
+        }
+        let ref_eq = self.daily_reference_equity.max(1.0);
+        let eq_dd_frac = if current_equity.is_finite() && current_equity > 0.0 {
+            ((ref_eq - current_equity) / ref_eq).max(0.0)
+        } else {
+            0.0
+        };
+        let realized_dd_frac = ((-self.daily_realized_pnl_usd).max(0.0) / ref_eq).max(0.0);
+        let dd_frac = eq_dd_frac.max(realized_dd_frac);
+        let cap = if max_daily_dd_frac > 0.0 {
+            max_daily_dd_frac
+        } else {
+            DEFAULT_MAX_DAILY_CLUSTER_DD_FRAC
+        };
+
+        if dd_frac >= cap {
+            let next_utc_midnight = (self.utc_day_index + 1) * 86_400_000;
+            self.locked_until_ts_ms = next_utc_midnight.max(now_ms + 14_400_000); // Until 00:00 UTC or min 4h
+            self.lockout_reason = format!(
+                "Daily Cross-Margin Drawdown {:.2}% >= {:.2}% cap (Ref: ${:.2}, PnL: ${:+.2})",
+                dd_frac * 100.0,
+                cap * 100.0,
+                ref_eq,
+                self.daily_realized_pnl_usd
+            );
+            return Some(self.lockout_reason.clone());
+        }
+        None
+    }
+
+    pub fn record_cluster_trade(
+        &mut self,
+        now_ms: u64,
+        net_pnl_usd: f64,
+        current_equity: f64,
+        max_daily_dd_frac: f64,
+    ) -> Option<String> {
+        self.sync_utc_day(now_ms, current_equity);
+        self.daily_realized_pnl_usd += net_pnl_usd;
+
+        if net_pnl_usd < -1e-6 {
+            if self.last_loss_ts_ms > 0 && now_ms.saturating_sub(self.last_loss_ts_ms) > 86_400_000 {
+                self.cluster_consecutive_losses = 0;
+            }
+            self.cluster_consecutive_losses += 1;
+            self.last_loss_ts_ms = now_ms;
+            if self.cluster_consecutive_losses >= 3 {
+                self.locked_until_ts_ms = self.locked_until_ts_ms.max(now_ms + 7_200_000); // 120m cluster cooldown
+                self.lockout_reason = format!(
+                    "Cluster 3 Consecutive Losses within 24h (Daily PnL: ${:+.2})",
+                    self.daily_realized_pnl_usd
+                );
+                self.cluster_consecutive_losses = 0;
+            }
+        } else {
+            self.cluster_consecutive_losses = 0;
+        }
+
+        self.evaluate_equity_drawdown(now_ms, current_equity, max_daily_dd_frac)
+    }
+}
+
+pub fn check_cluster_circuit_breaker(now_ms: u64, current_equity: f64) -> Option<String> {
+    let _guard = FlockGuard::acquire(CLUSTER_CB_LOCK_FILE).ok();
+    let mut cb: ClusterCircuitBreaker = fs::read_to_string(CLUSTER_CB_FILE)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_default();
+    let prev_day = cb.utc_day_index;
+    let prev_lock = cb.locked_until_ts_ms;
+    let res = cb.evaluate_equity_drawdown(now_ms, current_equity, DEFAULT_MAX_DAILY_CLUSTER_DD_FRAC);
+    if cb.utc_day_index != prev_day || cb.locked_until_ts_ms != prev_lock {
+        save_cluster_circuit_breaker_unlocked(&cb);
+    }
+    res
+}
+
+pub fn record_cluster_trade_outcome(
+    now_ms: u64,
+    net_pnl_usd: f64,
+    current_equity: f64,
+) -> Option<String> {
+    let _guard = FlockGuard::acquire(CLUSTER_CB_LOCK_FILE).ok();
+    let mut cb: ClusterCircuitBreaker = fs::read_to_string(CLUSTER_CB_FILE)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_default();
+    let res = cb.record_cluster_trade(
+        now_ms,
+        net_pnl_usd,
+        current_equity,
+        DEFAULT_MAX_DAILY_CLUSTER_DD_FRAC,
+    );
+    save_cluster_circuit_breaker_unlocked(&cb);
+    res
+}
+
+fn save_cluster_circuit_breaker_unlocked(cb: &ClusterCircuitBreaker) {
+    if let Ok(content) = serde_json::to_string_pretty(cb) {
+        let temp_path = format!("{}.tmp.{}", CLUSTER_CB_FILE, std::process::id());
+        let write_ok = (|| -> Result<(), std::io::Error> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temp_path)?;
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if write_ok.is_ok() {
+            let _ = fs::rename(&temp_path, CLUSTER_CB_FILE);
+            sync_parent_dir(CLUSTER_CB_FILE);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ArmedSignal {
     pub is_armed: bool,
@@ -1390,5 +1563,45 @@ mod tests {
 
         // Releasing a lease that is already absent from disk must succeed idempotently (never wedge)
         assert!(release_cluster_lease_authenticated("BTC", Some("stale_uuid"), Some(99)));
+    }
+
+    #[test]
+    fn test_cluster_cross_margin_circuit_breaker_drawdown_and_consecutive_losses() {
+        let mut cb = ClusterCircuitBreaker::default();
+        let day1_start_ms = 1_793_404_800_000u64; // 2026-10-31 00:00:00 UTC
+
+        // 1. Initialize day with $534.00 equity -> unlocked
+        assert!(cb
+            .evaluate_equity_drawdown(day1_start_ms + 60_000, 534.0, 0.0275)
+            .is_none());
+        assert_eq!(cb.daily_reference_equity, 534.0);
+
+        // 2. Two small losses (-$2.00 each) -> consecutive = 2, still unlocked
+        assert!(cb
+            .record_cluster_trade(day1_start_ms + 120_000, -2.0, 532.0, 0.0275)
+            .is_none());
+        assert!(cb
+            .record_cluster_trade(day1_start_ms + 180_000, -2.0, 530.0, 0.0275)
+            .is_none());
+        assert_eq!(cb.cluster_consecutive_losses, 2);
+
+        // 3. Third consecutive loss (-$2.00) -> trips 120m cluster consecutive-loss lockout!
+        let lock_msg = cb.record_cluster_trade(day1_start_ms + 240_000, -2.0, 528.0, 0.0275);
+        assert!(lock_msg.is_some());
+        assert!(lock_msg.unwrap().contains("3 Consecutive Losses"));
+
+        // Still locked 60m later, unlocked 125m later
+        assert!(cb.is_locked(day1_start_ms + 3_600_000).is_some());
+        assert!(cb.is_locked(day1_start_ms + 7_800_000).is_none());
+
+        // 4. Severe daily drawdown (-$15.50 on $534 = 2.90% >= 2.75% cap) -> trips daily lockout until 00:00 UTC!
+        let dd_msg = cb.evaluate_equity_drawdown(day1_start_ms + 8_000_000, 518.50, 0.0275);
+        assert!(dd_msg.is_some());
+        assert!(dd_msg.unwrap().contains("Daily Cross-Margin Drawdown"));
+
+        // 5. Next UTC day rollover after lock expiry resets daily PnL and unlocks
+        let day2_ms = day1_start_ms + 86_400_000 + 60_000;
+        assert!(cb.evaluate_equity_drawdown(day2_ms, 518.50, 0.0275).is_none());
+        assert!((cb.daily_realized_pnl_usd).abs() < 1e-9);
     }
 }

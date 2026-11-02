@@ -1411,6 +1411,207 @@ pub fn utc_session_sigma_offset(utc_hour: u32, is_weekend: bool) -> f64 {
     }
 }
 
+/// Piecewise-deterministic exogenous macro hazard state \lambda_{exo}(t) \in [0.0, 1.0].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MacroHazardState {
+    pub lambda_exo: f64,
+    pub is_hard_blackout: bool,
+    pub event_name: &'static str,
+}
+
+const FOMC_DECISION_DATES: &[(i32, u32, u32)] = &[
+    (2025, 1, 29),
+    (2025, 3, 19),
+    (2025, 5, 7),
+    (2025, 6, 18),
+    (2025, 7, 30),
+    (2025, 9, 17),
+    (2025, 10, 29),
+    (2025, 12, 10),
+    (2026, 1, 28),
+    (2026, 3, 18),
+    (2026, 4, 29),
+    (2026, 6, 17),
+    (2026, 7, 29),
+    (2026, 9, 16),
+    (2026, 11, 4),
+    (2026, 12, 9),
+    (2027, 1, 27),
+    (2027, 3, 17),
+    (2027, 4, 28),
+    (2027, 6, 9),
+    (2027, 7, 28),
+    (2027, 9, 15),
+    (2027, 10, 27),
+    (2027, 12, 8),
+];
+
+const US_CPI_RELEASE_DATES: &[(i32, u32, u32)] = &[
+    (2025, 1, 15),
+    (2025, 2, 12),
+    (2025, 3, 12),
+    (2025, 4, 10),
+    (2025, 5, 13),
+    (2025, 6, 11),
+    (2025, 7, 15),
+    (2025, 8, 12),
+    (2025, 9, 11),
+    (2025, 10, 15),
+    (2025, 11, 13),
+    (2025, 12, 10),
+    (2026, 1, 13),
+    (2026, 2, 11),
+    (2026, 3, 11),
+    (2026, 4, 14),
+    (2026, 5, 12),
+    (2026, 6, 10),
+    (2026, 7, 14),
+    (2026, 8, 12),
+    (2026, 9, 11),
+    (2026, 10, 14),
+    (2026, 11, 12),
+    (2026, 12, 10),
+    (2027, 1, 13),
+    (2027, 2, 10),
+    (2027, 3, 10),
+    (2027, 4, 13),
+    (2027, 5, 12),
+    (2027, 6, 10),
+    (2027, 7, 14),
+    (2027, 8, 11),
+    (2027, 9, 14),
+    (2027, 10, 13),
+    (2027, 11, 10),
+    (2027, 12, 14),
+];
+
+/// Returns true if a given UTC calendar date falls within US Daylight Saving Time (EDT, UTC-4).
+/// US DST begins on the second Sunday of March and ends on the first Sunday of November.
+pub fn is_us_daylight_saving_date(year: i32, month: u32, day: u32) -> bool {
+    use chrono::{Datelike, NaiveDate};
+    if (4..=10).contains(&month) {
+        return true;
+    }
+    if !(3..=11).contains(&month) {
+        return false;
+    }
+    if month == 3 {
+        if let Some(mar1) = NaiveDate::from_ymd_opt(year, 3, 1) {
+            let wd = mar1.weekday().num_days_from_sunday();
+            let second_sunday = 1 + ((7 - wd) % 7) + 7;
+            return day >= second_sunday;
+        }
+    } else if month == 11 {
+        if let Some(nov1) = NaiveDate::from_ymd_opt(year, 11, 1) {
+            let wd = nov1.weekday().num_days_from_sunday();
+            let first_sunday = 1 + ((7 - wd) % 7);
+            return day < first_sunday;
+        }
+    }
+    false
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 30,
+    }
+}
+
+/// Evaluates the Piecewise-Deterministic Exogenous Macro Hazard Intensity \lambda_{exo}(t) \in [0.0, 1.0]
+/// across scheduled Tier-1 US macroeconomic releases (FOMC, CPI, NFP, Core PCE).
+/// Zero network dependencies and 100% bit-for-bit identical in `src/backtest.rs` and `src/main.rs`.
+pub fn evaluate_macro_hazard(ts_ms: u64) -> MacroHazardState {
+    use chrono::{Datelike, NaiveDate, TimeZone, Utc, Weekday};
+    let dt = match Utc.timestamp_millis_opt(ts_ms as i64).single() {
+        Some(d) => d,
+        None => return MacroHazardState::default(),
+    };
+    let year = dt.year();
+    let month = dt.month();
+    let day = dt.day();
+    let weekday = dt.weekday();
+    let is_edt = is_us_daylight_saving_date(year, month, day);
+
+    let mut best = MacroHazardState::default();
+
+    let eval_kernel = |release_ts_ms: i64,
+                       hold_mins: f64,
+                       half_life_mins: f64,
+                       event_name: &'static str,
+                       best: &mut MacroHazardState| {
+        let diff_mins = (ts_ms as i64 - release_ts_ms) as f64 / 60_000.0;
+        let lambda = if (-30.0..-15.0).contains(&diff_mins) {
+            0.60 * ((diff_mins + 30.0) / 15.0)
+        } else if (-15.0..=hold_mins).contains(&diff_mins) {
+            1.0
+        } else if diff_mins > hold_mins && diff_mins <= hold_mins + 5.0 * half_life_mins {
+            let raw = (-std::f64::consts::LN_2 * (diff_mins - hold_mins) / half_life_mins).exp();
+            if raw >= 0.05 { raw } else { 0.0 }
+        } else {
+            0.0
+        };
+        if lambda > best.lambda_exo {
+            best.lambda_exo = lambda;
+            best.is_hard_blackout = lambda >= 0.60;
+            best.event_name = event_name;
+        }
+    };
+
+    if let Some(base_date) = NaiveDate::from_ymd_opt(year, month, day) {
+        // 1. Check FOMC (14:00 America/New_York = 18:00 UTC in EDT, 19:00 UTC in EST)
+        if FOMC_DECISION_DATES
+            .binary_search(&(year, month, day))
+            .is_ok()
+        {
+            let fomc_utc_hour = if is_edt { 18 } else { 19 };
+            if let Some(rel_dt) = base_date.and_hms_opt(fomc_utc_hour, 0, 0) {
+                let rel_ms = Utc.from_utc_datetime(&rel_dt).timestamp_millis();
+                eval_kernel(rel_ms, 60.0, 20.0, "US_FOMC_DECISION", &mut best);
+            }
+        }
+
+        // 2. Check 08:30 America/New_York Tier-1 prints (12:30 UTC in EDT, 13:30 UTC in EST)
+        let print_0830_utc_hour = if is_edt { 12 } else { 13 };
+        if let Some(rel_dt) = base_date.and_hms_opt(print_0830_utc_hour, 30, 0) {
+            let rel_ms = Utc.from_utc_datetime(&rel_dt).timestamp_millis();
+            if US_CPI_RELEASE_DATES
+                .binary_search(&(year, month, day))
+                .is_ok()
+            {
+                eval_kernel(rel_ms, 15.0, 15.0, "US_CPI_PRINT", &mut best);
+            } else if weekday == Weekday::Fri && day <= 7 {
+                eval_kernel(rel_ms, 15.0, 15.0, "US_NFP_PAYROLLS", &mut best);
+            } else if weekday == Weekday::Fri && (day + 7) > days_in_month(year, month) {
+                eval_kernel(rel_ms, 15.0, 15.0, "US_CORE_PCE", &mut best);
+            }
+        }
+    }
+
+    best
+}
+
+/// Returns a descriptive veto string if `ts_ms` falls inside a Tier-1 US Macro Hard Blackout window (\lambda_{exo} >= 0.60).
+pub fn check_macro_calendar_veto(ts_ms: u64) -> Option<String> {
+    let h = evaluate_macro_hazard(ts_ms);
+    if h.is_hard_blackout {
+        Some(format!(
+            "Tier-1 US Macro Shield ({}, lambda={:.2})",
+            h.event_name, h.lambda_exo
+        ))
+    } else {
+        None
+    }
+}
+
 /// Computes the robust Median Absolute Deviation (MAD) of a return series,
 /// scaled by 1.4826 for normal consistency and floored at 1e-5.
 pub fn calculate_mad_sigma(returns: &[f64]) -> f64 {
@@ -1631,13 +1832,21 @@ pub fn calculate_features_with_funding_at(
                 } else {
                     0.0
                 };
+                let macro_state = eval_timestamp_ms
+                    .map(evaluate_macro_hazard)
+                    .unwrap_or_default();
+                let hazard_mult = if macro_state.is_hard_blackout {
+                    1.0
+                } else {
+                    1.0 + 0.35 * macro_state.lambda_exo
+                };
                 let th = calculate_carry_adjusted_thresholds(
                     &ou_params,
                     tx_cost,
-                    cfg.base_entry_sigma + session_offset,
+                    (cfg.base_entry_sigma + session_offset) * hazard_mult,
                     hourly_funding_rate,
                     cfg.min_entry_sigma,
-                    cfg.max_entry_sigma,
+                    cfg.max_entry_sigma * hazard_mult,
                 );
                 // Per both research audits, Tier 2 (1.25\sigma) premature entries are disabled in production;
                 // `thresholds_175_opt` is kept populated for counterfactual telemetry compatibility.
@@ -2088,5 +2297,45 @@ mod tests {
         let trend_storm = sol_cfg.volatility_adjusted_trend_notional_cap(534.0, 100.0, 1.30);
         assert!(trend_calm >= base_cap);
         assert!((trend_storm - 113.0).abs() <= 2.0);
+    }
+
+    #[test]
+    fn test_macro_calendar_hazard_fomc_cpi_nfp_pce_and_dst() {
+        use chrono::{TimeZone, Utc};
+        // 1. US DST transitions in 2026: EDT starts March 8, 2026 and ends Nov 1, 2026
+        assert!(!is_us_daylight_saving_date(2026, 3, 7));
+        assert!(is_us_daylight_saving_date(2026, 3, 8));
+        assert!(is_us_daylight_saving_date(2026, 10, 30));
+        assert!(!is_us_daylight_saving_date(2026, 11, 4));
+
+        // 2. Friday Oct 30, 2026 (Last Friday of Oct -> US Core PCE at 08:30 EDT = 12:30 UTC):
+        // At 12:20 UTC (T - 10m): hard blackout (lambda = 1.0)
+        let pce_pre_ms = Utc
+            .with_ymd_and_hms(2026, 10, 30, 12, 20, 0)
+            .unwrap()
+            .timestamp_millis() as u64;
+        let h_pce = evaluate_macro_hazard(pce_pre_ms);
+        assert!(h_pce.is_hard_blackout);
+        assert_eq!(h_pce.event_name, "US_CORE_PCE");
+        assert!((h_pce.lambda_exo - 1.0).abs() < 1e-6);
+
+        // At 13:00 UTC (T + 30m, 15m after 12:45 plateau = 1 half-life): lambda = 0.50 (soft band expansion, not hard blackout)
+        let pce_decay_ms = Utc
+            .with_ymd_and_hms(2026, 10, 30, 13, 0, 0)
+            .unwrap()
+            .timestamp_millis() as u64;
+        let h_decay = evaluate_macro_hazard(pce_decay_ms);
+        assert!(!h_decay.is_hard_blackout);
+        assert!((h_decay.lambda_exo - 0.50).abs() < 0.02);
+
+        // 3. Wednesday Nov 4, 2026 (FOMC Decision in EST -> 14:00 EST = 19:00 UTC):
+        // At 19:45 UTC (T + 45m, during Powell Press Conference): still hard blackout (60m plateau)!
+        let fomc_powell_ms = Utc
+            .with_ymd_and_hms(2026, 11, 4, 19, 45, 0)
+            .unwrap()
+            .timestamp_millis() as u64;
+        let h_fomc = evaluate_macro_hazard(fomc_powell_ms);
+        assert!(h_fomc.is_hard_blackout);
+        assert_eq!(h_fomc.event_name, "US_FOMC_DECISION");
     }
 }

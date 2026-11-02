@@ -38,11 +38,12 @@ use crate::hyperliquid::{
 };
 use crate::order::{emergency_flatten, place_ou_maker_entry};
 use crate::ou_process::{
-    calculate_directional_edge_bps, calculate_features_with_funding,
+    calculate_directional_edge_bps, calculate_features_with_funding, check_macro_calendar_veto,
 };
 use crate::state::{
-    has_active_cluster_position, load_armed_signal, load_circuit_breaker, load_state,
-    save_armed_signal, save_circuit_breaker, save_state, Side, StateMap,
+    check_cluster_circuit_breaker, has_active_cluster_position, load_armed_signal,
+    load_circuit_breaker, load_state, save_armed_signal, save_circuit_breaker, save_state, Side,
+    StateMap,
 };
 use crate::trend::{
     append_candidate_log, calculate_atr, calculate_donchian, check_trend_alignment,
@@ -338,11 +339,12 @@ async fn main() {
             grand_net_bps += res.net_pnl_bps;
 
             println!(
-                "📊 [BACKTEST SUMMARY - {}] Bars: {} | Armed: {} | BTC Vetoes: {} | Submitted: {} | Filled: {} | Win/Loss: {}W/{}L ({:.1}%) | Net PnL: {:+.1} bps (${:+.2}) | PF: {:.2} | Max DD: ${:.2}",
+                "📊 [BACKTEST SUMMARY - {}] Bars: {} | Armed: {} | BTC Vetoes: {} | Macro Vetoes: {} | Submitted: {} | Filled: {} | Win/Loss: {}W/{}L ({:.1}%) | Net PnL: {:+.1} bps (${:+.2}) | PF: {:.2} | Max DD: ${:.2}",
                 sym,
                 res.bars_evaluated,
                 res.signals_armed,
                 res.btc_impulse_vetoes,
+                res.macro_calendar_vetoes,
                 res.orders_submitted,
                 res.orders_filled,
                 res.wins,
@@ -1288,6 +1290,16 @@ async fn main() {
                                     );
                                     is_truly_dead = true;
                                     reported_status = "TOXIC_OBI_ABORT".to_string();
+                                } else if pos.engine_type != "EngineB"
+                                    && check_macro_calendar_veto(now_ms).is_some()
+                                {
+                                    let macro_msg = check_macro_calendar_veto(now_ms).unwrap_or_default();
+                                    println!(
+                                        "🛡️ [FAST-SENTINEL MACRO CALENDAR ABORT] Cancelling resting {} entry {} on {} prior to scheduled macro release: {}",
+                                        pos.side, oid, watcher_symbol, macro_msg
+                                    );
+                                    is_truly_dead = true;
+                                    reported_status = "MACRO_CALENDAR_ABORT".to_string();
                                 } else if let Some(btc_veto) = check_btc_lead_lag_veto(
                                     &watcher_symbol,
                                     pos.side == "LONG",
@@ -2210,8 +2222,18 @@ async fn main() {
                     let thresholds_175_opt = live_feat.thresholds_175_opt.clone();
 
                     let cb_lock = cb_clone.lock().await;
-                    let is_cb_paused = cb_lock.is_paused();
+                    let symbol_cb_paused = cb_lock.is_paused();
                     drop(cb_lock);
+                    let now_ms_cb = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                    let live_eq_cb = *cached_equity_loop.read().await;
+                    let cluster_cb_reason = check_cluster_circuit_breaker(now_ms_cb, live_eq_cb);
+                    if let Some(ref reason) = cluster_cb_reason {
+                        println!(
+                            "🚨 [CLUSTER CROSS-MARGIN CIRCUIT BREAKER ACTIVE] {} locked out: {}",
+                            symbol_clone, reason
+                        );
+                    }
+                    let is_cb_paused = symbol_cb_paused || cluster_cb_reason.is_some();
 
                     let cluster_active = has_active_cluster_position(&symbol_clone);
                     let is_cluster_blocked = cluster_active.is_some();
@@ -3898,6 +3920,13 @@ async fn main() {
                                 && z_60 < 1.90
                                 && ret_240 < max_short_drift_240
                                 && (ma60_vs_240 <= 0.0040 || (ret_720 < -0.0150 && ma60_vs_240 <= 0.0080));
+                            let macro_calendar_veto = check_macro_calendar_veto(now_ms_cb);
+                            if let Some(ref m_veto) = macro_calendar_veto {
+                                println!(
+                                    "🛡️ [MACRO CALENDAR SHIELD] {} Engine A gated during scheduled release window: {}",
+                                    symbol_clone, m_veto
+                                );
+                            }
                             let is_eligible = !candle_feed_degraded
                                 && !is_candle_gap
                                 && is_consolidation
@@ -3905,6 +3934,7 @@ async fn main() {
                                 && is_valid_half_life
                                 && !is_cb_paused
                                 && !is_cluster_blocked
+                                && macro_calendar_veto.is_none()
                                 && controller.current_mode == ControllerMode::MeanReversion;
 
                             if controller.current_mode != ControllerMode::MeanReversion {
@@ -3917,10 +3947,10 @@ async fn main() {
                                 funnel_counters.engine_a_stationarity_ineligible += 1;
                             }
 
-                            if armed_state.is_armed && (!consolidation_vol_ok || controller.current_mode != ControllerMode::MeanReversion) {
+                            if armed_state.is_armed && (!consolidation_vol_ok || controller.current_mode != ControllerMode::MeanReversion || macro_calendar_veto.is_some()) {
                                 println!(
-                                    "⏸️ [MEAN REVERSION VETO] Volatility breach or mode is {} (vol_ok: {}, Z15: {:.2}, Z60: {:.2}). Clearing armed state for {}.",
-                                    controller.current_mode, consolidation_vol_ok, z_15, z_60, symbol_clone
+                                    "⏸️ [MEAN REVERSION VETO] Volatility breach, macro shield, or mode is {} (vol_ok: {}, macro_shield: {}, Z15: {:.2}, Z60: {:.2}). Clearing armed state for {}.",
+                                    controller.current_mode, consolidation_vol_ok, macro_calendar_veto.is_some(), z_15, z_60, symbol_clone
                                 );
                                 armed_state.is_armed = false;
                                 save_armed_signal(&arm_path_clone, &armed_state);
