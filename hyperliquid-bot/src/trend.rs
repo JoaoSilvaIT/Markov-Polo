@@ -908,13 +908,14 @@ impl ChandelierExitState {
                     let ret_fav_pct = if self.entry_price > 0.0 { delta_fav / self.entry_price } else { 0.0 };
                     let eps = 1e-6;
 
-                    // 1. Breakeven Floor: once favorable progress >= 0.75 ATR or >= +45 bps (0.45%), stop moves to at least entry + 15 bps (bounded by 50% of delta_fav when ATR is tight)
-                    if delta_fav >= (0.75 * current_atr) - eps || ret_fav_pct >= 0.0045 {
+                    // 1. Breakeven Floor: once favorable progress >= 0.75 ATR or >= +45 bps (0.45%), AND at least +32 bps gross (to cover round-trip fees + breathing room),
+                    // stop moves to at least entry + 15 bps (bounded by 50% of delta_fav)
+                    if (delta_fav >= (0.75 * current_atr) - eps || ret_fav_pct >= 0.0045) && ret_fav_pct >= 0.0032 {
                         let be_stop = (self.entry_price * 1.0015).min(self.entry_price + 0.50 * delta_fav);
                         candidate_stop = f64::max(candidate_stop, be_stop);
                     }
-                    // 1b. Early Impulse Profit Lock: once favorable progress >= 1.0 ATR or >= +75 bps (0.75%), protect at least 45% of peak excursion
-                    if delta_fav >= (1.0 * current_atr) - eps || ret_fav_pct >= 0.0075 {
+                    // 1b. Early Impulse Profit Lock: once favorable progress >= 1.0 ATR or >= +75 bps (0.75%), AND at least +40 bps gross, protect at least 45% of peak excursion
+                    if (delta_fav >= (1.0 * current_atr) - eps || ret_fav_pct >= 0.0075) && ret_fav_pct >= 0.0040 {
                         candidate_stop = f64::max(candidate_stop, self.entry_price + 0.45 * delta_fav);
                     }
                     // 2. Tier 2 (+2% Gain Rule): once gain >= +2.0%, lock in at least +1.0% net profit
@@ -930,8 +931,8 @@ impl ChandelierExitState {
                         let locked_70 = self.entry_price + 0.70 * delta_fav;
                         candidate_stop = f64::max(candidate_stop, f64::max(self.entry_price * 1.0250, locked_70));
                     }
-                    // 5. ATR Giveback Floor: once progress >= 1.5 ATR, protect at least 50% of peak progress
-                    if delta_fav >= (1.5 * current_atr) - eps {
+                    // 5. ATR Giveback Floor: once progress >= 1.5 ATR AND at least +45 bps gross, protect at least 50% of peak progress
+                    if delta_fav >= (1.5 * current_atr) - eps && ret_fav_pct >= 0.0045 {
                         candidate_stop = f64::max(candidate_stop, self.entry_price + 0.5 * delta_fav);
                     }
                 }
@@ -950,13 +951,14 @@ impl ChandelierExitState {
                     let ret_fav_pct = if self.entry_price > 0.0 { delta_fav / self.entry_price } else { 0.0 };
                     let eps = 1e-6;
 
-                    // 1. Breakeven Floor: once favorable progress >= 0.75 ATR or >= +45 bps (0.45%), stop moves to at least entry - 15 bps (bounded by 50% of delta_fav when ATR is tight)
-                    if delta_fav >= (0.75 * current_atr) - eps || ret_fav_pct >= 0.0045 {
+                    // 1. Breakeven Floor: once favorable progress >= 0.75 ATR or >= +45 bps (0.45%), AND at least +32 bps gross (to cover round-trip fees + breathing room),
+                    // stop moves to at least entry - 15 bps (bounded by 50% of delta_fav)
+                    if (delta_fav >= (0.75 * current_atr) - eps || ret_fav_pct >= 0.0045) && ret_fav_pct >= 0.0032 {
                         let be_stop = (self.entry_price * 0.9985).max(self.entry_price - 0.50 * delta_fav);
                         candidate_stop = f64::min(candidate_stop, be_stop);
                     }
-                    // 1b. Early Impulse Profit Lock: once favorable progress >= 1.0 ATR or >= +75 bps (0.75%), protect at least 45% of peak excursion
-                    if delta_fav >= (1.0 * current_atr) - eps || ret_fav_pct >= 0.0075 {
+                    // 1b. Early Impulse Profit Lock: once favorable progress >= 1.0 ATR or >= +75 bps (0.75%), AND at least +40 bps gross, protect at least 45% of peak excursion
+                    if (delta_fav >= (1.0 * current_atr) - eps || ret_fav_pct >= 0.0075) && ret_fav_pct >= 0.0040 {
                         candidate_stop = f64::min(candidate_stop, self.entry_price - 0.45 * delta_fav);
                     }
                     // 2. Tier 2 (+2% Gain Rule): once gain >= +2.0%, lock in at least +1.0% net profit
@@ -972,8 +974,8 @@ impl ChandelierExitState {
                         let locked_70 = self.entry_price - 0.70 * delta_fav;
                         candidate_stop = f64::min(candidate_stop, f64::min(self.entry_price * 0.9750, locked_70));
                     }
-                    // 5. ATR Giveback Floor: once progress >= 1.5 ATR, protect at least 50% of peak progress
-                    if delta_fav >= (1.5 * current_atr) - eps {
+                    // 5. ATR Giveback Floor: once progress >= 1.5 ATR AND at least +45 bps gross, protect at least 50% of peak progress
+                    if delta_fav >= (1.5 * current_atr) - eps && ret_fav_pct >= 0.0045 {
                         candidate_stop = f64::min(candidate_stop, self.entry_price - 0.5 * delta_fav);
                     }
                 }

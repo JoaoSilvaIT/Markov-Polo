@@ -15,7 +15,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
-use crate::hyperliquid::effective_tick_size;
+use crate::controller::{ControllerMode, RegimeController};
+use crate::hmm::{compute_hmm_posteriors, train_hmm_offline, GaussianHMM};
+use crate::hyperliquid::{effective_tick_size, optimal_engine_b_tp_atr_multiple, quantize_price};
 use crate::ou_process::{
     asset_ou_config, calculate_directional_edge_bps, calculate_features_with_funding_at,
     calculate_mad_sigma, check_macro_calendar_veto, compute_safe_tp_offset_bps,
@@ -24,6 +26,10 @@ use crate::ou_process::{
 };
 use crate::state::{ClusterCircuitBreaker, Side, DEFAULT_MAX_DAILY_CLUSTER_DD_FRAC};
 use crate::telemetry::{evaluate_btc_impulse_veto, BtcImpulseSnapshot};
+use crate::trend::{
+    calculate_atr, calculate_donchian, check_trend_alignment, evaluate_pre_breakout_budget,
+    CandleBar, ChandelierExitState, MarketCrowdingTracker, TrendAlignment,
+};
 
 /// Single 1-minute historical market bar + L2 microstructure + derivatives context record
 /// persisted continuously to `hl_history_{symbol}.jsonl` on the NAS (~1 MB/day across 4 coins).
@@ -96,8 +102,10 @@ pub struct SimulatedExchangeConfig {
     pub maker_fee_bps: f64,
     pub taker_fee_bps: f64,
     pub stop_slippage_bps: f64,
-    /// Require price to trade strictly through the limit price by at least 1 tick (conservative queue model)
+    /// Require price to trade strictly through the limit price by at least `trade_through_ticks` ticks (conservative queue model)
     pub strict_trade_through_fills: bool,
+    /// Number of ticks price must trade through the limit price to fill when `strict_trade_through_fills` is true (default: 1.0)
+    pub trade_through_ticks: f64,
     /// Use adaptive intrabar ordering (if close >= open, visit low before high; else visit high before low)
     pub bar_adaptive_high_low_ordering: bool,
     pub notional_usdc: f64,
@@ -112,6 +120,7 @@ impl Default for SimulatedExchangeConfig {
             taker_fee_bps: 4.5,
             stop_slippage_bps: 2.5,
             strict_trade_through_fills: true,
+            trade_through_ticks: 1.0,
             bar_adaptive_high_low_ordering: true,
             notional_usdc: 60.0,
             account_equity_usdc: 142.50,
@@ -248,6 +257,8 @@ struct RestingMakerEntry {
     submitted_bar_idx: usize,
     ttl_bars: usize,
     policy: &'static str,
+    is_engine_b: bool,
+    entry_atr: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +282,9 @@ struct OpenSimulatedPosition {
     last_reprice_time_ms: u64,
     inv_mgr: TwoTierInvalidationManager,
     policy: &'static str,
+    is_engine_b: bool,
+    chandelier_opt: Option<ChandelierExitState>,
+    entry_atr: f64,
 }
 
 /// Runs a causal, discrete-event simulation of Engine A across a sequence of 1-minute `HistoricalMarketBarRecord`s
@@ -315,6 +329,83 @@ pub fn run_engine_a_backtest_with_btc(
     let warmup = 720usize.min(bars.len().saturating_sub(30));
     let mut closes_history: Vec<f64> = bars[..warmup].iter().map(|b| b.close).collect();
 
+    // Pre-aggregate 15m bars from warmup history for Dual-Engine (Engine B & HMM Controller)
+    let mut rolling_15m_bars: Vec<CandleBar> = Vec::with_capacity(120);
+    let mut current_15m_bar: Option<CandleBar> = None;
+    let mut all_15m_closes: Vec<f64> = Vec::with_capacity(1024);
+    for b in &bars[..warmup] {
+        let bucket_15m = (b.timestamp_ms / (15 * 60 * 1000)) * (15 * 60 * 1000);
+        let is_last_1m = b.timestamp_ms + 60_000 >= bucket_15m + 15 * 60 * 1000;
+        if let Some(mut cur) = current_15m_bar.take() {
+            if cur.time_open == bucket_15m {
+                cur.high = cur.high.max(b.high);
+                cur.low = cur.low.min(b.low);
+                cur.close = b.close;
+                cur.volume += b.volume;
+                if is_last_1m {
+                    all_15m_closes.push(cur.close);
+                    rolling_15m_bars.push(cur);
+                    if rolling_15m_bars.len() > 100 {
+                        rolling_15m_bars.remove(0);
+                    }
+                } else {
+                    current_15m_bar = Some(cur);
+                }
+            } else {
+                all_15m_closes.push(cur.close);
+                rolling_15m_bars.push(cur);
+                if rolling_15m_bars.len() > 100 {
+                    rolling_15m_bars.remove(0);
+                }
+                let nb = CandleBar {
+                    time_open: bucket_15m,
+                    open: b.open,
+                    high: b.high,
+                    low: b.low,
+                    close: b.close,
+                    volume: b.volume,
+                };
+                if is_last_1m {
+                    all_15m_closes.push(nb.close);
+                    rolling_15m_bars.push(nb);
+                    if rolling_15m_bars.len() > 100 {
+                        rolling_15m_bars.remove(0);
+                    }
+                } else {
+                    current_15m_bar = Some(nb);
+                }
+            }
+        } else {
+            let nb = CandleBar {
+                time_open: bucket_15m,
+                open: b.open,
+                high: b.high,
+                low: b.low,
+                close: b.close,
+                volume: b.volume,
+            };
+            if is_last_1m {
+                all_15m_closes.push(nb.close);
+                rolling_15m_bars.push(nb);
+                if rolling_15m_bars.len() > 100 {
+                    rolling_15m_bars.remove(0);
+                }
+            } else {
+                current_15m_bar = Some(nb);
+            }
+        }
+    }
+
+    let hmm_path = format!("hl_hmm_{}.json", symbol.to_uppercase());
+    let mut hmm_model = GaussianHMM::load_weights(&hmm_path).unwrap_or_else(|_| GaussianHMM::new(3, 4));
+    let mut controller = RegimeController::default();
+    let mut _current_p_c = 0.60;
+    let mut current_p_t = 0.25;
+    let mut current_p_s = 0.15;
+    let mut crowding_tracker = MarketCrowdingTracker::default();
+    let donchian_period = 12usize;
+    let chandelier_atr_mult = 2.0_f64;
+
     // Armed state
     let mut is_armed = false;
     let mut arm_side = Side::Long;
@@ -357,10 +448,78 @@ pub fn run_engine_a_backtest_with_btc(
         let bar = &bars[idx];
         let tick_sz = effective_tick_size(bar.close, sim_cfg.sz_decimals);
         let fill_pad = if sim_cfg.strict_trade_through_fills {
-            tick_sz
+            tick_sz * sim_cfg.trade_through_ticks.max(0.0)
         } else {
             0.0
         };
+
+        // Update 15m bar aggregation & crowding tracker
+        crowding_tracker.update(bar.funding_1h, bar.open_interest, bar.mark_px, bar.oracle_px);
+        let candle_bucket_15m = (bar.timestamp_ms / (15 * 60 * 1000)) * (15 * 60 * 1000);
+        let is_last_1m_of_15m = bar.timestamp_ms + 60_000 >= candle_bucket_15m + 15 * 60 * 1000;
+        let mut finalized_15m_bar: Option<CandleBar> = None;
+        if let Some(mut cur_15m) = current_15m_bar.take() {
+            if cur_15m.time_open == candle_bucket_15m {
+                cur_15m.high = cur_15m.high.max(bar.high);
+                cur_15m.low = cur_15m.low.min(bar.low);
+                cur_15m.close = bar.close;
+                cur_15m.volume += bar.volume;
+                if is_last_1m_of_15m {
+                    all_15m_closes.push(cur_15m.close);
+                    rolling_15m_bars.push(cur_15m.clone());
+                    if rolling_15m_bars.len() > 100 {
+                        rolling_15m_bars.remove(0);
+                    }
+                    finalized_15m_bar = Some(cur_15m);
+                } else {
+                    current_15m_bar = Some(cur_15m);
+                }
+            } else {
+                all_15m_closes.push(cur_15m.close);
+                rolling_15m_bars.push(cur_15m.clone());
+                if rolling_15m_bars.len() > 100 {
+                    rolling_15m_bars.remove(0);
+                }
+                finalized_15m_bar = Some(cur_15m);
+                let nb = CandleBar {
+                    time_open: candle_bucket_15m,
+                    open: bar.open,
+                    high: bar.high,
+                    low: bar.low,
+                    close: bar.close,
+                    volume: bar.volume,
+                };
+                if is_last_1m_of_15m {
+                    all_15m_closes.push(nb.close);
+                    rolling_15m_bars.push(nb.clone());
+                    if rolling_15m_bars.len() > 100 {
+                        rolling_15m_bars.remove(0);
+                    }
+                    finalized_15m_bar = Some(nb);
+                } else {
+                    current_15m_bar = Some(nb);
+                }
+            }
+        } else {
+            let nb = CandleBar {
+                time_open: candle_bucket_15m,
+                open: bar.open,
+                high: bar.high,
+                low: bar.low,
+                close: bar.close,
+                volume: bar.volume,
+            };
+            if is_last_1m_of_15m {
+                all_15m_closes.push(nb.close);
+                rolling_15m_bars.push(nb.clone());
+                if rolling_15m_bars.len() > 100 {
+                    rolling_15m_bars.remove(0);
+                }
+                finalized_15m_bar = Some(nb);
+            } else {
+                current_15m_bar = Some(nb);
+            }
+        }
 
         // ------------------------------------------------------------------
         // 1. MATCHING ENGINE: Process Resting Post-Only (Alo) Entry Order
@@ -376,6 +535,19 @@ pub fn run_engine_a_backtest_with_btc(
                 summary.orders_filled += 1;
                 let entry_notional = entry_ord.qty * entry_ord.limit_px;
                 let entry_fee = entry_notional * (sim_cfg.maker_fee_bps * 1e-4);
+                let chandelier_opt = if entry_ord.is_engine_b {
+                    Some(ChandelierExitState {
+                        side: entry_ord.side.clone(),
+                        entry_price: entry_ord.limit_px,
+                        extreme_favorable_price: entry_ord.limit_px,
+                        current_stop: entry_ord.hard_stop_px,
+                        initial_stop: entry_ord.hard_stop_px,
+                        base_multiplier: chandelier_atr_mult,
+                        active_multiplier: chandelier_atr_mult,
+                    })
+                } else {
+                    None
+                };
                 open_pos = Some(OpenSimulatedPosition {
                     side: entry_ord.side.clone(),
                     entry_px: entry_ord.limit_px,
@@ -403,6 +575,9 @@ pub fn run_engine_a_backtest_with_btc(
                         entry_ord.half_life_m,
                     ),
                     policy: entry_ord.policy,
+                    is_engine_b: entry_ord.is_engine_b,
+                    chandelier_opt,
+                    entry_atr: entry_ord.entry_atr,
                 });
             } else if age_bars >= entry_ord.ttl_bars {
                 summary.orders_expired_unfilled += 1;
@@ -415,7 +590,7 @@ pub fn run_engine_a_backtest_with_btc(
                         evaluate_btc_impulse_veto(
                             symbol,
                             entry_ord.side == Side::Long,
-                            false,
+                            entry_ord.is_engine_b,
                             &snap,
                         )
                     });
@@ -441,6 +616,56 @@ pub fn run_engine_a_backtest_with_btc(
             bar.funding_1h,
             Some(bar.timestamp_ms),
         );
+
+        // Update 3-Mode HMM & Regime Controller on 1m shocks and finalized 15m bar closes
+        if let Some(ref feat) = live_feat_opt {
+            let is_controller_shock_1m = feat.is_downside_shock
+                || (feat.is_upside_shock && (current_p_s >= 0.50 || feat.z_15.abs() >= 3.5));
+            if is_controller_shock_1m {
+                controller.force_shock_cooldown(feat.z_15, feat.z_60, bar.timestamp_ms);
+            }
+            if let Some(ref closed_15m) = finalized_15m_bar {
+                if all_15m_closes.len() >= 140 && all_15m_closes.len() % 96 == 0 {
+                    let window_start = all_15m_closes.len().saturating_sub(1000);
+                    if let Some(new_hmm) = train_hmm_offline(&all_15m_closes[window_start..]) {
+                        hmm_model = new_hmm;
+                        controller.notify_model_hotswap();
+                    }
+                }
+                let closes_15m: Vec<f64> = rolling_15m_bars.iter().map(|b| b.close).collect();
+                let (p_c, p_t, p_s) = if closes_15m.len() >= 15 {
+                    compute_hmm_posteriors(&hmm_model, &closes_15m).unwrap_or((0.60, 0.25, 0.15))
+                } else {
+                    (0.60, 0.25, 0.15)
+                };
+                _current_p_c = p_c;
+                current_p_t = p_t;
+                current_p_s = p_s;
+
+                let prior_bars = if rolling_15m_bars.len() > 1 {
+                    &rolling_15m_bars[..rolling_15m_bars.len() - 1]
+                } else {
+                    &rolling_15m_bars[..]
+                };
+                let has_donchian_breakout = calculate_donchian(prior_bars, donchian_period)
+                    .map(|d| closed_15m.close > d.upper || closed_15m.close < d.lower)
+                    .unwrap_or(false);
+                let is_severe_shock_15m = feat.is_downside_shock
+                    || (feat.is_upside_shock && (p_t < 0.82 || p_s >= 0.50));
+                let _ = controller.evaluate_15m_bar_idempotent(
+                    closed_15m.time_open + 15 * 60 * 1000,
+                    bar.timestamp_ms,
+                    p_c,
+                    p_t,
+                    feat.z_15,
+                    feat.z_60,
+                    has_donchian_breakout,
+                    feat.is_stationary,
+                    feat.is_valid_half_life,
+                    is_severe_shock_15m,
+                );
+            }
+        }
 
         if let Some(mut pos) = open_pos.take() {
             // Update MFE / MAE
@@ -490,177 +715,264 @@ pub fn run_engine_a_backtest_with_btc(
             };
 
             let mut closed_outcome: Option<(f64, bool, &'static str)> = None;
-            if tp_hit && hard_sl_hit {
-                if check_tp_first {
-                    closed_outcome = Some((pos.tp_limit_px, true, "MAKER_TP"));
+            let elapsed_mins_1m = bar.timestamp_ms.saturating_sub(pos.entry_time_ms) as f64 / 60_000.0;
+
+            if pos.is_engine_b {
+                let current_atr = calculate_atr(&rolling_15m_bars, 20).unwrap_or(pos.entry_atr);
+                let mut chandelier_hit = false;
+                if let Some(ref mut chand) = pos.chandelier_opt {
+                    let prev_stop = chand.current_stop;
+                    let new_stop = chand.update_with_ratchet_and_cap(
+                        bar.high,
+                        bar.low,
+                        current_atr,
+                        current_p_t,
+                        Some(0.5 / 15.0),
+                        true,
+                    );
+                    pos.hard_stop_px = new_stop;
+                    if chand.is_bar_stopped_out(prev_stop, bar.high, bar.low, bar.close) {
+                        chandelier_hit = true;
+                    }
+                }
+
+                let is_profit_locked_stop = match pos.side {
+                    Side::Long => pos.hard_stop_px > pos.entry_px,
+                    Side::Short => pos.hard_stop_px > 0.0 && pos.hard_stop_px < pos.entry_px,
+                };
+                let stop_label = if is_profit_locked_stop {
+                    "CHANDELIER_PROFIT_LOCK"
                 } else {
+                    "CHANDELIER_STOP"
+                };
+
+                if tp_hit && chandelier_hit {
+                    if check_tp_first {
+                        closed_outcome = Some((pos.tp_limit_px, true, "MAKER_TP"));
+                    } else {
+                        let slip = match pos.side {
+                            Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
+                            Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
+                        };
+                        closed_outcome = Some((pos.hard_stop_px * slip, false, stop_label));
+                        controller.notify_trend_stopped_out();
+                    }
+                } else if chandelier_hit {
+                    let slip = match pos.side {
+                        Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
+                        Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
+                    };
+                    closed_outcome = Some((pos.hard_stop_px * slip, false, stop_label));
+                    controller.notify_trend_stopped_out();
+                } else if tp_hit {
+                    closed_outcome = Some((pos.tp_limit_px, true, "MAKER_TP"));
+                }
+
+                if closed_outcome.is_none() {
+                    let d_0 = match pos.side {
+                        Side::Long => pos.initial_tp_px - pos.entry_px,
+                        Side::Short => pos.entry_px - pos.initial_tp_px,
+                    };
+                    if d_0 > 0.0 {
+                        let q_t = match pos.side {
+                            Side::Long => (bar.close - pos.entry_px) / d_0,
+                            Side::Short => (pos.entry_px - bar.close) / d_0,
+                        };
+                        if q_t > pos.max_progress {
+                            pos.max_progress = q_t;
+                        }
+                        if (pos.max_progress >= 0.75 && q_t <= (pos.max_progress - 0.20).max(0.15))
+                            || (elapsed_mins_1m >= 45.0
+                                && pos.max_progress >= 0.30
+                                && q_t <= (pos.max_progress - 0.15).max(0.08))
+                        {
+                            let slip = match pos.side {
+                                Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
+                                Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
+                            };
+                            closed_outcome = Some((bar.close * slip, false, "GIVEBACK_RATCHET"));
+                        }
+                    }
+                }
+                if closed_outcome.is_none() && elapsed_mins_1m >= 75.0 {
+                    let slip = match pos.side {
+                        Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
+                        Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
+                    };
+                    closed_outcome = Some((bar.close * slip, false, "TIME_DECAY_STOP"));
+                }
+            } else {
+                if tp_hit && hard_sl_hit {
+                    if check_tp_first {
+                        closed_outcome = Some((pos.tp_limit_px, true, "MAKER_TP"));
+                    } else {
+                        let slip = match pos.side {
+                            Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
+                            Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
+                        };
+                        closed_outcome = Some((pos.hard_stop_px * slip, false, "DISASTER_STOP"));
+                    }
+                } else if hard_sl_hit {
                     let slip = match pos.side {
                         Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
                         Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
                     };
                     closed_outcome = Some((pos.hard_stop_px * slip, false, "DISASTER_STOP"));
+                } else if tp_hit {
+                    closed_outcome = Some((pos.tp_limit_px, true, "MAKER_TP"));
                 }
-            } else if hard_sl_hit {
-                let slip = match pos.side {
-                    Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
-                    Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
-                };
-                closed_outcome = Some((pos.hard_stop_px * slip, false, "DISASTER_STOP"));
-            } else if tp_hit {
-                closed_outcome = Some((pos.tp_limit_px, true, "MAKER_TP"));
-            }
 
-            // Evaluate 1m Time-Decay Max Hold Stop (matches `src/main.rs` 1m check)
-            let elapsed_mins_1m = bar.timestamp_ms.saturating_sub(pos.entry_time_ms) as f64 / 60_000.0;
-            let max_hold_1m = (3.5 * pos.inv_mgr.half_life_minutes).clamp(90.0, 360.0);
-            if closed_outcome.is_none() && elapsed_mins_1m >= max_hold_1m {
-                let slip = match pos.side {
-                    Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
-                    Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
-                };
-                closed_outcome = Some((bar.close * slip, false, "TIME_DECAY_STOP"));
-            }
-
-            // Evaluate 5m Two-Tier Soft Structural Invalidation on completed 5-minute bars
-            if closed_outcome.is_none() && (bar.timestamp_ms / 60_000) % 5 == 4 {
-                if let Some(ref feat) = live_feat_opt {
-                    let raw_frozen_z_ou = if pos.frozen_center_px > 0.0 && pos.frozen_sigma_eq_log > 1e-6 {
-                        (bar.close / pos.frozen_center_px).ln() / pos.frozen_sigma_eq_log
-                    } else {
-                        feat.z_ou
+                // Evaluate 1m Time-Decay Max Hold Stop (matches `src/main.rs` 1m check)
+                let max_hold_1m = (3.5 * pos.inv_mgr.half_life_minutes).clamp(90.0, 360.0);
+                if closed_outcome.is_none() && elapsed_mins_1m >= max_hold_1m {
+                    let slip = match pos.side {
+                        Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
+                        Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
                     };
-                    let adverse_bps_from_entry = match pos.side {
-                        Side::Long => ((pos.entry_px - bar.close) / pos.entry_px * 1e4).max(0.0),
-                        Side::Short => ((bar.close - pos.entry_px) / pos.entry_px * 1e4).max(0.0),
-                    };
-                    let min_soft_inv_excursion_bps = match symbol.to_uppercase().as_str() {
-                        "BTC" => 45.0,
-                        "ETH" => 50.0,
-                        "SOL" => 60.0,
-                        "AVAX" => 62.0,
-                        _ => 50.0,
-                    };
-                    let (frozen_z_ou, eff_z_15) = if adverse_bps_from_entry >= min_soft_inv_excursion_bps {
-                        (raw_frozen_z_ou, feat.z_15)
-                    } else {
-                        (0.0, 0.0)
-                    };
-                    let kalman_against = match pos.side {
-                        Side::Long => (feat.kalman_drift_veto && feat.kalman_slope < 0.0) || feat.cusum_neg >= 8.0 || adverse_bps_from_entry >= min_soft_inv_excursion_bps,
-                        Side::Short => (feat.kalman_drift_veto && feat.kalman_slope > 0.0) || feat.cusum_pos >= 8.0 || adverse_bps_from_entry >= min_soft_inv_excursion_bps,
-                    };
-                    let elapsed_mins = bar.timestamp_ms.saturating_sub(pos.entry_time_ms) as f64 / 60_000.0;
-                    pos.inv_mgr.elapsed_minutes = (elapsed_mins - 5.0).max(0.0);
-                    match pos.inv_mgr.on_5m_bar_close(
-                        frozen_z_ou,
-                        eff_z_15,
-                        kalman_against,
-                        sim_cfg.maker_fee_bps,
-                        tick_sz,
-                    ) {
-                        InvalidationDecision::TriggerSoftInvalidationFlatten { reason } => {
-                            let slip = match pos.side {
-                                Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
-                                Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
-                            };
-                            closed_outcome = Some((bar.close * slip, false, reason));
-                        }
-                        InvalidationDecision::TriggerTimeDecayExit => {
-                            let slip = match pos.side {
-                                Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
-                                Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
-                            };
-                            closed_outcome = Some((bar.close * slip, false, "TIME_DECAY_STOP"));
-                        }
-                        InvalidationDecision::HoldPosition {
-                            updated_tp_price: Some(be_px),
-                        } => {
-                            match pos.side {
-                                Side::Long if be_px < pos.tp_limit_px && be_px > bar.close => {
-                                    pos.tp_limit_px = be_px;
-                                }
-                                Side::Short if be_px > pos.tp_limit_px && be_px < bar.close => {
-                                    pos.tp_limit_px = be_px;
-                                }
-                                _ => {}
-                            }
-                        }
-                        InvalidationDecision::HoldPosition {
-                            updated_tp_price: None,
-                        } => {}
-                    }
+                    closed_outcome = Some((bar.close * slip, false, "TIME_DECAY_STOP"));
                 }
-            }
 
-            // Normalized Progress & 20% Giveback Ratchet + One-Way Adaptive Ratchet (`OU Exit Management and Maker Execution Review.md`)
-            if closed_outcome.is_none() {
-                let d_0 = match pos.side {
-                    Side::Long => pos.initial_tp_px - pos.entry_px,
-                    Side::Short => pos.entry_px - pos.initial_tp_px,
-                };
-                if d_0 > 0.0 {
-                    let q_t = match pos.side {
-                        Side::Long => (bar.close - pos.entry_px) / d_0,
-                        Side::Short => (pos.entry_px - bar.close) / d_0,
-                    };
-                    if q_t > pos.max_progress {
-                        pos.max_progress = q_t;
-                    }
-                    let fav_close_bps = match pos.side {
-                        Side::Long => ((bar.close - pos.entry_px) / pos.entry_px * 1e4).max(0.0),
-                        Side::Short => ((pos.entry_px - bar.close) / pos.entry_px * 1e4).max(0.0),
-                    };
-                    let abs_arm_bps = 1.8 * ou_cfg.min_net_edge_bps;
-                    let arm_q_thresh = (abs_arm_bps / (d_0 / pos.entry_px * 1e4).max(1e-6)).min(0.75);
-                    let _ = fav_close_bps;
-                    if pos.max_progress >= arm_q_thresh && q_t <= (pos.max_progress - 0.20).max(0.15) {
-                        let slip = match pos.side {
-                            Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
-                            Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
+                // Evaluate 5m Two-Tier Soft Structural Invalidation on completed 5-minute bars
+                if closed_outcome.is_none() && (bar.timestamp_ms / 60_000) % 5 == 4 {
+                    if let Some(ref feat) = live_feat_opt {
+                        let raw_frozen_z_ou = if pos.frozen_center_px > 0.0 && pos.frozen_sigma_eq_log > 1e-6 {
+                            (bar.close / pos.frozen_center_px).ln() / pos.frozen_sigma_eq_log
+                        } else {
+                            feat.z_ou
                         };
-                        closed_outcome = Some((bar.close * slip, false, "GIVEBACK_RATCHET"));
-                    } else if let Some(ref feat) = live_feat_opt {
-                        if let Some(ref th) = feat.thresholds_opt {
-                            let entry_tick = effective_tick_size(pos.entry_px, sim_cfg.sz_decimals);
-                            let delta_reprice = (pos.entry_px * 0.0005)
-                                .max(0.10 * d_0)
-                                .max(3.0 * entry_tick);
-                            let cooldown_ok = bar.timestamp_ms.saturating_sub(pos.last_reprice_time_ms) >= 180_000;
-                            match pos.side {
-                                Side::Long => {
-                                    let live_mu = th.exit_long;
-                                    let mu_tick = effective_tick_size(live_mu, sim_cfg.sz_decimals);
-                                    let eps_shave = (live_mu * 0.0005).max(2.0 * mu_tick);
-                                    let b_cand = crate::hyperliquid::quantize_price(live_mu - eps_shave, sim_cfg.sz_decimals);
-                                    let p_min = pos.entry_px * 1.0020;
-                                    if b_cand <= pos.tp_limit_px - delta_reprice && b_cand >= p_min && b_cand > bar.close {
-                                        pos.candidate_lower_count += 1;
-                                        if pos.candidate_lower_count >= 3 && cooldown_ok && pos.reprice_count < 3 {
-                                            pos.tp_limit_px = b_cand;
-                                            pos.last_reprice_time_ms = bar.timestamp_ms;
-                                            pos.reprice_count += 1;
-                                            pos.candidate_lower_count = 0;
-                                        }
-                                    } else if b_cand > pos.tp_limit_px {
-                                        pos.candidate_lower_count = 0;
+                        let adverse_bps_from_entry = match pos.side {
+                            Side::Long => ((pos.entry_px - bar.close) / pos.entry_px * 1e4).max(0.0),
+                            Side::Short => ((bar.close - pos.entry_px) / pos.entry_px * 1e4).max(0.0),
+                        };
+                        let min_soft_inv_excursion_bps = match symbol.to_uppercase().as_str() {
+                            "BTC" => 45.0,
+                            "ETH" => 50.0,
+                            "SOL" => 60.0,
+                            "AVAX" => 62.0,
+                            _ => 50.0,
+                        };
+                        let (frozen_z_ou, eff_z_15) = if adverse_bps_from_entry >= min_soft_inv_excursion_bps {
+                            (raw_frozen_z_ou, feat.z_15)
+                        } else {
+                            (0.0, 0.0)
+                        };
+                        let kalman_against = match pos.side {
+                            Side::Long => (feat.kalman_drift_veto && feat.kalman_slope < 0.0) || feat.cusum_neg >= 8.0 || adverse_bps_from_entry >= min_soft_inv_excursion_bps,
+                            Side::Short => (feat.kalman_drift_veto && feat.kalman_slope > 0.0) || feat.cusum_pos >= 8.0 || adverse_bps_from_entry >= min_soft_inv_excursion_bps,
+                        };
+                        let elapsed_mins = bar.timestamp_ms.saturating_sub(pos.entry_time_ms) as f64 / 60_000.0;
+                        pos.inv_mgr.elapsed_minutes = (elapsed_mins - 5.0).max(0.0);
+                        match pos.inv_mgr.on_5m_bar_close(
+                            frozen_z_ou,
+                            eff_z_15,
+                            kalman_against,
+                            sim_cfg.maker_fee_bps,
+                            tick_sz,
+                        ) {
+                            InvalidationDecision::TriggerSoftInvalidationFlatten { reason } => {
+                                let slip = match pos.side {
+                                    Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
+                                    Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
+                                };
+                                closed_outcome = Some((bar.close * slip, false, reason));
+                            }
+                            InvalidationDecision::TriggerTimeDecayExit => {
+                                let slip = match pos.side {
+                                    Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
+                                    Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
+                                };
+                                closed_outcome = Some((bar.close * slip, false, "TIME_DECAY_STOP"));
+                            }
+                            InvalidationDecision::HoldPosition {
+                                updated_tp_price: Some(be_px),
+                            } => {
+                                match pos.side {
+                                    Side::Long if be_px < pos.tp_limit_px && be_px > bar.close => {
+                                        pos.tp_limit_px = be_px;
                                     }
+                                    Side::Short if be_px > pos.tp_limit_px && be_px < bar.close => {
+                                        pos.tp_limit_px = be_px;
+                                    }
+                                    _ => {}
                                 }
-                                Side::Short => {
-                                    let live_mu = th.exit_short;
-                                    let mu_tick = effective_tick_size(live_mu, sim_cfg.sz_decimals);
-                                    let eps_shave = (live_mu * 0.0005).max(2.0 * mu_tick);
-                                    let b_cand = crate::hyperliquid::quantize_price(live_mu + eps_shave, sim_cfg.sz_decimals);
-                                    let p_max = pos.entry_px * 0.9980;
-                                    if b_cand >= pos.tp_limit_px + delta_reprice && b_cand <= p_max && b_cand < bar.close {
-                                        pos.candidate_lower_count += 1;
-                                        if pos.candidate_lower_count >= 3 && cooldown_ok && pos.reprice_count < 3 {
-                                            pos.tp_limit_px = b_cand;
-                                            pos.last_reprice_time_ms = bar.timestamp_ms;
-                                            pos.reprice_count += 1;
+                            }
+                            InvalidationDecision::HoldPosition {
+                                updated_tp_price: None,
+                            } => {}
+                        }
+                    }
+                }
+
+                // Normalized Progress & 20% Giveback Ratchet + One-Way Adaptive Ratchet (`OU Exit Management and Maker Execution Review.md`)
+                if closed_outcome.is_none() {
+                    let d_0 = match pos.side {
+                        Side::Long => pos.initial_tp_px - pos.entry_px,
+                        Side::Short => pos.entry_px - pos.initial_tp_px,
+                    };
+                    if d_0 > 0.0 {
+                        let q_t = match pos.side {
+                            Side::Long => (bar.close - pos.entry_px) / d_0,
+                            Side::Short => (pos.entry_px - bar.close) / d_0,
+                        };
+                        if q_t > pos.max_progress {
+                            pos.max_progress = q_t;
+                        }
+                        let fav_close_bps = match pos.side {
+                            Side::Long => ((bar.close - pos.entry_px) / pos.entry_px * 1e4).max(0.0),
+                            Side::Short => ((pos.entry_px - bar.close) / pos.entry_px * 1e4).max(0.0),
+                        };
+                        let abs_arm_bps = 1.8 * ou_cfg.min_net_edge_bps;
+                        let arm_q_thresh = (abs_arm_bps / (d_0 / pos.entry_px * 1e4).max(1e-6)).min(0.75);
+                        let _ = fav_close_bps;
+                        if pos.max_progress >= arm_q_thresh && q_t <= (pos.max_progress - 0.20).max(0.15) {
+                            let slip = match pos.side {
+                                Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
+                                Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
+                            };
+                            closed_outcome = Some((bar.close * slip, false, "GIVEBACK_RATCHET"));
+                        } else if let Some(ref feat) = live_feat_opt {
+                            if let Some(ref th) = feat.thresholds_opt {
+                                let entry_tick = effective_tick_size(pos.entry_px, sim_cfg.sz_decimals);
+                                let delta_reprice = (pos.entry_px * 0.0005)
+                                    .max(0.10 * d_0)
+                                    .max(3.0 * entry_tick);
+                                let cooldown_ok = bar.timestamp_ms.saturating_sub(pos.last_reprice_time_ms) >= 180_000;
+                                match pos.side {
+                                    Side::Long => {
+                                        let live_mu = th.exit_long;
+                                        let mu_tick = effective_tick_size(live_mu, sim_cfg.sz_decimals);
+                                        let eps_shave = (live_mu * 0.0005).max(2.0 * mu_tick);
+                                        let b_cand = crate::hyperliquid::quantize_price(live_mu - eps_shave, sim_cfg.sz_decimals);
+                                        let p_min = pos.entry_px * 1.0020;
+                                        if b_cand <= pos.tp_limit_px - delta_reprice && b_cand >= p_min && b_cand > bar.close {
+                                            pos.candidate_lower_count += 1;
+                                            if pos.candidate_lower_count >= 3 && cooldown_ok && pos.reprice_count < 3 {
+                                                pos.tp_limit_px = b_cand;
+                                                pos.last_reprice_time_ms = bar.timestamp_ms;
+                                                pos.reprice_count += 1;
+                                                pos.candidate_lower_count = 0;
+                                            }
+                                        } else if b_cand > pos.tp_limit_px {
                                             pos.candidate_lower_count = 0;
                                         }
-                                    } else if b_cand < pos.tp_limit_px {
-                                        pos.candidate_lower_count = 0;
+                                    }
+                                    Side::Short => {
+                                        let live_mu = th.exit_short;
+                                        let mu_tick = effective_tick_size(live_mu, sim_cfg.sz_decimals);
+                                        let eps_shave = (live_mu * 0.0005).max(2.0 * mu_tick);
+                                        let b_cand = crate::hyperliquid::quantize_price(live_mu + eps_shave, sim_cfg.sz_decimals);
+                                        let p_max = pos.entry_px * 0.9980;
+                                        if b_cand >= pos.tp_limit_px + delta_reprice && b_cand <= p_max && b_cand < bar.close {
+                                            pos.candidate_lower_count += 1;
+                                            if pos.candidate_lower_count >= 3 && cooldown_ok && pos.reprice_count < 3 {
+                                                pos.tp_limit_px = b_cand;
+                                                pos.last_reprice_time_ms = bar.timestamp_ms;
+                                                pos.reprice_count += 1;
+                                                pos.candidate_lower_count = 0;
+                                            }
+                                        } else if b_cand < pos.tp_limit_px {
+                                            pos.candidate_lower_count = 0;
+                                        }
                                     }
                                 }
                             }
@@ -739,10 +1051,152 @@ pub fn run_engine_a_backtest_with_btc(
         }
 
         // ------------------------------------------------------------------
-        // 3. STRATEGY ENGINE A: Evaluate 5m O-U Arming & 1m Multi-Bar Reversal Confirmation
+        // 3. DUAL-ENGINE EVALUATION: Engine B (15m Donchian Trend) & Engine A (5m O-U Mean Reversion)
         // ------------------------------------------------------------------
         if open_pos.is_none() && resting_entry.is_none() {
             if let Some(ref feat) = live_feat_opt {
+                let macro_veto = check_macro_calendar_veto(bar.timestamp_ms);
+                let cb_veto = cluster_cb.evaluate_equity_drawdown(
+                    bar.timestamp_ms,
+                    sim_cfg.account_equity_usdc + cumulative_pnl_usd,
+                    DEFAULT_MAX_DAILY_CLUSTER_DD_FRAC,
+                );
+
+                // 3A. ENGINE B: Evaluate on completed 15m candle close when Controller is in Trend mode
+                if !is_armed && controller.current_mode == ControllerMode::Trend {
+                    if let Some(ref closed_15m) = finalized_15m_bar {
+                        let prior_15m = if rolling_15m_bars.len() > 1 {
+                            &rolling_15m_bars[..rolling_15m_bars.len() - 1]
+                        } else {
+                            &rolling_15m_bars[..]
+                        };
+                        if let Some(ref donchian) = calculate_donchian(prior_15m, donchian_period) {
+                            let closes_15m: Vec<f64> = rolling_15m_bars.iter().map(|b| b.close).collect();
+                            let alignment = check_trend_alignment(&closes_15m);
+                            let rng_15m = (closed_15m.high - closed_15m.low).max(1e-9);
+                            let is_15m_bull_close =
+                                closed_15m.close > closed_15m.open && (closed_15m.close - closed_15m.low) / rng_15m >= 0.65;
+                            let is_15m_bear_close =
+                                closed_15m.close < closed_15m.open && (closed_15m.high - closed_15m.close) / rng_15m >= 0.65;
+                            let is_long_breakout = is_15m_bull_close
+                                && !feat.is_upside_shock
+                                && feat.z_60 < 2.5
+                                && feat.z_15 < 3.0
+                                && bar.close > donchian.upper
+                                && bar.close >= bar.open
+                                && alignment == TrendAlignment::Bullish;
+                            let is_short_breakout = is_15m_bear_close
+                                && !feat.is_downside_shock
+                                && feat.z_60 > -2.5
+                                && feat.z_15 > -3.0
+                                && bar.close < donchian.lower
+                                && bar.close <= bar.open
+                                && alignment == TrendAlignment::Bearish;
+
+                            if is_long_breakout || is_short_breakout {
+                                if macro_veto.is_some() {
+                                    summary.macro_calendar_vetoes += 1;
+                                } else if cb_veto.is_some() {
+                                    summary.cluster_cb_vetoes += 1;
+                                } else if let Some(current_atr) = calculate_atr(&rolling_15m_bars, 20).filter(|&a| a > 0.0) {
+                                    let side = if is_long_breakout { Side::Long } else { Side::Short };
+                                    let is_long = side == Side::Long;
+                                    let obi_ok = if is_long {
+                                        bar.obi_instant >= -0.18 && bar.obi_1s >= -0.15 && bar.obi_5s >= -0.12
+                                    } else {
+                                        bar.obi_instant <= 0.18 && bar.obi_1s <= 0.15 && bar.obi_5s <= 0.12
+                                    };
+                                    let btc_veto = eff_btc_bars
+                                        .and_then(|bb| build_historical_btc_impulse_snapshot(bb, bar.timestamp_ms))
+                                        .and_then(|snap| evaluate_btc_impulse_veto(symbol, is_long, true, &snap));
+                                    let crowding_mult = crowding_tracker.directional_trend_multiplier(&side);
+                                    let budget_verdict = evaluate_pre_breakout_budget(
+                                        symbol,
+                                        &rolling_15m_bars,
+                                        donchian,
+                                        current_atr,
+                                        bar.close,
+                                        feat.z_60,
+                                        &side,
+                                    );
+                                    if btc_veto.is_some() {
+                                        summary.btc_impulse_vetoes += 1;
+                                    } else if obi_ok && crowding_mult >= 0.45 && budget_verdict.approved {
+                                        let eff_bid = if bar.best_bid > 0.0 { bar.best_bid } else { bar.close - 0.5 * tick_sz };
+                                        let eff_ask = if bar.best_ask > eff_bid { bar.best_ask } else { bar.close + 0.5 * tick_sz };
+                                        let spread = eff_ask - eff_bid;
+                                        let raw_limit = if is_long {
+                                            if spread >= 2.0 * tick_sz - 1e-9 && eff_bid + tick_sz < eff_ask - 1e-9 {
+                                                eff_bid + tick_sz
+                                            } else {
+                                                eff_bid
+                                            }
+                                        } else if spread >= 2.0 * tick_sz - 1e-9 && eff_ask - tick_sz > eff_bid + 1e-9 {
+                                            eff_ask - tick_sz
+                                        } else {
+                                            eff_ask
+                                        };
+                                        let limit_px = quantize_price(raw_limit, sim_cfg.sz_decimals);
+                                        let initial_sl = quantize_price(
+                                            if is_long {
+                                                limit_px - chandelier_atr_mult * current_atr
+                                            } else {
+                                                limit_px + chandelier_atr_mult * current_atr
+                                            },
+                                            sim_cfg.sz_decimals,
+                                        );
+                                        let k_tp = optimal_engine_b_tp_atr_multiple(symbol);
+                                        let tp_dist = (k_tp * current_atr).max(limit_px * 0.0045);
+                                        let tp_px = quantize_price(
+                                            if is_long {
+                                                limit_px + tp_dist
+                                            } else {
+                                                (limit_px - tp_dist).max(tick_sz)
+                                            },
+                                            sim_cfg.sz_decimals,
+                                        );
+                                        let max_b_notional = ou_cfg.volatility_adjusted_trend_notional_cap(
+                                            sim_cfg.account_equity_usdc,
+                                            limit_px,
+                                            current_atr,
+                                        );
+                                        let notional = crate::hyperliquid::calculate_risk_scaled_notional(
+                                            sim_cfg.account_equity_usdc,
+                                            (sim_cfg.notional_usdc * crowding_mult).min(max_b_notional),
+                                            0.0060 * crowding_mult,
+                                            limit_px,
+                                            initial_sl,
+                                            3,
+                                            2,
+                                            11.0,
+                                            max_b_notional,
+                                        );
+                                        let qty = notional / limit_px.max(1e-9);
+                                        summary.signals_armed += 1;
+                                        summary.orders_submitted += 1;
+                                        resting_entry = Some(RestingMakerEntry {
+                                            side,
+                                            limit_px,
+                                            qty,
+                                            target_tp_px: tp_px,
+                                            hard_stop_px: initial_sl,
+                                            frozen_center_px: tp_px,
+                                            frozen_sigma_eq_log: feat.sigma_eq_log,
+                                            half_life_m: 45.0,
+                                            submitted_bar_idx: idx,
+                                            ttl_bars: 5,
+                                            policy: "ENGINE_B_TREND",
+                                            is_engine_b: true,
+                                            entry_atr: current_atr,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 3B. ENGINE A: Evaluate 5m O-U Arming & 1m Multi-Bar Reversal Confirmation
                 let consolidation_vol_ok = feat.z_15.abs() < 2.2 && feat.z_60.abs() < 2.5;
                 let n_hist = closes_history.len();
                 let ret_60 = if n_hist >= 60 && closes_history[n_hist - 60] > 0.0 {
@@ -794,13 +1248,10 @@ pub fn run_engine_a_backtest_with_btc(
                     && ret_240 < max_short_drift_240
                     && (ma60_vs_240 <= 0.0040 || (ret_720 < -0.0150 && ma60_vs_240 <= 0.0080));
 
-                let is_eligible = feat.is_consolidation && consolidation_vol_ok && feat.is_valid_half_life;
-                let macro_veto = check_macro_calendar_veto(bar.timestamp_ms);
-                let cb_veto = cluster_cb.evaluate_equity_drawdown(
-                    bar.timestamp_ms,
-                    sim_cfg.account_equity_usdc + cumulative_pnl_usd,
-                    DEFAULT_MAX_DAILY_CLUSTER_DD_FRAC,
-                );
+                let is_eligible = resting_entry.is_none()
+                    && feat.is_consolidation
+                    && consolidation_vol_ok
+                    && feat.is_valid_half_life;
 
                 if is_armed {
                     let shock_vetoed = match arm_side {
@@ -957,6 +1408,8 @@ pub fn run_engine_a_backtest_with_btc(
                                                 submitted_bar_idx: idx,
                                                 ttl_bars: entry_ttl_mins.round() as usize,
                                                 policy,
+                                                is_engine_b: false,
+                                                entry_atr: 0.0,
                                             });
                                         }
                                     }

@@ -14,6 +14,7 @@ pub mod counterfactual;
 mod discord;
 mod hmm;
 mod hyperliquid;
+pub mod monte_carlo;
 mod order;
 mod ou_process;
 mod state;
@@ -254,7 +255,9 @@ pub async fn execute_emergency_flatten_with_retry(
 #[tokio::main]
 async fn main() {
     let cli_args: Vec<String> = std::env::args().collect();
-    if cli_args.iter().any(|a| a == "--backtest") {
+    let run_bt = cli_args.iter().any(|a| a == "--backtest");
+    let run_mc = cli_args.iter().any(|a| a == "--monte-carlo");
+    if run_bt || run_mc {
         println!("🔬 [NAUTILUS-STYLE SIMULATED EXCHANGE BACKTESTER] Starting discrete-event replay...");
         let info = InfoClient::new(None, Some(BaseUrl::Mainnet))
             .await
@@ -269,6 +272,7 @@ async fn main() {
         let mut grand_net_bps = 0.0;
 
         let mut btc_bars_cache = crate::backtest::load_historical_bars("BTC");
+        let mut loaded_portfolio: Vec<(&'static str, Vec<crate::backtest::HistoricalMarketBarRecord>, u32)> = Vec::new();
 
         for &sym in &["BTC", "ETH", "SOL", "AVAX"] {
             let mut bars = crate::backtest::load_historical_bars(sym);
@@ -364,6 +368,7 @@ async fn main() {
                     dt_str, t.symbol, t.side, t.entry_policy, t.entry_px, t.exit_px, t.net_bps, t.net_pnl_usd, t.mfe_bps, t.mae_bps, t.exit_reason
                 );
             }
+            loaded_portfolio.push((sym, bars, sz_dec));
         }
         let total_tr = grand_wins + grand_losses;
         let wr = if total_tr > 0 {
@@ -375,6 +380,14 @@ async fn main() {
             "🏆 [PORTFOLIO BACKTEST TOTAL] Trades: {} ({}W / {}L, {:.1}% WR) | Total Net PnL: {:+.1} bps (${:+.2} USDC)",
             total_tr, grand_wins, grand_losses, wr, grand_net_bps, grand_net_usd
         );
+
+        if run_mc {
+            crate::monte_carlo::run_portfolio_monte_carlo_and_sensitivity(
+                &loaded_portfolio,
+                &btc_bars_cache,
+                1000,
+            );
+        }
         return;
     }
 
@@ -2796,20 +2809,18 @@ async fn main() {
                                 let closes_15m: Vec<f64> = rolling_15m_bars.iter().map(|b| b.close).collect();
                                 let alignment = check_trend_alignment(&closes_15m);
                                 let has_donchian_breakout_1m = close_price > donchian.upper || close_price < donchian.lower;
-                                let forming_15m_high = current_15m_bar
-                                    .as_ref()
-                                    .or(finalized_15m_bar.as_ref())
-                                    .map(|b| b.high)
-                                    .unwrap_or(high_price);
-                                let forming_15m_low = current_15m_bar
-                                    .as_ref()
-                                    .or(finalized_15m_bar.as_ref())
-                                    .map(|b| b.low)
-                                    .unwrap_or(low_price);
                                 // Engine B Execution: Strictly requires a completed 15-minute bar close (`finalized_15m_bar.is_some()`)
-                                // above/below the 12-bar 15m Donchian channel. Never enters on mid-bar 1m wicks!
-                                let is_15m_close_tick = finalized_15m_bar.is_some();
-                                let is_long_breakout = is_15m_close_tick
+                                // above/below the 12-bar 15m Donchian channel with a strong 15m candle close in the outer 35% of the 15m bar range.
+                                let (is_15m_bull_close, is_15m_bear_close) = if let Some(ref c15) = finalized_15m_bar {
+                                    let rng = (c15.high - c15.low).max(1e-9);
+                                    (
+                                        c15.close > c15.open && (c15.close - c15.low) / rng >= 0.65,
+                                        c15.close < c15.open && (c15.high - c15.close) / rng >= 0.65,
+                                    )
+                                } else {
+                                    (false, false)
+                                };
+                                let is_long_breakout = is_15m_bull_close
                                     && !candle_feed_degraded
                                     && !is_candle_gap
                                     && !is_upside_shock
@@ -2817,9 +2828,8 @@ async fn main() {
                                     && z_15 < 3.0
                                     && close_price > donchian.upper
                                     && close_price >= open_price
-                                    && close_price >= forming_15m_high * 0.9992
                                     && alignment == TrendAlignment::Bullish;
-                                let is_short_breakout = is_15m_close_tick
+                                let is_short_breakout = is_15m_bear_close
                                     && !candle_feed_degraded
                                     && !is_candle_gap
                                     && !is_downside_shock
@@ -2827,11 +2837,15 @@ async fn main() {
                                     && z_15 > -3.0
                                     && close_price < donchian.lower
                                     && close_price <= open_price
-                                    && close_price <= forming_15m_low * 1.0008
                                     && alignment == TrendAlignment::Bearish;
 
+                                let macro_veto_b = check_macro_calendar_veto(now_ms_cb);
                                 if (is_long_breakout || is_short_breakout) && is_cluster_blocked {
                                     println!("⏸️ [SHADOW-TREND VETO] Active cluster lease in place. Vetoing Engine B entry to prevent cross-engine conflict.");
+                                } else if (is_long_breakout || is_short_breakout) && is_cb_paused {
+                                    println!("🚨 [ENGINE B CIRCUIT BREAKER VETO] {} breakout vetoed: Symbol or Cluster Daily Drawdown Circuit Breaker active.", symbol_clone);
+                                } else if (is_long_breakout || is_short_breakout) && macro_veto_b.is_some() {
+                                    println!("🛡️ [MACRO CALENDAR SHIELD] {} Engine B breakout gated during scheduled release window: {}", symbol_clone, macro_veto_b.unwrap_or_default());
                                 } else if is_long_breakout || is_short_breakout {
                                         let side = if is_long_breakout { Side::Long } else { Side::Short };
                                         let atr_opt = calculate_atr(&rolling_15m_bars, 20);
