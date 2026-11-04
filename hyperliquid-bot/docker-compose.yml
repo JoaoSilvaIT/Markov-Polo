@@ -80,6 +80,7 @@ services:
   hl_dashboard:
     image: python:3.11-alpine
     container_name: hl_dashboard
+    profiles: ["dashboard", "all"]
     init: true
     restart: unless-stopped
     read_only: true
