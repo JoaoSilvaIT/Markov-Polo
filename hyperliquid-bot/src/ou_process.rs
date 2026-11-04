@@ -1066,7 +1066,7 @@ impl TwoTierInvalidationManager {
         }
 
         let mut updated_tp_price = None;
-        let breakeven_ratchet_mins = (2.4 * self.half_life_minutes).clamp(75.0, 240.0);
+        let breakeven_ratchet_mins = (1.6 * self.half_life_minutes).clamp(45.0, 180.0);
         if !self.breakeven_ratchet_armed && self.elapsed_minutes >= breakeven_ratchet_mins {
             self.breakeven_ratchet_armed = true;
             let min_harvest_margin = (2.0 * maker_fee_bps + 12.0) * 1e-4;

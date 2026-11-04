@@ -336,20 +336,20 @@ pub fn run_engine_a_backtest_with_btc(
     let mut gross_losses_usd = 0.0;
     let mut cluster_cb = ClusterCircuitBreaker::default();
 
-    let (max_drift_120, max_slow_drift_180, max_slow_drift_240) =
+    let (max_drift_60, max_drift_120, max_slow_drift_180, max_slow_drift_240) =
         match symbol.to_uppercase().as_str() {
-            "BTC" => (0.0025, 0.0025, 0.0030),
-            "ETH" => (0.0030, 0.0030, 0.0035),
-            "SOL" => (0.0045, 0.0045, 0.0055),
-            "AVAX" => (0.0050, 0.0060, 0.0075),
-            _ => (0.0030, 0.0030, 0.0035),
+            "BTC" => (0.0035, 0.0025, 0.0025, 0.0030),
+            "ETH" => (0.0045, 0.0030, 0.0030, 0.0035),
+            "SOL" => (0.0052, 0.0045, 0.0045, 0.0055),
+            "AVAX" => (0.0065, 0.0050, 0.0060, 0.0075),
+            _ => (0.0045, 0.0030, 0.0030, 0.0035),
         };
-    let max_short_drift_240 = match symbol.to_uppercase().as_str() {
-        "BTC" => 0.0065,
-        "ETH" => 0.0080,
-        "SOL" => 0.0100,
-        "AVAX" => 0.0140,
-        _ => 0.0080,
+    let (max_short_drift_120, max_short_drift_240) = match symbol.to_uppercase().as_str() {
+        "BTC" => (0.0075, 0.0065),
+        "ETH" => (0.0100, 0.0080),
+        "SOL" => (0.0135, 0.0100),
+        "AVAX" => (0.0160, 0.0140),
+        _ => (0.0100, 0.0080),
     };
 
     for idx in warmup..bars.len() {
@@ -745,6 +745,11 @@ pub fn run_engine_a_backtest_with_btc(
             if let Some(ref feat) = live_feat_opt {
                 let consolidation_vol_ok = feat.z_15.abs() < 2.2 && feat.z_60.abs() < 2.5;
                 let n_hist = closes_history.len();
+                let ret_60 = if n_hist >= 60 && closes_history[n_hist - 60] > 0.0 {
+                    (bar.close / closes_history[n_hist - 60]).ln()
+                } else {
+                    0.0
+                };
                 let ret_120 = if n_hist >= 120 && closes_history[n_hist - 120] > 0.0 {
                     (bar.close / closes_history[n_hist - 120]).ln()
                 } else {
@@ -778,12 +783,14 @@ pub fn run_engine_a_backtest_with_btc(
                     (feat.kalman_drift_veto && feat.kalman_slope > 0.0) || feat.cusum_pos >= 8.0;
                 let kalman_long_ok = !kalman_waterfall_down
                     && feat.z_60 > -1.90
+                    && !(ret_60 <= -max_drift_60 && ret_120 <= 0.0015)
                     && ret_120 > -max_drift_120
                     && ret_180 > -max_slow_drift_180
                     && ret_240 > -max_slow_drift_240
                     && (ma60_vs_240 >= -0.0008 || symbol.eq_ignore_ascii_case("BTC") && ma60_vs_240 >= -0.0022);
                 let kalman_short_ok = !kalman_waterfall_up
                     && feat.z_60 < 1.90
+                    && ret_120 < max_short_drift_120
                     && ret_240 < max_short_drift_240
                     && (ma60_vs_240 <= 0.0040 || (ret_720 < -0.0150 && ma60_vs_240 <= 0.0080));
 
@@ -1042,20 +1049,21 @@ mod tests {
 
             log_dev = 0.98 * log_dev + 0.0012 * z_innov;
 
-            // At bar 780, inject a clean O-U excursion below entry_long followed by a 3-bar rebound to mean
+            // At bar 780, inject a clean O-U excursion where close stays within multi-hour drift limits
+            // while the 1m liquidity wick pierces below entry_long, followed by a 3-bar rebound to mean
             if i == 780 {
-                log_dev = -0.0095;
+                log_dev = -0.0022;
             } else if i == 781 {
-                log_dev = -0.0085;
+                log_dev = -0.0018;
             } else if i == 782 {
-                log_dev = -0.0070;
+                log_dev = -0.0010;
             } else if (783..=792).contains(&i) {
                 log_dev *= 0.65;
             }
 
             let px = 2500.0 * log_dev.exp();
             let high = px * 1.0008;
-            let low = px * 0.9992;
+            let low = if i == 780 { px * 0.9890 } else { px * 0.9992 };
             bars.push(HistoricalMarketBarRecord {
                 symbol: "ETH".to_string(),
                 timestamp_ms: base_ts + (i as u64) * 60_000,
@@ -1112,20 +1120,21 @@ mod tests {
             log_dev = 0.98 * log_dev + 0.0012 * z_innov;
 
             if i == 780 {
-                log_dev = -0.0095;
+                log_dev = -0.0022;
             } else if i == 781 {
-                log_dev = -0.0085;
+                log_dev = -0.0018;
             } else if i == 782 {
-                log_dev = -0.0070;
+                log_dev = -0.0010;
             }
 
             let px = 2500.0 * log_dev.exp();
+            let low = if i == 780 { px * 0.9890 } else { px * 0.9992 };
             bars.push(HistoricalMarketBarRecord {
                 symbol: "ETH".to_string(),
                 timestamp_ms: base_ts + (i as u64) * 60_000,
                 open: px,
                 high: px * 1.0008,
-                low: px * 0.9992,
+                low,
                 close: px,
                 volume: 100.0,
                 best_bid: px - 0.10,

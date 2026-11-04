@@ -2806,9 +2806,11 @@ async fn main() {
                                     .or(finalized_15m_bar.as_ref())
                                     .map(|b| b.low)
                                     .unwrap_or(low_price);
-                                // Engine B Execution: Trend Regime confirmed by 15m candle close.
-                                // Entry requires a fresh 1m expansion close near the forming 15m extreme AND unexhausted macro Z-score (|Z60| < 2.5, |Z15| < 3.0).
-                                let is_long_breakout = !candle_feed_degraded
+                                // Engine B Execution: Strictly requires a completed 15-minute bar close (`finalized_15m_bar.is_some()`)
+                                // above/below the 12-bar 15m Donchian channel. Never enters on mid-bar 1m wicks!
+                                let is_15m_close_tick = finalized_15m_bar.is_some();
+                                let is_long_breakout = is_15m_close_tick
+                                    && !candle_feed_degraded
                                     && !is_candle_gap
                                     && !is_upside_shock
                                     && z_60 < 2.5
@@ -2817,7 +2819,8 @@ async fn main() {
                                     && close_price >= open_price
                                     && close_price >= forming_15m_high * 0.9992
                                     && alignment == TrendAlignment::Bullish;
-                                let is_short_breakout = !candle_feed_degraded
+                                let is_short_breakout = is_15m_close_tick
+                                    && !candle_feed_degraded
                                     && !is_candle_gap
                                     && !is_downside_shock
                                     && z_60 > -2.5
@@ -3363,7 +3366,7 @@ async fn main() {
                                             chandelier_stopped = true;
                                         }
 
-                                        // Also track normalized progress & 20% giveback ratchet relative to Engine B Take-Profit target
+                                        // Also track normalized progress & 20% giveback ratchet + 45m stagnation harvest relative to Engine B Take-Profit target
                                         let is_long = pos.side == "LONG";
                                         let d_0 = if is_long {
                                             pos.take_profit_price - pos.entry_price
@@ -3384,7 +3387,16 @@ async fn main() {
                                                 && q_t <= f64::max(q_be, pos.max_progress - 0.20)
                                             {
                                                 giveback_triggered = true;
+                                            } else if elapsed_mins >= 45.0
+                                                && pos.max_progress >= 0.30
+                                                && q_t <= (pos.max_progress - 0.15).max(0.08)
+                                            {
+                                                giveback_triggered = true;
                                             }
+                                        }
+                                        max_allowed_mins = 75.0;
+                                        if elapsed_mins >= max_allowed_mins {
+                                            time_stop_triggered = true;
                                         }
                                     } else {
                                         // Engine A Position Management (Option 1B + 1C Synthesis):
@@ -3885,22 +3897,27 @@ async fn main() {
                             // Avoid fading a strong multi-hour directional trend (scaled by asset volatility),
                             // while never disarming an already-armed signal on a normal bottom/top wick unless
                             // a genuine shock (`is_downside_shock`/`is_upside_shock`) or Kalman LLT waterfall fires.
-                            let (max_drift_120, max_slow_drift_180, max_slow_drift_240) =
+                            let (max_drift_60, max_drift_120, max_slow_drift_180, max_slow_drift_240) =
                                 match symbol_clone.as_str() {
-                                    "BTC" => (0.0025, 0.0025, 0.0030),
-                                    "ETH" => (0.0030, 0.0030, 0.0035),
-                                    "SOL" => (0.0045, 0.0045, 0.0055),
-                                    "AVAX" => (0.0050, 0.0060, 0.0075),
-                                    _ => (0.0030, 0.0030, 0.0035),
+                                    "BTC" => (0.0035, 0.0025, 0.0025, 0.0030),
+                                    "ETH" => (0.0045, 0.0030, 0.0030, 0.0035),
+                                    "SOL" => (0.0052, 0.0045, 0.0045, 0.0055),
+                                    "AVAX" => (0.0065, 0.0050, 0.0060, 0.0075),
+                                    _ => (0.0045, 0.0030, 0.0030, 0.0035),
                                 };
-                            let max_short_drift_240 = match symbol_clone.as_str() {
-                                "BTC" => 0.0065,
-                                "ETH" => 0.0080,
-                                "SOL" => 0.0100,
-                                "AVAX" => 0.0140,
-                                _ => 0.0080,
+                            let (max_short_drift_120, max_short_drift_240) = match symbol_clone.as_str() {
+                                "BTC" => (0.0075, 0.0065),
+                                "ETH" => (0.0100, 0.0080),
+                                "SOL" => (0.0135, 0.0100),
+                                "AVAX" => (0.0160, 0.0140),
+                                _ => (0.0100, 0.0080),
                             };
                             let n_rc_hist = rolling_closes.len();
+                            let ret_60 = if n_rc_hist >= 60 && rolling_closes[n_rc_hist - 60] > 0.0 {
+                                (close_price / rolling_closes[n_rc_hist - 60]).ln()
+                            } else {
+                                0.0
+                            };
                             let ret_120 = if n_rc_hist >= 120 && rolling_closes[n_rc_hist - 120] > 0.0 {
                                 (close_price / rolling_closes[n_rc_hist - 120]).ln()
                             } else {
@@ -3934,12 +3951,14 @@ async fn main() {
                                 || live_feat.cusum_pos >= 8.0;
                             let kalman_long_ok = !kalman_waterfall_down
                                 && z_60 > -1.90
+                                && !(ret_60 <= -max_drift_60 && ret_120 <= 0.0015)
                                 && ret_120 > -max_drift_120
                                 && ret_180 > -max_slow_drift_180
                                 && ret_240 > -max_slow_drift_240
                                 && (ma60_vs_240 >= -0.0008 || (symbol_clone == "BTC" && ma60_vs_240 >= -0.0022));
                             let kalman_short_ok = !kalman_waterfall_up
                                 && z_60 < 1.90
+                                && ret_120 < max_short_drift_120
                                 && ret_240 < max_short_drift_240
                                 && (ma60_vs_240 <= 0.0040 || (ret_720 < -0.0150 && ma60_vs_240 <= 0.0080));
                             let macro_calendar_veto = check_macro_calendar_veto(now_ms_cb);

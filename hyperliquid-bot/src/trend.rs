@@ -198,7 +198,8 @@ pub fn evaluate_pre_breakout_budget(
         Side::Short => (donchian.lower - current_px).max(0.0) / atr,
     };
 
-    // Active 60m (4-bar) directional displacement from the 60m-ago open/close
+    // Active 60m (4-bar) and 240m (16-bar / 4h) directional displacement
+    // Prevents chasing late-stage multi-hour trend exhaustion rallies/waterfalls
     let recent_n = bars_15m.len().min(4);
     let d_60_atr = if recent_n >= 1 {
         let anchor_px = bars_15m[bars_15m.len() - recent_n].open;
@@ -209,8 +210,18 @@ pub fn evaluate_pre_breakout_budget(
     } else {
         0.5 * dcw_20
     };
+    let slow_n = bars_15m.len().min(16);
+    let d_240_atr = if slow_n >= 4 {
+        let anchor_px = bars_15m[bars_15m.len() - slow_n].open;
+        match side {
+            Side::Long => (current_px - anchor_px).max(0.0) / atr,
+            Side::Short => (anchor_px - current_px).max(0.0) / atr,
+        }
+    } else {
+        d_60_atr
+    };
 
-    let consumed_budget = (0.5 * dcw_20).max(d_60_atr) + 0.50 * overshoot_atr;
+    let consumed_budget = (0.5 * dcw_20).max(d_60_atr).max(0.55 * d_240_atr) + 0.50 * overshoot_atr;
     let rmb_atr = b_max_atr - consumed_budget;
 
     let is_coiled = dcw_20 >= 1.20
@@ -218,9 +229,10 @@ pub fn evaluate_pre_breakout_budget(
         && bbw_atr_20 <= coil_bbw
         && z_60.abs() <= 1.76;
 
-    // Hard reject if DCW_20 >= 4.5, |Z60| >= asset 90th-pct cutoff, overshoot > max_overshoot_atr, or RMB < min_rmb_atr
+    // Hard reject if DCW_20 >= 4.5, 4h run-up > 3.2x ATR, |Z60| >= asset 90th-pct cutoff, overshoot > max_overshoot_atr, or RMB < min_rmb_atr
     let approved = dcw_20 >= 1.20
         && dcw_20 < 4.50
+        && d_240_atr <= 3.20
         && z_60.abs() < max_z60
         && overshoot_atr <= max_overshoot_atr
         && rmb_atr >= min_rmb_atr;
