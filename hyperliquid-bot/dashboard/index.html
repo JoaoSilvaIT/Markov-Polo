@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>MarkovPolo · Live Hyperliquid Trading Dashboard</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -417,6 +418,42 @@
         </div>
       </div>
     </header>
+
+    <!-- ================= INSTITUTIONAL SHIELD & EPOCH SPECIFICITY STRIP ================= -->
+    <div class="cosmic-card px-5 py-3 flex flex-wrap items-center justify-between gap-3 text-xs font-mono">
+      <div class="flex flex-wrap items-center gap-2.5">
+        <!-- Epoch Selector -->
+        <div class="flex items-center gap-1 bg-white/[0.04] border border-white/[0.09] rounded-full p-0.5">
+          <button onclick="setStatsEpoch('UPGRADE')" id="epoch-btn-UPGRADE" class="px-3 py-1 rounded-full text-[11px] font-semibold bg-cosmic-purple text-[#090812] transition-all">Post-Upgrade (Oct 29+)</button>
+          <button onclick="setStatsEpoch('SCALEUP')" id="epoch-btn-SCALEUP" class="px-3 py-1 rounded-full text-[11px] font-medium text-cosmic-muted hover:text-white transition-all">$534 Scale-Up (Nov 01+)</button>
+        </div>
+
+        <!-- Macro Calendar Shield Badge -->
+        <div id="badge-macro-shield" class="px-3 py-1 rounded-full bg-white/[0.04] border border-white/[0.09] text-white/90 flex items-center gap-1.5">
+          <span class="w-2 h-2 rounded-full bg-[#10f587]" id="dot-macro-shield"></span>
+          <span id="text-macro-shield">Macro Shield: Clear (λ=0.000)</span>
+        </div>
+
+        <!-- Cross-Margin Cluster Circuit Breaker Badge -->
+        <div id="badge-cluster-cb" class="px-3 py-1 rounded-full bg-white/[0.04] border border-white/[0.09] text-white/90 flex items-center gap-1.5">
+          <span class="w-2 h-2 rounded-full bg-[#10f587]" id="dot-cluster-cb"></span>
+          <span id="text-cluster-cb">Cross-Margin CB: Clear (0/3 Strikes · 2.75% Cap)</span>
+        </div>
+      </div>
+
+      <div class="flex flex-wrap items-center gap-2.5">
+        <!-- Counterfactual Shield Alpha Saved -->
+        <div onclick="setHistoryFilter('SHIELD'); switchSection('history');" class="cursor-pointer px-3 py-1 rounded-full bg-[#10f587]/[0.10] border border-[#10f587]/30 text-[#10f587] hover:bg-[#10f587]/20 transition-colors flex items-center gap-1.5" title="Click to inspect avoided losses in the Counterfactual Audit Log">
+          <span>🛡️</span>
+          <span id="text-cf-saved">Shield Saved: 0 Losses (0.0 bps)</span>
+        </div>
+
+        <!-- Prometheus OpenMetrics Endpoint -->
+        <a href="/metrics" target="_blank" class="px-2.5 py-1 rounded-full bg-white/[0.04] border border-white/[0.09] text-cosmic-muted hover:text-white transition-colors">
+          /metrics
+        </a>
+      </div>
+    </div>
 
     <!-- ================= ROW 1: THREE REAL-TRADE KPI CARDS (Matches Video Frame 10 & 12) ================= -->
     <section class="grid grid-cols-1 md:grid-cols-3 gap-5">
@@ -906,12 +943,13 @@
               </div>
             </div>
 
-            <!-- Filter Tabs (Real Trades Only) -->
-            <div class="flex items-center gap-1.5 bg-white/[0.03] border border-white/[0.07] rounded-full p-1 text-xs">
+            <!-- Filter Tabs (Real Trades + Counterfactual Shield Audit) -->
+            <div class="flex flex-wrap items-center gap-1.5 bg-white/[0.03] border border-white/[0.07] rounded-full p-1 text-xs">
               <button onclick="setHistoryFilter('ALL')" id="hist-tab-ALL" class="px-3 py-1 rounded-full font-semibold bg-cosmic-purple text-[#090812] transition-all">All Trades</button>
               <button onclick="setHistoryFilter('WINS')" id="hist-tab-WINS" class="px-3 py-1 rounded-full font-medium text-cosmic-muted hover:text-white transition-all">Wins</button>
               <button onclick="setHistoryFilter('LOSSES')" id="hist-tab-LOSSES" class="px-3 py-1 rounded-full font-medium text-cosmic-muted hover:text-white transition-all">Losses</button>
               <button onclick="setHistoryFilter('OPEN')" id="hist-tab-OPEN" class="px-3 py-1 rounded-full font-medium text-cosmic-muted hover:text-white transition-all">Open (<span id="positions-count-badge">0</span>)</button>
+              <button onclick="setHistoryFilter('SHIELD')" id="hist-tab-SHIELD" class="px-3 py-1 rounded-full font-medium text-[#10f587] hover:text-white transition-all">🛡️ Shield Vetoes</button>
             </div>
           </div>
 
@@ -1005,6 +1043,38 @@
 
     </section>
 
+    <!-- ================= ROW 4.5: TRADINGVIEW LIGHTWEIGHT CHARTS 1M TERMINAL (O-U & DONCHIAN BANDS) ================= -->
+    <section id="section-tv-terminal" class="cosmic-card cosmic-stars p-6 space-y-4">
+      <div class="relative z-10 flex flex-wrap items-center justify-between gap-4">
+        <div class="flex items-center gap-3">
+          <div class="w-2.5 h-2.5 rounded-full bg-[#10f587] shadow-[0_0_10px_#10f587]"></div>
+          <div>
+            <h2 class="text-[17px] font-bold text-white tracking-tight">Live 1m Microstructure & O-U / Donchian Bands Terminal</h2>
+            <div class="text-[11px] font-mono text-cosmic-muted" id="tv-chart-subtitle">Local NAS 1m Recorder · Zero Exchange Rate-Limit Overhead · Strict Ascending UTCTimestamp</div>
+          </div>
+        </div>
+
+        <div class="flex items-center gap-2">
+          <div class="flex items-center gap-1 bg-white/[0.03] border border-white/[0.08] rounded-full p-1 text-xs font-mono">
+            <button onclick="selectTvSymbol('BTC')" id="tv-btn-BTC" class="px-3 py-1 rounded-full font-semibold bg-cosmic-purple text-[#090812] transition-all">BTC</button>
+            <button onclick="selectTvSymbol('ETH')" id="tv-btn-ETH" class="px-3 py-1 rounded-full font-medium text-cosmic-muted hover:text-white transition-all">ETH</button>
+            <button onclick="selectTvSymbol('SOL')" id="tv-btn-SOL" class="px-3 py-1 rounded-full font-medium text-cosmic-muted hover:text-white transition-all">SOL</button>
+            <button onclick="selectTvSymbol('AVAX')" id="tv-btn-AVAX" class="px-3 py-1 rounded-full font-medium text-cosmic-muted hover:text-white transition-all">AVAX</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Legend Strip -->
+      <div class="relative z-10 flex flex-wrap items-center gap-4 text-[11px] font-mono text-cosmic-muted px-1">
+        <span class="flex items-center gap-1.5"><span class="w-3 h-0.5 bg-[#10f587] inline-block"></span> O-U Long Entry (<span id="tv-leg-long" class="text-white">--</span>)</span>
+        <span class="flex items-center gap-1.5"><span class="w-3 h-0.5 bg-[#ff3b4e] inline-block"></span> O-U Short Entry (<span id="tv-leg-short" class="text-white">--</span>)</span>
+        <span class="flex items-center gap-1.5"><span class="w-3 h-0.5 bg-[#a78bfa] inline-block"></span> O-U Equilibrium μ (<span id="tv-leg-mean" class="text-white">--</span>)</span>
+        <span class="flex items-center gap-1.5"><span class="w-3 h-0.5 bg-[#f5c418] inline-block"></span> Donchian 3h Range (<span id="tv-leg-don" class="text-white">--</span>)</span>
+      </div>
+
+      <div id="tv-lightweight-chart" class="relative z-10 w-full h-[310px] rounded-xl overflow-hidden border border-white/[0.06] bg-[#090812]/90"></div>
+    </section>
+
     <!-- ================= ROW 5: 4-ASSET LIVE MARKETS (BTC, ETH, SOL, AVAX) ================= -->
     <section id="section-assets" class="space-y-4 pt-2">
       <div class="flex items-center justify-between">
@@ -1029,8 +1099,43 @@
     let latestTelemetry = null;
     let focusAsset = 'ALL';
     let historyFilter = 'ALL';
+    let statsEpoch = 'UPGRADE'; // 'UPGRADE' (Oct 29+) or 'SCALEUP' (Nov 01+)
+    let tvSymbol = 'BTC';
+    let tvChart = null;
+    let tvCandleSeries = null;
+    let tvPriceLines = [];
+    let lastTvFetchMs = 0;
     let selectedCalDay = new Date().getUTCDate();
     let calMonthOffset = 0;
+
+    function setStatsEpoch(ep) {
+      statsEpoch = ep;
+      ['UPGRADE', 'SCALEUP'].forEach(k => {
+        const btn = document.getElementById('epoch-btn-' + k);
+        if (!btn) return;
+        if (k === ep) {
+          btn.className = 'px-3 py-1 rounded-full text-[11px] font-semibold bg-cosmic-purple text-[#090812] transition-all';
+        } else {
+          btn.className = 'px-3 py-1 rounded-full text-[11px] font-medium text-cosmic-muted hover:text-white transition-all';
+        }
+      });
+      if (latestTelemetry) renderAll(latestTelemetry);
+    }
+
+    function selectTvSymbol(sym) {
+      tvSymbol = sym;
+      ['BTC', 'ETH', 'SOL', 'AVAX'].forEach(s => {
+        const btn = document.getElementById('tv-btn-' + s);
+        if (!btn) return;
+        if (s === sym) {
+          btn.className = 'px-3 py-1 rounded-full font-semibold bg-cosmic-purple text-[#090812] transition-all';
+        } else {
+          btn.className = 'px-3 py-1 rounded-full font-medium text-cosmic-muted hover:text-white transition-all';
+        }
+      });
+      lastTvFetchMs = 0;
+      if (latestTelemetry) updateTvChart(latestTelemetry, true);
+    }
 
     function switchSection(sec) {
       document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
@@ -1068,13 +1173,15 @@
 
     function setHistoryFilter(f) {
       historyFilter = f;
-      ['ALL', 'WINS', 'LOSSES', 'OPEN'].forEach(k => {
+      ['ALL', 'WINS', 'LOSSES', 'OPEN', 'SHIELD'].forEach(k => {
         const btn = document.getElementById('hist-tab-' + k);
         if (!btn) return;
         if (k === f) {
           btn.className = 'px-3 py-1 rounded-full font-semibold bg-cosmic-purple text-[#090812] transition-all';
         } else {
-          btn.className = 'px-3 py-1 rounded-full font-medium text-cosmic-muted hover:text-white transition-all';
+          btn.className = k === 'SHIELD'
+            ? 'px-3 py-1 rounded-full font-medium text-[#10f587] hover:text-white transition-all'
+            : 'px-3 py-1 rounded-full font-medium text-cosmic-muted hover:text-white transition-all';
         }
       });
       renderTradingHistory();
@@ -1241,50 +1348,104 @@
       renderTradingHistory();
       renderCalendar();
       renderAssetCards(data);
+      updateTvChart(data, false);
     }
 
     function renderRealKPIsAndInfo(data) {
       const perf = data.real_performance || {};
+      const su = perf.scaleup_stats || {};
+      const useScaleUp = (statsEpoch === 'SCALEUP');
       const positions = data.positions || {};
       const maxConcurrent = data.max_concurrent || 2;
 
-      const totalTrades = Number(perf.total_trades_done || 0);
-      const winCount = Number(perf.win_count || 0);
-      const lossCount = Number(perf.loss_count || 0);
-      const winRatePct = Number(perf.win_rate_pct || 0);
+      const totalTrades = Number(useScaleUp ? (su.total_trades_done || 0) : (perf.total_trades_done || 0));
+      const winCount = Number(useScaleUp ? (su.win_count || 0) : (perf.win_count || 0));
+      const lossCount = Number(useScaleUp ? (su.loss_count || 0) : (perf.loss_count || 0));
+      const winRatePct = Number(useScaleUp ? (su.win_rate_pct || 0) : (perf.win_rate_pct || 0));
 
-      const avgWinUsd = Number(perf.avg_win_usd || 0);
-      const avgWinPct = Number(perf.avg_win_pct || 0);
+      const avgWinUsd = Number(useScaleUp ? (su.avg_win_usd || 0) : (perf.avg_win_usd || 0));
+      const avgWinBps = Number(useScaleUp ? (su.avg_win_bps || 0) : (perf.avg_win_bps || 0));
       const totalWinUsd = Number(perf.total_win_usd || 0);
 
-      const avgLossUsd = Number(perf.avg_loss_usd || 0);
-      const avgLossPct = Number(perf.avg_loss_pct || 0);
+      const avgLossUsd = Number(useScaleUp ? (su.avg_loss_usd || 0) : (perf.avg_loss_usd || 0));
+      const avgLossBps = Number(useScaleUp ? (su.avg_loss_bps || 0) : (perf.avg_loss_bps || 0));
       const totalLossUsd = Number(perf.total_loss_usd || 0);
 
-      const netRealizedUsd = Number(perf.net_realized_pnl_usd || 0);
+      const netRealizedUsd = Number(useScaleUp ? (su.net_realized_pnl_usd || 0) : (perf.net_realized_pnl_usd || 0));
       const liveEquity = Number(perf.account_equity_usd || 0.0);
+      const profitFactor = Number(perf.profit_factor || 0.0);
+      const expectancyBps = Number(perf.expectancy_bps || 0.0);
 
-      // KPI 1: Average Win (Real Trades)
+      // Update Epoch button labels with live trade counts
+      const upBtn = document.getElementById('epoch-btn-UPGRADE');
+      const suBtn = document.getElementById('epoch-btn-SCALEUP');
+      if (upBtn) upBtn.textContent = `Post-Upgrade Oct 29+ (${perf.total_trades_done || 0}T · ${Number(perf.win_rate_pct || 0).toFixed(1)}% WR)`;
+      if (suBtn) suBtn.textContent = `$534 Scale-Up Nov 01+ (${su.total_trades_done || 0}T · ${Number(su.win_rate_pct || 0).toFixed(1)}% WR)`;
+
+      // Update Macro Calendar Shield Badge
+      const macro = data.macro_shield || {};
+      const lam = Number(macro.lambda_exo || 0);
+      const isBlackout = Boolean(macro.is_hard_blackout);
+      const schedStr = macro.scheduled_today || 'None Today';
+      const dotMacro = document.getElementById('dot-macro-shield');
+      const txtMacro = document.getElementById('text-macro-shield');
+      if (dotMacro && txtMacro) {
+        if (isBlackout) {
+          dotMacro.className = 'w-2 h-2 rounded-full bg-[#ff3b4e] shadow-[0_0_8px_#ff3b4e]';
+          txtMacro.textContent = `Macro Shield: BLACKOUT (${macro.event_name} · λ=${lam.toFixed(2)})`;
+        } else if (lam > 0.0) {
+          dotMacro.className = 'w-2 h-2 rounded-full bg-[#f5c418] shadow-[0_0_8px_#f5c418]';
+          txtMacro.textContent = `Macro Shield: Digest (${macro.event_name} · λ=${lam.toFixed(2)})`;
+        } else {
+          dotMacro.className = 'w-2 h-2 rounded-full bg-[#10f587]';
+          txtMacro.textContent = `Macro Shield: Armed (${schedStr} · λ=${lam.toFixed(2)})`;
+        }
+      }
+
+      // Update Cross-Margin Cluster Circuit Breaker Badge
+      const ccb = data.cluster_circuit_breaker || {};
+      const cLosses = Number(ccb.cluster_consecutive_losses || 0);
+      const cLocked = Number(ccb.locked_until_ts_ms || 0) > Date.now();
+      const dotCcb = document.getElementById('dot-cluster-cb');
+      const txtCcb = document.getElementById('text-cluster-cb');
+      if (dotCcb && txtCcb) {
+        if (cLocked) {
+          dotCcb.className = 'w-2 h-2 rounded-full bg-[#ff3b4e] shadow-[0_0_8px_#ff3b4e]';
+          txtCcb.textContent = `Cross-Margin CB: LOCKED (${ccb.lockout_reason || 'Drawdown Cap'})`;
+        } else {
+          dotCcb.className = 'w-2 h-2 rounded-full bg-[#10f587]';
+          txtCcb.textContent = `Cross-Margin CB: Clear (${cLosses}/3 Strikes · 2.75% Daily Cap)`;
+        }
+      }
+
+      // Update Counterfactual Shield Saved Badge
+      const cf = data.counterfactual_summary || {};
+      const txtCf = document.getElementById('text-cf-saved');
+      if (txtCf) {
+        txtCf.textContent = `Shield Saved: ${cf.avoided_losses_count || 0} Losses (-${Number(cf.avoided_losses_bps || 0).toFixed(1)} bps Avoided)`;
+      }
+
+      // KPI 1: Average Win (Real Trades — USD + bps)
       document.getElementById('kpi1-value').textContent = fmtUsd(avgWinUsd);
-      document.getElementById('kpi1-badge').textContent = `+${avgWinPct.toFixed(2)}%`;
-      document.getElementById('kpi1-foot').textContent = `Wins: ${winCount} · Total Won: ${fmtUsd(totalWinUsd, true)}`;
+      document.getElementById('kpi1-badge').textContent = `+${avgWinBps.toFixed(1)} bps`;
+      document.getElementById('kpi1-foot').textContent = `Wins: ${winCount} · Total Won: ${fmtUsd(useScaleUp ? netRealizedUsd : totalWinUsd, true)}`;
 
-      // KPI 2: Average Loss (Real Trades)
+      // KPI 2: Average Loss (Real Trades — USD + bps)
       document.getElementById('kpi2-value').textContent = fmtUsd(avgLossUsd);
-      document.getElementById('kpi2-badge').textContent = `-${avgLossPct.toFixed(2)}%`;
-      document.getElementById('kpi2-foot').textContent = `Losses: ${lossCount} · Total Lost: -${fmtUsd(totalLossUsd)}`;
+      document.getElementById('kpi2-badge').textContent = `-${avgLossBps.toFixed(1)} bps`;
+      document.getElementById('kpi2-foot').textContent = `Losses: ${lossCount} · Total Lost: -${fmtUsd(useScaleUp ? 0 : totalLossUsd)}`;
 
-      // KPI 3: Win Ratio (Real Win Rate)
-      document.getElementById('kpi3-value').textContent = `${Math.round(winRatePct)}%`;
-      document.getElementById('kpi3-badge').textContent = `${totalTrades} Trades`;
-      document.getElementById('kpi3-foot').textContent = `Trades Done: ${totalTrades} (${winCount}W / ${lossCount}L)`;
+      // KPI 3: Win Ratio (Exact 1-decimal precision + Profit Factor & Expectancy)
+      document.getElementById('kpi3-value').textContent = `${winRatePct.toFixed(1)}%`;
+      document.getElementById('kpi3-badge').textContent = `${totalTrades} Trades (${winCount}W/${lossCount}L)`;
+      document.getElementById('kpi3-foot').textContent = `PF: ${profitFactor.toFixed(1)}x · Expectancy: +${expectancyBps.toFixed(1)} bps/trade`;
 
       // Info Card (7 Real Account Rows)
       const activePosSyms = Object.keys(positions);
       document.getElementById('positions-count-badge').textContent = activePosSyms.length;
       document.getElementById('matrix-slots-summary').textContent = `Active Positions: ${activePosSyms.length} / ${maxConcurrent}`;
 
-      document.getElementById('info-phase').textContent = `${totalTrades} (${winCount}W / ${lossCount}L)`;
+      document.getElementById('info-phase').textContent = `${totalTrades} (${winCount}W / ${lossCount}L · ${winRatePct.toFixed(1)}%)`;
       document.getElementById('info-account-size').textContent = fmtUsd(liveEquity);
 
       const pnlEl = document.getElementById('info-realized-pnl');
@@ -1295,7 +1456,7 @@
 
       // Check circuit breakers (only active if paused_until is in the future)
       const cbs = data.circuit_breakers || {};
-      let anyPaused = false;
+      let anyPaused = cLocked;
       const nowMs = Date.now();
       Object.values(cbs).forEach(cb => {
         if (cb && cb.paused_until) {
@@ -1303,15 +1464,15 @@
           if (Number.isFinite(pauseMs) && pauseMs > nowMs) anyPaused = true;
         }
       });
-      document.getElementById('info-objectives').textContent = anyPaused ? 'Paused (3 Strikes)' : 'Active';
+      document.getElementById('info-objectives').textContent = anyPaused ? 'Paused (Circuit Breaker)' : 'Active (All Shields Armed)';
 
-      // Daily Loss Limit Card
+      // Daily Loss Limit Card (2.75% Cross-Margin Cap)
       const startEq = Number(perf.today_starting_equity_usd || liveEquity);
-      const maxLoss = Number(perf.daily_loss_limit_usd !== undefined ? perf.daily_loss_limit_usd : (startEq * 0.05));
+      const maxLoss = Number(perf.daily_loss_limit_usd !== undefined ? perf.daily_loss_limit_usd : (startEq * 0.0275));
       const threshEq = Number(perf.daily_threshold_usd !== undefined ? perf.daily_threshold_usd : (startEq - maxLoss));
       const leftLoss = Number(perf.daily_loss_left_usd !== undefined ? perf.daily_loss_left_usd : maxLoss);
 
-      document.getElementById('risk-max-row').textContent = `${fmtUsd(maxLoss)} daily loss`;
+      document.getElementById('risk-max-row').textContent = `${fmtUsd(maxLoss)} (2.75% Cross Cap)`;
       document.getElementById('risk-start-row').textContent = fmtUsd(startEq);
       document.getElementById('risk-threshold-row').textContent = fmtUsd(threshEq);
 
@@ -1437,7 +1598,9 @@
       });
 
       // 2. Real Executed Closed Trades
+      const scaleupCutoffMs = 1793559600000;
       realTrades.forEach(t => {
+        if (statsEpoch === 'SCALEUP' && Number(t.close_ms || 0) < scaleupCutoffMs) return;
         const sym = t.symbol || 'PERP';
         const side = t.side || 'LONG';
         const pnlUsd = Number(t.pnl_usd || 0);
@@ -1447,8 +1610,8 @@
           category: isWin ? 'WINS' : 'LOSSES',
           isWin: isWin,
           symbol: `#${sym} (${side})`,
-          openDate: t.open_date || '--',
-          closeDate: t.close_date || '--',
+          openDate: `${t.open_date || '--'} @ ${fmtPx(t.entry_price, sym)}`,
+          closeDate: `${t.close_date || '--'} @ ${fmtPx(t.exit_price, sym)}`,
           lots: Number(t.lots || 0).toFixed(sym === 'BTC' ? 5 : (sym === 'ETH' ? 4 : 2)),
           profitStr: `${fmtUsd(pnlUsd, true)} (${pnlBps >= 0 ? '+' : ''}${pnlBps.toFixed(1)} bps)`,
           positive: isWin,
@@ -1456,8 +1619,25 @@
         });
       });
 
-      // Apply filters
-      if (historyFilter === 'WINS') {
+      // 3. Counterfactual Shield Veto Audit Events (when SHIELD tab is selected)
+      if (historyFilter === 'SHIELD') {
+        const cfEvents = (data.counterfactual_summary && data.counterfactual_summary.recent_events) || [];
+        rows = cfEvents.map(ev => {
+          const isProt = ev.classification === 'ALPHA_PROTECTIVE';
+          const isStrang = ev.classification === 'ALPHA_STRANGLING';
+          return {
+            category: 'SHIELD',
+            isWin: isProt,
+            symbol: `🛡️ ${ev.symbol} (${ev.side})`,
+            openDate: `${ev.ts_utc} · ${ev.primary_veto}`,
+            closeDate: `Ref: ${fmtPx(ev.ref_price, ev.symbol)} → ${fmtPx(ev.exit_price, ev.symbol)}`,
+            lots: isProt ? 'SAVED' : (isStrang ? 'MISSED' : 'NOISE'),
+            profitStr: `${isProt ? 'Avoided ' : ''}${ev.net_bps >= 0 ? '+' : ''}${ev.net_bps.toFixed(1)} bps`,
+            positive: isProt,
+            checked: isProt
+          };
+        });
+      } else if (historyFilter === 'WINS') {
         rows = rows.filter(r => r.category === 'WINS');
       } else if (historyFilter === 'LOSSES') {
         rows = rows.filter(r => r.category === 'LOSSES');
@@ -1476,7 +1656,7 @@
       }
 
       if (rows.length === 0) {
-        container.innerHTML = `<div class="py-10 text-center text-xs font-mono text-cosmic-muted">No real trades recorded for this filter yet. Waiting for next live execution on Hyperliquid.</div>`;
+        container.innerHTML = `<div class="py-10 text-center text-xs font-mono text-cosmic-muted">No records found for this filter.</div>`;
         return;
       }
 
@@ -1506,6 +1686,7 @@
 
       symbols.forEach(sym => {
         const d = (data.assets && data.assets[sym]) ? data.assets[sym] : null;
+        const f = (data.funnels && data.funnels[sym]) ? data.funnels[sym] : {};
         if (!d) {
           html += `<div class="cosmic-card cosmic-stars p-6 font-mono text-xs text-cosmic-muted">${sym}: Connecting to Hyperliquid L1...</div>`;
           return;
@@ -1521,22 +1702,32 @@
         const isMR = (mode === 'MEANREVERSION' || mode === 'MEAN_REVERSION' || mode === 'CONSOLIDATION');
         const isTrend = (mode === 'TREND');
 
-        let statusBadge = '<span class="px-2.5 py-1 rounded-lg text-[10.5px] font-mono font-semibold bg-white/[0.06] text-cosmic-purpleLight border border-cosmic-purple/30">STANDBY</span>';
+        let statusBadge = '<span class="px-2.5 py-1 rounded-lg text-[10.5px] font-mono font-semibold bg-white/[0.06] text-cosmic-purpleLight border border-cosmic-purple/30">NEUTRAL CASH</span>';
         if (pos) {
           statusBadge = `<span class="px-2.5 py-1 rounded-lg text-[10.5px] font-mono font-semibold bg-[#10f587]/20 text-[#10f587] border border-[#10f587]/40">IN POSITION (${pos.side})</span>`;
         } else if (armed) {
           statusBadge = `<span class="px-2.5 py-1 rounded-lg text-[10.5px] font-mono font-semibold bg-[#f5c418]/20 text-[#f5c418] border border-[#f5c418]/40">ARMED ${armed.side}</span>`;
         } else if (isMR) {
-          statusBadge = '<span class="px-2.5 py-1 rounded-lg text-[10.5px] font-mono font-semibold bg-[#10f587]/15 text-[#10f587] border border-[#10f587]/30">ENGINE A ACTIVE</span>';
+          statusBadge = '<span class="px-2.5 py-1 rounded-lg text-[10.5px] font-mono font-semibold bg-[#10f587]/15 text-[#10f587] border border-[#10f587]/30">ENGINE A (O-U)</span>';
         } else if (isTrend) {
-          statusBadge = '<span class="px-2.5 py-1 rounded-lg text-[10.5px] font-mono font-semibold bg-cosmic-purple/20 text-white border border-cosmic-purple/50">ENGINE B ACTIVE</span>';
+          statusBadge = '<span class="px-2.5 py-1 rounded-lg text-[10.5px] font-mono font-semibold bg-cosmic-purple/20 text-white border border-cosmic-purple/50">ENGINE B (TREND)</span>';
         }
 
         const buyPx = d.long_buy ? Number(d.long_buy) : null;
         const sellPx = d.short_sell ? Number(d.short_sell) : null;
         const donUp = d.donchian_upper ? Number(d.donchian_upper) : null;
         const donLow = d.donchian_lower ? Number(d.donchian_lower) : null;
-        const proxPct = Math.round(d.overall_proximity_pct || 0);
+        const proxPct = Number(d.overall_proximity_pct || 0).toFixed(1);
+
+        const pC = (Number(d.p_consolidation || 0) * 100).toFixed(1);
+        const pT = (Number(d.p_trend || 0) * 100).toFixed(1);
+        const pS = (Number(d.p_shock || 0) * 100).toFixed(1);
+        const halfLife = Number(d.half_life_m || 0).toFixed(1);
+        const z15 = Number(d.z_15 || 0).toFixed(2);
+        const z60 = Number(d.z_60 || 0).toFixed(2);
+        const obi1s = Number(d.obi_1s || 0);
+        const obiInst = Number(d.obi_instant || 0);
+        const obiPct = Math.max(5, Math.min(95, 50 + obi1s * 50));
 
         let channelPosPct = 50;
         if (buyPx && sellPx && sellPx > buyPx) {
@@ -1546,27 +1737,43 @@
         }
 
         html += `
-        <div class="cosmic-card cosmic-stars glow-purple-bottom p-6 flex flex-col justify-between space-y-4">
+        <div onclick="selectTvSymbol('${sym}')" class="cursor-pointer cosmic-card cosmic-stars glow-purple-bottom p-6 flex flex-col justify-between space-y-3.5">
           <div class="relative z-10">
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-2.5">
                 <div class="w-9 h-9 rounded-xl bg-white/[0.06] border border-white/10 flex items-center justify-center font-bold text-sm text-cosmic-purpleLight">${sym[0]}</div>
                 <div>
                   <div class="text-[16px] font-bold text-white">${sym}-PERP</div>
-                  <div class="text-[10.5px] font-mono text-cosmic-muted">3x Cross Margin</div>
+                  <div class="text-[10.5px] font-mono text-cosmic-muted">t½: ${halfLife}m · Z15: ${z15} · Z60: ${z60}</div>
                 </div>
               </div>
               ${statusBadge}
             </div>
 
-            <div class="mt-4 flex items-baseline justify-between">
-              <span class="font-mono text-[26px] font-bold text-white tracking-tight">${fmtPx(price, sym)}</span>
-              <span class="font-mono text-xs text-cosmic-muted">Proximity: <strong class="text-white">${proxPct}%</strong></span>
+            <div class="mt-3.5 flex items-baseline justify-between">
+              <span class="font-mono text-[25px] font-bold text-white tracking-tight">${fmtPx(price, sym)}</span>
+              <span class="font-mono text-xs text-cosmic-muted">Prox: <strong class="text-white">${proxPct}%</strong></span>
+            </div>
+          </div>
+
+          <!-- HMM Posterior Distribution Strip (Exact 0.1% Precision) -->
+          <div class="relative z-10 cosmic-inset p-2.5 space-y-1.5 font-mono text-[10.5px]">
+            <div class="flex items-center justify-between text-cosmic-muted">
+              <span>HMM: <strong class="text-[#10f587]">C:${pC}%</strong></span>
+              <span><strong class="text-cosmic-purpleLight">T:${pT}%</strong></span>
+              <span><strong class="text-[#ff3b4e]">S:${pS}%</strong></span>
+            </div>
+            <div class="flex items-center justify-between text-cosmic-muted pt-1 border-t border-white/[0.05]">
+              <span>L2 OBI (inst/1s):</span>
+              <span class="${obi1s >= 0 ? 'text-[#10f587]' : 'text-[#ff3b4e]'} font-semibold">${obiInst >= 0 ? '+' : ''}${obiInst.toFixed(2)} / ${obi1s >= 0 ? '+' : ''}${obi1s.toFixed(2)}</span>
+            </div>
+            <div class="w-full h-1.5 bg-white/[0.07] rounded-full overflow-hidden">
+              <div class="h-full ${obi1s >= 0 ? 'bg-[#10f587]' : 'bg-[#ff3b4e]'}" style="width: ${obiPct}%"></div>
             </div>
           </div>
 
           <!-- Channel Progress Bar -->
-          <div class="relative z-10 cosmic-inset p-3.5 space-y-2">
+          <div class="relative z-10 cosmic-inset p-3 space-y-1.5">
             <div class="relative w-full h-2 bg-white/[0.07] rounded-full overflow-hidden">
               <div class="h-full bg-gradient-to-r from-cosmic-purpleDeep via-cosmic-purple to-[#10f587] rounded-full" style="width: ${channelPosPct}%"></div>
             </div>
@@ -1576,23 +1783,144 @@
             </div>
           </div>
 
-          <!-- Engine A & Engine B Trigger Prices -->
-          <div class="relative z-10 grid grid-cols-2 gap-2.5 font-mono text-[11px]">
+          <!-- Engine A & Engine B Trigger Prices + Funnel Audit -->
+          <div class="relative z-10 grid grid-cols-2 gap-2 font-mono text-[10.5px]">
             <div class="cosmic-inset p-2.5">
-              <div class="text-[10px] text-cosmic-muted uppercase">Mean Reversion</div>
+              <div class="text-[9.5px] text-cosmic-muted uppercase">Engine A (O-U)</div>
               <div class="mt-1 flex justify-between"><span class="text-cosmic-muted">Long:</span><span class="text-[#10f587]">${fmtPx(buyPx, sym)}</span></div>
               <div class="flex justify-between"><span class="text-cosmic-muted">Short:</span><span class="text-[#ff3b4e]">${fmtPx(sellPx, sym)}</span></div>
+              <div class="mt-1 pt-1 border-t border-white/[0.05] text-[9.5px] text-cosmic-muted">Armed: ${f.engine_a_armed_waiting_bounce || 0} · Ord: ${f.engine_a_orders_placed || 0}</div>
             </div>
             <div class="cosmic-inset p-2.5">
-              <div class="text-[10px] text-cosmic-muted uppercase">Breakout (3h)</div>
+              <div class="text-[9.5px] text-cosmic-muted uppercase">Engine B (Donchian)</div>
               <div class="mt-1 flex justify-between"><span class="text-cosmic-muted">Long:</span><span class="text-cosmic-purpleLight">${fmtPx(donUp, sym)}</span></div>
               <div class="flex justify-between"><span class="text-cosmic-muted">Short:</span><span class="text-[#ff3b4e]">${fmtPx(donLow, sym)}</span></div>
+              <div class="mt-1 pt-1 border-t border-white/[0.05] text-[9.5px] text-cosmic-muted">OBI Veto: ${f.engine_b_obi_hurdle_veto || 0} · Ord: ${f.engine_b_orders_placed || 0}</div>
             </div>
           </div>
         </div>`;
       });
 
       container.innerHTML = html;
+    }
+
+    async function updateTvChart(data, forceReload) {
+      const container = document.getElementById('tv-lightweight-chart');
+      if (!container || typeof LightweightCharts === 'undefined') return;
+
+      if (!tvChart) {
+        tvChart = LightweightCharts.createChart(container, {
+          width: container.clientWidth,
+          height: 310,
+          layout: {
+            background: { type: 'solid', color: '#090812' },
+            textColor: '#8e8ca3',
+            fontFamily: 'JetBrains Mono, monospace',
+          },
+          grid: {
+            vertLines: { color: 'rgba(255, 255, 255, 0.04)' },
+            horzLines: { color: 'rgba(255, 255, 255, 0.04)' },
+          },
+          timeScale: {
+            timeVisible: true,
+            secondsVisible: false,
+            borderColor: 'rgba(255, 255, 255, 0.08)',
+          },
+          rightPriceScale: {
+            borderColor: 'rgba(255, 255, 255, 0.08)',
+          },
+        });
+        tvCandleSeries = tvChart.addCandlestickSeries({
+          upColor: '#10f587',
+          downColor: '#ff3b4e',
+          borderVisible: false,
+          wickUpColor: '#10f587',
+          wickDownColor: '#ff3b4e',
+        });
+        window.addEventListener('resize', () => {
+          if (tvChart && container) tvChart.applyOptions({ width: container.clientWidth });
+        });
+      }
+
+      const nowMs = Date.now();
+      if (!forceReload && nowMs - lastTvFetchMs < 10000) return;
+      lastTvFetchMs = nowMs;
+
+      try {
+        const res = await fetch('/api/candles?symbol=' + tvSymbol);
+        if (!res.ok) return;
+        const payload = await res.json();
+        const candles = payload.candles || [];
+        if (candles.length > 0) {
+          tvCandleSeries.setData(candles);
+        }
+
+        // Clear old price lines and draw updated O-U & Donchian trigger levels
+        tvPriceLines.forEach(pl => {
+          try { tvCandleSeries.removePriceLine(pl); } catch (_) {}
+        });
+        tvPriceLines = [];
+
+        const d = (data.assets && data.assets[tvSymbol]) ? data.assets[tvSymbol] : {};
+        document.getElementById('tv-leg-long').textContent = fmtPx(d.long_buy, tvSymbol);
+        document.getElementById('tv-leg-short').textContent = fmtPx(d.short_sell, tvSymbol);
+        document.getElementById('tv-leg-mean').textContent = fmtPx(d.exit_long || d.exit_short, tvSymbol);
+        document.getElementById('tv-leg-don').textContent = `${fmtPx(d.donchian_lower, tvSymbol)} – ${fmtPx(d.donchian_upper, tvSymbol)}`;
+
+        if (d.long_buy && Number(d.long_buy) > 0) {
+          tvPriceLines.push(tvCandleSeries.createPriceLine({
+            price: Number(d.long_buy),
+            color: '#10f587',
+            lineWidth: 2,
+            lineStyle: LightweightCharts.LineStyle.Dashed,
+            axisLabelVisible: true,
+            title: 'O-U Long Buy',
+          }));
+        }
+        if (d.short_sell && Number(d.short_sell) > 0) {
+          tvPriceLines.push(tvCandleSeries.createPriceLine({
+            price: Number(d.short_sell),
+            color: '#ff3b4e',
+            lineWidth: 2,
+            lineStyle: LightweightCharts.LineStyle.Dashed,
+            axisLabelVisible: true,
+            title: 'O-U Short Sell',
+          }));
+        }
+        const muPx = d.exit_long || d.exit_short;
+        if (muPx && Number(muPx) > 0) {
+          tvPriceLines.push(tvCandleSeries.createPriceLine({
+            price: Number(muPx),
+            color: '#a78bfa',
+            lineWidth: 1,
+            lineStyle: LightweightCharts.LineStyle.Dotted,
+            axisLabelVisible: true,
+            title: 'O-U Mean μ',
+          }));
+        }
+        if (d.donchian_upper && Number(d.donchian_upper) > 0) {
+          tvPriceLines.push(tvCandleSeries.createPriceLine({
+            price: Number(d.donchian_upper),
+            color: '#f5c418',
+            lineWidth: 1,
+            lineStyle: LightweightCharts.LineStyle.SparseDotted,
+            axisLabelVisible: true,
+            title: 'Donchian High',
+          }));
+        }
+        if (d.donchian_lower && Number(d.donchian_lower) > 0) {
+          tvPriceLines.push(tvCandleSeries.createPriceLine({
+            price: Number(d.donchian_lower),
+            color: '#f5c418',
+            lineWidth: 1,
+            lineStyle: LightweightCharts.LineStyle.SparseDotted,
+            axisLabelVisible: true,
+            title: 'Donchian Low',
+          }));
+        }
+      } catch (e) {
+        console.error('TV chart update error:', e);
+      }
     }
 
     // Initialize Calendar & Live Poll

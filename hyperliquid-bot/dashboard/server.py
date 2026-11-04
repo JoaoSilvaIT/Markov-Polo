@@ -20,8 +20,10 @@ MAX_CONCURRENT = int(os.environ.get("HL_MAX_CONCURRENT_POSITIONS", 2))
 WALLET_ADDRESS = os.environ.get("HL_WALLET_ADDRESS", "").strip()
 IS_MAINNET = os.environ.get("HL_IS_MAINNET", "true").strip().lower() != "false"
 HL_INFO_URL = "https://api.hyperliquid.xyz/info" if IS_MAINNET else "https://api.hyperliquid-testnet.xyz/info"
-# Clean-slate cutoff: 2026-10-22 00:00 UTC architecture upgrade (includes only the new 5m O-U trades onwards)
-CLEAN_SLATE_EPOCH_MS = int(os.environ.get("HL_CLEAN_SLATE_EPOCH_MS", "1792600000000"))
+# Clean-slate cutoff: 2026-10-29 15:30 UTC major quant architecture upgrade (5m Kalman O-U + Excursion Caps + Ratchet)
+CLEAN_SLATE_EPOCH_MS = int(os.environ.get("HL_CLEAN_SLATE_EPOCH_MS", "1793287800000"))
+# Scale-up cutoff: 2026-11-01 19:00 UTC ($534 USDC capital scale-up epoch)
+SCALEUP_EPOCH_MS = int(os.environ.get("HL_SCALEUP_EPOCH_MS", "1793559600000"))
 
 SEARCH_DIRS = [
     "/app/data",                      # Docker container mount
@@ -82,7 +84,7 @@ def get_cached_hl_exchange_data(wallet_addr):
     if not wallet_addr or len(wallet_addr) < 20:
         return _HL_CACHE
 
-    if now_s - _HL_CACHE["last_fetch_s"] < 15.0:
+    if now_s - _HL_CACHE["last_fetch_s"] < 30.0:
         return _HL_CACHE
 
     _HL_CACHE["last_fetch_s"] = now_s
@@ -298,9 +300,31 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
 
     avg_win_usd = round(total_win_usd / win_count, 2) if win_count > 0 else 0.0
     avg_win_pct = round(sum(t["pnl_pct"] for t in wins) / win_count, 2) if win_count > 0 else 0.0
+    avg_win_bps = round(sum(t["pnl_bps"] for t in wins) / win_count, 1) if win_count > 0 else 0.0
 
     avg_loss_usd = round(total_loss_usd / loss_count, 2) if loss_count > 0 else 0.0
     avg_loss_pct = round(sum(abs(t["pnl_pct"]) for t in losses) / loss_count, 2) if loss_count > 0 else 0.0
+    avg_loss_bps = round(sum(abs(t["pnl_bps"]) for t in losses) / loss_count, 1) if loss_count > 0 else 0.0
+
+    profit_factor = round(total_win_usd / total_loss_usd, 2) if total_loss_usd > 1e-4 else (99.9 if total_win_usd > 0 else 0.0)
+    expectancy_bps = round(sum(t["pnl_bps"] for t in real_trades) / total_trades, 1) if total_trades > 0 else 0.0
+
+    # Also compute Post-$534 Scale-Up Epoch stats (Nov 01, 2026+)
+    scaleup_trades = [t for t in real_trades if t["close_ms"] >= SCALEUP_EPOCH_MS]
+    su_wins = [t for t in scaleup_trades if t["pnl_usd"] > 0.0]
+    su_losses = [t for t in scaleup_trades if t["pnl_usd"] <= 0.0]
+    su_total = len(scaleup_trades)
+    scaleup_stats = {
+        "total_trades_done": su_total,
+        "win_count": len(su_wins),
+        "loss_count": len(su_losses),
+        "win_rate_pct": round((len(su_wins) / su_total) * 100.0, 1) if su_total > 0 else 0.0,
+        "net_realized_pnl_usd": round(sum(t["pnl_usd"] for t in scaleup_trades), 2),
+        "avg_win_usd": round(sum(t["pnl_usd"] for t in su_wins) / len(su_wins), 2) if su_wins else 0.0,
+        "avg_win_bps": round(sum(t["pnl_bps"] for t in su_wins) / len(su_wins), 1) if su_wins else 0.0,
+        "avg_loss_usd": round(sum(abs(t["pnl_usd"]) for t in su_losses) / len(su_losses), 2) if su_losses else 0.0,
+        "avg_loss_bps": round(sum(abs(t["pnl_bps"]) for t in su_losses) / len(su_losses), 1) if su_losses else 0.0,
+    }
 
     # Compute live unrealized PnL across any active positions
     unrealized_pnl_usd = round(
@@ -374,7 +398,7 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
 
     today_obj = daily_summary[today_key]
     today_starting_equity = round(live_equity - today_obj["net_pnl_usd"], 2)
-    daily_loss_limit_usd = round(today_starting_equity * 0.05, 2) if today_starting_equity > 0.0 else 0.0  # 5% daily drawdown limit (3 strikes)
+    daily_loss_limit_usd = round(today_starting_equity * 0.0275, 2) if today_starting_equity > 0.0 else 0.0  # 2.75% Cross-Margin Daily Drawdown Cap (Rank 1)
     daily_threshold_usd = round(today_starting_equity - daily_loss_limit_usd, 2) if today_starting_equity > 0.0 else 0.0
     daily_loss_used_usd = max(0.0, -today_obj["net_pnl_usd"])
     daily_loss_left_usd = round(max(0.0, daily_loss_limit_usd - daily_loss_used_usd), 2)
@@ -393,12 +417,17 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
         "win_count": win_count,
         "loss_count": loss_count,
         "win_rate_pct": win_rate_pct,
+        "profit_factor": profit_factor,
+        "expectancy_bps": expectancy_bps,
         "avg_win_usd": avg_win_usd,
         "avg_win_pct": avg_win_pct,
+        "avg_win_bps": avg_win_bps,
         "total_win_usd": total_win_usd,
         "avg_loss_usd": avg_loss_usd,
         "avg_loss_pct": avg_loss_pct,
+        "avg_loss_bps": avg_loss_bps,
         "total_loss_usd": total_loss_usd,
+        "scaleup_stats": scaleup_stats,
         "today_starting_equity_usd": today_starting_equity,
         "daily_loss_limit_usd": daily_loss_limit_usd,
         "daily_threshold_usd": daily_threshold_usd,
@@ -407,6 +436,241 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
         "daily_summary": daily_summary,
         "recent_trades": list(reversed(real_trades[-50:])),
     }
+
+
+FOMC_DATES = {
+    (2025, 1, 29), (2025, 3, 19), (2025, 5, 7), (2025, 6, 18),
+    (2025, 7, 30), (2025, 9, 17), (2025, 10, 29), (2025, 12, 10),
+    (2026, 1, 28), (2026, 3, 18), (2026, 4, 29), (2026, 6, 17),
+    (2026, 7, 29), (2026, 9, 16), (2026, 11, 4), (2026, 12, 9),
+    (2027, 1, 27), (2027, 3, 17), (2027, 4, 28), (2027, 6, 9),
+    (2027, 7, 28), (2027, 9, 15), (2027, 10, 27), (2027, 12, 8),
+}
+
+CPI_DATES = {
+    (2025, 1, 15), (2025, 2, 12), (2025, 3, 12), (2025, 4, 10),
+    (2025, 5, 13), (2025, 6, 11), (2025, 7, 15), (2025, 8, 12),
+    (2025, 9, 11), (2025, 10, 15), (2025, 11, 13), (2025, 12, 10),
+    (2026, 1, 13), (2026, 2, 11), (2026, 3, 11), (2026, 4, 14),
+    (2026, 5, 12), (2026, 6, 10), (2026, 7, 14), (2026, 8, 12),
+    (2026, 9, 11), (2026, 10, 14), (2026, 11, 12), (2026, 12, 10),
+    (2027, 1, 13), (2027, 2, 10), (2027, 3, 10), (2027, 4, 13),
+    (2027, 5, 12), (2027, 6, 10), (2027, 7, 14), (2027, 8, 11),
+    (2027, 9, 14), (2027, 10, 13), (2027, 11, 10), (2027, 12, 14),
+}
+
+
+def is_us_dst(year, month, day):
+    if 4 <= month <= 10:
+        return True
+    if month < 3 or month > 11:
+        return False
+    if month == 3:
+        mar1_wd = (datetime(year, 3, 1).weekday() + 1) % 7
+        second_sun = 1 + ((7 - mar1_wd) % 7) + 7
+        return day >= second_sun
+    if month == 11:
+        nov1_wd = (datetime(year, 11, 1).weekday() + 1) % 7
+        first_sun = 1 + ((7 - nov1_wd) % 7)
+        return day < first_sun
+    return False
+
+
+def evaluate_macro_shield_status(now_ms):
+    import math
+    dt = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc)
+    y, m, d = dt.year, dt.month, dt.day
+    wd = dt.weekday()  # 0=Mon .. 4=Fri
+    edt = is_us_dst(y, m, d)
+
+    lambda_exo = 0.0
+    is_blackout = False
+    event_name = "CLEAR"
+    scheduled_today = None
+
+    def check_ev(rel_hour, rel_min, hold_m, hl_m, name):
+        nonlocal lambda_exo, is_blackout, event_name, scheduled_today
+        rel_dt = datetime(y, m, d, rel_hour, rel_min, 0, tzinfo=timezone.utc)
+        rel_ms = int(rel_dt.timestamp() * 1000)
+        diff_m = (now_ms - rel_ms) / 60000.0
+        scheduled_today = f"{name} ({rel_hour:02d}:{rel_min:02d} UTC)"
+        lam = 0.0
+        if -30.0 <= diff_m < -15.0:
+            lam = 0.60 * ((diff_m + 30.0) / 15.0)
+        elif -15.0 <= diff_m <= hold_m:
+            lam = 1.0
+        elif hold_m < diff_m <= hold_m + 5.0 * hl_m:
+            raw = math.exp(-math.log(2.0) * (diff_m - hold_m) / hl_m)
+            lam = raw if raw >= 0.05 else 0.0
+        if lam > lambda_exo:
+            lambda_exo = round(lam, 3)
+            is_blackout = lam >= 0.60
+            event_name = name
+
+    if (y, m, d) in FOMC_DATES:
+        check_ev(18 if edt else 19, 0, 60.0, 20.0, "US_FOMC_DECISION")
+    print_hr = 12 if edt else 13
+    if (y, m, d) in CPI_DATES:
+        check_ev(print_hr, 30, 15.0, 15.0, "US_CPI_PRINT")
+    elif wd == 4 and d <= 7:
+        check_ev(print_hr, 30, 15.0, 15.0, "US_NFP_PAYROLLS")
+    elif wd == 4 and d >= 24:
+        check_ev(print_hr, 30, 15.0, 15.0, "US_CORE_PCE")
+
+    return {
+        "lambda_exo": lambda_exo,
+        "is_hard_blackout": is_blackout,
+        "event_name": event_name,
+        "scheduled_today": scheduled_today or "None Today",
+    }
+
+
+def load_counterfactual_summary(valid_dirs):
+    summary = {
+        "total_evaluated": 0,
+        "avoided_losses_count": 0,
+        "avoided_losses_bps": 0.0,
+        "missed_profits_count": 0,
+        "missed_profits_bps": 0.0,
+        "recent_events": [],
+    }
+    for d in valid_dirs:
+        p = os.path.join(d, "hl_counterfactual_trades.jsonl")
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rec = json.loads(line)
+                    summary["total_evaluated"] += 1
+                    out = rec.get("outcome", {})
+                    dec = rec.get("decision", {})
+                    v_class = str(out.get("veto_classification", "NEUTRAL_NOISE"))
+                    net_bps = float(out.get("counterfactual_net_pnl_bps", 0.0) or 0.0)
+                    if v_class == "ALPHA_PROTECTIVE":
+                        summary["avoided_losses_count"] += 1
+                        summary["avoided_losses_bps"] = round(summary["avoided_losses_bps"] + abs(net_bps), 1)
+                    elif v_class == "ALPHA_STRANGLING":
+                        summary["missed_profits_count"] += 1
+                        summary["missed_profits_bps"] = round(summary["missed_profits_bps"] + max(0.0, net_bps), 1)
+
+                # Keep last 25 resolved events in reverse chronological order
+                recent = []
+                for line in reversed(lines[-40:]):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rec = json.loads(line)
+                    out = rec.get("outcome", {})
+                    dec = rec.get("decision", {})
+                    mkt = rec.get("market_at_decision", {})
+                    recent.append({
+                        "ts_utc": str(rec.get("ts_utc", ""))[:16].replace("T", " "),
+                        "symbol": str(rec.get("asset", "PERP")),
+                        "side": str(rec.get("side", "BUY")),
+                        "engine": str(rec.get("engine", "EngineA")),
+                        "primary_veto": str(dec.get("primary_veto", "VETO")),
+                        "ref_price": float(mkt.get("reference_price", 0.0) or 0.0),
+                        "exit_price": float(out.get("exit_price", 0.0) or 0.0),
+                        "net_bps": round(float(out.get("counterfactual_net_pnl_bps", 0.0) or 0.0), 1),
+                        "mfe_bps": round(float(out.get("mfe_bps", 0.0) or 0.0), 1),
+                        "mae_bps": round(float(out.get("mae_bps", 0.0) or 0.0), 1),
+                        "classification": str(out.get("veto_classification", "NEUTRAL_NOISE")),
+                    })
+                    if len(recent) >= 25:
+                        break
+                summary["recent_events"] = recent
+            except Exception:
+                pass
+            break
+    return summary
+
+
+def load_recent_candles(valid_dirs, symbol, limit=140):
+    """
+    Loads the last `limit` 1m candles from `hl_history_{symbol}.jsonl` on the local NAS/SSD.
+    Enforces strictly ascending unique UTCTimestamp in integer seconds as required by TradingView Lightweight Charts.
+    """
+    sym_low = str(symbol or "BTC").strip().lower()
+    for d in valid_dirs:
+        p = os.path.join(d, f"hl_history_{sym_low}.jsonl")
+        if os.path.exists(p):
+            try:
+                with open(p, "rb") as f:
+                    f.seek(0, os.SEEK_END)
+                    fsize = f.tell()
+                    read_sz = min(fsize, limit * 520)
+                    f.seek(max(0, fsize - read_sz), os.SEEK_SET)
+                    raw_lines = f.read().decode("utf-8", errors="ignore").splitlines()
+                by_sec = {}
+                for line in raw_lines[-limit * 2:]:
+                    line = line.strip()
+                    if not line.startswith("{"):
+                        continue
+                    rec = json.loads(line)
+                    ts_sec = int(int(rec.get("timestamp_ms", 0) or 0) // 1000)
+                    o = float(rec.get("open", 0.0) or 0.0)
+                    h = float(rec.get("high", 0.0) or 0.0)
+                    l = float(rec.get("low", 0.0) or 0.0)
+                    c = float(rec.get("close", 0.0) or 0.0)
+                    if ts_sec > 0 and c > 0 and h >= l > 0:
+                        by_sec[ts_sec] = {
+                            "time": ts_sec,
+                            "open": o,
+                            "high": h,
+                            "low": l,
+                            "close": c,
+                            "volume": float(rec.get("volume", 0.0) or 0.0),
+                        }
+                sorted_bars = [by_sec[k] for k in sorted(by_sec.keys())]
+                return sorted_bars[-limit:]
+            except Exception:
+                pass
+    return []
+
+
+def format_prometheus_metrics(data):
+    """
+    Exposes Prometheus / OpenMetrics text format with strictly bounded low-cardinality labels
+    (symbol, state, horizon, stage) per `Open-Source Trading Dashboard Research.md` Section 3.1.
+    """
+    lines = [
+        "# HELP markov_polo_account_equity_usd Total account equity in USDC",
+        "# TYPE markov_polo_account_equity_usd gauge",
+    ]
+    perf = data.get("real_performance", {})
+    lines.append(f"markov_polo_account_equity_usd {float(perf.get('account_equity_usd', 0.0))}")
+    lines.append(f"markov_polo_high_water_mark_usd {float(perf.get('high_water_mark_usd', 0.0))}")
+    lines.append(f"markov_polo_net_realized_pnl_usd {float(perf.get('net_realized_pnl_usd', 0.0))}")
+    lines.append(f"markov_polo_win_rate_pct {float(perf.get('win_rate_pct', 0.0))}")
+    lines.append(f"markov_polo_trades_total{{outcome=\"win\"}} {int(perf.get('win_count', 0))}")
+    lines.append(f"markov_polo_trades_total{{outcome=\"loss\"}} {int(perf.get('loss_count', 0))}")
+
+    macro = data.get("macro_shield", {})
+    lines.append(f"markov_polo_macro_hazard_lambda {float(macro.get('lambda_exo', 0.0))}")
+    lines.append(f"markov_polo_macro_blackout_active {1 if macro.get('is_hard_blackout') else 0}")
+
+    ccb = data.get("cluster_circuit_breaker", {})
+    lines.append(f"markov_polo_cluster_consecutive_losses {int(ccb.get('cluster_consecutive_losses', 0))}")
+
+    for sym, a in (data.get("assets") or {}).items():
+        if sym not in ("BTC", "ETH", "SOL", "AVAX"):
+            continue
+        lines.append(f'markov_polo_asset_price{{symbol="{sym}"}} {float(a.get("price", 0.0) or 0.0)}')
+        lines.append(f'markov_polo_ou_half_life_minutes{{symbol="{sym}"}} {float(a.get("half_life_m", 0.0) or 0.0)}')
+        lines.append(f'markov_polo_z_score{{symbol="{sym}",window="15m"}} {float(a.get("z_15", 0.0) or 0.0)}')
+        lines.append(f'markov_polo_z_score{{symbol="{sym}",window="60m"}} {float(a.get("z_60", 0.0) or 0.0)}')
+        lines.append(f'markov_polo_l2_obi{{symbol="{sym}",horizon="instant"}} {float(a.get("obi_instant", 0.0) or 0.0)}')
+        lines.append(f'markov_polo_l2_obi{{symbol="{sym}",horizon="1s"}} {float(a.get("obi_1s", 0.0) or 0.0)}')
+        lines.append(f'markov_polo_l2_obi{{symbol="{sym}",horizon="5s"}} {float(a.get("obi_5s", 0.0) or 0.0)}')
+        lines.append(f'markov_polo_hmm_probability{{symbol="{sym}",state="consolidation"}} {float(a.get("p_consolidation", 0.0) or 0.0)}')
+        lines.append(f'markov_polo_hmm_probability{{symbol="{sym}",state="trend"}} {float(a.get("p_trend", 0.0) or 0.0)}')
+        lines.append(f'markov_polo_hmm_probability{{symbol="{sym}",state="shock"}} {float(a.get("p_shock", 0.0) or 0.0)}')
+
+    return "\n".join(lines) + "\n"
 
 
 def get_telemetry_data():
@@ -553,8 +817,16 @@ def get_telemetry_data():
             except Exception:
                 pass
 
-    # 4. Load Circuit Breakers
+    # 4. Load Circuit Breakers & Cross-Margin Cluster Circuit Breaker
+    results["cluster_circuit_breaker"] = {}
     for d in valid_dirs:
+        ccb_path = os.path.join(d, "hl_cluster_circuit_breaker.json")
+        if os.path.exists(ccb_path) and not results["cluster_circuit_breaker"]:
+            try:
+                with open(ccb_path, "r", encoding="utf-8") as f:
+                    results["cluster_circuit_breaker"] = json.load(f)
+            except Exception:
+                pass
         for pattern, prefix in (("hl_hmm_cb_*.json", "hl_hmm_cb_"), ("hl_cb_*.json", "hl_cb_")):
             for path in glob.glob(os.path.join(d, pattern)):
                 base = os.path.basename(path)
@@ -571,6 +843,10 @@ def get_telemetry_data():
         valid_dirs, results["assets"], results["positions"]
     )
 
+    # 6. Compute Macro Shield & Counterfactual Summary
+    results["macro_shield"] = evaluate_macro_shield_status(now_ms)
+    results["counterfactual_summary"] = load_counterfactual_summary(valid_dirs)
+
     return results
 
 
@@ -586,6 +862,32 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+            return
+
+        if clean_path == "/api/candles":
+            qs = urllib.parse.parse_qs(parsed.query)
+            sym = (qs.get("symbol") or ["BTC"])[0].upper()
+            valid_dirs = [d for d in SEARCH_DIRS if os.path.isdir(d)] or ["."]
+            candles = load_recent_candles(valid_dirs, sym, limit=140)
+            content = json.dumps({"symbol": sym, "candles": candles}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+            return
+
+        if clean_path == "/metrics":
+            data = get_telemetry_data()
+            content = format_prometheus_metrics(data).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
             self.send_header("Content-Length", str(len(content)))
             self.end_headers()
             self.wfile.write(content)

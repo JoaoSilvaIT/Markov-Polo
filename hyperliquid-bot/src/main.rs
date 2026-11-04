@@ -1091,15 +1091,33 @@ async fn main() {
 
                     if is_breached {
                         let breach_px = if pos.side == "LONG" { best_bid } else { best_ask };
-                        println!(
-                            "🛑 [FAST-SENTINEL 1.5s STOP LOSS] {} breached catastrophe stop at ${:.2} (Current: ${:.2})! Emergency flattening...",
-                            watcher_symbol, pos.stop_loss_price, breach_px
-                        );
-                        let stop_msg = format!(
-                            "🛑 **CATASTROPHE STOP LOSS HIT (1.5s FAST-SENTINEL):** {}\n**Side:** {}\n**Breach Price:** ${:.2}\n**Hard Stop:** ${:.2}\nEmergency flattening immediately.",
-                            watcher_symbol, pos.side, breach_px, pos.stop_loss_price
-                        );
-                        crate::discord::send_alert(watcher_discord.as_deref(), &stop_msg).await;
+                        let is_profit_lock = if pos.side == "LONG" {
+                            pos.entry_price > 0.0 && breach_px > pos.entry_price * 1.0005
+                        } else {
+                            pos.entry_price > 0.0 && breach_px < pos.entry_price * 0.9995
+                        };
+
+                        if is_profit_lock {
+                            println!(
+                                "🟢 [FAST-SENTINEL PROFIT-LOCK TRAILING STOP] {} hit profit-locked stop at ${:.4} (Entry: ${:.4}, Current: ${:.4})! Harvesting profit...",
+                                watcher_symbol, pos.stop_loss_price, pos.entry_price, breach_px
+                            );
+                            let profit_msg = format!(
+                                "🟢 **PROFIT-LOCK TRAILING STOP HIT (FAST-SENTINEL):** {}\n**Side:** {}\n**Entry:** ${:.4}\n**Harvest Price:** ${:.4}\nClosing position in profit.",
+                                watcher_symbol, pos.side, pos.entry_price, breach_px
+                            );
+                            crate::discord::send_alert(watcher_discord.as_deref(), &profit_msg).await;
+                        } else {
+                            println!(
+                                "🛑 [FAST-SENTINEL 1.5s STOP LOSS] {} breached catastrophe stop at ${:.4} (Current: ${:.4})! Emergency flattening...",
+                                watcher_symbol, pos.stop_loss_price, breach_px
+                            );
+                            let stop_msg = format!(
+                                "🛑 **CATASTROPHE STOP LOSS HIT (1.5s FAST-SENTINEL):** {}\n**Side:** {}\n**Breach Price:** ${:.4}\n**Hard Stop:** ${:.4}\nEmergency flattening immediately.",
+                                watcher_symbol, pos.side, breach_px, pos.stop_loss_price
+                            );
+                            crate::discord::send_alert(watcher_discord.as_deref(), &stop_msg).await;
+                        }
 
                         {
                             let mut state_lock = watcher_state.lock().await;
@@ -1117,7 +1135,11 @@ async fn main() {
                         }
 
                         let mut cb_lock = watcher_cb.lock().await;
-                        cb_lock.record_loss();
+                        if is_profit_lock {
+                            cb_lock.record_win();
+                        } else {
+                            cb_lock.record_loss();
+                        }
                         save_circuit_breaker(&watcher_cb_path, &cb_lock);
                         continue;
                     }
