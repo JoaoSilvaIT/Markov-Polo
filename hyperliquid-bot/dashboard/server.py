@@ -19,17 +19,21 @@ PORT = int(os.environ.get("DASHBOARD_PORT", 8088))
 MAX_CONCURRENT = int(os.environ.get("HL_MAX_CONCURRENT_POSITIONS", 2))
 WALLET_ADDRESS = os.environ.get("HL_WALLET_ADDRESS", "").strip()
 IS_MAINNET = os.environ.get("HL_IS_MAINNET", "true").strip().lower() != "false"
-HL_INFO_URL = "https://api.hyperliquid.xyz/info" if IS_MAINNET else "https://api.hyperliquid-testnet.xyz/info"
+HL_INFO_URL = (
+    "https://api.hyperliquid.xyz/info"
+    if IS_MAINNET
+    else "https://api.hyperliquid-testnet.xyz/info"
+)
 # Clean-slate cutoff: 2026-10-29 15:30 UTC major quant architecture upgrade (5m Kalman O-U + Excursion Caps + Ratchet)
 CLEAN_SLATE_EPOCH_MS = int(os.environ.get("HL_CLEAN_SLATE_EPOCH_MS", "1793287800000"))
 # Scale-up cutoff: 2026-11-01 19:00 UTC ($534 USDC capital scale-up epoch)
 SCALEUP_EPOCH_MS = int(os.environ.get("HL_SCALEUP_EPOCH_MS", "1793559600000"))
 
 SEARCH_DIRS = [
-    "/app/data",                      # Docker container mount
-    "/app",                           # Alternative Docker mount
-    "./hl_bot_data",                  # Local dev inside hyperliquid-bot
-    ".",                              # Current directory
+    "/app/data",  # Docker container mount
+    "/app",  # Alternative Docker mount
+    "./hl_bot_data",  # Local dev inside hyperliquid-bot
+    ".",  # Current directory
     "../hl_bot_data",
 ]
 
@@ -151,7 +155,8 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
 
     # 1. Reconstruct closed trades from Hyperliquid L1 `userFills` if available (post-clean-slate only)
     raw_fills = [
-        f for f in (hl_live.get("fills") or [])
+        f
+        for f in (hl_live.get("fills") or [])
         if int(f.get("time", 0) or 0) >= CLEAN_SLATE_EPOCH_MS
     ]
     if raw_fills:
@@ -173,16 +178,43 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
             if "Open" in direction:
                 side = "LONG" if "Long" in direction else "SHORT"
                 if coin not in open_tracker:
-                    open_tracker[coin] = {"time": ts_ms, "px_sz": px * sz, "sz": sz, "side": side, "fee": fee}
+                    open_tracker[coin] = {
+                        "time": ts_ms,
+                        "px_sz": px * sz,
+                        "sz": sz,
+                        "side": side,
+                        "fee": fee,
+                    }
                 else:
                     open_tracker[coin]["px_sz"] += px * sz
                     open_tracker[coin]["sz"] += sz
                     open_tracker[coin]["fee"] += fee
             elif "Close" in direction or abs(closed_pnl) > 1e-9:
-                side = "LONG" if "Long" in direction else ("SHORT" if "Short" in direction else (open_tracker.get(coin, {}).get("side", "LONG")))
-                open_info = open_tracker.get(coin, {"time": max(0, ts_ms - 1800_000), "px_sz": px * sz, "sz": sz, "side": side, "fee": 0.0})
+                side = (
+                    "LONG"
+                    if "Long" in direction
+                    else (
+                        "SHORT"
+                        if "Short" in direction
+                        else (open_tracker.get(coin, {}).get("side", "LONG"))
+                    )
+                )
+                open_info = open_tracker.get(
+                    coin,
+                    {
+                        "time": max(0, ts_ms - 1800_000),
+                        "px_sz": px * sz,
+                        "sz": sz,
+                        "side": side,
+                        "fee": 0.0,
+                    },
+                )
                 tot_op_sz = max(float(open_info.get("sz", 0.0) or 0.0), 1e-9)
-                entry_px = float(open_info.get("px_sz", 0.0) or (px * sz)) / tot_op_sz if open_info.get("sz", 0.0) > 0 else px
+                entry_px = (
+                    float(open_info.get("px_sz", 0.0) or (px * sz)) / tot_op_sz
+                    if open_info.get("sz", 0.0) > 0
+                    else px
+                )
                 open_ms = int(open_info.get("time") or ts_ms)
                 net_pnl = closed_pnl - fee - float(open_info.get("fee", 0.0) or 0.0)
                 open_info["fee"] = 0.0  # consume open fee once
@@ -193,13 +225,20 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
                         del open_tracker[coin]
 
                 # Merge partial fills belonging to the same close order or within 10s on same coin
-                if grouped_closes and grouped_closes[-1]["symbol"] == coin and (
-                    grouped_closes[-1]["oid"] == oid or abs(ts_ms - grouped_closes[-1]["close_ms"]) <= 10_000
+                if (
+                    grouped_closes
+                    and grouped_closes[-1]["symbol"] == coin
+                    and (
+                        grouped_closes[-1]["oid"] == oid
+                        or abs(ts_ms - grouped_closes[-1]["close_ms"]) <= 10_000
+                    )
                 ):
                     prev = grouped_closes[-1]
                     total_sz = prev["lots"] + sz
                     if total_sz > 0:
-                        prev["exit_price"] = (prev["exit_price"] * prev["lots"] + px * sz) / total_sz
+                        prev["exit_price"] = (
+                            prev["exit_price"] * prev["lots"] + px * sz
+                        ) / total_sz
                     prev["lots"] = round(total_sz, 5)
                     prev["pnl_usd"] = round(prev["pnl_usd"] + net_pnl, 4)
                     prev["close_ms"] = ts_ms
@@ -212,25 +251,27 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
                 else:
                     notional = max(entry_px * sz, 1e-6)
                     pnl_bps = (net_pnl / notional) * 10000.0
-                    grouped_closes.append({
-                        "oid": oid,
-                        "symbol": coin,
-                        "side": side,
-                        "engine": "Live L1",
-                        "lots": round(sz, 5),
-                        "entry_price": entry_px,
-                        "exit_price": px,
-                        "open_ms": open_ms,
-                        "close_ms": ts_ms,
-                        "open_date": fmt_ts_ms(open_ms),
-                        "close_date": fmt_ts_ms(ts_ms),
-                        "day_key": fmt_date_slash(ts_ms),
-                        "pnl_usd": round(net_pnl, 4),
-                        "pnl_bps": round(pnl_bps, 2),
-                        "pnl_pct": round(pnl_bps / 100.0, 2),
-                        "exit_reason": "EXCHANGE_FILL",
-                        "is_win": net_pnl > 0.0,
-                    })
+                    grouped_closes.append(
+                        {
+                            "oid": oid,
+                            "symbol": coin,
+                            "side": side,
+                            "engine": "Live L1",
+                            "lots": round(sz, 5),
+                            "entry_price": entry_px,
+                            "exit_price": px,
+                            "open_ms": open_ms,
+                            "close_ms": ts_ms,
+                            "open_date": fmt_ts_ms(open_ms),
+                            "close_date": fmt_ts_ms(ts_ms),
+                            "day_key": fmt_date_slash(ts_ms),
+                            "pnl_usd": round(net_pnl, 4),
+                            "pnl_bps": round(pnl_bps, 2),
+                            "pnl_pct": round(pnl_bps / 100.0, 2),
+                            "exit_reason": "EXCHANGE_FILL",
+                            "is_win": net_pnl > 0.0,
+                        }
+                    )
 
         real_trades.extend(grouped_closes)
 
@@ -248,38 +289,55 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
                         sym = str(rec.get("symbol", "")).upper()
                         closed_dt = parse_iso_time(rec.get("closed_at"))
                         opened_dt = parse_iso_time(rec.get("opened_at"))
-                        close_ms = int(closed_dt.timestamp() * 1000) if closed_dt else int(time.time() * 1000)
-                        open_ms = int(opened_dt.timestamp() * 1000) if opened_dt else close_ms
+                        close_ms = (
+                            int(closed_dt.timestamp() * 1000)
+                            if closed_dt
+                            else int(time.time() * 1000)
+                        )
+                        open_ms = (
+                            int(opened_dt.timestamp() * 1000) if opened_dt else close_ms
+                        )
                         if close_ms < CLEAN_SLATE_EPOCH_MS:
                             continue
 
                         # Deduplicate against exchange fills within 90s on same coin
                         is_dup = any(
-                            t["symbol"] == sym and abs(t["close_ms"] - close_ms) <= 90_000
+                            t["symbol"] == sym
+                            and abs(t["close_ms"] - close_ms) <= 90_000
                             for t in real_trades
                         )
                         if not is_dup:
                             pnl_usd = float(rec.get("pnl_usd", 0.0) or 0.0)
                             pnl_bps = float(rec.get("pnl_bps", 0.0) or 0.0)
-                            real_trades.append({
-                                "oid": "",
-                                "symbol": sym,
-                                "side": str(rec.get("side", "LONG")).upper(),
-                                "engine": str(rec.get("engine", "EngineA")),
-                                "lots": round(float(rec.get("amount", 0.0) or 0.0), 5),
-                                "entry_price": float(rec.get("entry_price", 0.0) or 0.0),
-                                "exit_price": float(rec.get("exit_price", 0.0) or 0.0),
-                                "open_ms": open_ms,
-                                "close_ms": close_ms,
-                                "open_date": fmt_ts_ms(open_ms),
-                                "close_date": fmt_ts_ms(close_ms),
-                                "day_key": fmt_date_slash(close_ms),
-                                "pnl_usd": round(pnl_usd, 4),
-                                "pnl_bps": round(pnl_bps, 2),
-                                "pnl_pct": round(pnl_bps / 100.0, 2),
-                                "exit_reason": str(rec.get("exit_reason", "CLOSED")),
-                                "is_win": bool(rec.get("is_win", pnl_usd > 0.0)),
-                            })
+                            real_trades.append(
+                                {
+                                    "oid": "",
+                                    "symbol": sym,
+                                    "side": str(rec.get("side", "LONG")).upper(),
+                                    "engine": str(rec.get("engine", "EngineA")),
+                                    "lots": round(
+                                        float(rec.get("amount", 0.0) or 0.0), 5
+                                    ),
+                                    "entry_price": float(
+                                        rec.get("entry_price", 0.0) or 0.0
+                                    ),
+                                    "exit_price": float(
+                                        rec.get("exit_price", 0.0) or 0.0
+                                    ),
+                                    "open_ms": open_ms,
+                                    "close_ms": close_ms,
+                                    "open_date": fmt_ts_ms(open_ms),
+                                    "close_date": fmt_ts_ms(close_ms),
+                                    "day_key": fmt_date_slash(close_ms),
+                                    "pnl_usd": round(pnl_usd, 4),
+                                    "pnl_bps": round(pnl_bps, 2),
+                                    "pnl_pct": round(pnl_bps / 100.0, 2),
+                                    "exit_reason": str(
+                                        rec.get("exit_reason", "CLOSED")
+                                    ),
+                                    "is_win": bool(rec.get("is_win", pnl_usd > 0.0)),
+                                }
+                            )
             except Exception:
                 pass
             break
@@ -292,22 +350,44 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
     losses = [t for t in real_trades if t["pnl_usd"] <= 0.0]
     win_count = len(wins)
     loss_count = len(losses)
-    win_rate_pct = round((win_count / total_trades) * 100.0, 1) if total_trades > 0 else 0.0
+    win_rate_pct = (
+        round((win_count / total_trades) * 100.0, 1) if total_trades > 0 else 0.0
+    )
 
     total_win_usd = round(sum(t["pnl_usd"] for t in wins), 2)
     total_loss_usd = round(sum(abs(t["pnl_usd"]) for t in losses), 2)
     net_realized_pnl_usd = round(sum(t["pnl_usd"] for t in real_trades), 2)
 
     avg_win_usd = round(total_win_usd / win_count, 2) if win_count > 0 else 0.0
-    avg_win_pct = round(sum(t["pnl_pct"] for t in wins) / win_count, 2) if win_count > 0 else 0.0
-    avg_win_bps = round(sum(t["pnl_bps"] for t in wins) / win_count, 1) if win_count > 0 else 0.0
+    avg_win_pct = (
+        round(sum(t["pnl_pct"] for t in wins) / win_count, 2) if win_count > 0 else 0.0
+    )
+    avg_win_bps = (
+        round(sum(t["pnl_bps"] for t in wins) / win_count, 1) if win_count > 0 else 0.0
+    )
 
     avg_loss_usd = round(total_loss_usd / loss_count, 2) if loss_count > 0 else 0.0
-    avg_loss_pct = round(sum(abs(t["pnl_pct"]) for t in losses) / loss_count, 2) if loss_count > 0 else 0.0
-    avg_loss_bps = round(sum(abs(t["pnl_bps"]) for t in losses) / loss_count, 1) if loss_count > 0 else 0.0
+    avg_loss_pct = (
+        round(sum(abs(t["pnl_pct"]) for t in losses) / loss_count, 2)
+        if loss_count > 0
+        else 0.0
+    )
+    avg_loss_bps = (
+        round(sum(abs(t["pnl_bps"]) for t in losses) / loss_count, 1)
+        if loss_count > 0
+        else 0.0
+    )
 
-    profit_factor = round(total_win_usd / total_loss_usd, 2) if total_loss_usd > 1e-4 else (99.9 if total_win_usd > 0 else 0.0)
-    expectancy_bps = round(sum(t["pnl_bps"] for t in real_trades) / total_trades, 1) if total_trades > 0 else 0.0
+    profit_factor = (
+        round(total_win_usd / total_loss_usd, 2)
+        if total_loss_usd > 1e-4
+        else (99.9 if total_win_usd > 0 else 0.0)
+    )
+    expectancy_bps = (
+        round(sum(t["pnl_bps"] for t in real_trades) / total_trades, 1)
+        if total_trades > 0
+        else 0.0
+    )
 
     # Also compute Post-$534 Scale-Up Epoch stats (Nov 01, 2026+)
     scaleup_trades = [t for t in real_trades if t["close_ms"] >= SCALEUP_EPOCH_MS]
@@ -318,46 +398,119 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
         "total_trades_done": su_total,
         "win_count": len(su_wins),
         "loss_count": len(su_losses),
-        "win_rate_pct": round((len(su_wins) / su_total) * 100.0, 1) if su_total > 0 else 0.0,
+        "win_rate_pct": round((len(su_wins) / su_total) * 100.0, 1)
+        if su_total > 0
+        else 0.0,
         "net_realized_pnl_usd": round(sum(t["pnl_usd"] for t in scaleup_trades), 2),
-        "avg_win_usd": round(sum(t["pnl_usd"] for t in su_wins) / len(su_wins), 2) if su_wins else 0.0,
-        "avg_win_bps": round(sum(t["pnl_bps"] for t in su_wins) / len(su_wins), 1) if su_wins else 0.0,
-        "avg_loss_usd": round(sum(abs(t["pnl_usd"]) for t in su_losses) / len(su_losses), 2) if su_losses else 0.0,
-        "avg_loss_bps": round(sum(abs(t["pnl_bps"]) for t in su_losses) / len(su_losses), 1) if su_losses else 0.0,
+        "avg_win_usd": round(sum(t["pnl_usd"] for t in su_wins) / len(su_wins), 2)
+        if su_wins
+        else 0.0,
+        "avg_win_bps": round(sum(t["pnl_bps"] for t in su_wins) / len(su_wins), 1)
+        if su_wins
+        else 0.0,
+        "avg_loss_usd": round(
+            sum(abs(t["pnl_usd"]) for t in su_losses) / len(su_losses), 2
+        )
+        if su_losses
+        else 0.0,
+        "avg_loss_bps": round(
+            sum(abs(t["pnl_bps"]) for t in su_losses) / len(su_losses), 1
+        )
+        if su_losses
+        else 0.0,
     }
 
     # Compute live unrealized PnL across any active positions
     unrealized_pnl_usd = round(
-        sum(float(p.get("unrealized_pnl_usd", 0.0) or 0.0) for p in open_positions.values() if p.get("is_filled")),
+        sum(
+            float(p.get("unrealized_pnl_usd", 0.0) or 0.0)
+            for p in open_positions.values()
+            if p.get("is_filled")
+        ),
         4,
     )
     account_balance_usd = round(live_equity - unrealized_pnl_usd, 2)
 
-    # Reconstruct chronological equity curve from clean-slate baseline up to `live_equity`
+    # Reconstruct chronological equity curve across all real trades up to `live_equity`
     equity_curve = []
+    today_str = fmt_date_slash(int(time.time() * 1000))
     if real_trades:
-        recent_for_curve = real_trades[-12:]
-        start_eq = live_equity - sum(t["pnl_usd"] for t in recent_for_curve)
+        start_eq = max(0.0, live_equity - sum(t["pnl_usd"] for t in real_trades))
         running_eq = start_eq
-        pts = [{"label": "Start", "date": recent_for_curve[0]["open_date"], "equity": round(running_eq, 2)}]
-        for t in recent_for_curve:
-            running_eq = running_eq + t["pnl_usd"]
-            pts.append({
-                "label": t["close_date"].split(" ")[-1],
-                "date": t["close_date"],
+        cum_pnl = 0.0
+        first_open_ms = real_trades[0]["open_ms"]
+        pts = [
+            {
+                "time_ms": first_open_ms,
+                "date": real_trades[0]["open_date"],
+                "label": "Start",
                 "equity": round(running_eq, 2),
-                "symbol": t["symbol"],
-                "pnl_usd": t["pnl_usd"],
-            })
+                "cum_pnl_usd": 0.0,
+                "pnl_usd": 0.0,
+                "symbol": "START",
+                "side": "--",
+            }
+        ]
+        for t in real_trades:
+            running_eq += t["pnl_usd"]
+            cum_pnl += t["pnl_usd"]
+            pts.append(
+                {
+                    "time_ms": t["close_ms"],
+                    "date": t["close_date"],
+                    "label": t["close_date"].split(" ")[-1]
+                    if " " in t["close_date"]
+                    else t["close_date"],
+                    "equity": round(running_eq, 2),
+                    "cum_pnl_usd": round(cum_pnl, 2),
+                    "pnl_usd": t["pnl_usd"],
+                    "pnl_bps": t.get("pnl_bps", 0.0),
+                    "symbol": t["symbol"],
+                    "side": t["side"],
+                }
+            )
+        now_ms = int(time.time() * 1000)
+        pts.append(
+            {
+                "time_ms": now_ms,
+                "date": fmt_ts_ms(now_ms),
+                "label": "Now",
+                "equity": round(live_equity, 2),
+                "cum_pnl_usd": round(cum_pnl, 2),
+                "pnl_usd": 0.0,
+                "symbol": "LIVE",
+                "side": "--",
+            }
+        )
         equity_curve = pts
     else:
-        today_str = fmt_date_slash(int(time.time() * 1000))
+        now_ms = int(time.time() * 1000)
         equity_curve = [
-            {"label": "Start", "date": today_str, "equity": round(account_balance_usd, 2)},
-            {"label": "Live", "date": today_str, "equity": round(live_equity, 2)},
+            {
+                "time_ms": now_ms - 86400000,
+                "label": "Start",
+                "date": today_str,
+                "equity": round(account_balance_usd, 2),
+                "cum_pnl_usd": 0.0,
+                "pnl_usd": 0.0,
+                "symbol": "START",
+                "side": "--",
+            },
+            {
+                "time_ms": now_ms,
+                "label": "Live",
+                "date": today_str,
+                "equity": round(live_equity, 2),
+                "cum_pnl_usd": 0.0,
+                "pnl_usd": 0.0,
+                "symbol": "LIVE",
+                "side": "--",
+            },
         ]
 
-    high_water_mark = max([live_equity] + [float(p.get("equity", 0.0) or 0.0) for p in equity_curve])
+    high_water_mark = max(
+        [live_equity] + [float(p.get("equity", 0.0) or 0.0) for p in equity_curve]
+    )
 
     # Daily breakdown for Calendar + "Summary of the day"
     daily_summary = {}
@@ -377,12 +530,16 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
             }
         daily_summary[dk]["ending_balance"] = round(running_bal, 2)
         daily_summary[dk]["trades_done"] += 1
-        daily_summary[dk]["net_pnl_usd"] = round(daily_summary[dk]["net_pnl_usd"] + t["pnl_usd"], 2)
+        daily_summary[dk]["net_pnl_usd"] = round(
+            daily_summary[dk]["net_pnl_usd"] + t["pnl_usd"], 2
+        )
         if t["pnl_usd"] > 0:
             daily_summary[dk]["wins"] += 1
         else:
             daily_summary[dk]["losses"] += 1
-            daily_summary[dk]["lost_usd"] = round(daily_summary[dk]["lost_usd"] + abs(t["pnl_usd"]), 2)
+            daily_summary[dk]["lost_usd"] = round(
+                daily_summary[dk]["lost_usd"] + abs(t["pnl_usd"]), 2
+            )
 
     today_key = fmt_date_slash(int(time.time() * 1000))
     if today_key not in daily_summary:
@@ -398,13 +555,25 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
 
     today_obj = daily_summary[today_key]
     today_starting_equity = round(live_equity - today_obj["net_pnl_usd"], 2)
-    daily_loss_limit_usd = round(today_starting_equity * 0.0275, 2) if today_starting_equity > 0.0 else 0.0  # 2.75% Cross-Margin Daily Drawdown Cap (Rank 1)
-    daily_threshold_usd = round(today_starting_equity - daily_loss_limit_usd, 2) if today_starting_equity > 0.0 else 0.0
+    daily_loss_limit_usd = (
+        round(today_starting_equity * 0.0275, 2) if today_starting_equity > 0.0 else 0.0
+    )  # 2.75% Cross-Margin Daily Drawdown Cap (Rank 1)
+    daily_threshold_usd = (
+        round(today_starting_equity - daily_loss_limit_usd, 2)
+        if today_starting_equity > 0.0
+        else 0.0
+    )
     daily_loss_used_usd = max(0.0, -today_obj["net_pnl_usd"])
     daily_loss_left_usd = round(max(0.0, daily_loss_limit_usd - daily_loss_used_usd), 2)
 
     starting_equity_total = max(live_equity - net_realized_pnl_usd, 0.0)
-    total_profit_pct = round(((live_equity - starting_equity_total) / starting_equity_total) * 100.0, 4) if starting_equity_total > 0.0 else 0.0
+    total_profit_pct = (
+        round(
+            ((live_equity - starting_equity_total) / starting_equity_total) * 100.0, 4
+        )
+        if starting_equity_total > 0.0
+        else 0.0
+    )
 
     return {
         "account_balance_usd": round(account_balance_usd, 2),
@@ -439,24 +608,69 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
 
 
 FOMC_DATES = {
-    (2025, 1, 29), (2025, 3, 19), (2025, 5, 7), (2025, 6, 18),
-    (2025, 7, 30), (2025, 9, 17), (2025, 10, 29), (2025, 12, 10),
-    (2026, 1, 28), (2026, 3, 18), (2026, 4, 29), (2026, 6, 17),
-    (2026, 7, 29), (2026, 9, 16), (2026, 11, 4), (2026, 12, 9),
-    (2027, 1, 27), (2027, 3, 17), (2027, 4, 28), (2027, 6, 9),
-    (2027, 7, 28), (2027, 9, 15), (2027, 10, 27), (2027, 12, 8),
+    (2025, 1, 29),
+    (2025, 3, 19),
+    (2025, 5, 7),
+    (2025, 6, 18),
+    (2025, 7, 30),
+    (2025, 9, 17),
+    (2025, 10, 29),
+    (2025, 12, 10),
+    (2026, 1, 28),
+    (2026, 3, 18),
+    (2026, 4, 29),
+    (2026, 6, 17),
+    (2026, 7, 29),
+    (2026, 9, 16),
+    (2026, 11, 4),
+    (2026, 12, 9),
+    (2027, 1, 27),
+    (2027, 3, 17),
+    (2027, 4, 28),
+    (2027, 6, 9),
+    (2027, 7, 28),
+    (2027, 9, 15),
+    (2027, 10, 27),
+    (2027, 12, 8),
 }
 
 CPI_DATES = {
-    (2025, 1, 15), (2025, 2, 12), (2025, 3, 12), (2025, 4, 10),
-    (2025, 5, 13), (2025, 6, 11), (2025, 7, 15), (2025, 8, 12),
-    (2025, 9, 11), (2025, 10, 15), (2025, 11, 13), (2025, 12, 10),
-    (2026, 1, 13), (2026, 2, 11), (2026, 3, 11), (2026, 4, 14),
-    (2026, 5, 12), (2026, 6, 10), (2026, 7, 14), (2026, 8, 12),
-    (2026, 9, 11), (2026, 10, 14), (2026, 11, 12), (2026, 12, 10),
-    (2027, 1, 13), (2027, 2, 10), (2027, 3, 10), (2027, 4, 13),
-    (2027, 5, 12), (2027, 6, 10), (2027, 7, 14), (2027, 8, 11),
-    (2027, 9, 14), (2027, 10, 13), (2027, 11, 10), (2027, 12, 14),
+    (2025, 1, 15),
+    (2025, 2, 12),
+    (2025, 3, 12),
+    (2025, 4, 10),
+    (2025, 5, 13),
+    (2025, 6, 11),
+    (2025, 7, 15),
+    (2025, 8, 12),
+    (2025, 9, 11),
+    (2025, 10, 15),
+    (2025, 11, 13),
+    (2025, 12, 10),
+    (2026, 1, 13),
+    (2026, 2, 11),
+    (2026, 3, 11),
+    (2026, 4, 14),
+    (2026, 5, 12),
+    (2026, 6, 10),
+    (2026, 7, 14),
+    (2026, 8, 12),
+    (2026, 9, 11),
+    (2026, 10, 14),
+    (2026, 11, 12),
+    (2026, 12, 10),
+    (2027, 1, 13),
+    (2027, 2, 10),
+    (2027, 3, 10),
+    (2027, 4, 13),
+    (2027, 5, 12),
+    (2027, 6, 10),
+    (2027, 7, 14),
+    (2027, 8, 11),
+    (2027, 9, 14),
+    (2027, 10, 13),
+    (2027, 11, 10),
+    (2027, 12, 14),
 }
 
 
@@ -478,6 +692,7 @@ def is_us_dst(year, month, day):
 
 def evaluate_macro_shield_status(now_ms):
     import math
+
     dt = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc)
     y, m, d = dt.year, dt.month, dt.day
     wd = dt.weekday()  # 0=Mon .. 4=Fri
@@ -552,10 +767,14 @@ def load_counterfactual_summary(valid_dirs):
                     net_bps = float(out.get("counterfactual_net_pnl_bps", 0.0) or 0.0)
                     if v_class == "ALPHA_PROTECTIVE":
                         summary["avoided_losses_count"] += 1
-                        summary["avoided_losses_bps"] = round(summary["avoided_losses_bps"] + abs(net_bps), 1)
+                        summary["avoided_losses_bps"] = round(
+                            summary["avoided_losses_bps"] + abs(net_bps), 1
+                        )
                     elif v_class == "ALPHA_STRANGLING":
                         summary["missed_profits_count"] += 1
-                        summary["missed_profits_bps"] = round(summary["missed_profits_bps"] + max(0.0, net_bps), 1)
+                        summary["missed_profits_bps"] = round(
+                            summary["missed_profits_bps"] + max(0.0, net_bps), 1
+                        )
 
                 # Keep last 25 resolved events in reverse chronological order
                 recent = []
@@ -567,19 +786,28 @@ def load_counterfactual_summary(valid_dirs):
                     out = rec.get("outcome", {})
                     dec = rec.get("decision", {})
                     mkt = rec.get("market_at_decision", {})
-                    recent.append({
-                        "ts_utc": str(rec.get("ts_utc", ""))[:16].replace("T", " "),
-                        "symbol": str(rec.get("asset", "PERP")),
-                        "side": str(rec.get("side", "BUY")),
-                        "engine": str(rec.get("engine", "EngineA")),
-                        "primary_veto": str(dec.get("primary_veto", "VETO")),
-                        "ref_price": float(mkt.get("reference_price", 0.0) or 0.0),
-                        "exit_price": float(out.get("exit_price", 0.0) or 0.0),
-                        "net_bps": round(float(out.get("counterfactual_net_pnl_bps", 0.0) or 0.0), 1),
-                        "mfe_bps": round(float(out.get("mfe_bps", 0.0) or 0.0), 1),
-                        "mae_bps": round(float(out.get("mae_bps", 0.0) or 0.0), 1),
-                        "classification": str(out.get("veto_classification", "NEUTRAL_NOISE")),
-                    })
+                    recent.append(
+                        {
+                            "ts_utc": str(rec.get("ts_utc", ""))[:16].replace("T", " "),
+                            "symbol": str(rec.get("asset", "PERP")),
+                            "side": str(rec.get("side", "BUY")),
+                            "engine": str(rec.get("engine", "EngineA")),
+                            "primary_veto": str(dec.get("primary_veto", "VETO")),
+                            "ref_price": float(mkt.get("reference_price", 0.0) or 0.0),
+                            "exit_price": float(out.get("exit_price", 0.0) or 0.0),
+                            "net_bps": round(
+                                float(
+                                    out.get("counterfactual_net_pnl_bps", 0.0) or 0.0
+                                ),
+                                1,
+                            ),
+                            "mfe_bps": round(float(out.get("mfe_bps", 0.0) or 0.0), 1),
+                            "mae_bps": round(float(out.get("mae_bps", 0.0) or 0.0), 1),
+                            "classification": str(
+                                out.get("veto_classification", "NEUTRAL_NOISE")
+                            ),
+                        }
+                    )
                     if len(recent) >= 25:
                         break
                 summary["recent_events"] = recent
@@ -606,7 +834,7 @@ def load_recent_candles(valid_dirs, symbol, limit=140):
                     f.seek(max(0, fsize - read_sz), os.SEEK_SET)
                     raw_lines = f.read().decode("utf-8", errors="ignore").splitlines()
                 by_sec = {}
-                for line in raw_lines[-limit * 2:]:
+                for line in raw_lines[-limit * 2 :]:
                     line = line.strip()
                     if not line.startswith("{"):
                         continue
@@ -642,33 +870,69 @@ def format_prometheus_metrics(data):
         "# TYPE markov_polo_account_equity_usd gauge",
     ]
     perf = data.get("real_performance", {})
-    lines.append(f"markov_polo_account_equity_usd {float(perf.get('account_equity_usd', 0.0))}")
-    lines.append(f"markov_polo_high_water_mark_usd {float(perf.get('high_water_mark_usd', 0.0))}")
-    lines.append(f"markov_polo_net_realized_pnl_usd {float(perf.get('net_realized_pnl_usd', 0.0))}")
+    lines.append(
+        f"markov_polo_account_equity_usd {float(perf.get('account_equity_usd', 0.0))}"
+    )
+    lines.append(
+        f"markov_polo_high_water_mark_usd {float(perf.get('high_water_mark_usd', 0.0))}"
+    )
+    lines.append(
+        f"markov_polo_net_realized_pnl_usd {float(perf.get('net_realized_pnl_usd', 0.0))}"
+    )
     lines.append(f"markov_polo_win_rate_pct {float(perf.get('win_rate_pct', 0.0))}")
-    lines.append(f"markov_polo_trades_total{{outcome=\"win\"}} {int(perf.get('win_count', 0))}")
-    lines.append(f"markov_polo_trades_total{{outcome=\"loss\"}} {int(perf.get('loss_count', 0))}")
+    lines.append(
+        f'markov_polo_trades_total{{outcome="win"}} {int(perf.get("win_count", 0))}'
+    )
+    lines.append(
+        f'markov_polo_trades_total{{outcome="loss"}} {int(perf.get("loss_count", 0))}'
+    )
 
     macro = data.get("macro_shield", {})
-    lines.append(f"markov_polo_macro_hazard_lambda {float(macro.get('lambda_exo', 0.0))}")
-    lines.append(f"markov_polo_macro_blackout_active {1 if macro.get('is_hard_blackout') else 0}")
+    lines.append(
+        f"markov_polo_macro_hazard_lambda {float(macro.get('lambda_exo', 0.0))}"
+    )
+    lines.append(
+        f"markov_polo_macro_blackout_active {1 if macro.get('is_hard_blackout') else 0}"
+    )
 
     ccb = data.get("cluster_circuit_breaker", {})
-    lines.append(f"markov_polo_cluster_consecutive_losses {int(ccb.get('cluster_consecutive_losses', 0))}")
+    lines.append(
+        f"markov_polo_cluster_consecutive_losses {int(ccb.get('cluster_consecutive_losses', 0))}"
+    )
 
     for sym, a in (data.get("assets") or {}).items():
         if sym not in ("BTC", "ETH", "SOL", "AVAX"):
             continue
-        lines.append(f'markov_polo_asset_price{{symbol="{sym}"}} {float(a.get("price", 0.0) or 0.0)}')
-        lines.append(f'markov_polo_ou_half_life_minutes{{symbol="{sym}"}} {float(a.get("half_life_m", 0.0) or 0.0)}')
-        lines.append(f'markov_polo_z_score{{symbol="{sym}",window="15m"}} {float(a.get("z_15", 0.0) or 0.0)}')
-        lines.append(f'markov_polo_z_score{{symbol="{sym}",window="60m"}} {float(a.get("z_60", 0.0) or 0.0)}')
-        lines.append(f'markov_polo_l2_obi{{symbol="{sym}",horizon="instant"}} {float(a.get("obi_instant", 0.0) or 0.0)}')
-        lines.append(f'markov_polo_l2_obi{{symbol="{sym}",horizon="1s"}} {float(a.get("obi_1s", 0.0) or 0.0)}')
-        lines.append(f'markov_polo_l2_obi{{symbol="{sym}",horizon="5s"}} {float(a.get("obi_5s", 0.0) or 0.0)}')
-        lines.append(f'markov_polo_hmm_probability{{symbol="{sym}",state="consolidation"}} {float(a.get("p_consolidation", 0.0) or 0.0)}')
-        lines.append(f'markov_polo_hmm_probability{{symbol="{sym}",state="trend"}} {float(a.get("p_trend", 0.0) or 0.0)}')
-        lines.append(f'markov_polo_hmm_probability{{symbol="{sym}",state="shock"}} {float(a.get("p_shock", 0.0) or 0.0)}')
+        lines.append(
+            f'markov_polo_asset_price{{symbol="{sym}"}} {float(a.get("price", 0.0) or 0.0)}'
+        )
+        lines.append(
+            f'markov_polo_ou_half_life_minutes{{symbol="{sym}"}} {float(a.get("half_life_m", 0.0) or 0.0)}'
+        )
+        lines.append(
+            f'markov_polo_z_score{{symbol="{sym}",window="15m"}} {float(a.get("z_15", 0.0) or 0.0)}'
+        )
+        lines.append(
+            f'markov_polo_z_score{{symbol="{sym}",window="60m"}} {float(a.get("z_60", 0.0) or 0.0)}'
+        )
+        lines.append(
+            f'markov_polo_l2_obi{{symbol="{sym}",horizon="instant"}} {float(a.get("obi_instant", 0.0) or 0.0)}'
+        )
+        lines.append(
+            f'markov_polo_l2_obi{{symbol="{sym}",horizon="1s"}} {float(a.get("obi_1s", 0.0) or 0.0)}'
+        )
+        lines.append(
+            f'markov_polo_l2_obi{{symbol="{sym}",horizon="5s"}} {float(a.get("obi_5s", 0.0) or 0.0)}'
+        )
+        lines.append(
+            f'markov_polo_hmm_probability{{symbol="{sym}",state="consolidation"}} {float(a.get("p_consolidation", 0.0) or 0.0)}'
+        )
+        lines.append(
+            f'markov_polo_hmm_probability{{symbol="{sym}",state="trend"}} {float(a.get("p_trend", 0.0) or 0.0)}'
+        )
+        lines.append(
+            f'markov_polo_hmm_probability{{symbol="{sym}",state="shock"}} {float(a.get("p_shock", 0.0) or 0.0)}'
+        )
 
     return "\n".join(lines) + "\n"
 
@@ -747,7 +1011,11 @@ def get_telemetry_data():
             try:
                 with open(lock_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                if isinstance(data, dict) and "leases" in data and isinstance(data["leases"], dict):
+                if (
+                    isinstance(data, dict)
+                    and "leases" in data
+                    and isinstance(data["leases"], dict)
+                ):
                     for sym, l in data["leases"].items():
                         if sym not in seen_lease_symbols:
                             exp_dt = parse_iso_time(l.get("expires_at"))
@@ -787,11 +1055,11 @@ def get_telemetry_data():
                         if lifecycle != "Active":
                             continue
                         is_occupied = (
-                            pos.get("is_filled", False) or
-                            float(pos.get("amount", 0.0) or 0.0) > 0.0 or
-                            bool(pos.get("order_id")) or
-                            bool(pos.get("tp_order_id")) or
-                            bool(pos.get("client_order_id"))
+                            pos.get("is_filled", False)
+                            or float(pos.get("amount", 0.0) or 0.0) > 0.0
+                            or bool(pos.get("order_id"))
+                            or bool(pos.get("tp_order_id"))
+                            or bool(pos.get("client_order_id"))
                         )
                         if is_occupied and sym not in results["positions"]:
                             asset_telem = results["assets"].get(sym, {})
@@ -827,7 +1095,10 @@ def get_telemetry_data():
                     results["cluster_circuit_breaker"] = json.load(f)
             except Exception:
                 pass
-        for pattern, prefix in (("hl_hmm_cb_*.json", "hl_hmm_cb_"), ("hl_cb_*.json", "hl_cb_")):
+        for pattern, prefix in (
+            ("hl_hmm_cb_*.json", "hl_hmm_cb_"),
+            ("hl_cb_*.json", "hl_cb_"),
+        ):
             for path in glob.glob(os.path.join(d, pattern)):
                 base = os.path.basename(path)
                 sym = base.replace(prefix, "").replace(".json", "")
@@ -921,5 +1192,7 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
 if __name__ == "__main__":
     with ThreadingHTTPServer(("0.0.0.0", PORT), DashboardHandler) as httpd:
-        print(f"🚀 [DASHBOARD] Institutional Trading Terminal listening on http://0.0.0.0:{PORT}")
+        print(
+            f"🚀 [DASHBOARD] Institutional Trading Terminal listening on http://0.0.0.0:{PORT}"
+        )
         httpd.serve_forever()
