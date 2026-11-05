@@ -20,9 +20,10 @@ use crate::hmm::{compute_hmm_posteriors, train_hmm_offline, GaussianHMM};
 use crate::hyperliquid::{effective_tick_size, optimal_engine_b_tp_atr_multiple, quantize_price};
 use crate::ou_process::{
     asset_ou_config, calculate_directional_edge_bps, calculate_features_with_funding_at,
-    calculate_mad_sigma, check_macro_calendar_veto, compute_safe_tp_offset_bps,
-    evaluate_armed_reversal_1m_step, InvalidationDecision, OrderPlacementAction,
-    TwoTierInvalidationManager,
+    calculate_mad_sigma, check_macro_calendar_veto, compute_adaptive_tp_offset_bps,
+    compute_fee_adjusted_kelly_scalar, evaluate_armed_reversal_1m_step,
+    evaluate_engine_c_hourly_squeeze, evaluate_engine_d_cascade_reversal, InvalidationDecision,
+    OrderPlacementAction, TwoTierInvalidationManager,
 };
 use crate::state::{ClusterCircuitBreaker, Side, DEFAULT_MAX_DAILY_CLUSTER_DD_FRAC};
 use crate::telemetry::{evaluate_btc_impulse_veto, BtcImpulseSnapshot};
@@ -397,7 +398,8 @@ pub fn run_engine_a_backtest_with_btc(
     }
 
     let hmm_path = format!("hl_hmm_{}.json", symbol.to_uppercase());
-    let mut hmm_model = GaussianHMM::load_weights(&hmm_path).unwrap_or_else(|_| GaussianHMM::new(3, 4));
+    let mut hmm_model =
+        GaussianHMM::load_weights(&hmm_path).unwrap_or_else(|_| GaussianHMM::new(3, 4));
     let mut controller = RegimeController::default();
     let mut _current_p_c = 0.60;
     let mut current_p_t = 0.25;
@@ -431,17 +433,22 @@ pub fn run_engine_a_backtest_with_btc(
         match symbol.to_uppercase().as_str() {
             "BTC" => (0.0035, 0.0025, 0.0025, 0.0030),
             "ETH" => (0.0045, 0.0030, 0.0030, 0.0035),
-            "SOL" => (0.0052, 0.0045, 0.0045, 0.0055),
-            "AVAX" => (0.0065, 0.0050, 0.0060, 0.0075),
+            "XRP" | "LINK" => (0.0050, 0.0042, 0.0042, 0.0050),
+            "SOL" | "HYPE" => (0.0052, 0.0045, 0.0045, 0.0055),
+            "AVAX" | "SUI" => (0.0065, 0.0050, 0.0060, 0.0075),
+            "NEAR" => (0.0055, 0.0045, 0.0060, 0.0075),
             _ => (0.0045, 0.0030, 0.0030, 0.0035),
         };
-    let (max_short_drift_120, max_short_drift_240) = match symbol.to_uppercase().as_str() {
-        "BTC" => (0.0075, 0.0065),
-        "ETH" => (0.0100, 0.0080),
-        "SOL" => (0.0135, 0.0100),
-        "AVAX" => (0.0160, 0.0140),
-        _ => (0.0100, 0.0080),
-    };
+    let (max_short_drift_60, max_short_drift_120, max_short_drift_240) =
+        match symbol.to_uppercase().as_str() {
+            "BTC" => (0.0085, 0.0075, 0.0065),
+            "ETH" => (0.0095, 0.0100, 0.0080),
+            "XRP" | "LINK" => (0.0110, 0.0125, 0.0095),
+            "SOL" | "HYPE" => (0.0120, 0.0135, 0.0100),
+            "AVAX" | "SUI" => (0.0135, 0.0160, 0.0140),
+            "NEAR" => (0.0140, 0.0160, 0.0140),
+            _ => (0.0095, 0.0100, 0.0080),
+        };
 
     for idx in warmup..bars.len() {
         summary.bars_evaluated += 1;
@@ -454,7 +461,12 @@ pub fn run_engine_a_backtest_with_btc(
         };
 
         // Update 15m bar aggregation & crowding tracker
-        crowding_tracker.update(bar.funding_1h, bar.open_interest, bar.mark_px, bar.oracle_px);
+        crowding_tracker.update(
+            bar.funding_1h,
+            bar.open_interest,
+            bar.mark_px,
+            bar.oracle_px,
+        );
         let candle_bucket_15m = (bar.timestamp_ms / (15 * 60 * 1000)) * (15 * 60 * 1000);
         let is_last_1m_of_15m = bar.timestamp_ms + 60_000 >= candle_bucket_15m + 15 * 60 * 1000;
         let mut finalized_15m_bar: Option<CandleBar> = None;
@@ -650,8 +662,8 @@ pub fn run_engine_a_backtest_with_btc(
                 let has_donchian_breakout = calculate_donchian(prior_bars, donchian_period)
                     .map(|d| closed_15m.close > d.upper || closed_15m.close < d.lower)
                     .unwrap_or(false);
-                let is_severe_shock_15m = feat.is_downside_shock
-                    || (feat.is_upside_shock && (p_t < 0.82 || p_s >= 0.50));
+                let is_severe_shock_15m =
+                    feat.is_downside_shock || (feat.is_upside_shock && (p_t < 0.82 || p_s >= 0.50));
                 let _ = controller.evaluate_15m_bar_idempotent(
                     closed_15m.time_open + 15 * 60 * 1000,
                     bar.timestamp_ms,
@@ -686,7 +698,11 @@ pub fn run_engine_a_backtest_with_btc(
 
             // Hourly funding settlement at :00 UTC boundary
             if (bar.timestamp_ms / 60_000) % 60 == 0 && bar.funding_1h.abs() > 1e-9 {
-                let oracle_ref = if bar.oracle_px > 0.0 { bar.oracle_px } else { bar.close };
+                let oracle_ref = if bar.oracle_px > 0.0 {
+                    bar.oracle_px
+                } else {
+                    bar.close
+                };
                 let signed_carry = match pos.side {
                     Side::Long => -bar.funding_1h,
                     Side::Short => bar.funding_1h,
@@ -715,7 +731,8 @@ pub fn run_engine_a_backtest_with_btc(
             };
 
             let mut closed_outcome: Option<(f64, bool, &'static str)> = None;
-            let elapsed_mins_1m = bar.timestamp_ms.saturating_sub(pos.entry_time_ms) as f64 / 60_000.0;
+            let elapsed_mins_1m =
+                bar.timestamp_ms.saturating_sub(pos.entry_time_ms) as f64 / 60_000.0;
 
             if pos.is_engine_b {
                 let current_atr = calculate_atr(&rolling_15m_bars, 20).unwrap_or(pos.entry_atr);
@@ -835,32 +852,49 @@ pub fn run_engine_a_backtest_with_btc(
                 // Evaluate 5m Two-Tier Soft Structural Invalidation on completed 5-minute bars
                 if closed_outcome.is_none() && (bar.timestamp_ms / 60_000) % 5 == 4 {
                     if let Some(ref feat) = live_feat_opt {
-                        let raw_frozen_z_ou = if pos.frozen_center_px > 0.0 && pos.frozen_sigma_eq_log > 1e-6 {
-                            (bar.close / pos.frozen_center_px).ln() / pos.frozen_sigma_eq_log
-                        } else {
-                            feat.z_ou
-                        };
+                        let raw_frozen_z_ou =
+                            if pos.frozen_center_px > 0.0 && pos.frozen_sigma_eq_log > 1e-6 {
+                                (bar.close / pos.frozen_center_px).ln() / pos.frozen_sigma_eq_log
+                            } else {
+                                feat.z_ou
+                            };
                         let adverse_bps_from_entry = match pos.side {
-                            Side::Long => ((pos.entry_px - bar.close) / pos.entry_px * 1e4).max(0.0),
-                            Side::Short => ((bar.close - pos.entry_px) / pos.entry_px * 1e4).max(0.0),
+                            Side::Long => {
+                                ((pos.entry_px - bar.close) / pos.entry_px * 1e4).max(0.0)
+                            }
+                            Side::Short => {
+                                ((bar.close - pos.entry_px) / pos.entry_px * 1e4).max(0.0)
+                            }
                         };
                         let min_soft_inv_excursion_bps = match symbol.to_uppercase().as_str() {
                             "BTC" => 45.0,
                             "ETH" => 50.0,
-                            "SOL" => 60.0,
-                            "AVAX" => 62.0,
+                            "XRP" | "LINK" => 58.0,
+                            "SOL" | "HYPE" => 60.0,
+                            "AVAX" | "SUI" => 62.0,
+                            "NEAR" => 68.0,
                             _ => 50.0,
                         };
-                        let (frozen_z_ou, eff_z_15) = if adverse_bps_from_entry >= min_soft_inv_excursion_bps {
-                            (raw_frozen_z_ou, feat.z_15)
-                        } else {
-                            (0.0, 0.0)
-                        };
+                        let (frozen_z_ou, eff_z_15) =
+                            if adverse_bps_from_entry >= min_soft_inv_excursion_bps {
+                                (raw_frozen_z_ou, feat.z_15)
+                            } else {
+                                (0.0, 0.0)
+                            };
                         let kalman_against = match pos.side {
-                            Side::Long => (feat.kalman_drift_veto && feat.kalman_slope < 0.0) || feat.cusum_neg >= 8.0 || adverse_bps_from_entry >= min_soft_inv_excursion_bps,
-                            Side::Short => (feat.kalman_drift_veto && feat.kalman_slope > 0.0) || feat.cusum_pos >= 8.0 || adverse_bps_from_entry >= min_soft_inv_excursion_bps,
+                            Side::Long => {
+                                (feat.kalman_drift_veto && feat.kalman_slope < 0.0)
+                                    || feat.cusum_neg >= 8.0
+                                    || adverse_bps_from_entry >= min_soft_inv_excursion_bps
+                            }
+                            Side::Short => {
+                                (feat.kalman_drift_veto && feat.kalman_slope > 0.0)
+                                    || feat.cusum_pos >= 8.0
+                                    || adverse_bps_from_entry >= min_soft_inv_excursion_bps
+                            }
                         };
-                        let elapsed_mins = bar.timestamp_ms.saturating_sub(pos.entry_time_ms) as f64 / 60_000.0;
+                        let elapsed_mins =
+                            bar.timestamp_ms.saturating_sub(pos.entry_time_ms) as f64 / 60_000.0;
                         pos.inv_mgr.elapsed_minutes = (elapsed_mins - 5.0).max(0.0);
                         match pos.inv_mgr.on_5m_bar_close(
                             frozen_z_ou,
@@ -885,17 +919,15 @@ pub fn run_engine_a_backtest_with_btc(
                             }
                             InvalidationDecision::HoldPosition {
                                 updated_tp_price: Some(be_px),
-                            } => {
-                                match pos.side {
-                                    Side::Long if be_px < pos.tp_limit_px && be_px > bar.close => {
-                                        pos.tp_limit_px = be_px;
-                                    }
-                                    Side::Short if be_px > pos.tp_limit_px && be_px < bar.close => {
-                                        pos.tp_limit_px = be_px;
-                                    }
-                                    _ => {}
+                            } => match pos.side {
+                                Side::Long if be_px < pos.tp_limit_px && be_px > bar.close => {
+                                    pos.tp_limit_px = be_px;
                                 }
-                            }
+                                Side::Short if be_px > pos.tp_limit_px && be_px < bar.close => {
+                                    pos.tp_limit_px = be_px;
+                                }
+                                _ => {}
+                            },
                             InvalidationDecision::HoldPosition {
                                 updated_tp_price: None,
                             } => {}
@@ -918,13 +950,20 @@ pub fn run_engine_a_backtest_with_btc(
                             pos.max_progress = q_t;
                         }
                         let fav_close_bps = match pos.side {
-                            Side::Long => ((bar.close - pos.entry_px) / pos.entry_px * 1e4).max(0.0),
-                            Side::Short => ((pos.entry_px - bar.close) / pos.entry_px * 1e4).max(0.0),
+                            Side::Long => {
+                                ((bar.close - pos.entry_px) / pos.entry_px * 1e4).max(0.0)
+                            }
+                            Side::Short => {
+                                ((pos.entry_px - bar.close) / pos.entry_px * 1e4).max(0.0)
+                            }
                         };
                         let abs_arm_bps = 1.8 * ou_cfg.min_net_edge_bps;
-                        let arm_q_thresh = (abs_arm_bps / (d_0 / pos.entry_px * 1e4).max(1e-6)).min(0.75);
+                        let arm_q_thresh =
+                            (abs_arm_bps / (d_0 / pos.entry_px * 1e4).max(1e-6)).min(0.75);
                         let _ = fav_close_bps;
-                        if pos.max_progress >= arm_q_thresh && q_t <= (pos.max_progress - 0.20).max(0.15) {
+                        if pos.max_progress >= arm_q_thresh
+                            && q_t <= (pos.max_progress - 0.20).max(0.15)
+                        {
                             let slip = match pos.side {
                                 Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
                                 Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
@@ -932,21 +971,34 @@ pub fn run_engine_a_backtest_with_btc(
                             closed_outcome = Some((bar.close * slip, false, "GIVEBACK_RATCHET"));
                         } else if let Some(ref feat) = live_feat_opt {
                             if let Some(ref th) = feat.thresholds_opt {
-                                let entry_tick = effective_tick_size(pos.entry_px, sim_cfg.sz_decimals);
+                                let entry_tick =
+                                    effective_tick_size(pos.entry_px, sim_cfg.sz_decimals);
                                 let delta_reprice = (pos.entry_px * 0.0005)
                                     .max(0.10 * d_0)
                                     .max(3.0 * entry_tick);
-                                let cooldown_ok = bar.timestamp_ms.saturating_sub(pos.last_reprice_time_ms) >= 180_000;
+                                let cooldown_ok =
+                                    bar.timestamp_ms.saturating_sub(pos.last_reprice_time_ms)
+                                        >= 180_000;
                                 match pos.side {
                                     Side::Long => {
                                         let live_mu = th.exit_long;
-                                        let mu_tick = effective_tick_size(live_mu, sim_cfg.sz_decimals);
+                                        let mu_tick =
+                                            effective_tick_size(live_mu, sim_cfg.sz_decimals);
                                         let eps_shave = (live_mu * 0.0005).max(2.0 * mu_tick);
-                                        let b_cand = crate::hyperliquid::quantize_price(live_mu - eps_shave, sim_cfg.sz_decimals);
+                                        let b_cand = crate::hyperliquid::quantize_price(
+                                            live_mu - eps_shave,
+                                            sim_cfg.sz_decimals,
+                                        );
                                         let p_min = pos.entry_px * 1.0020;
-                                        if b_cand <= pos.tp_limit_px - delta_reprice && b_cand >= p_min && b_cand > bar.close {
+                                        if b_cand <= pos.tp_limit_px - delta_reprice
+                                            && b_cand >= p_min
+                                            && b_cand > bar.close
+                                        {
                                             pos.candidate_lower_count += 1;
-                                            if pos.candidate_lower_count >= 3 && cooldown_ok && pos.reprice_count < 3 {
+                                            if pos.candidate_lower_count >= 3
+                                                && cooldown_ok
+                                                && pos.reprice_count < 3
+                                            {
                                                 pos.tp_limit_px = b_cand;
                                                 pos.last_reprice_time_ms = bar.timestamp_ms;
                                                 pos.reprice_count += 1;
@@ -958,13 +1010,23 @@ pub fn run_engine_a_backtest_with_btc(
                                     }
                                     Side::Short => {
                                         let live_mu = th.exit_short;
-                                        let mu_tick = effective_tick_size(live_mu, sim_cfg.sz_decimals);
+                                        let mu_tick =
+                                            effective_tick_size(live_mu, sim_cfg.sz_decimals);
                                         let eps_shave = (live_mu * 0.0005).max(2.0 * mu_tick);
-                                        let b_cand = crate::hyperliquid::quantize_price(live_mu + eps_shave, sim_cfg.sz_decimals);
+                                        let b_cand = crate::hyperliquid::quantize_price(
+                                            live_mu + eps_shave,
+                                            sim_cfg.sz_decimals,
+                                        );
                                         let p_max = pos.entry_px * 0.9980;
-                                        if b_cand >= pos.tp_limit_px + delta_reprice && b_cand <= p_max && b_cand < bar.close {
+                                        if b_cand >= pos.tp_limit_px + delta_reprice
+                                            && b_cand <= p_max
+                                            && b_cand < bar.close
+                                        {
                                             pos.candidate_lower_count += 1;
-                                            if pos.candidate_lower_count >= 3 && cooldown_ok && pos.reprice_count < 3 {
+                                            if pos.candidate_lower_count >= 3
+                                                && cooldown_ok
+                                                && pos.reprice_count < 3
+                                            {
                                                 pos.tp_limit_px = b_cand;
                                                 pos.last_reprice_time_ms = bar.timestamp_ms;
                                                 pos.reprice_count += 1;
@@ -1071,13 +1133,14 @@ pub fn run_engine_a_backtest_with_btc(
                             &rolling_15m_bars[..]
                         };
                         if let Some(ref donchian) = calculate_donchian(prior_15m, donchian_period) {
-                            let closes_15m: Vec<f64> = rolling_15m_bars.iter().map(|b| b.close).collect();
+                            let closes_15m: Vec<f64> =
+                                rolling_15m_bars.iter().map(|b| b.close).collect();
                             let alignment = check_trend_alignment(&closes_15m);
                             let rng_15m = (closed_15m.high - closed_15m.low).max(1e-9);
-                            let is_15m_bull_close =
-                                closed_15m.close > closed_15m.open && (closed_15m.close - closed_15m.low) / rng_15m >= 0.65;
-                            let is_15m_bear_close =
-                                closed_15m.close < closed_15m.open && (closed_15m.high - closed_15m.close) / rng_15m >= 0.65;
+                            let is_15m_bull_close = closed_15m.close > closed_15m.open
+                                && (closed_15m.close - closed_15m.low) / rng_15m >= 0.65;
+                            let is_15m_bear_close = closed_15m.close < closed_15m.open
+                                && (closed_15m.high - closed_15m.close) / rng_15m >= 0.65;
                             let is_long_breakout = is_15m_bull_close
                                 && !feat.is_upside_shock
                                 && feat.z_60 < 2.5
@@ -1098,18 +1161,36 @@ pub fn run_engine_a_backtest_with_btc(
                                     summary.macro_calendar_vetoes += 1;
                                 } else if cb_veto.is_some() {
                                     summary.cluster_cb_vetoes += 1;
-                                } else if let Some(current_atr) = calculate_atr(&rolling_15m_bars, 20).filter(|&a| a > 0.0) {
-                                    let side = if is_long_breakout { Side::Long } else { Side::Short };
+                                } else if let Some(current_atr) =
+                                    calculate_atr(&rolling_15m_bars, 20).filter(|&a| a > 0.0)
+                                {
+                                    let side = if is_long_breakout {
+                                        Side::Long
+                                    } else {
+                                        Side::Short
+                                    };
                                     let is_long = side == Side::Long;
                                     let obi_ok = if is_long {
-                                        bar.obi_instant >= -0.18 && bar.obi_1s >= -0.15 && bar.obi_5s >= -0.12
+                                        bar.obi_instant >= -0.18
+                                            && bar.obi_1s >= -0.15
+                                            && bar.obi_5s >= -0.12
                                     } else {
-                                        bar.obi_instant <= 0.18 && bar.obi_1s <= 0.15 && bar.obi_5s <= 0.12
+                                        bar.obi_instant <= 0.18
+                                            && bar.obi_1s <= 0.15
+                                            && bar.obi_5s <= 0.12
                                     };
                                     let btc_veto = eff_btc_bars
-                                        .and_then(|bb| build_historical_btc_impulse_snapshot(bb, bar.timestamp_ms))
-                                        .and_then(|snap| evaluate_btc_impulse_veto(symbol, is_long, true, &snap));
-                                    let crowding_mult = crowding_tracker.directional_trend_multiplier(&side);
+                                        .and_then(|bb| {
+                                            build_historical_btc_impulse_snapshot(
+                                                bb,
+                                                bar.timestamp_ms,
+                                            )
+                                        })
+                                        .and_then(|snap| {
+                                            evaluate_btc_impulse_veto(symbol, is_long, true, &snap)
+                                        });
+                                    let crowding_mult =
+                                        crowding_tracker.directional_trend_multiplier(&side);
                                     let budget_verdict = evaluate_pre_breakout_budget(
                                         symbol,
                                         &rolling_15m_bars,
@@ -1121,22 +1202,38 @@ pub fn run_engine_a_backtest_with_btc(
                                     );
                                     if btc_veto.is_some() {
                                         summary.btc_impulse_vetoes += 1;
-                                    } else if obi_ok && crowding_mult >= 0.45 && budget_verdict.approved {
-                                        let eff_bid = if bar.best_bid > 0.0 { bar.best_bid } else { bar.close - 0.5 * tick_sz };
-                                        let eff_ask = if bar.best_ask > eff_bid { bar.best_ask } else { bar.close + 0.5 * tick_sz };
+                                    } else if obi_ok
+                                        && crowding_mult >= 0.45
+                                        && budget_verdict.approved
+                                    {
+                                        let eff_bid = if bar.best_bid > 0.0 {
+                                            bar.best_bid
+                                        } else {
+                                            bar.close - 0.5 * tick_sz
+                                        };
+                                        let eff_ask = if bar.best_ask > eff_bid {
+                                            bar.best_ask
+                                        } else {
+                                            bar.close + 0.5 * tick_sz
+                                        };
                                         let spread = eff_ask - eff_bid;
                                         let raw_limit = if is_long {
-                                            if spread >= 2.0 * tick_sz - 1e-9 && eff_bid + tick_sz < eff_ask - 1e-9 {
+                                            if spread >= 2.0 * tick_sz - 1e-9
+                                                && eff_bid + tick_sz < eff_ask - 1e-9
+                                            {
                                                 eff_bid + tick_sz
                                             } else {
                                                 eff_bid
                                             }
-                                        } else if spread >= 2.0 * tick_sz - 1e-9 && eff_ask - tick_sz > eff_bid + 1e-9 {
+                                        } else if spread >= 2.0 * tick_sz - 1e-9
+                                            && eff_ask - tick_sz > eff_bid + 1e-9
+                                        {
                                             eff_ask - tick_sz
                                         } else {
                                             eff_ask
                                         };
-                                        let limit_px = quantize_price(raw_limit, sim_cfg.sz_decimals);
+                                        let limit_px =
+                                            quantize_price(raw_limit, sim_cfg.sz_decimals);
                                         let initial_sl = quantize_price(
                                             if is_long {
                                                 limit_px - chandelier_atr_mult * current_atr
@@ -1155,22 +1252,25 @@ pub fn run_engine_a_backtest_with_btc(
                                             },
                                             sim_cfg.sz_decimals,
                                         );
-                                        let max_b_notional = ou_cfg.volatility_adjusted_trend_notional_cap(
-                                            sim_cfg.account_equity_usdc,
-                                            limit_px,
-                                            current_atr,
-                                        );
-                                        let notional = crate::hyperliquid::calculate_risk_scaled_notional(
-                                            sim_cfg.account_equity_usdc,
-                                            (sim_cfg.notional_usdc * crowding_mult).min(max_b_notional),
-                                            0.0060 * crowding_mult,
-                                            limit_px,
-                                            initial_sl,
-                                            3,
-                                            2,
-                                            11.0,
-                                            max_b_notional,
-                                        );
+                                        let max_b_notional = ou_cfg
+                                            .volatility_adjusted_trend_notional_cap(
+                                                sim_cfg.account_equity_usdc,
+                                                limit_px,
+                                                current_atr,
+                                            );
+                                        let notional =
+                                            crate::hyperliquid::calculate_risk_scaled_notional(
+                                                sim_cfg.account_equity_usdc,
+                                                (sim_cfg.notional_usdc * crowding_mult)
+                                                    .min(max_b_notional),
+                                                0.0060 * crowding_mult,
+                                                limit_px,
+                                                initial_sl,
+                                                3,
+                                                2,
+                                                11.0,
+                                                max_b_notional,
+                                            );
                                         let qty = notional / limit_px.max(1e-9);
                                         summary.signals_armed += 1;
                                         summary.orders_submitted += 1;
@@ -1227,7 +1327,11 @@ pub fn run_engine_a_backtest_with_btc(
                 let ma60_vs_240 = if n_hist >= 240 {
                     let ma60 = closes_history[n_hist - 60..].iter().sum::<f64>() / 60.0;
                     let ma240 = closes_history[n_hist - 240..].iter().sum::<f64>() / 240.0;
-                    if ma240 > 0.0 { (ma60 / ma240) - 1.0 } else { 0.0 }
+                    if ma240 > 0.0 {
+                        (ma60 / ma240) - 1.0
+                    } else {
+                        0.0
+                    }
                 } else {
                     0.0
                 };
@@ -1241,9 +1345,11 @@ pub fn run_engine_a_backtest_with_btc(
                     && ret_120 > -max_drift_120
                     && ret_180 > -max_slow_drift_180
                     && ret_240 > -max_slow_drift_240
-                    && (ma60_vs_240 >= -0.0008 || symbol.eq_ignore_ascii_case("BTC") && ma60_vs_240 >= -0.0022);
+                    && (ma60_vs_240 >= -0.0008
+                        || symbol.eq_ignore_ascii_case("BTC") && ma60_vs_240 >= -0.0022);
                 let kalman_short_ok = !kalman_waterfall_up
                     && feat.z_60 < 1.90
+                    && ret_60 < max_short_drift_60
                     && ret_120 < max_short_drift_120
                     && ret_240 < max_short_drift_240
                     && (ma60_vs_240 <= 0.0040 || (ret_720 < -0.0150 && ma60_vs_240 <= 0.0080));
@@ -1353,10 +1459,11 @@ pub fn run_engine_a_backtest_with_btc(
                                         - funding_drag_bps;
 
                                     if net_edge_bps >= ou_cfg.min_net_edge_bps {
-                                        if let Some(off_bps) = compute_safe_tp_offset_bps(
+                                        if let Some(off_bps) = compute_adaptive_tp_offset_bps(
                                             arm_exit_px,
                                             limit_price,
                                             tick_sz,
+                                            arm_half_life,
                                         ) {
                                             let shave = arm_exit_px * (off_bps * 1e-4);
                                             let tp_px = if is_long {
@@ -1378,17 +1485,25 @@ pub fn run_engine_a_backtest_with_btc(
                                                     sim_cfg.account_equity_usdc,
                                                     arm_sigma_eq_log,
                                                 );
-                                            let notional = crate::hyperliquid::calculate_risk_scaled_notional(
-                                                sim_cfg.account_equity_usdc,
-                                                sim_cfg.notional_usdc.min(vol_adj_cap),
-                                                0.0075,
-                                                limit_price,
-                                                hard_sl_px,
-                                                3,
-                                                2,
-                                                11.0,
-                                                vol_adj_cap,
+                                            let kelly_scalar = compute_fee_adjusted_kelly_scalar(
+                                                raw_edge_bps,
+                                                ou_cfg.min_net_edge_bps,
+                                                sim_cfg.maker_fee_bps,
+                                                funding_drag_bps,
                                             );
+                                            let notional =
+                                                crate::hyperliquid::calculate_risk_scaled_notional(
+                                                    sim_cfg.account_equity_usdc,
+                                                    (sim_cfg.notional_usdc * kelly_scalar)
+                                                        .min(vol_adj_cap),
+                                                    0.0075 * kelly_scalar,
+                                                    limit_price,
+                                                    hard_sl_px,
+                                                    3,
+                                                    2,
+                                                    11.0,
+                                                    vol_adj_cap,
+                                                );
                                             let qty = notional / limit_price.max(1e-9);
                                             let policy = if (entry_ttl_mins - 2.0).abs() < 1e-6 {
                                                 "JOIN_BOOK"
@@ -1422,7 +1537,8 @@ pub fn run_engine_a_backtest_with_btc(
                         let wants_long = (bar.close <= th.entry_long || bar.low <= th.entry_long)
                             && !feat.is_downside_shock
                             && kalman_long_ok;
-                        let wants_short = (bar.close >= th.entry_short || bar.high >= th.entry_short)
+                        let wants_short = (bar.close >= th.entry_short
+                            || bar.high >= th.entry_short)
                             && !feat.is_upside_shock
                             && kalman_short_ok;
                         if wants_long || wants_short {
@@ -1454,6 +1570,118 @@ pub fn run_engine_a_backtest_with_btc(
                                 summary.signals_armed += 1;
                             }
                         }
+                    }
+                }
+
+                // 3C. ENGINE C (`HourlySqueezeHarvester`) & ENGINE D (`CascadeAbsorptionReversal`)
+                if !is_armed && resting_entry.is_none() && macro_veto.is_none() && cb_veto.is_none()
+                {
+                    let low_30m = bars[idx.saturating_sub(30)..=idx]
+                        .iter()
+                        .map(|b| b.low)
+                        .fold(bar.low, f64::min);
+                    let dlog_oi_3m =
+                        if idx >= 3 && bars[idx - 3].open_interest > 0.0 && bar.open_interest > 0.0
+                        {
+                            (bar.open_interest / bars[idx - 3].open_interest).ln()
+                        } else {
+                            0.0
+                        };
+                    if let Some(sq) = evaluate_engine_c_hourly_squeeze(
+                        bar.timestamp_ms,
+                        bar.funding_1h,
+                        bar.close,
+                        bar.best_bid,
+                        bar.oracle_px,
+                        low_30m,
+                        feat.sigma_eq_log,
+                        ou_cfg.min_net_edge_bps,
+                        feat.z_15,
+                        feat.z_60,
+                        tick_sz,
+                    ) {
+                        let limit_px = quantize_price(sq.limit_px, sim_cfg.sz_decimals);
+                        let tp_px = quantize_price(sq.target_tp_px, sim_cfg.sz_decimals);
+                        let sl_px = quantize_price(sq.hard_stop_px, sim_cfg.sz_decimals);
+                        let vol_adj_cap = ou_cfg.volatility_adjusted_notional_cap(
+                            sim_cfg.account_equity_usdc,
+                            feat.sigma_eq_log,
+                        );
+                        let notional = crate::hyperliquid::calculate_risk_scaled_notional(
+                            sim_cfg.account_equity_usdc,
+                            sim_cfg.notional_usdc.min(vol_adj_cap),
+                            0.0065,
+                            limit_px,
+                            sl_px,
+                            3,
+                            2,
+                            11.0,
+                            vol_adj_cap,
+                        );
+                        summary.signals_armed += 1;
+                        summary.orders_submitted += 1;
+                        resting_entry = Some(RestingMakerEntry {
+                            side: sq.side,
+                            limit_px,
+                            qty: notional / limit_px.max(1e-9),
+                            target_tp_px: tp_px,
+                            hard_stop_px: sl_px,
+                            frozen_center_px: tp_px,
+                            frozen_sigma_eq_log: feat.sigma_eq_log,
+                            half_life_m: 30.0,
+                            submitted_bar_idx: idx,
+                            ttl_bars: 3,
+                            policy: "ENGINE_C_SQUEEZE",
+                            is_engine_b: false,
+                            entry_atr: 0.0,
+                        });
+                    } else if let Some(cas) = evaluate_engine_d_cascade_reversal(
+                        bar.close,
+                        bar.open,
+                        bar.low,
+                        bar.best_bid,
+                        bar.oracle_px,
+                        dlog_oi_3m,
+                        feat.z_15,
+                        bar.obi_instant,
+                        ou_cfg.min_net_edge_bps,
+                        tick_sz,
+                    ) {
+                        let limit_px = quantize_price(cas.limit_px, sim_cfg.sz_decimals);
+                        let tp_px = quantize_price(cas.target_tp_px, sim_cfg.sz_decimals);
+                        let sl_px = quantize_price(cas.hard_stop_px, sim_cfg.sz_decimals);
+                        let vol_adj_cap = ou_cfg.volatility_adjusted_notional_cap(
+                            sim_cfg.account_equity_usdc,
+                            feat.sigma_eq_log,
+                        );
+                        let notional = crate::hyperliquid::calculate_risk_scaled_notional(
+                            sim_cfg.account_equity_usdc,
+                            (sim_cfg.notional_usdc * 0.75).min(vol_adj_cap),
+                            0.0060,
+                            limit_px,
+                            sl_px,
+                            3,
+                            2,
+                            11.0,
+                            vol_adj_cap,
+                        );
+                        summary.signals_armed += 1;
+                        summary.orders_submitted += 1;
+                        resting_entry = Some(RestingMakerEntry {
+                            side: cas.side,
+                            limit_px,
+                            qty: notional / limit_px.max(1e-9),
+                            target_tp_px: tp_px,
+                            hard_stop_px: sl_px,
+                            frozen_center_px: tp_px,
+                            frozen_sigma_eq_log: feat.sigma_eq_log,
+                            half_life_m: 20.0,
+                            submitted_bar_idx: idx,
+                            ttl_bars: 2,
+                            policy: "ENGINE_D_CASCADE",
+                            is_engine_b: false,
+                            entry_atr: 0.0,
+                        });
                     }
                 }
             }
@@ -1497,7 +1725,8 @@ mod tests {
             rng_state ^= rng_state >> 12;
             rng_state ^= rng_state << 25;
             rng_state ^= rng_state >> 27;
-            let u = ((rng_state.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64) / ((1u64 << 53) as f64);
+            let u =
+                ((rng_state.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64) / ((1u64 << 53) as f64);
             let z_innov = (u - 0.5) * 3.4641016; // Uniform[-sqrt(3), +sqrt(3)] -> Var = 1.0
 
             log_dev = 0.98 * log_dev + 0.0012 * z_innov;
@@ -1568,7 +1797,8 @@ mod tests {
             rng_state ^= rng_state >> 12;
             rng_state ^= rng_state << 25;
             rng_state ^= rng_state >> 27;
-            let u = ((rng_state.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64) / ((1u64 << 53) as f64);
+            let u =
+                ((rng_state.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64) / ((1u64 << 53) as f64);
             let z_innov = (u - 0.5) * 3.4641016;
             log_dev = 0.98 * log_dev + 0.0012 * z_innov;
 

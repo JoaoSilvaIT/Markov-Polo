@@ -295,11 +295,16 @@
           </div>
 
           <!-- Candlestick Asset Selector (Visible in Candles Mode) -->
-          <div id="candle-asset-controls" class="hidden items-center gap-1 bg-terminal-inset border border-terminal-border rounded p-0.5 text-xs font-mono">
+          <div id="candle-asset-controls" class="hidden flex-wrap items-center gap-1 bg-terminal-inset border border-terminal-border rounded p-0.5 text-xs font-mono">
             <button onclick="selectCandleSymbol('BTC')" id="candle-btn-BTC" class="btn-period active">BTC</button>
             <button onclick="selectCandleSymbol('ETH')" id="candle-btn-ETH" class="btn-period">ETH</button>
             <button onclick="selectCandleSymbol('SOL')" id="candle-btn-SOL" class="btn-period">SOL</button>
             <button onclick="selectCandleSymbol('AVAX')" id="candle-btn-AVAX" class="btn-period">AVAX</button>
+            <button onclick="selectCandleSymbol('HYPE')" id="candle-btn-HYPE" class="btn-period">HYPE</button>
+            <button onclick="selectCandleSymbol('NEAR')" id="candle-btn-NEAR" class="btn-period">NEAR</button>
+            <button onclick="selectCandleSymbol('XRP')" id="candle-btn-XRP" class="btn-period">XRP</button>
+            <button onclick="selectCandleSymbol('SUI')" id="candle-btn-SUI" class="btn-period">SUI</button>
+            <button onclick="selectCandleSymbol('LINK')" id="candle-btn-LINK" class="btn-period">LINK</button>
           </div>
 
           <!-- Metric Toggle (Equity $ vs Net PnL $) in Progress Mode -->
@@ -326,22 +331,19 @@
       </div>
     </section>
 
-    <!-- ================= ROW 3: 4 ASSETS - LIVE SPECS & ENTRY TRIGGERS ================= -->
+    <!-- ================= ROW 3: 9 ASSETS - LIVE SPECS & ENTRY TRIGGERS ================= -->
     <section class="space-y-2">
       <div class="flex items-center justify-between px-1">
         <div class="flex items-center gap-2">
-          <h2 class="text-xs font-semibold uppercase tracking-wider text-terminal-muted">4-Asset Quantitative Specs & Trigger Matrix</h2>
-          <span class="text-[11px] font-mono text-terminal-dim">(BTC · ETH · SOL · AVAX)</span>
+          <h2 class="text-xs font-semibold uppercase tracking-wider text-terminal-muted">9-Asset Quantitative Specs & Trigger Matrix</h2>
+          <span class="text-[11px] font-mono text-terminal-dim">(BTC · ETH · SOL · AVAX · HYPE · NEAR · XRP · SUI · LINK)</span>
         </div>
-        <span class="text-[11px] font-mono text-terminal-dim">Dual-Engine: Engine A (5m O-U) & Engine B (15m Donchian)</span>
+        <span class="text-[11px] font-mono text-terminal-dim">Multi-Engine: Engine A (5m O-U) · Engine B (15m Donchian) · Engine C/D</span>
       </div>
 
-      <div id="assets-grid" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
+      <div id="assets-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
         <!-- Rendered dynamically -->
-        <div class="panel-card p-4 text-terminal-muted font-mono text-xs">Loading BTC specifications...</div>
-        <div class="panel-card p-4 text-terminal-muted font-mono text-xs">Loading ETH specifications...</div>
-        <div class="panel-card p-4 text-terminal-muted font-mono text-xs">Loading SOL specifications...</div>
-        <div class="panel-card p-4 text-terminal-muted font-mono text-xs">Loading AVAX specifications...</div>
+        <div class="panel-card p-4 text-terminal-muted font-mono text-xs">Loading portfolio specifications...</div>
       </div>
     </section>
 
@@ -501,7 +503,7 @@
 
     function selectCandleSymbol(sym) {
       candleSymbol = sym;
-      ['BTC', 'ETH', 'SOL', 'AVAX'].forEach(s => {
+      ['BTC', 'ETH', 'SOL', 'AVAX', 'HYPE', 'NEAR', 'XRP', 'SUI', 'LINK'].forEach(s => {
         const btn = document.getElementById('candle-btn-' + s);
         if (btn) btn.className = s === sym ? 'btn-period active' : 'btn-period';
       });
@@ -814,12 +816,12 @@
       }
     }
 
-    // Render 4 Asset Cards
+    // Render 9 Asset Cards
     function renderAssetCards(data) {
       const container = document.getElementById('assets-grid');
       if (!container) return;
 
-      const symbols = ['BTC', 'ETH', 'SOL', 'AVAX'];
+      const symbols = ['BTC', 'ETH', 'SOL', 'AVAX', 'HYPE', 'NEAR', 'XRP', 'SUI', 'LINK'];
       let html = '';
 
       symbols.forEach(sym => {

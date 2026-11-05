@@ -12,7 +12,9 @@ pub fn get_tick_size(symbol: &str) -> f64 {
         "BTC" => 1.0,
         "ETH" => 0.10,
         "SOL" => 0.01,
-        "AVAX" => 0.001,
+        "AVAX" | "HYPE" | "LINK" => 0.001,
+        "NEAR" | "XRP" => 0.0001,
+        "SUI" => 0.00001,
         _ => 0.01,
     }
 }
@@ -242,7 +244,13 @@ impl ActiveOpportunity {
     }
 
     /// Evaluates incoming 1m candle (high, low, close) to track fills, MFE/MAE, and exits
-    pub fn update_with_candle(&mut self, high: f64, low: f64, close: f64, now_ms: u64) -> Option<CounterfactualRecord> {
+    pub fn update_with_candle(
+        &mut self,
+        high: f64,
+        low: f64,
+        close: f64,
+        now_ms: u64,
+    ) -> Option<CounterfactualRecord> {
         if self.is_resolved {
             return None;
         }
@@ -636,7 +644,12 @@ impl CounterfactualTracker {
 mod tests {
     use super::*;
 
-    fn create_test_opportunity(side: &str, limit_px: f64, sl_px: f64, tp_px: f64) -> ActiveOpportunity {
+    fn create_test_opportunity(
+        side: &str,
+        limit_px: f64,
+        sl_px: f64,
+        tp_px: f64,
+    ) -> ActiveOpportunity {
         ActiveOpportunity::new(
             "ETH".to_string(),
             "EngineA_MeanReversion".to_string(),
@@ -714,7 +727,10 @@ mod tests {
         assert!(res.is_some());
         let record = res.unwrap();
 
-        assert_eq!(record.outcome.veto_classification, VetoClassification::AlphaProtective);
+        assert_eq!(
+            record.outcome.veto_classification,
+            VetoClassification::AlphaProtective
+        );
         assert!(record.outcome.avoided_loss);
         assert!(!record.outcome.missed_profit);
         assert_eq!(record.outcome.exit_trigger, Some("STOP_LOSS".to_string()));
@@ -735,7 +751,10 @@ mod tests {
         assert!(res.is_some());
         let record = res.unwrap();
 
-        assert_eq!(record.outcome.veto_classification, VetoClassification::AlphaStrangling);
+        assert_eq!(
+            record.outcome.veto_classification,
+            VetoClassification::AlphaStrangling
+        );
         assert!(!record.outcome.avoided_loss);
         assert!(record.outcome.missed_profit);
         assert_eq!(record.outcome.exit_trigger, Some("TAKE_PROFIT".to_string()));

@@ -178,7 +178,11 @@ pub fn evaluate_pre_breakout_budget(
     let bbw_atr_20 = if slice_len >= 5 {
         let slice = &bars_15m[bars_15m.len() - slice_len..];
         let mean_c = slice.iter().map(|b| b.close).sum::<f64>() / (slice_len as f64);
-        let var_c = slice.iter().map(|b| (b.close - mean_c).powi(2)).sum::<f64>() / (slice_len as f64);
+        let var_c = slice
+            .iter()
+            .map(|b| (b.close - mean_c).powi(2))
+            .sum::<f64>()
+            / (slice_len as f64);
         (4.0 * var_c.sqrt()) / atr
     } else {
         dcw_20 * 0.75
@@ -188,8 +192,11 @@ pub fn evaluate_pre_breakout_budget(
         match symbol.to_uppercase().as_str() {
             "BTC" => (3.207, 2.518, 2.347, 0.65, 3.05, 1.05),
             "ETH" => (3.149, 2.370, 2.394, 0.70, 3.25, 1.15),
-            "SOL" => (3.163, 2.516, 2.261, 0.75, 3.55, 1.25),
-            "AVAX" => (3.203, 2.567, 2.222, 0.75, 3.70, 1.30),
+            "XRP" => (3.160, 2.480, 2.300, 0.72, 3.45, 1.20),
+            "LINK" => (3.175, 2.500, 2.280, 0.72, 3.50, 1.22),
+            "SOL" | "HYPE" => (3.163, 2.516, 2.261, 0.75, 3.55, 1.25),
+            "AVAX" | "SUI" => (3.203, 2.567, 2.222, 0.75, 3.70, 1.30),
+            "NEAR" => (3.220, 2.600, 2.200, 0.78, 3.80, 1.35),
             _ => (3.200, 2.500, 2.300, 0.70, 3.25, 1.15),
         };
 
@@ -224,10 +231,8 @@ pub fn evaluate_pre_breakout_budget(
     let consumed_budget = (0.5 * dcw_20).max(d_60_atr).max(0.55 * d_240_atr) + 0.50 * overshoot_atr;
     let rmb_atr = b_max_atr - consumed_budget;
 
-    let is_coiled = dcw_20 >= 1.20
-        && dcw_20 <= coil_dcw
-        && bbw_atr_20 <= coil_bbw
-        && z_60.abs() <= 1.76;
+    let is_coiled =
+        dcw_20 >= 1.20 && dcw_20 <= coil_dcw && bbw_atr_20 <= coil_bbw && z_60.abs() <= 1.76;
 
     // Hard reject if DCW_20 >= 4.5, 4h run-up > 3.2x ATR, |Z60| >= asset 90th-pct cutoff, overshoot > max_overshoot_atr, or RMB < min_rmb_atr
     let approved = dcw_20 >= 1.20
@@ -267,9 +272,15 @@ pub struct FeedQualityStats {
     pub regime: String,
 }
 
-fn default_tau_1() -> f64 { 10_000.0 }
-fn default_tau_2() -> f64 { 30_000.0 }
-fn default_regime_label() -> String { "LowLatency".to_string() }
+fn default_tau_1() -> f64 {
+    10_000.0
+}
+fn default_tau_2() -> f64 {
+    30_000.0
+}
+fn default_regime_label() -> String {
+    "LowLatency".to_string()
+}
 
 /// Real-time L2 continuous order book tracker with basis-point distance weighting, multiscale physical-time dynamic EWMA, and local latency instrumentation
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -335,7 +346,13 @@ impl Default for L2ObiTracker {
 }
 
 impl L2ObiTracker {
-    pub fn update(&mut self, bids: &[(f64, f64)], asks: &[(f64, f64)], exchange_time_ms: u64, local_recv_ms: u64) {
+    pub fn update(
+        &mut self,
+        bids: &[(f64, f64)],
+        asks: &[(f64, f64)],
+        exchange_time_ms: u64,
+        local_recv_ms: u64,
+    ) {
         if bids.is_empty() || asks.is_empty() {
             return;
         }
@@ -373,7 +390,10 @@ impl L2ObiTracker {
 
         // Telemetry: record local inter-arrival via Instant (immune to NTP clock adjustments)
         let now_instant = std::time::Instant::now();
-        let instant_dt = self.last_instant.map(|prev| prev.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0);
+        let instant_dt = self
+            .last_instant
+            .map(|prev| prev.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
         let clock_dt = if self.last_local_recv_ms > 0 && local_recv_ms >= self.last_local_recv_ms {
             (local_recv_ms - self.last_local_recv_ms) as f64
         } else {
@@ -406,7 +426,9 @@ impl L2ObiTracker {
         // Amortized dynamic EWMA recalibration: evaluate every 12 updates to avoid hot-path sort overhead (~65s at 5.4s cadence)
         if (self.updates_since_reconnect + 1) % 12 == 0 && self.inter_arrival_samples.len() >= 8 {
             if let Some(qual) = self.compute_feed_quality() {
-                let is_degraded = qual.p95_ms > 7500.0 || qual.observed_age_p99_ms > 1500.0 || qual.mad_ms > 2500.0;
+                let is_degraded = qual.p95_ms > 7500.0
+                    || qual.observed_age_p99_ms > 1500.0
+                    || qual.mad_ms > 2500.0;
                 if is_degraded {
                     // Fail-Safe: Instant degradation on single cycle
                     self.low_latency_streak = 0;
@@ -504,7 +526,9 @@ impl L2ObiTracker {
         sorted_lags.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let lag_n = sorted_lags.len();
         let lag_percentile = |pct: f64| -> f64 {
-            if lag_n == 0 { return 0.0; }
+            if lag_n == 0 {
+                return 0.0;
+            }
             let idx = ((pct / 100.0) * (lag_n as f64 - 1.0)).round() as usize;
             sorted_lags[idx.min(lag_n - 1)]
         };
@@ -517,7 +541,12 @@ impl L2ObiTracker {
             0.0
         };
 
-        let status = if p95 > 12_000.0 || age_p99 > 3_000.0 || mean_lag > 3_000.0 || (self.gaps_over_3s > 0 && self.last_update_ms.saturating_sub(self.reconnect_time_ms) < 60_000) {
+        let status = if p95 > 12_000.0
+            || age_p99 > 3_000.0
+            || mean_lag > 3_000.0
+            || (self.gaps_over_3s > 0
+                && self.last_update_ms.saturating_sub(self.reconnect_time_ms) < 60_000)
+        {
             "SIGNAL_UNUSABLE".to_string()
         } else if p95 > 7_500.0 || age_p99 > 1_500.0 || mean_lag > 1_500.0 {
             "SIGNAL_DEGRADED".to_string()
@@ -600,7 +629,11 @@ pub fn append_l2_telemetry_record(
     });
     if let Ok(line) = serde_json::to_string(&record) {
         let file_path = format!("hl_l2_telemetry_{}.jsonl", symbol);
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&file_path) {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&file_path)
+        {
             let _ = writeln!(file, "{}", line);
         }
     }
@@ -630,7 +663,11 @@ pub struct EngineBCandidateLog {
 pub fn append_candidate_log(log_entry: &EngineBCandidateLog) {
     if let Ok(line) = serde_json::to_string(log_entry) {
         let file_path = format!("hl_candidates_{}.jsonl", log_entry.symbol);
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&file_path) {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&file_path)
+        {
             let _ = writeln!(file, "{}", line);
         }
     }
@@ -677,7 +714,10 @@ impl L2ObiTracker {
             Side::Long => {
                 // Multiscale hurdle: ensure bid depth is not overwhelmed by adverse sell walls.
                 // Tolerates natural taker absorption during breakout momentum (down to -0.18 instant, -0.15 1s, -0.12 5s) while rejecting toxic sell imbalance.
-                if self.instant_obi >= -0.18 && self.ewma_1s_obi >= -0.15 && self.ewma_5s_obi >= -0.12 {
+                if self.instant_obi >= -0.18
+                    && self.ewma_1s_obi >= -0.15
+                    && self.ewma_5s_obi >= -0.12
+                {
                     (true, "Bullish Multiscale Depth Alignment")
                 } else {
                     (false, "Insufficient Bid Depth / Fleeting Ask Asymmetry")
@@ -685,7 +725,8 @@ impl L2ObiTracker {
             }
             Side::Short => {
                 // Multiscale hurdle: ensure ask depth is not overwhelmed by adverse buy walls.
-                if self.instant_obi <= 0.18 && self.ewma_1s_obi <= 0.15 && self.ewma_5s_obi <= 0.12 {
+                if self.instant_obi <= 0.18 && self.ewma_1s_obi <= 0.15 && self.ewma_5s_obi <= 0.12
+                {
                     (true, "Bearish Multiscale Depth Alignment")
                 } else {
                     (false, "Insufficient Ask Depth / Fleeting Bid Asymmetry")
@@ -834,7 +875,13 @@ impl ChandelierExitState {
 
     /// Updates trailing stop on bar close / price tick with finite guards and optional contraction cap.
     #[allow(dead_code)]
-    pub fn update(&mut self, current_high: f64, current_low: f64, current_atr: f64, p_trend: f64) -> f64 {
+    pub fn update(
+        &mut self,
+        current_high: f64,
+        current_low: f64,
+        current_atr: f64,
+        p_trend: f64,
+    ) -> f64 {
         self.update_with_cap(current_high, current_low, current_atr, p_trend, None)
     }
 
@@ -866,9 +913,13 @@ impl ChandelierExitState {
         enable_breakeven_ratchet: bool,
     ) -> f64 {
         // Guard against non-finite or invalid inputs
-        if current_atr <= 0.0 || current_atr.is_nan() || current_atr.is_infinite()
-            || p_trend.is_nan() || p_trend.is_infinite()
-            || current_high.is_nan() || current_low.is_nan()
+        if current_atr <= 0.0
+            || current_atr.is_nan()
+            || current_atr.is_infinite()
+            || p_trend.is_nan()
+            || p_trend.is_infinite()
+            || current_high.is_nan()
+            || current_low.is_nan()
         {
             return self.current_stop;
         }
@@ -888,9 +939,11 @@ impl ChandelierExitState {
 
         if let Some(max_step) = max_contraction_step {
             if effective_multiplier < self.active_multiplier {
-                self.active_multiplier = (self.active_multiplier - max_step).max(effective_multiplier);
+                self.active_multiplier =
+                    (self.active_multiplier - max_step).max(effective_multiplier);
             } else {
-                self.active_multiplier = (self.active_multiplier + max_step).min(effective_multiplier);
+                self.active_multiplier =
+                    (self.active_multiplier + max_step).min(effective_multiplier);
             }
         } else {
             self.active_multiplier = effective_multiplier;
@@ -901,22 +954,33 @@ impl ChandelierExitState {
                 if current_high > self.extreme_favorable_price {
                     self.extreme_favorable_price = current_high;
                 }
-                let mut candidate_stop = self.extreme_favorable_price - self.active_multiplier * current_atr;
+                let mut candidate_stop =
+                    self.extreme_favorable_price - self.active_multiplier * current_atr;
 
                 if enable_breakeven_ratchet {
                     let delta_fav = (self.extreme_favorable_price - self.entry_price).max(0.0);
-                    let ret_fav_pct = if self.entry_price > 0.0 { delta_fav / self.entry_price } else { 0.0 };
+                    let ret_fav_pct = if self.entry_price > 0.0 {
+                        delta_fav / self.entry_price
+                    } else {
+                        0.0
+                    };
                     let eps = 1e-6;
 
                     // 1. Breakeven Floor: once favorable progress >= 0.75 ATR or >= +45 bps (0.45%), AND at least +32 bps gross (to cover round-trip fees + breathing room),
                     // stop moves to at least entry + 15 bps (bounded by 50% of delta_fav)
-                    if (delta_fav >= (0.75 * current_atr) - eps || ret_fav_pct >= 0.0045) && ret_fav_pct >= 0.0032 {
-                        let be_stop = (self.entry_price * 1.0015).min(self.entry_price + 0.50 * delta_fav);
+                    if (delta_fav >= (0.75 * current_atr) - eps || ret_fav_pct >= 0.0045)
+                        && ret_fav_pct >= 0.0032
+                    {
+                        let be_stop =
+                            (self.entry_price * 1.0015).min(self.entry_price + 0.50 * delta_fav);
                         candidate_stop = f64::max(candidate_stop, be_stop);
                     }
                     // 1b. Early Impulse Profit Lock: once favorable progress >= 1.0 ATR or >= +75 bps (0.75%), AND at least +40 bps gross, protect at least 45% of peak excursion
-                    if (delta_fav >= (1.0 * current_atr) - eps || ret_fav_pct >= 0.0075) && ret_fav_pct >= 0.0040 {
-                        candidate_stop = f64::max(candidate_stop, self.entry_price + 0.45 * delta_fav);
+                    if (delta_fav >= (1.0 * current_atr) - eps || ret_fav_pct >= 0.0075)
+                        && ret_fav_pct >= 0.0040
+                    {
+                        candidate_stop =
+                            f64::max(candidate_stop, self.entry_price + 0.45 * delta_fav);
                     }
                     // 2. Tier 2 (+2% Gain Rule): once gain >= +2.0%, lock in at least +1.0% net profit
                     if ret_fav_pct >= 0.020 {
@@ -929,11 +993,15 @@ impl ChandelierExitState {
                     // 4. Tier 4 (Super-Trend Runner): once gain >= +4.0%, protect at least 70% of peak excursion
                     if ret_fav_pct >= 0.040 {
                         let locked_70 = self.entry_price + 0.70 * delta_fav;
-                        candidate_stop = f64::max(candidate_stop, f64::max(self.entry_price * 1.0250, locked_70));
+                        candidate_stop = f64::max(
+                            candidate_stop,
+                            f64::max(self.entry_price * 1.0250, locked_70),
+                        );
                     }
                     // 5. ATR Giveback Floor: once progress >= 1.5 ATR AND at least +45 bps gross, protect at least 50% of peak progress
                     if delta_fav >= (1.5 * current_atr) - eps && ret_fav_pct >= 0.0045 {
-                        candidate_stop = f64::max(candidate_stop, self.entry_price + 0.5 * delta_fav);
+                        candidate_stop =
+                            f64::max(candidate_stop, self.entry_price + 0.5 * delta_fav);
                     }
                 }
 
@@ -944,22 +1012,33 @@ impl ChandelierExitState {
                 if current_low < self.extreme_favorable_price {
                     self.extreme_favorable_price = current_low;
                 }
-                let mut candidate_stop = self.extreme_favorable_price + self.active_multiplier * current_atr;
+                let mut candidate_stop =
+                    self.extreme_favorable_price + self.active_multiplier * current_atr;
 
                 if enable_breakeven_ratchet {
                     let delta_fav = (self.entry_price - self.extreme_favorable_price).max(0.0);
-                    let ret_fav_pct = if self.entry_price > 0.0 { delta_fav / self.entry_price } else { 0.0 };
+                    let ret_fav_pct = if self.entry_price > 0.0 {
+                        delta_fav / self.entry_price
+                    } else {
+                        0.0
+                    };
                     let eps = 1e-6;
 
                     // 1. Breakeven Floor: once favorable progress >= 0.75 ATR or >= +45 bps (0.45%), AND at least +32 bps gross (to cover round-trip fees + breathing room),
                     // stop moves to at least entry - 15 bps (bounded by 50% of delta_fav)
-                    if (delta_fav >= (0.75 * current_atr) - eps || ret_fav_pct >= 0.0045) && ret_fav_pct >= 0.0032 {
-                        let be_stop = (self.entry_price * 0.9985).max(self.entry_price - 0.50 * delta_fav);
+                    if (delta_fav >= (0.75 * current_atr) - eps || ret_fav_pct >= 0.0045)
+                        && ret_fav_pct >= 0.0032
+                    {
+                        let be_stop =
+                            (self.entry_price * 0.9985).max(self.entry_price - 0.50 * delta_fav);
                         candidate_stop = f64::min(candidate_stop, be_stop);
                     }
                     // 1b. Early Impulse Profit Lock: once favorable progress >= 1.0 ATR or >= +75 bps (0.75%), AND at least +40 bps gross, protect at least 45% of peak excursion
-                    if (delta_fav >= (1.0 * current_atr) - eps || ret_fav_pct >= 0.0075) && ret_fav_pct >= 0.0040 {
-                        candidate_stop = f64::min(candidate_stop, self.entry_price - 0.45 * delta_fav);
+                    if (delta_fav >= (1.0 * current_atr) - eps || ret_fav_pct >= 0.0075)
+                        && ret_fav_pct >= 0.0040
+                    {
+                        candidate_stop =
+                            f64::min(candidate_stop, self.entry_price - 0.45 * delta_fav);
                     }
                     // 2. Tier 2 (+2% Gain Rule): once gain >= +2.0%, lock in at least +1.0% net profit
                     if ret_fav_pct >= 0.020 {
@@ -972,11 +1051,15 @@ impl ChandelierExitState {
                     // 4. Tier 4 (Super-Trend Runner): once gain >= +4.0%, protect at least 70% of peak excursion
                     if ret_fav_pct >= 0.040 {
                         let locked_70 = self.entry_price - 0.70 * delta_fav;
-                        candidate_stop = f64::min(candidate_stop, f64::min(self.entry_price * 0.9750, locked_70));
+                        candidate_stop = f64::min(
+                            candidate_stop,
+                            f64::min(self.entry_price * 0.9750, locked_70),
+                        );
                     }
                     // 5. ATR Giveback Floor: once progress >= 1.5 ATR AND at least +45 bps gross, protect at least 50% of peak progress
                     if delta_fav >= (1.5 * current_atr) - eps && ret_fav_pct >= 0.0045 {
-                        candidate_stop = f64::min(candidate_stop, self.entry_price - 0.5 * delta_fav);
+                        candidate_stop =
+                            f64::min(candidate_stop, self.entry_price - 0.5 * delta_fav);
                     }
                 }
 
@@ -996,7 +1079,13 @@ impl ChandelierExitState {
         }
     }
 
-    pub fn is_bar_stopped_out(&self, prev_stop: f64, bar_high: f64, bar_low: f64, bar_close: f64) -> bool {
+    pub fn is_bar_stopped_out(
+        &self,
+        prev_stop: f64,
+        bar_high: f64,
+        bar_low: f64,
+        bar_close: f64,
+    ) -> bool {
         match self.side {
             Side::Long => bar_low <= prev_stop || bar_close <= self.current_stop,
             Side::Short => bar_high >= prev_stop || bar_close >= self.current_stop,
@@ -1174,7 +1263,12 @@ pub fn try_acquire_shadow_cluster_lease_with_uuid(
             return (false, None, 0);
         }
     };
-    let lease_token = format!("{}_{}_{}", symbol, new_token, Utc::now().timestamp_subsec_nanos());
+    let lease_token = format!(
+        "{}_{}_{}",
+        symbol,
+        new_token,
+        Utc::now().timestamp_subsec_nanos()
+    );
     let new_lease = ShadowClusterLease {
         symbol: symbol.to_string(),
         owner_uuid: owner_uuid.to_string(),
@@ -1324,17 +1418,17 @@ pub fn record_shadow_entry(
         .append(true)
         .open(SHADOW_TREND_JOURNAL)
     {
-        let _ = writeln!(f, "{}", serde_json::to_string(&log_entry).unwrap_or_default());
+        let _ = writeln!(
+            f,
+            "{}",
+            serde_json::to_string(&log_entry).unwrap_or_default()
+        );
     }
 
     trade
 }
 
-pub fn record_shadow_exit(
-    trade: &mut ShadowTrade,
-    exit_price: f64,
-    exit_reason: &str,
-) -> f64 {
+pub fn record_shadow_exit(trade: &mut ShadowTrade, exit_price: f64, exit_reason: &str) -> f64 {
     let now = Utc::now();
     let is_long = trade.side == Side::Long;
 
@@ -1392,7 +1486,11 @@ pub fn record_shadow_exit(
         .append(true)
         .open(SHADOW_TREND_JOURNAL)
     {
-        let _ = writeln!(f, "{}", serde_json::to_string(&log_entry).unwrap_or_default());
+        let _ = writeln!(
+            f,
+            "{}",
+            serde_json::to_string(&log_entry).unwrap_or_default()
+        );
     }
 
     net_pnl
@@ -1438,7 +1536,11 @@ mod tests {
         }
 
         let atr = calculate_atr(&bars, 20).expect("ATR calculated");
-        assert!((atr - 10.0).abs() < 1e-4, "ATR should converge to 10.0, got: {}", atr);
+        assert!(
+            (atr - 10.0).abs() < 1e-4,
+            "ATR should converge to 10.0, got: {}",
+            atr
+        );
     }
 
     #[test]
@@ -1461,7 +1563,7 @@ mod tests {
     #[test]
     fn test_obi_score_calculation() {
         let bids = vec![(100.0, 10.0), (99.0, 15.0), (98.0, 5.0)]; // sum = 30.0
-        let asks = vec![(101.0, 5.0), (102.0, 5.0)];                // sum = 10.0
+        let asks = vec![(101.0, 5.0), (102.0, 5.0)]; // sum = 10.0
 
         let obi = calculate_obi_score(&bids, &asks, 5);
         // (30 - 10) / (30 + 10) = 20 / 40 = 0.50
@@ -1555,7 +1657,11 @@ mod tests {
         // BUT with enable_breakeven_ratchet: true,
         // excursion >= 1.0 ATR triggers Breakeven Floor: entry - 10 bps = 10.00 * 0.9990 = 9.99!
         let stop = chandelier.update_with_ratchet_and_cap(9.85, 9.80, 0.20, 0.85, None, true);
-        assert!(stop <= 9.99, "Breakeven floor must lock stop below entry covering fees (stop: {})", stop);
+        assert!(
+            stop <= 9.99,
+            "Breakeven floor must lock stop below entry covering fees (stop: {})",
+            stop
+        );
         assert!(stop < chandelier.entry_price);
     }
 
@@ -1572,7 +1678,11 @@ mod tests {
         // BUT with 50% profit giveback ratchet:
         // protects at least 50% of peak progress: 100.00 + 0.5 * 4.00 = 102.00!
         let stop = chandelier.update_with_ratchet_and_cap(104.00, 102.00, 2.00, 0.85, None, true);
-        assert!(stop >= 102.00, "50% profit giveback ratchet must protect at least 102.00 (stop: {})", stop);
+        assert!(
+            stop >= 102.00,
+            "50% profit giveback ratchet must protect at least 102.00 (stop: {})",
+            stop
+        );
     }
 
     #[test]
@@ -1582,15 +1692,27 @@ mod tests {
 
         // 1. Gain reaches +2.0% (price drops to 9.80): stop locks at least +1.0% profit (<= 9.90)
         let stop_tier2 = chandelier.update_with_ratchet_and_cap(9.85, 9.80, 0.10, 0.85, None, true);
-        assert!(stop_tier2 <= 9.90, "Tier 2 (+2% gain) must lock in at least +1.0% profit (stop: {})", stop_tier2);
+        assert!(
+            stop_tier2 <= 9.90,
+            "Tier 2 (+2% gain) must lock in at least +1.0% profit (stop: {})",
+            stop_tier2
+        );
 
         // 2. Gain reaches +3.0% (price drops to 9.70): stop locks at least +2.0% profit (<= 9.80)
         let stop_tier3 = chandelier.update_with_ratchet_and_cap(9.75, 9.70, 0.10, 0.85, None, true);
-        assert!(stop_tier3 <= 9.80, "Tier 3 (+3% gain) must lock in at least +2.0% profit (stop: {})", stop_tier3);
+        assert!(
+            stop_tier3 <= 9.80,
+            "Tier 3 (+3% gain) must lock in at least +2.0% profit (stop: {})",
+            stop_tier3
+        );
 
         // 3. Gain reaches +5.0% (price drops to 9.50): delta_fav = 0.50, locks 70% of peak progress (0.50 * 0.70 = 0.35 -> stop <= 9.65)
         let stop_tier4 = chandelier.update_with_ratchet_and_cap(9.55, 9.50, 0.10, 0.85, None, true);
-        assert!(stop_tier4 <= 9.65, "Tier 4 (Super-Trend) must protect at least 70% of peak gain (stop: {})", stop_tier4);
+        assert!(
+            stop_tier4 <= 9.65,
+            "Tier 4 (Super-Trend) must protect at least 70% of peak gain (stop: {})",
+            stop_tier4
+        );
     }
 
     #[test]
@@ -1638,13 +1760,19 @@ mod tests {
         let t1 = t0 + 1000;
         let surge_asks = vec![(101.0, 50.0), (102.0, 50.0)];
         tracker.update(&bids, &surge_asks, t1, t1);
-        assert!(tracker.instant_obi < -0.50, "Instantaneous flipped heavily bearish");
+        assert!(
+            tracker.instant_obi < -0.50,
+            "Instantaneous flipped heavily bearish"
+        );
         // 1s EWMA should smoothly decay towards negative, but not instantly equal instant_obi
         assert!(tracker.ewma_1s_obi > tracker.instant_obi);
 
         // Check freshness
         assert!(tracker.is_fresh_and_uncrossed(t1 + 500, 7500));
-        assert!(!tracker.is_fresh_and_uncrossed(t1 + 8000, 7500), "Should expire stale books > 7500ms");
+        assert!(
+            !tracker.is_fresh_and_uncrossed(t1 + 8000, 7500),
+            "Should expire stale books > 7500ms"
+        );
     }
 
     #[test]
@@ -1659,7 +1787,9 @@ mod tests {
             tracker.update(&bids, &asks, t_exch, t_local);
         }
 
-        let qual = tracker.compute_feed_quality().expect("Quality stats computed");
+        let qual = tracker
+            .compute_feed_quality()
+            .expect("Quality stats computed");
         assert_eq!(qual.status, "SIGNAL_GOOD");
         assert!((qual.mean_lag_ms - 250.0).abs() < 1.0);
         assert!((qual.p50_ms - 5400.0).abs() < 50.0);
@@ -1717,14 +1847,20 @@ mod tests {
             let t = tracker.last_local_recv_ms + 5400;
             tracker.update(&bids, &asks, t - 200, t);
         }
-        assert_eq!(tracker.current_regime_label, "JitterSubsampled", "Hysteresis blocks premature flip on 1st cycle");
+        assert_eq!(
+            tracker.current_regime_label, "JitterSubsampled",
+            "Hysteresis blocks premature flip on 1st cycle"
+        );
 
         // Subsequent clean cycles until >=2 cycles and 60s of stable clean traffic has elapsed:
         for _ in 37..=72 {
             let t = tracker.last_local_recv_ms + 5400;
             tracker.update(&bids, &asks, t - 200, t);
         }
-        assert_eq!(tracker.current_regime_label, "LowLatency", "Recovered to LowLatency after consecutive cycles & 60s");
+        assert_eq!(
+            tracker.current_regime_label, "LowLatency",
+            "Recovered to LowLatency after consecutive cycles & 60s"
+        );
         assert_eq!(tracker.tau_1_ms, 10_000.0);
         assert_eq!(tracker.tau_2_ms, 30_000.0);
     }
@@ -1775,7 +1911,10 @@ mod tests {
         tracker.ewma_5s_obi = -0.024;
 
         let (ok, reason) = tracker.satisfies_entry_hurdle(&Side::Long, t0 + 100);
-        assert!(ok, "Taker sweep asymmetry must not strangle valid breakout entry");
+        assert!(
+            ok,
+            "Taker sweep asymmetry must not strangle valid breakout entry"
+        );
         assert_eq!(reason, "Bullish Multiscale Depth Alignment");
 
         // Toxic sell wall dumping (-0.25) must be vetoed!
@@ -1823,8 +1962,12 @@ mod tests {
         let eth_tok_str = eth_tok.expect("ETH token");
         assert!(eth_tok_str.contains("ETH"));
 
-        let eth_lease: ShadowClusterLease = serde_json::from_str(&fs::read_to_string(SHADOW_CLUSTER_LOCK).unwrap()).unwrap();
-        assert_eq!(eth_lease.fencing_token, 2, "Fencing token monotonically preserved across releases");
+        let eth_lease: ShadowClusterLease =
+            serde_json::from_str(&fs::read_to_string(SHADOW_CLUSTER_LOCK).unwrap()).unwrap();
+        assert_eq!(
+            eth_lease.fencing_token, 2,
+            "Fencing token monotonically preserved across releases"
+        );
 
         release_shadow_cluster_lease("ETH", Some(&eth_tok_str));
         let _ = fs::remove_file(SHADOW_CLUSTER_LOCK);
@@ -1856,7 +1999,8 @@ mod tests {
         };
 
         // When heartbeat refresh fails (e.g. lease lost / expired), unselection occurs
-        let refresh_ok = refresh_shadow_cluster_lease(&trade.symbol, trade.lease_token.as_deref().unwrap());
+        let refresh_ok =
+            refresh_shadow_cluster_lease(&trade.symbol, trade.lease_token.as_deref().unwrap());
         if !refresh_ok {
             trade.is_portfolio_selected = false;
             trade.lease_token = None;
@@ -1884,7 +2028,10 @@ mod tests {
 
         // 3. Out-of-order candle (backwards in time) -> dropped
         let bar3_backwards = 60_000;
-        assert!(bar3_backwards <= last_processed_1m_open, "Backwards bar rejected");
+        assert!(
+            bar3_backwards <= last_processed_1m_open,
+            "Backwards bar rejected"
+        );
 
         // 4. Gap candle (> 60s gap, e.g. 5 minutes missing) -> detected as gap
         let bar4_gap = 480_000;
@@ -1895,20 +2042,26 @@ mod tests {
 
     #[test]
     fn test_ohlcv_geometric_and_positivity_invariants() {
-        let validate_candle = |open: f64, high: f64, low: f64, close: f64, vol: f64| -> Result<(), &'static str> {
-            if !open.is_finite() || open <= 0.0
-                || !high.is_finite() || high <= 0.0
-                || !low.is_finite() || low <= 0.0
-                || !close.is_finite() || close <= 0.0
-                || !vol.is_finite() || vol < 0.0
-            {
-                return Err("Non-finite or non-positive value");
-            }
-            if high < open.max(close) || low > open.min(close) || high < low {
-                return Err("Geometric violation");
-            }
-            Ok(())
-        };
+        let validate_candle =
+            |open: f64, high: f64, low: f64, close: f64, vol: f64| -> Result<(), &'static str> {
+                if !open.is_finite()
+                    || open <= 0.0
+                    || !high.is_finite()
+                    || high <= 0.0
+                    || !low.is_finite()
+                    || low <= 0.0
+                    || !close.is_finite()
+                    || close <= 0.0
+                    || !vol.is_finite()
+                    || vol < 0.0
+                {
+                    return Err("Non-finite or non-positive value");
+                }
+                if high < open.max(close) || low > open.min(close) || high < low {
+                    return Err("Geometric violation");
+                }
+                Ok(())
+            };
 
         // 1. Valid candle
         assert!(validate_candle(100.0, 105.0, 95.0, 102.0, 50.0).is_ok());
@@ -1941,8 +2094,13 @@ mod tests {
         let prev_stop = chandelier.current_stop;
         // Price advances +10 bps ($100,100.0 = 1.0 * ATR).
         // Stop must NOT jump to $100,150.0 (+15 bps) above the high of $100,100.0!
-        let stop = chandelier.update_with_ratchet_and_cap(100_100.0, 100_020.0, 100.0, 0.85, None, true);
-        assert!(stop < 100_100.0, "Breakeven stop {} must never exceed extreme high 100100.0", stop);
+        let stop =
+            chandelier.update_with_ratchet_and_cap(100_100.0, 100_020.0, 100.0, 0.85, None, true);
+        assert!(
+            stop < 100_100.0,
+            "Breakeven stop {} must never exceed extreme high 100100.0",
+            stop
+        );
         assert!(!chandelier.is_bar_stopped_out(prev_stop, 100_100.0, 100_020.0, 100_100.0));
     }
 
@@ -1952,7 +2110,12 @@ mod tests {
         // Baseline normal funding (0.0000125 = 0.125 bps/hr) and steady OI (1000.0)
         for i in 0..30 {
             let jitter = if i % 2 == 0 { 1e-6 } else { -1e-6 };
-            tracker.update(0.0000125 + jitter, 1000.0 + (i as f64) * 0.5, 100.01, 100.00);
+            tracker.update(
+                0.0000125 + jitter,
+                1000.0 + (i as f64) * 0.5,
+                100.01,
+                100.00,
+            );
         }
         assert!((tracker.crowding_hazard() - 1.0).abs() < 1e-4);
         assert_eq!(tracker.directional_trend_multiplier(&Side::Long), 1.0);
@@ -1961,8 +2124,15 @@ mod tests {
         tracker.update(0.0008, 1250.0, 100.80, 100.00);
         let mult_long = tracker.directional_trend_multiplier(&Side::Long);
         let mult_short = tracker.directional_trend_multiplier(&Side::Short);
-        assert!(mult_long < 0.45, "Extreme crowded positive funding + OI surge must suppress Long breakout (mult={})", mult_long);
-        assert_eq!(mult_short, 1.0, "Opposite Short breakout should not be penalized by positive funding crowding");
+        assert!(
+            mult_long < 0.45,
+            "Extreme crowded positive funding + OI surge must suppress Long breakout (mult={})",
+            mult_long
+        );
+        assert_eq!(
+            mult_short, 1.0,
+            "Opposite Short breakout should not be penalized by positive funding crowding"
+        );
     }
 
     #[test]
@@ -1994,8 +2164,15 @@ mod tests {
             1.15,   // calm Z60
             &Side::Long,
         );
-        assert!(verdict_fresh.approved, "Coiled fresh breakout must be approved (rmb={})", verdict_fresh.rmb_atr);
-        assert!(verdict_fresh.is_coiled, "Tight DCW20=2.25x and low BBW must be classified as coiled");
+        assert!(
+            verdict_fresh.approved,
+            "Coiled fresh breakout must be approved (rmb={})",
+            verdict_fresh.rmb_atr
+        );
+        assert!(
+            verdict_fresh.is_coiled,
+            "Tight DCW20=2.25x and low BBW must be classified as coiled"
+        );
 
         // 2. Exhausted cascade on SOL: channel already expanded to $3.85 (6.0x ATR of 0.64) and Z60 = -3.76
         let donchian_wide = DonchianChannel {
@@ -2012,6 +2189,9 @@ mod tests {
             -3.76,
             &Side::Short,
         );
-        assert!(!verdict_exhausted.approved, "Exhausted cascade with DCW20=6.0x and Z60=-3.76 must be rejected");
+        assert!(
+            !verdict_exhausted.approved,
+            "Exhausted cascade with DCW20=6.0x and Z60=-3.76 must be rejected"
+        );
     }
 }

@@ -460,7 +460,8 @@ impl ClusterCircuitBreaker {
         self.daily_realized_pnl_usd += net_pnl_usd;
 
         if net_pnl_usd < -1e-6 {
-            if self.last_loss_ts_ms > 0 && now_ms.saturating_sub(self.last_loss_ts_ms) > 86_400_000 {
+            if self.last_loss_ts_ms > 0 && now_ms.saturating_sub(self.last_loss_ts_ms) > 86_400_000
+            {
                 self.cluster_consecutive_losses = 0;
             }
             self.cluster_consecutive_losses += 1;
@@ -489,7 +490,8 @@ pub fn check_cluster_circuit_breaker(now_ms: u64, current_equity: f64) -> Option
         .unwrap_or_default();
     let prev_day = cb.utc_day_index;
     let prev_lock = cb.locked_until_ts_ms;
-    let res = cb.evaluate_equity_drawdown(now_ms, current_equity, DEFAULT_MAX_DAILY_CLUSTER_DD_FRAC);
+    let res =
+        cb.evaluate_equity_drawdown(now_ms, current_equity, DEFAULT_MAX_DAILY_CLUSTER_DD_FRAC);
     if cb.utc_day_index != prev_day || cb.locked_until_ts_ms != prev_lock {
         save_cluster_circuit_breaker_unlocked(&cb);
     }
@@ -711,8 +713,7 @@ fn write_leases_atomic(leases: &HashMap<String, ClusterLease>) -> Result<(), Str
         file.sync_all()
             .map_err(|e| format!("Failed to sync temp lease: {}", e))?;
     }
-    fs::rename(&tmp_path, lock_path)
-        .map_err(|e| format!("Failed to rename lease file: {}", e))?;
+    fs::rename(&tmp_path, lock_path).map_err(|e| format!("Failed to rename lease file: {}", e))?;
     sync_parent_dir(CLUSTER_LOCK_FILE);
     Ok(())
 }
@@ -774,9 +775,14 @@ pub fn try_acquire_cluster_lease(symbol: &str, duration_secs: i64) -> bool {
 }
 
 #[allow(dead_code)]
-pub fn try_acquire_cluster_lease_for_engine(symbol: &str, engine_owner: &str, duration_secs: i64) -> bool {
+pub fn try_acquire_cluster_lease_for_engine(
+    symbol: &str,
+    engine_owner: &str,
+    duration_secs: i64,
+) -> bool {
     let owner_uuid = format!("{}_{}", symbol, chrono::Utc::now().timestamp_micros());
-    try_acquire_cluster_lease_for_engine_with_uuid(symbol, engine_owner, &owner_uuid, duration_secs).0
+    try_acquire_cluster_lease_for_engine_with_uuid(symbol, engine_owner, &owner_uuid, duration_secs)
+        .0
 }
 
 pub fn try_acquire_cluster_lease_for_engine_with_uuid(
@@ -873,6 +879,17 @@ pub fn try_acquire_cluster_lease_for_engine_with_uuid(
         );
         let _ = write_leases_atomic(&leases);
         return (false, 0);
+    }
+
+    if max_allowed > 1 {
+        if let Some(corr_reason) = is_cluster_slot_correlated_veto(symbol, &other_active_symbols) {
+            eprintln!(
+                "⏸️ [CLUSTER CORRELATION VETO] Symbol {} blocked by correlated active slot: {}.",
+                symbol, corr_reason
+            );
+            let _ = write_leases_atomic(&leases);
+            return (false, 0);
+        }
     }
 
     // 4. Acquire brand-new lease epoch with incremented monotonic fencing token
@@ -987,7 +1004,12 @@ pub fn assert_current_lease(
 ) -> Result<(), String> {
     let _guard = match FlockGuard::acquire(CLUSTER_LOCK_GUARD_FILE) {
         Ok(g) => g,
-        Err(e) => return Err(format!("Failed to acquire cluster flock guard for lease assertion: {}", e)),
+        Err(e) => {
+            return Err(format!(
+                "Failed to acquire cluster flock guard for lease assertion: {}",
+                e
+            ))
+        }
     };
 
     let leases = load_cluster_leases();
@@ -1016,14 +1038,140 @@ pub fn assert_current_lease(
         }
         Ok(())
     } else {
-        Err(format!("No active cluster lease found on disk for {}", symbol))
+        Err(format!(
+            "No active cluster lease found on disk for {}",
+            symbol
+        ))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssetCluster {
+    Major,
+    AltL1,
+    DeFiInfra,
+    Momentum,
+}
+
+/// Assigns each Hyperliquid perpetual to one of the 4 orthogonal structural clusters
+/// per `Hyperliquid Quant System Scaling Research.txt`.
+pub fn asset_cluster(symbol: &str) -> AssetCluster {
+    match symbol.to_uppercase().as_str() {
+        "BTC" | "ETH" => AssetCluster::Major,
+        "SOL" | "AVAX" | "SUI" | "NEAR" | "HYPE" => AssetCluster::AltL1,
+        "LINK" | "AAVE" | "UNI" | "ENA" => AssetCluster::DeFiInfra,
+        "XRP" | "DOGE" | "WLD" => AssetCluster::Momentum,
+        _ => AssetCluster::AltL1,
+    }
+}
+
+/// Empirical 180-minute downside semibeta (\beta_i^-) conditioned on negative 1m BTC log returns.
+pub fn asset_downside_semibeta(symbol: &str) -> f64 {
+    match symbol.to_uppercase().as_str() {
+        "BTC" => 1.00,
+        "XRP" => 1.00,
+        "HYPE" => 1.15,
+        "ETH" => 1.20,
+        "LINK" => 1.30,
+        "SOL" => 1.35,
+        "AVAX" => 1.35,
+        "SUI" => 1.40,
+        "NEAR" => 1.65,
+        _ => 1.35,
+    }
+}
+
+/// Evaluates the Downside Semibeta & Sector Cluster Orthogonality Lease constraint:
+/// Prevents two non-Major altcoins in the same structural cluster (e.g., SOL + SUI in AltL1)
+/// or two high-beta assets whose combined downside semibeta exceeds 2.65 from occupying
+/// both portfolio slots simultaneously.
+pub fn is_cluster_slot_correlated_veto(
+    candidate_symbol: &str,
+    active_other_symbols: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if active_other_symbols.is_empty() {
+        return None;
+    }
+    let cand_cluster = asset_cluster(candidate_symbol);
+    let cand_beta = asset_downside_semibeta(candidate_symbol);
+    for other in active_other_symbols {
+        let other_cluster = asset_cluster(other);
+        let other_beta = asset_downside_semibeta(other);
+        if cand_cluster != AssetCluster::Major && cand_cluster == other_cluster {
+            return Some(format!("{}(SameCluster:{:?})", other, cand_cluster));
+        }
+        if cand_beta + other_beta > 2.65 + 1e-9 {
+            return Some(format!(
+                "{}(BetaCap:{:.2}>2.65)",
+                other,
+                cand_beta + other_beta
+            ));
+        }
+    }
+    None
+}
+
+/// Computes the Marchenko-Pastur Systemic Absorption Ratio (AR_t = \lambda_1 / M)
+/// via 8-step power iteration on the standardized correlation matrix of asset return streams.
+/// When AR_t >= 0.72, systemic correlation collapse is active and altcoin Engine A Longs are vetoed.
+#[allow(dead_code)]
+pub fn compute_marchenko_pastur_absorption_ratio(return_streams: &[Vec<f64>]) -> f64 {
+    let m = return_streams.len();
+    if m <= 1 {
+        return 0.0;
+    }
+    let n = return_streams.iter().map(|s| s.len()).min().unwrap_or(0);
+    if n < 15 {
+        return 0.0;
+    }
+    let nf = n as f64;
+    let mut std_streams = Vec::with_capacity(m);
+    for s in return_streams {
+        let slice = &s[s.len() - n..];
+        let mean = slice.iter().sum::<f64>() / nf;
+        let var = slice.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / (nf - 1.0).max(1.0);
+        let sd = var.max(1e-18).sqrt();
+        std_streams.push(slice.iter().map(|&x| (x - mean) / sd).collect::<Vec<f64>>());
+    }
+    let mut corr = vec![vec![0.0; m]; m];
+    let denom = (nf - 1.0).max(1.0);
+    for i in 0..m {
+        corr[i][i] = 1.0;
+        for j in (i + 1)..m {
+            let mut cov = 0.0;
+            for k in 0..n {
+                cov += std_streams[i][k] * std_streams[j][k];
+            }
+            let r = (cov / denom).clamp(-1.0, 1.0);
+            corr[i][j] = r;
+            corr[j][i] = r;
+        }
+    }
+    let mut v = vec![1.0 / (m as f64).sqrt(); m];
+    let mut lambda_1 = 1.0;
+    for _ in 0..8 {
+        let mut next_v = vec![0.0; m];
+        for i in 0..m {
+            let mut acc = 0.0;
+            for j in 0..m {
+                acc += corr[i][j] * v[j];
+            }
+            next_v[i] = acc;
+        }
+        let norm = next_v.iter().map(|&x| x * x).sum::<f64>().sqrt().max(1e-12);
+        lambda_1 = norm;
+        for x in &mut next_v {
+            *x /= norm;
+        }
+        v = next_v;
+    }
+    (lambda_1 / (m as f64)).clamp(0.0, 1.0)
 }
 
 /// Returns configured universe of symbols participating in portfolio cluster
 pub fn configured_portfolio_symbols() -> Vec<String> {
-    if let Ok(val) = std::env::var("HL_PORTFOLIO_SYMBOLS")
-        .or_else(|_| std::env::var("PORTFOLIO_SYMBOLS"))
+    if let Ok(val) =
+        std::env::var("HL_PORTFOLIO_SYMBOLS").or_else(|_| std::env::var("PORTFOLIO_SYMBOLS"))
     {
         let syms: Vec<String> = val
             .split(',')
@@ -1039,6 +1187,11 @@ pub fn configured_portfolio_symbols() -> Vec<String> {
         "ETH".to_string(),
         "SOL".to_string(),
         "AVAX".to_string(),
+        "HYPE".to_string(),
+        "NEAR".to_string(),
+        "XRP".to_string(),
+        "SUI".to_string(),
+        "LINK".to_string(),
     ]
 }
 
@@ -1110,6 +1263,8 @@ pub fn has_active_cluster_position(current_symbol: &str) -> Option<String> {
         let mut sorted: Vec<String> = other_active_symbols.into_iter().collect();
         sorted.sort();
         Some(sorted.join(","))
+    } else if max_allowed > 1 {
+        is_cluster_slot_correlated_veto(current_symbol, &other_active_symbols)
     } else {
         None
     }
@@ -1214,7 +1369,8 @@ mod tests {
             }
         }"#;
 
-        let state_short: StateMap = serde_json::from_str(short_json).expect("Deserialization short");
+        let state_short: StateMap =
+            serde_json::from_str(short_json).expect("Deserialization short");
         let eth = state_short.get("ETH").unwrap();
         assert_eq!(eth.side, "SHORT");
     }
@@ -1278,7 +1434,8 @@ mod tests {
         let _ = fs::remove_file(CLUSTER_LOCK_FILE);
         let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
         let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
-        let (acq, tok1) = try_acquire_cluster_lease_for_engine_with_uuid("BTC", "EngineA", "uuid_btc", 60);
+        let (acq, tok1) =
+            try_acquire_cluster_lease_for_engine_with_uuid("BTC", "EngineA", "uuid_btc", 60);
         assert!(acq);
         let lease1 = get_current_cluster_lease().expect("lease1");
         assert_eq!(lease1.fencing_token, 1);
@@ -1286,27 +1443,51 @@ mod tests {
         assert_eq!(lease1.owner_uuid, "uuid_btc");
 
         // Authenticated Refresh PRESERVES fencing token epoch (does NOT change token during heartbeat)
-        assert!(refresh_cluster_lease_authenticated("BTC", Some("uuid_btc"), Some(1), 60));
+        assert!(refresh_cluster_lease_authenticated(
+            "BTC",
+            Some("uuid_btc"),
+            Some(1),
+            60
+        ));
         let lease2 = get_current_cluster_lease().expect("lease2");
         assert_eq!(lease2.fencing_token, 1);
 
         // Wrong token or UUID rejects refresh
-        assert!(!refresh_cluster_lease_authenticated("BTC", Some("wrong_uuid"), Some(1), 60));
-        assert!(!refresh_cluster_lease_authenticated("BTC", Some("uuid_btc"), Some(999), 60));
+        assert!(!refresh_cluster_lease_authenticated(
+            "BTC",
+            Some("wrong_uuid"),
+            Some(1),
+            60
+        ));
+        assert!(!refresh_cluster_lease_authenticated(
+            "BTC",
+            Some("uuid_btc"),
+            Some(999),
+            60
+        ));
 
         // Authenticated release succeeds with original token 1
-        assert!(release_cluster_lease_authenticated("BTC", Some("uuid_btc"), Some(1)));
+        assert!(release_cluster_lease_authenticated(
+            "BTC",
+            Some("uuid_btc"),
+            Some(1)
+        ));
         assert!(get_current_cluster_lease().is_none());
 
         // Re-acquire by ETH increments from persistent counter to token 2 (strictly monotonic epoch)
-        let (acq_eth, tok2) = try_acquire_cluster_lease_for_engine_with_uuid("ETH", "EngineB", "uuid_eth", 60);
+        let (acq_eth, tok2) =
+            try_acquire_cluster_lease_for_engine_with_uuid("ETH", "EngineB", "uuid_eth", 60);
         assert!(acq_eth);
         let lease3 = get_current_cluster_lease().expect("lease3");
         assert_eq!(lease3.fencing_token, 2);
         assert_eq!(tok2, 2);
         assert_eq!(lease3.engine_owner, "EngineB");
 
-        assert!(release_cluster_lease_authenticated("ETH", Some("uuid_eth"), Some(2)));
+        assert!(release_cluster_lease_authenticated(
+            "ETH",
+            Some("uuid_eth"),
+            Some(2)
+        ));
         let _ = fs::remove_file(CLUSTER_LOCK_FILE);
         let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
         let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
@@ -1319,21 +1500,32 @@ mod tests {
         let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
         let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
 
-        let (acq1, tok1) = try_acquire_cluster_lease_for_engine_with_uuid("BTC", "EngineA", "process_1_uuid", 60);
+        let (acq1, tok1) =
+            try_acquire_cluster_lease_for_engine_with_uuid("BTC", "EngineA", "process_1_uuid", 60);
         assert!(acq1);
         assert_eq!(tok1, 1);
 
         // Second instance with SAME symbol "BTC" but DIFFERENT UUID must be REJECTED while lease is valid!
-        let (acq2, tok2) = try_acquire_cluster_lease_for_engine_with_uuid("BTC", "EngineA", "process_2_duplicate_uuid", 60);
+        let (acq2, tok2) = try_acquire_cluster_lease_for_engine_with_uuid(
+            "BTC",
+            "EngineA",
+            "process_2_duplicate_uuid",
+            60,
+        );
         assert!(!acq2);
         assert_eq!(tok2, 0);
 
         // Same UUID is permitted (treated as idempotent re-acquire/refresh)
-        let (acq_same, tok_same) = try_acquire_cluster_lease_for_engine_with_uuid("BTC", "EngineA", "process_1_uuid", 60);
+        let (acq_same, tok_same) =
+            try_acquire_cluster_lease_for_engine_with_uuid("BTC", "EngineA", "process_1_uuid", 60);
         assert!(acq_same);
         assert_eq!(tok_same, 1);
 
-        assert!(release_cluster_lease_authenticated("BTC", Some("process_1_uuid"), Some(1)));
+        assert!(release_cluster_lease_authenticated(
+            "BTC",
+            Some("process_1_uuid"),
+            Some(1)
+        ));
         let _ = fs::remove_file(CLUSTER_LOCK_FILE);
         let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
         let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
@@ -1347,7 +1539,10 @@ mod tests {
         // Valid write
         fs::write(CLUSTER_COUNTER_FILE, "corrupted_garbage_text").unwrap();
         let res = get_and_inc_cluster_counter();
-        assert!(res.is_err(), "Corrupted counter must return Err, never reset to 0!");
+        assert!(
+            res.is_err(),
+            "Corrupted counter must return Err, never reset to 0!"
+        );
 
         let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
     }
@@ -1470,7 +1665,8 @@ mod tests {
         let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
         let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
 
-        let (acq, tok) = try_acquire_cluster_lease_for_engine_with_uuid("BTC", "EngineA", "uuid_owner_1", 60);
+        let (acq, tok) =
+            try_acquire_cluster_lease_for_engine_with_uuid("BTC", "EngineA", "uuid_owner_1", 60);
         assert!(acq);
 
         // Valid assertion succeeds
@@ -1486,7 +1682,11 @@ mod tests {
         assert!(assert_current_lease("BTC", "uuid_owner_1", tok + 1).is_err());
 
         // Release lease
-        assert!(release_cluster_lease_authenticated("BTC", Some("uuid_owner_1"), Some(tok)));
+        assert!(release_cluster_lease_authenticated(
+            "BTC",
+            Some("uuid_owner_1"),
+            Some(tok)
+        ));
 
         // Assertion after release fails (lease missing)
         assert!(assert_current_lease("BTC", "uuid_owner_1", tok).is_err());
@@ -1507,12 +1707,14 @@ mod tests {
         std::env::set_var("HL_MAX_CONCURRENT_POSITIONS", "2");
 
         // First position: BTC acquires lease
-        let (acq_btc, tok_btc) = try_acquire_cluster_lease_for_engine_with_uuid("BTC", "EngineA", "uuid_btc", 60);
+        let (acq_btc, tok_btc) =
+            try_acquire_cluster_lease_for_engine_with_uuid("BTC", "EngineA", "uuid_btc", 60);
         assert!(acq_btc);
         assert_eq!(tok_btc, 1);
 
         // Second position: ETH acquires lease concurrently (since max is 2)
-        let (acq_eth, tok_eth) = try_acquire_cluster_lease_for_engine_with_uuid("ETH", "EngineB", "uuid_eth", 60);
+        let (acq_eth, tok_eth) =
+            try_acquire_cluster_lease_for_engine_with_uuid("ETH", "EngineB", "uuid_eth", 60);
         assert!(acq_eth);
         assert_eq!(tok_eth, 2);
 
@@ -1521,7 +1723,8 @@ mod tests {
         assert!(has_active_cluster_position("ETH").is_none());
 
         // Third position: SOL tries to acquire, but portfolio is at capacity (2/2) -> REJECTED
-        let (acq_sol, tok_sol) = try_acquire_cluster_lease_for_engine_with_uuid("SOL", "EngineA", "uuid_sol", 60);
+        let (acq_sol, tok_sol) =
+            try_acquire_cluster_lease_for_engine_with_uuid("SOL", "EngineA", "uuid_sol", 60);
         assert!(!acq_sol);
         assert_eq!(tok_sol, 0);
         let blocked = has_active_cluster_position("SOL");
@@ -1534,19 +1737,32 @@ mod tests {
         assert!(assert_current_lease("ETH", "uuid_eth", tok_eth).is_ok());
 
         // Release BTC
-        assert!(release_cluster_lease_authenticated("BTC", Some("uuid_btc"), Some(tok_btc)));
+        assert!(release_cluster_lease_authenticated(
+            "BTC",
+            Some("uuid_btc"),
+            Some(tok_btc)
+        ));
         assert!(assert_current_lease("BTC", "uuid_btc", tok_btc).is_err());
         assert!(assert_current_lease("ETH", "uuid_eth", tok_eth).is_ok());
 
         // Now capacity is 1/2: SOL can now acquire lease!
-        let (acq_sol2, tok_sol2) = try_acquire_cluster_lease_for_engine_with_uuid("SOL", "EngineA", "uuid_sol", 60);
+        let (acq_sol2, tok_sol2) =
+            try_acquire_cluster_lease_for_engine_with_uuid("SOL", "EngineA", "uuid_sol", 60);
         assert!(acq_sol2);
         assert_eq!(tok_sol2, 3);
         assert!(assert_current_lease("SOL", "uuid_sol", tok_sol2).is_ok());
 
         // Cleanup
-        assert!(release_cluster_lease_authenticated("ETH", Some("uuid_eth"), Some(tok_eth)));
-        assert!(release_cluster_lease_authenticated("SOL", Some("uuid_sol"), Some(tok_sol2)));
+        assert!(release_cluster_lease_authenticated(
+            "ETH",
+            Some("uuid_eth"),
+            Some(tok_eth)
+        ));
+        assert!(release_cluster_lease_authenticated(
+            "SOL",
+            Some("uuid_sol"),
+            Some(tok_sol2)
+        ));
 
         std::env::remove_var("HL_MAX_CONCURRENT_POSITIONS");
         let _ = fs::remove_file(CLUSTER_LOCK_FILE);
@@ -1562,7 +1778,11 @@ mod tests {
         let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
 
         // Releasing a lease that is already absent from disk must succeed idempotently (never wedge)
-        assert!(release_cluster_lease_authenticated("BTC", Some("stale_uuid"), Some(99)));
+        assert!(release_cluster_lease_authenticated(
+            "BTC",
+            Some("stale_uuid"),
+            Some(99)
+        ));
     }
 
     #[test]
@@ -1601,7 +1821,66 @@ mod tests {
 
         // 5. Next UTC day rollover after lock expiry resets daily PnL and unlocks
         let day2_ms = day1_start_ms + 86_400_000 + 60_000;
-        assert!(cb.evaluate_equity_drawdown(day2_ms, 518.50, 0.0275).is_none());
+        assert!(cb
+            .evaluate_equity_drawdown(day2_ms, 518.50, 0.0275)
+            .is_none());
         assert!((cb.daily_realized_pnl_usd).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_sector_cluster_and_downside_semibeta_lease_orthogonality() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let _ = fs::remove_file(CLUSTER_LOCK_FILE);
+        let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
+        let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
+        std::env::set_var("HL_MAX_CONCURRENT_POSITIONS", "2");
+
+        // 1. SOL (AltL1, beta=1.35) acquires Slot 1
+        let (acq_sol, tok_sol) =
+            try_acquire_cluster_lease_for_engine_with_uuid("SOL", "EngineA", "uuid_sol", 60);
+        assert!(acq_sol);
+
+        // 2. SUI and NEAR (both AltL1) MUST be rejected by SameCluster orthogonality rule!
+        let (acq_sui, _) =
+            try_acquire_cluster_lease_for_engine_with_uuid("SUI", "EngineA", "uuid_sui", 60);
+        assert!(!acq_sui, "Same non-Major cluster (AltL1) must be vetoed");
+
+        // 3. XRP (Momentum, beta=1.00; sum=2.35 <= 2.65) is orthogonal and MUST succeed!
+        let (acq_xrp, tok_xrp) =
+            try_acquire_cluster_lease_for_engine_with_uuid("XRP", "EngineA", "uuid_xrp", 60);
+        assert!(
+            acq_xrp,
+            "Orthogonal Momentum cluster with beta sum <= 2.65 must be allowed"
+        );
+
+        assert!(release_cluster_lease_authenticated(
+            "SOL",
+            Some("uuid_sol"),
+            Some(tok_sol)
+        ));
+        assert!(release_cluster_lease_authenticated(
+            "XRP",
+            Some("uuid_xrp"),
+            Some(tok_xrp)
+        ));
+
+        // 4. Test Marchenko-Pastur Absorption Ratio on perfectly correlated vs independent streams
+        let base_stream: Vec<f64> = (0..30).map(|i| (i as f64 * 0.3).sin() * 0.01).collect();
+        let synced = vec![
+            base_stream.clone(),
+            base_stream.clone(),
+            base_stream.clone(),
+        ];
+        let ar_synced = compute_marchenko_pastur_absorption_ratio(&synced);
+        assert!(
+            ar_synced > 0.95,
+            "Synchronized streams must yield AR_t ~ 1.0 (got {})",
+            ar_synced
+        );
+
+        std::env::remove_var("HL_MAX_CONCURRENT_POSITIONS");
+        let _ = fs::remove_file(CLUSTER_LOCK_FILE);
+        let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
+        let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
     }
 }

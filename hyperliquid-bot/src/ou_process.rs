@@ -96,8 +96,11 @@ impl AssetOuConfig {
         let ref_atr_bps = match self.symbol {
             "BTC" => 35.0,
             "ETH" => 45.0,
-            "SOL" => 65.0,
-            "AVAX" => 75.0,
+            "XRP" => 55.0,
+            "SOL" | "LINK" => 65.0,
+            "HYPE" => 70.0,
+            "AVAX" | "SUI" => 75.0,
+            "NEAR" => 85.0,
             _ => 45.0,
         };
         let vol_mult = (ref_atr_bps / atr_bps.max(10.0)).clamp(0.45, 1.05);
@@ -178,6 +181,96 @@ pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
             soft_z_ou_threshold: 2.85,
             soft_z15_shock_threshold: 3.20,
             hard_disaster_stop_bps: 220.0,
+        },
+        "HYPE" => AssetOuConfig {
+            symbol: "HYPE",
+            lookback_5m_bars: 120,
+            min_half_life_m: 15.0,
+            max_half_life_m: 135.0,
+            min_sigma_eq_bps: 34.0,
+            base_entry_sigma: 1.70,
+            min_entry_sigma: 1.50,
+            max_entry_sigma: 2.00,
+            rebound_gamma: 0.30,
+            max_join_consumption_ratio: 0.22,
+            max_retest_consumption_ratio: 0.45,
+            min_net_edge_bps: 32.0,
+            target_notional_cap_usdc: 55.0,
+            soft_z_ou_threshold: 2.85,
+            soft_z15_shock_threshold: 3.20,
+            hard_disaster_stop_bps: 220.0,
+        },
+        "NEAR" => AssetOuConfig {
+            symbol: "NEAR",
+            lookback_5m_bars: 120,
+            min_half_life_m: 15.0,
+            max_half_life_m: 135.0,
+            min_sigma_eq_bps: 38.0,
+            base_entry_sigma: 1.75,
+            min_entry_sigma: 1.55,
+            max_entry_sigma: 2.05,
+            rebound_gamma: 0.30,
+            max_join_consumption_ratio: 0.22,
+            max_retest_consumption_ratio: 0.45,
+            min_net_edge_bps: 35.0,
+            target_notional_cap_usdc: 50.0,
+            soft_z_ou_threshold: 2.90,
+            soft_z15_shock_threshold: 3.30,
+            hard_disaster_stop_bps: 240.0,
+        },
+        "XRP" => AssetOuConfig {
+            symbol: "XRP",
+            lookback_5m_bars: 120,
+            min_half_life_m: 15.0,
+            max_half_life_m: 135.0,
+            min_sigma_eq_bps: 30.0,
+            base_entry_sigma: 1.65,
+            min_entry_sigma: 1.45,
+            max_entry_sigma: 1.95,
+            rebound_gamma: 0.30,
+            max_join_consumption_ratio: 0.22,
+            max_retest_consumption_ratio: 0.45,
+            min_net_edge_bps: 28.0,
+            target_notional_cap_usdc: 60.0,
+            soft_z_ou_threshold: 2.85,
+            soft_z15_shock_threshold: 3.20,
+            hard_disaster_stop_bps: 200.0,
+        },
+        "SUI" => AssetOuConfig {
+            symbol: "SUI",
+            lookback_5m_bars: 120,
+            min_half_life_m: 15.0,
+            max_half_life_m: 135.0,
+            min_sigma_eq_bps: 35.0,
+            base_entry_sigma: 1.70,
+            min_entry_sigma: 1.50,
+            max_entry_sigma: 2.00,
+            rebound_gamma: 0.30,
+            max_join_consumption_ratio: 0.22,
+            max_retest_consumption_ratio: 0.45,
+            min_net_edge_bps: 32.0,
+            target_notional_cap_usdc: 55.0,
+            soft_z_ou_threshold: 2.85,
+            soft_z15_shock_threshold: 3.20,
+            hard_disaster_stop_bps: 220.0,
+        },
+        "LINK" => AssetOuConfig {
+            symbol: "LINK",
+            lookback_5m_bars: 120,
+            min_half_life_m: 15.0,
+            max_half_life_m: 135.0,
+            min_sigma_eq_bps: 32.0,
+            base_entry_sigma: 1.68,
+            min_entry_sigma: 1.48,
+            max_entry_sigma: 1.98,
+            rebound_gamma: 0.30,
+            max_join_consumption_ratio: 0.22,
+            max_retest_consumption_ratio: 0.45,
+            min_net_edge_bps: 30.0,
+            target_notional_cap_usdc: 58.0,
+            soft_z_ou_threshold: 2.85,
+            soft_z15_shock_threshold: 3.20,
+            hard_disaster_stop_bps: 210.0,
         },
         _ => AssetOuConfig {
             symbol: "ETH",
@@ -445,8 +538,7 @@ impl AltcoinCausalResidualEngine {
         let phi = [1.0, r_btc, self.prev_btc_ret];
 
         // 1. Causal a priori idiosyncratic return innovation u_{k,t}
-        let pred_r_alt =
-            phi[0] * self.theta[0] + phi[1] * self.theta[1] + phi[2] * self.theta[2];
+        let pred_r_alt = phi[0] * self.theta[0] + phi[1] * self.theta[1] + phi[2] * self.theta[2];
         let u_innov = r_alt - pred_r_alt;
 
         // 2. Huber clipping for RLS parameter stability against liquidation wicks
@@ -456,17 +548,13 @@ impl AltcoinCausalResidualEngine {
         // 3. Compute P_{t-1} * phi
         let mut p_phi = [0.0; 3];
         for i in 0..3 {
-            p_phi[i] = self.p_mat[i][0] * phi[0]
-                + self.p_mat[i][1] * phi[1]
-                + self.p_mat[i][2] * phi[2];
+            p_phi[i] =
+                self.p_mat[i][0] * phi[0] + self.p_mat[i][1] * phi[1] + self.p_mat[i][2] * phi[2];
         }
 
         // Denominator: lambda + phi^T * P_{t-1} * phi
-        let denom = (self.lambda
-            + phi[0] * p_phi[0]
-            + phi[1] * p_phi[1]
-            + phi[2] * p_phi[2])
-            .max(1e-12);
+        let denom =
+            (self.lambda + phi[0] * p_phi[0] + phi[1] * p_phi[1] + phi[2] * p_phi[2]).max(1e-12);
 
         let k_gain = [p_phi[0] / denom, p_phi[1] / denom, p_phi[2] / denom];
 
@@ -480,9 +568,8 @@ impl AltcoinCausalResidualEngine {
         // 5. Update RLS covariance matrix: P_t = (P_{t-1} - k * (phi^T * P_{t-1})) / lambda
         let mut phi_t_p = [0.0; 3];
         for j in 0..3 {
-            phi_t_p[j] = phi[0] * self.p_mat[0][j]
-                + phi[1] * self.p_mat[1][j]
-                + phi[2] * self.p_mat[2][j];
+            phi_t_p[j] =
+                phi[0] * self.p_mat[0][j] + phi[1] * self.p_mat[1][j] + phi[2] * self.p_mat[2][j];
         }
         let inv_lambda = 1.0 / self.lambda;
         for i in 0..3 {
@@ -846,12 +933,21 @@ pub fn evaluate_armed_reversal_1m_step(
     }
 
     // Deduct expected TP front-running offset before applying the gross/net-edge hurdle (Researcher 1 line 447)
-    let tp_offset_bps = compute_safe_tp_offset_bps(mean_target_price, bar_close, tick_size).unwrap_or(0.0);
-    let c_req = (min_net_edge_bps + 2.0 * maker_fee_bps + expected_funding_drag_bps.max(0.0) + tp_offset_bps) * 1e-4;
+    let tp_offset_bps =
+        compute_safe_tp_offset_bps(mean_target_price, bar_close, tick_size).unwrap_or(0.0);
+    let c_req = (min_net_edge_bps
+        + 2.0 * maker_fee_bps
+        + expected_funding_drag_bps.max(0.0)
+        + tp_offset_bps)
+        * 1e-4;
     let m_star = mean_target_price.ln();
 
     let eff_bid = if best_bid > 0.0 { best_bid } else { bar_close };
-    let eff_ask = if best_ask > 0.0 { best_ask } else { bar_close + tick_size };
+    let eff_ask = if best_ask > 0.0 {
+        best_ask
+    } else {
+        bar_close + tick_size
+    };
 
     if consumed_ratio <= max_join_consumption_ratio {
         // Regime A: Controlled rebound -> Join-Bid / Join-Ask Policy capped by exp(m* -/+ c_req)
@@ -926,18 +1022,173 @@ pub fn compute_safe_tp_offset_bps(target_mu: f64, entry_price: f64, tick_size: f
     }
 }
 
+/// Phase 2 Dynamic Volatility- and Queue-Adaptive TP Shave (\eta^*):
+/// Shaves a smaller fraction (~5.0 bps) when O-U half-life is fast (<= 35m), and scales up the shave
+/// toward 12-15% of `d_rem_bps` (up to 10.0 bps) when `half_life_m` is slow (> 55m), increasing maker
+/// TP fill rate before the Profit-Harvest Ratchet or HMM regime transitions occur.
+pub fn compute_adaptive_tp_offset_bps(
+    target_mu: f64,
+    entry_price: f64,
+    tick_size: f64,
+    half_life_m: f64,
+) -> Option<f64> {
+    if target_mu <= 0.0 || entry_price <= 0.0 || tick_size <= 0.0 {
+        return None;
+    }
+    let d_rem_bps = ((target_mu - entry_price).abs() / entry_price) * 1e4;
+    let tick_bps = (tick_size / target_mu) * 1e4;
+    let lower = (2.0 * tick_bps).max(2.0);
+    let upper = 10.0_f64.min(0.15 * d_rem_bps);
+    if lower > upper {
+        return None;
+    }
+    let hl_clamped = half_life_m.clamp(15.0, 120.0);
+    let eta_star = (0.04 + 0.08 * ((hl_clamped - 25.0).max(0.0) / 95.0)).clamp(0.04, 0.14);
+    let target_shave_bps = (eta_star * d_rem_bps).max(5.0);
+    Some(target_shave_bps.max(lower).min(upper))
+}
+
+/// Phase 2 Fee-Adjusted Fractional Kelly Tranche Scalar (\kappa_{Kelly} \in [0.65, 1.00]):
+/// Modulates base tranche size according to the net payoff odds ratio after round-trip maker fees
+/// and expected funding drag.
+pub fn compute_fee_adjusted_kelly_scalar(
+    gross_edge_bps: f64,
+    min_net_edge_bps: f64,
+    maker_fee_bps: f64,
+    funding_drag_bps: f64,
+) -> f64 {
+    let cost_bps = 2.0 * maker_fee_bps + funding_drag_bps.max(0.0);
+    let net_edge_bps = (gross_edge_bps - cost_bps).max(0.0);
+    let ref_net_bps = (min_net_edge_bps * 1.15).max(15.0);
+    (net_edge_bps / ref_net_bps).sqrt().clamp(0.65, 1.00)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HourlySqueezeVerdict {
+    pub approved: bool,
+    pub side: Side,
+    pub limit_px: f64,
+    pub target_tp_px: f64,
+    pub hard_stop_px: f64,
+}
+
+/// Phase 3 Candidate Engine C (`HourlySqueezeHarvester`):
+/// Exploits Hyperliquid L1's deterministic hourly `:00` UTC peer-to-peer funding settlement cycle.
+/// Enters Long during the Pre-Settlement Accumulation Window (`:42` to `:55` UTC) when 1h funding
+/// reaches extreme negative levels (`<= -5.5 bps/hr` ~ `-48%` APR), Open Interest is non-contracting,
+/// and price holds >= 0.25 * \sigma_{eq} above the 30-minute absorption low while trading at a discount
+/// to the CEX spot oracle.
+pub fn evaluate_engine_c_hourly_squeeze(
+    timestamp_ms: u64,
+    funding_1h: f64,
+    close_px: f64,
+    best_bid: f64,
+    oracle_px: f64,
+    low_30m: f64,
+    sigma_eq_log: f64,
+    min_net_edge_bps: f64,
+    z_15: f64,
+    z_60: f64,
+    tick_size: f64,
+) -> Option<HourlySqueezeVerdict> {
+    if close_px <= 0.0 || oracle_px <= 0.0 || low_30m <= 0.0 || tick_size <= 0.0 {
+        return None;
+    }
+    let minute_of_hour = (timestamp_ms / 60_000) % 60;
+    if !(42..=55).contains(&minute_of_hour) {
+        return None;
+    }
+    // Require extreme negative hourly funding (<= -5.5 bps/hr = -0.00055) and non-crash volatility
+    if funding_1h > -0.00055 || z_15 <= -1.85 || z_60 <= -2.10 {
+        return None;
+    }
+    // Require price absorption above 30m low by at least 0.25 * \sigma_{eq} and discount/parity to spot oracle
+    let absorption_floor = low_30m * (1.0 + 0.25 * sigma_eq_log.max(0.0020));
+    if close_px < absorption_floor || close_px > oracle_px * 1.0002 {
+        return None;
+    }
+    let eff_bid = if best_bid > 0.0 {
+        best_bid
+    } else {
+        close_px - tick_size
+    };
+    let min_tp = eff_bid * (1.0 + (min_net_edge_bps + 3.0) * 1e-4);
+    let target_tp_px = oracle_px.max(min_tp);
+    let hard_stop_px = (low_30m - 2.0 * tick_size).min(eff_bid * (1.0 - 0.0085));
+    Some(HourlySqueezeVerdict {
+        approved: true,
+        side: Side::Long,
+        limit_px: eff_bid,
+        target_tp_px,
+        hard_stop_px,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CascadeReversalVerdict {
+    pub approved: bool,
+    pub side: Side,
+    pub limit_px: f64,
+    pub target_tp_px: f64,
+    pub hard_stop_px: f64,
+}
+
+/// Phase 3 Candidate Engine D (`CascadeAbsorptionReversal`):
+/// Detects the exhaustion point of Hyperliquid's Stage-1 on-book market liquidation waterfall
+/// as it transitions to Stage-2 off-book HLP vault absorption:
+/// 1. Severe 15m downside shock (`z_15 <= -2.5`),
+/// 2. Open Interest deleveraging contraction (`dlog_oi_3m <= -0.012`),
+/// 3. Perp-to-Oracle discount dislocation (`(close - oracle) / oracle <= -0.0025`, i.e. <= -25 bps),
+/// 4. Stoikov Micro-Price / L2 OBI reversal confirmation (`obi_instant >= 0.22` and bullish 1m close).
+pub fn evaluate_engine_d_cascade_reversal(
+    close_px: f64,
+    open_px: f64,
+    low_px: f64,
+    best_bid: f64,
+    oracle_px: f64,
+    dlog_oi_3m: f64,
+    z_15: f64,
+    obi_instant: f64,
+    min_net_edge_bps: f64,
+    tick_size: f64,
+) -> Option<CascadeReversalVerdict> {
+    if close_px <= 0.0 || oracle_px <= 0.0 || low_px <= 0.0 || tick_size <= 0.0 {
+        return None;
+    }
+    let oracle_dislocation = (close_px - oracle_px) / oracle_px;
+    if z_15 <= -2.50
+        && dlog_oi_3m <= -0.012
+        && oracle_dislocation <= -0.0025
+        && obi_instant >= 0.22
+        && close_px > open_px
+    {
+        let eff_bid = if best_bid > 0.0 {
+            best_bid
+        } else {
+            close_px - tick_size
+        };
+        let min_tp = eff_bid * (1.0 + (min_net_edge_bps + 3.0) * 1e-4);
+        let target_tp_px = oracle_px.max(min_tp);
+        let hard_stop_px = (low_px - 3.0 * tick_size).min(eff_bid * (1.0 - 0.0075));
+        return Some(CascadeReversalVerdict {
+            approved: true,
+            side: Side::Long,
+            limit_px: eff_bid,
+            target_tp_px,
+            hard_stop_px,
+        });
+    }
+    None
+}
+
 // ============================================================================
 // 3. TWO-TIER POSITION INVALIDATION LOGIC (SOFT MULTI-BAR + HARD CRASH STOP)
 // ============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InvalidationDecision {
-    HoldPosition {
-        updated_tp_price: Option<f64>,
-    },
-    TriggerSoftInvalidationFlatten {
-        reason: &'static str,
-    },
+    HoldPosition { updated_tp_price: Option<f64> },
+    TriggerSoftInvalidationFlatten { reason: &'static str },
     TriggerTimeDecayExit,
 }
 
@@ -1066,8 +1317,8 @@ impl TwoTierInvalidationManager {
         }
 
         let mut updated_tp_price = None;
-        let breakeven_ratchet_mins = (1.6 * self.half_life_minutes).clamp(45.0, 180.0);
-        if !self.breakeven_ratchet_armed && self.elapsed_minutes >= breakeven_ratchet_mins {
+        let breakeven_ratchet_mins = (1.15 * self.half_life_minutes).clamp(38.0, 90.0);
+        if self.elapsed_minutes >= breakeven_ratchet_mins {
             self.breakeven_ratchet_armed = true;
             let min_harvest_margin = (2.0 * maker_fee_bps + 12.0) * 1e-4;
             let be_px = match self.side {
@@ -1321,8 +1572,9 @@ pub fn estimate_ou_5m_kalman(
             if let Some(mut params) = estimate_ou_parameters(slice_5m, dt) {
                 let hl = params.half_life_minutes();
                 if hl >= cfg.min_half_life_m && hl <= cfg.max_half_life_m {
-                    let sigma_eq_raw_log =
-                        ((params.sigma / params.mu.max(1e-9)).powi(2) / (2.0 * params.theta)).sqrt();
+                    let sigma_eq_raw_log = ((params.sigma / params.mu.max(1e-9)).powi(2)
+                        / (2.0 * params.theta))
+                        .sqrt();
                     let sigma_eq_eff_log = sigma_eq_raw_log.max(sigma_eq_floor_log);
                     params.sigma = params.mu * sigma_eq_eff_log * (2.0 * params.theta).sqrt();
                     ou_opt = Some((params, sigma_eq_eff_log));
@@ -1339,7 +1591,11 @@ pub fn estimate_ou_5m_kalman(
 }
 
 #[allow(dead_code)]
-pub fn calculate_thresholds_at_sigma(params: &OuParameters, transaction_cost: f64, num_sigma: f64) -> OptimalThresholds {
+pub fn calculate_thresholds_at_sigma(
+    params: &OuParameters,
+    transaction_cost: f64,
+    num_sigma: f64,
+) -> OptimalThresholds {
     let sigma_eq = (params.sigma * params.sigma / (2.0 * params.theta)).sqrt();
     let min_required_profit = transaction_cost * 2.5;
     let deviation = (num_sigma * sigma_eq).max(min_required_profit);
@@ -1352,7 +1608,10 @@ pub fn calculate_thresholds_at_sigma(params: &OuParameters, transaction_cost: f6
 }
 
 #[allow(dead_code)]
-pub fn calculate_optimal_thresholds(params: &OuParameters, transaction_cost: f64) -> OptimalThresholds {
+pub fn calculate_optimal_thresholds(
+    params: &OuParameters,
+    transaction_cost: f64,
+) -> OptimalThresholds {
     calculate_thresholds_at_sigma(params, transaction_cost, 1.65)
 }
 
@@ -1555,7 +1814,11 @@ pub fn evaluate_macro_hazard(ts_ms: u64) -> MacroHazardState {
             1.0
         } else if diff_mins > hold_mins && diff_mins <= hold_mins + 5.0 * half_life_mins {
             let raw = (-std::f64::consts::LN_2 * (diff_mins - hold_mins) / half_life_mins).exp();
-            if raw >= 0.05 { raw } else { 0.0 }
+            if raw >= 0.05 {
+                raw
+            } else {
+                0.0
+            }
         } else {
             0.0
         };
@@ -1661,8 +1924,17 @@ pub fn calculate_net_edge_bps(entry_price: f64, exit_target: f64) -> f64 {
 }
 
 #[allow(dead_code)]
-pub fn calculate_rogers_satchell_sigma(opens: &[f64], highs: &[f64], lows: &[f64], closes: &[f64]) -> f64 {
-    let n = opens.len().min(highs.len()).min(lows.len()).min(closes.len());
+pub fn calculate_rogers_satchell_sigma(
+    opens: &[f64],
+    highs: &[f64],
+    lows: &[f64],
+    closes: &[f64],
+) -> f64 {
+    let n = opens
+        .len()
+        .min(highs.len())
+        .min(lows.len())
+        .min(closes.len());
     if n < 2 {
         return 0.0;
     }
@@ -1690,8 +1962,17 @@ pub fn calculate_rogers_satchell_sigma(opens: &[f64], highs: &[f64], lows: &[f64
 }
 
 #[allow(dead_code)]
-pub fn calculate_garman_klass_sigma(opens: &[f64], highs: &[f64], lows: &[f64], closes: &[f64]) -> f64 {
-    let n = opens.len().min(highs.len()).min(lows.len()).min(closes.len());
+pub fn calculate_garman_klass_sigma(
+    opens: &[f64],
+    highs: &[f64],
+    lows: &[f64],
+    closes: &[f64],
+) -> f64 {
+    let n = opens
+        .len()
+        .min(highs.len())
+        .min(lows.len())
+        .min(closes.len());
     if n < 2 {
         return 0.0;
     }
@@ -1756,7 +2037,11 @@ pub struct FeatureSnapshot {
 }
 
 #[allow(dead_code)]
-pub fn calculate_features(closes_history: &[f64], eval_close: f64, symbol: &str) -> Option<FeatureSnapshot> {
+pub fn calculate_features(
+    closes_history: &[f64],
+    eval_close: f64,
+    symbol: &str,
+) -> Option<FeatureSnapshot> {
     calculate_features_with_funding(closes_history, eval_close, symbol, 0.0)
 }
 
@@ -1768,7 +2053,13 @@ pub fn calculate_features_with_funding(
     symbol: &str,
     hourly_funding_rate: f64,
 ) -> Option<FeatureSnapshot> {
-    calculate_features_with_funding_at(closes_history, eval_close, symbol, hourly_funding_rate, None)
+    calculate_features_with_funding_at(
+        closes_history,
+        eval_close,
+        symbol,
+        hourly_funding_rate,
+        None,
+    )
 }
 
 /// Evaluates stochastic 5m O-U features at a specific bar timestamp (`eval_timestamp_ms`)
@@ -1807,8 +2098,12 @@ pub fn calculate_features_with_funding_at(
         if let Some(mut ou_params) = ou_5m_opt {
             let hl = ou_params.half_life_minutes();
             let is_stationary_hl = hl > 0.0 && hl <= cfg.max_half_life_m;
-            if hourly_funding_rate.is_finite() && hourly_funding_rate.abs() > 1e-7 && ou_params.theta > 1e-5 {
-                let carry_shift = (-hourly_funding_rate / (60.0 * ou_params.theta)).clamp(-0.0015, 0.0015);
+            if hourly_funding_rate.is_finite()
+                && hourly_funding_rate.abs() > 1e-7
+                && ou_params.theta > 1e-5
+            {
+                let carry_shift =
+                    (-hourly_funding_rate / (60.0 * ou_params.theta)).clamp(-0.0015, 0.0015);
                 ou_params.mu *= 1.0 + carry_shift;
             }
             let mu_dev = (ou_params.mu - hist_last_price).abs() / hist_last_price;
@@ -1827,7 +2122,10 @@ pub fn calculate_features_with_funding_at(
                     let ref_utc = eval_timestamp_ms
                         .and_then(|ms| chrono::DateTime::from_timestamp_millis(ms as i64))
                         .unwrap_or_else(chrono::Utc::now);
-                    let is_weekend = matches!(ref_utc.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun);
+                    let is_weekend = matches!(
+                        ref_utc.weekday(),
+                        chrono::Weekday::Sat | chrono::Weekday::Sun
+                    );
                     utc_session_sigma_offset(ref_utc.hour(), is_weekend)
                 } else {
                     0.0
@@ -1911,8 +2209,10 @@ pub fn calculate_features_with_funding_at(
     let max_economic_drift = match symbol.to_uppercase().as_str() {
         "BTC" => 0.020,
         "ETH" => 0.025,
-        "SOL" => 0.040,
-        "AVAX" => 0.050,
+        "XRP" | "LINK" => 0.035,
+        "SOL" | "HYPE" => 0.040,
+        "AVAX" | "SUI" => 0.050,
+        "NEAR" => 0.055,
         _ => 0.025,
     };
 
@@ -1942,8 +2242,10 @@ pub fn calculate_features_with_funding_at(
     let (hurdle_15, hurdle_60) = match symbol.to_uppercase().as_str() {
         "BTC" => (0.0075, 0.0150),
         "ETH" => (0.0100, 0.0200),
-        "SOL" => (0.0150, 0.0300),
-        "AVAX" => (0.0200, 0.0400),
+        "XRP" | "LINK" => (0.0140, 0.0280),
+        "SOL" | "HYPE" => (0.0150, 0.0300),
+        "AVAX" | "SUI" => (0.0200, 0.0400),
+        "NEAR" => (0.0220, 0.0440),
         _ => (0.0100, 0.0200),
     };
 
@@ -1956,7 +2258,8 @@ pub fn calculate_features_with_funding_at(
     let is_upside_shock = shock_15_up || shock_60_up;
     let is_stationary = thresholds_opt.is_some();
     let is_consolidation = !is_drifting && is_stationary;
-    let is_valid_half_life = half_life_m >= cfg.min_half_life_m && half_life_m <= cfg.max_half_life_m;
+    let is_valid_half_life =
+        half_life_m >= cfg.min_half_life_m && half_life_m <= cfg.max_half_life_m;
 
     Some(FeatureSnapshot {
         thresholds_opt,
@@ -2113,15 +2416,24 @@ mod tests {
 
         let feat_quiet = calculate_features(&history, 100.28, "BTC").expect("features");
         assert!(feat_quiet.z_15 > 3.0);
-        assert!(!feat_quiet.is_upside_shock, "28 bps move must not trigger shock veto despite high Z!");
+        assert!(
+            !feat_quiet.is_upside_shock,
+            "28 bps move must not trigger shock veto despite high Z!"
+        );
 
         let feat_real_shock = calculate_features(&history, 101.50, "BTC").expect("features");
         assert!(feat_real_shock.z_15 > 3.0);
-        assert!(feat_real_shock.is_upside_shock, "150 bps flash move must trigger shock veto!");
+        assert!(
+            feat_real_shock.is_upside_shock,
+            "150 bps flash move must trigger shock veto!"
+        );
 
         let feat_dump = calculate_features(&history, 98.00, "BTC").expect("features");
         assert!(feat_dump.z_15 < -3.0);
-        assert!(feat_dump.is_downside_shock, "-200 bps flash crash must trigger downside shock!");
+        assert!(
+            feat_dump.is_downside_shock,
+            "-200 bps flash crash must trigger downside shock!"
+        );
     }
 
     #[test]
@@ -2142,7 +2454,8 @@ mod tests {
         };
         let tx_cost = 0.05;
         let neutral = calculate_carry_adjusted_thresholds(&params, tx_cost, 1.65, 0.0, 1.45, 1.95);
-        let pos_fund = calculate_carry_adjusted_thresholds(&params, tx_cost, 1.65, 0.0005, 1.45, 1.95);
+        let pos_fund =
+            calculate_carry_adjusted_thresholds(&params, tx_cost, 1.65, 0.0005, 1.45, 1.95);
         assert!(pos_fund.entry_short < neutral.entry_short);
         assert!(pos_fund.entry_long < neutral.entry_long);
     }
@@ -2160,10 +2473,22 @@ mod tests {
             "Expected 5m t_half in 20m-135m band, got {}",
             feat.half_life_m
         );
-        assert!(feat.is_stationary, "5m stationary process must be stationary");
-        assert!(feat.is_valid_half_life, "t_half in 20m-135m band must pass is_valid_half_life");
-        assert!(feat.is_consolidation, "Non-drifting stationary series must be valid consolidation");
-        assert!(feat.sigma_eq_log >= 0.0055 - 1e-6, "SOL sigma_eq_log must respect 55 bps floor");
+        assert!(
+            feat.is_stationary,
+            "5m stationary process must be stationary"
+        );
+        assert!(
+            feat.is_valid_half_life,
+            "t_half in 20m-135m band must pass is_valid_half_life"
+        );
+        assert!(
+            feat.is_consolidation,
+            "Non-drifting stationary series must be valid consolidation"
+        );
+        assert!(
+            feat.sigma_eq_log >= 0.0055 - 1e-6,
+            "SOL sigma_eq_log must respect 55 bps floor"
+        );
     }
 
     #[test]
@@ -2185,8 +2510,14 @@ mod tests {
                 veto_fired = true;
             }
         }
-        assert!(veto_fired, "Kalman LLT filter must trigger waterfall drift veto during steep sell-off");
-        assert!(llt.cusum_neg > 2.0, "Downside innovation CUSUM must accumulate during waterfall");
+        assert!(
+            veto_fired,
+            "Kalman LLT filter must trigger waterfall drift veto during steep sell-off"
+        );
+        assert!(
+            llt.cusum_neg > 2.0,
+            "Downside innovation CUSUM must accumulate during waterfall"
+        );
     }
 
     #[test]
@@ -2212,7 +2543,12 @@ mod tests {
         // 3m return ln(99.35 / 99.28) > 0, consumed = (99.35 - 99.25) / (100.00 - 99.25) = 13.3% <= 22% -> PostAloJoinBook!
         let a3 = machine.on_1m_bar_close(99.36, 99.28, 99.35, 99.34, 99.36, 0.01, 0.0007);
         match a3 {
-            OrderPlacementAction::PostAloJoinBook { side, limit_price, entry_ttl_mins, .. } => {
+            OrderPlacementAction::PostAloJoinBook {
+                side,
+                limit_price,
+                entry_ttl_mins,
+                ..
+            } => {
                 assert_eq!(side, Side::Long);
                 assert!((limit_price - 99.34).abs() < 1e-6);
                 assert_eq!(entry_ttl_mins, 2.0);
@@ -2229,7 +2565,7 @@ mod tests {
             150.0, // 150 bps disaster stop -> $98.50
             2.75,  // 2.75\sigma soft 5m threshold
             3.00,
-            40.0,  // 40m half-life
+            40.0, // 40m half-life
         );
         assert!((mgr.exchange_hard_stop_price(0.01) - 98.50).abs() < 1e-6);
 
@@ -2246,7 +2582,10 @@ mod tests {
         // 5m Bars 3 & 4: two consecutive completed 5m bars with Z_OU <= -2.75 -> triggers soft flatten!
         let _ = mgr.on_5m_bar_close(-2.80, -1.2, false, 1.5, 0.01);
         let d4 = mgr.on_5m_bar_close(-2.95, -1.4, false, 1.5, 0.01);
-        assert!(matches!(d4, InvalidationDecision::TriggerSoftInvalidationFlatten { .. }));
+        assert!(matches!(
+            d4,
+            InvalidationDecision::TriggerSoftInvalidationFlatten { .. }
+        ));
     }
 
     #[test]
@@ -2337,5 +2676,60 @@ mod tests {
         let h_fomc = evaluate_macro_hazard(fomc_powell_ms);
         assert!(h_fomc.is_hard_blackout);
         assert_eq!(h_fomc.event_name, "US_FOMC_DECISION");
+    }
+
+    #[test]
+    fn test_adaptive_tp_shave_and_engine_c_and_d_evaluators() {
+        // 1. Fast half-life (20m) shaves 5.0 bps on 80 bps excursion; slow half-life (110m) shaves more (~9.0 bps)
+        let fast_shave = compute_adaptive_tp_offset_bps(100.80, 100.0, 0.01, 20.0).unwrap();
+        let slow_shave = compute_adaptive_tp_offset_bps(100.80, 100.0, 0.01, 110.0).unwrap();
+        assert!((fast_shave - 5.0).abs() < 1e-6);
+        assert!(slow_shave > fast_shave && slow_shave <= 10.0);
+
+        // 2. Kelly scalar scales down borderline edge and gives 1.0x to strong excursions
+        let k_low = compute_fee_adjusted_kelly_scalar(26.0, 28.0, 1.5, 0.0);
+        let k_high = compute_fee_adjusted_kelly_scalar(48.0, 28.0, 1.5, 0.0);
+        assert!(k_low < 0.90 && k_low >= 0.65);
+        assert!((k_high - 1.0).abs() < 1e-6);
+
+        // 3. Engine C (HourlySqueezeHarvester): fires at minute :48 UTC with -8 bps/hr funding and absorption
+        let ts_min_48 = 48 * 60_000;
+        let sig_c = evaluate_engine_c_hourly_squeeze(
+            ts_min_48, -0.0008, // -8.0 bps/hr
+            99.80, 99.79, 100.20, // oracle above perp
+            99.50,  // 30m low
+            0.0035, 28.0, -0.8, -1.0, 0.01,
+        );
+        assert!(
+            sig_c.is_some(),
+            "Engine C must fire during :42-:55 UTC pre-settlement window"
+        );
+        assert!(evaluate_engine_c_hourly_squeeze(
+            15 * 60_000, // minute :15 UTC -> outside window
+            -0.0008,
+            99.80,
+            99.79,
+            100.20,
+            99.50,
+            0.0035,
+            28.0,
+            -0.8,
+            -1.0,
+            0.01,
+        )
+        .is_none());
+
+        // 4. Engine D (CascadeAbsorptionReversal): fires on severe shock + OI destruction + oracle discount + OBI flip
+        let sig_d = evaluate_engine_d_cascade_reversal(
+            99.50, 99.35, 99.20, 99.49, 99.90,  // -40 bps discount to CEX spot oracle
+            -0.025, // -2.5% OI destruction in 3m
+            -3.20,  // Z_15 = -3.20 shock
+            0.35,   // strong bid refill OBI
+            28.0, 0.01,
+        );
+        assert!(
+            sig_d.is_some(),
+            "Engine D must fire when all 4 HLP cascade exhaustion gates align"
+        );
     }
 }

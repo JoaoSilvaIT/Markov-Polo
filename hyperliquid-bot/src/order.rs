@@ -109,10 +109,14 @@ pub async fn place_ou_maker_entry(
         ));
     }
 
-    // Repaired TP Front-Running Offset (\epsilon_t) per `Hyperliquid OU Audit Payoff Geometry...md` (lines 443–448):
-    // L = max(2 * tick_bps, 2.0), U = min(10.0, 0.15 * D_rem_bps); if L > U, skip setup.
+    // Dynamic Volatility- & Half-Life-Adaptive TP Shave (\eta^*):
     let tick_sz = effective_tick_size(target_mu, sz_decimals);
-    let safe_offset_bps = match crate::ou_process::compute_safe_tp_offset_bps(target_mu, post_only_price, tick_sz) {
+    let safe_offset_bps = match crate::ou_process::compute_adaptive_tp_offset_bps(
+        target_mu,
+        post_only_price,
+        tick_sz,
+        half_life_minutes,
+    ) {
         Some(bps) => bps,
         None => {
             let _ = release_cluster_lease_authenticated(symbol, Some(&lease_uuid), Some(fencing_token));

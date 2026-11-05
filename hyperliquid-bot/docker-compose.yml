@@ -2,7 +2,7 @@ x-bot-env: &bot-env
   HL_LEVERAGE: ${HL_LEVERAGE:-3}
   HL_IS_CROSS: ${HL_IS_CROSS:-true}
   HL_TREND_ENGINE_MODE: ${HL_TREND_ENGINE_MODE:-live}
-  HL_PORTFOLIO_SYMBOLS: ${HL_PORTFOLIO_SYMBOLS:-BTC,ETH,SOL,AVAX}
+  HL_PORTFOLIO_SYMBOLS: ${HL_PORTFOLIO_SYMBOLS:-BTC,ETH,SOL,AVAX,HYPE,NEAR,XRP,SUI,LINK}
   HL_MAX_CONCURRENT_POSITIONS: ${HL_MAX_CONCURRENT_POSITIONS:-2}
   HL_DONCHIAN_PERIOD: ${HL_DONCHIAN_PERIOD:-12}
   HL_CHANDELIER_ATR_MULT: ${HL_CHANDELIER_ATR_MULT:-2.0}
@@ -76,6 +76,41 @@ services:
     environment:
       <<: *bot-env
       HL_TRADING_SYMBOL: AVAX
+
+  hl_bot_hype:
+    <<: *bot-common
+    container_name: hl_bot_hype
+    environment:
+      <<: *bot-env
+      HL_TRADING_SYMBOL: HYPE
+
+  hl_bot_near:
+    <<: *bot-common
+    container_name: hl_bot_near
+    environment:
+      <<: *bot-env
+      HL_TRADING_SYMBOL: NEAR
+
+  hl_bot_xrp:
+    <<: *bot-common
+    container_name: hl_bot_xrp
+    environment:
+      <<: *bot-env
+      HL_TRADING_SYMBOL: XRP
+
+  hl_bot_sui:
+    <<: *bot-common
+    container_name: hl_bot_sui
+    environment:
+      <<: *bot-env
+      HL_TRADING_SYMBOL: SUI
+
+  hl_bot_link:
+    <<: *bot-common
+    container_name: hl_bot_link
+    environment:
+      <<: *bot-env
+      HL_TRADING_SYMBOL: LINK
 
   hl_dashboard:
     image: python:3.11-alpine

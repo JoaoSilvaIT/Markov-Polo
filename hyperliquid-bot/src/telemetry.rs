@@ -101,27 +101,27 @@ pub struct FunnelAuditCounters {
     pub feed_quality_degraded: u64,
     pub candle_gap_detected: u64,
     pub shock_cooldown_active: u64,
-    pub short_term_shock_veto: u64,     // |Z15| >= 2.5
+    pub short_term_shock_veto: u64,      // |Z15| >= 2.5
     pub lingering_macro_shock_veto: u64, // |Z60| >= 2.5
     pub portfolio_lock_congested: u64,
     pub circuit_breaker_paused: u64,
 
     // Engine A (Mean Reversion) Funnel
-    pub engine_a_mode_ineligible: u64,       // Not in MeanReversion mode (Neutral or Trend)
-    pub engine_a_volatility_ineligible: u64,  // |Z15| >= 1.5
-    pub engine_a_half_life_ineligible: u64,   // t_half < 15m or > 360m
+    pub engine_a_mode_ineligible: u64, // Not in MeanReversion mode (Neutral or Trend)
+    pub engine_a_volatility_ineligible: u64, // |Z15| >= 1.5
+    pub engine_a_half_life_ineligible: u64, // t_half < 15m or > 360m
     pub engine_a_stationarity_ineligible: u64,
-    pub engine_a_outside_band: u64,          // Price inside channel, not touching entry band
-    pub engine_a_armed_waiting_bounce: u64,  // Armed, waiting for reversal bounce confirmation
-    pub engine_a_reversal_hurdle_veto: u64,  // Net edge < 25 bps
+    pub engine_a_outside_band: u64, // Price inside channel, not touching entry band
+    pub engine_a_armed_waiting_bounce: u64, // Armed, waiting for reversal bounce confirmation
+    pub engine_a_reversal_hurdle_veto: u64, // Net edge < 25 bps
     pub engine_a_orders_placed: u64,
     pub engine_a_orders_rejected: u64,
 
     // Engine B (Trend Momentum) Funnel
-    pub engine_b_mode_ineligible: u64,       // Not in Trend mode
-    pub engine_b_no_breakout: u64,           // Price inside Donchian channel
-    pub engine_b_alignment_veto: u64,        // EMA alignment contradicts breakout
-    pub engine_b_obi_hurdle_veto: u64,       // Continuous L2 EWMA OBI below hurdle
+    pub engine_b_mode_ineligible: u64, // Not in Trend mode
+    pub engine_b_no_breakout: u64,     // Price inside Donchian channel
+    pub engine_b_alignment_veto: u64,  // EMA alignment contradicts breakout
+    pub engine_b_obi_hurdle_veto: u64, // Continuous L2 EWMA OBI below hurdle
     pub engine_b_orders_placed: u64,
     pub engine_b_orders_rejected: u64,
 }
@@ -182,15 +182,26 @@ pub fn load_funnel_counters(symbol: &str) -> FunnelAuditCounters {
         .unwrap_or_else(|| FunnelAuditCounters::new(symbol))
 }
 
-/// Returns the empirical Hyperliquid BTC-to-altcoin beta seed for causal impulse scaling.
+/// Returns the empirical Hyperliquid BTC-to-altcoin downside semibeta seed for causal impulse scaling.
 pub fn empirical_btc_beta(symbol: &str, is_stress: bool) -> f64 {
     match (symbol.to_uppercase().as_str(), is_stress) {
+        ("BTC", _) => 1.00,
+        ("XRP", false) => 1.05,
+        ("XRP", true) => 1.25,
+        ("HYPE", false) => 1.15,
+        ("HYPE", true) => 1.40,
         ("ETH", false) => 1.20,
         ("ETH", true) => 1.45,
+        ("LINK", false) => 1.35,
+        ("LINK", true) => 1.60,
         ("SOL", false) => 1.60,
         ("SOL", true) => 1.80,
         ("AVAX", false) => 1.60,
         ("AVAX", true) => 1.80,
+        ("SUI", false) => 1.60,
+        ("SUI", true) => 1.80,
+        ("NEAR", false) => 1.75,
+        ("NEAR", true) => 1.95,
         _ => 1.20,
     }
 }
@@ -247,8 +258,7 @@ pub fn evaluate_btc_impulse_veto(
         return None;
     }
 
-    let is_stress =
-        btc.is_severe_shock || btc.z_15.abs() >= 2.5 || btc.ret_3m_bps.abs() >= 22.0;
+    let is_stress = btc.is_severe_shock || btc.z_15.abs() >= 2.5 || btc.ret_3m_bps.abs() >= 22.0;
     let beta = empirical_btc_beta(current_symbol, is_stress);
     let beta_ret_3m_bps = beta * btc.ret_3m_bps;
     let beta_ret_5m_bps = beta * btc.ret_5m_bps;
@@ -464,7 +474,8 @@ mod tests {
             "proximity_summary": "Testing"
         }"#;
 
-        let telem: LiveTelemetry = serde_json::from_str(legacy_json).expect("Deserialization must succeed with defaults");
+        let telem: LiveTelemetry =
+            serde_json::from_str(legacy_json).expect("Deserialization must succeed with defaults");
         assert_eq!(telem.symbol, "ETH");
         assert_eq!(telem.donchian_upper, None);
         assert_eq!(telem.donchian_status, "");

@@ -39,11 +39,16 @@ pub async fn fetch_sz_decimals_map(info: &InfoClient) -> HashMap<String, u32> {
             map.insert(asset.name, asset.sz_decimals);
         }
     } else {
-        // Safe fallbacks for major assets
+        // Safe fallbacks for major and Tier-1 assets
         map.insert("BTC".to_string(), 5);
         map.insert("ETH".to_string(), 4);
         map.insert("SOL".to_string(), 2);
         map.insert("AVAX".to_string(), 2);
+        map.insert("HYPE".to_string(), 2);
+        map.insert("NEAR".to_string(), 1);
+        map.insert("XRP".to_string(), 0);
+        map.insert("SUI".to_string(), 1);
+        map.insert("LINK".to_string(), 1);
     }
     map
 }
@@ -229,8 +234,9 @@ pub fn optimal_engine_b_tp_atr_multiple(symbol: &str) -> f64 {
     match symbol.to_uppercase().as_str() {
         "BTC" => 1.0,
         "ETH" => 1.5,
-        "SOL" => 2.0,
-        "AVAX" => 2.5,
+        "XRP" | "LINK" => 1.8,
+        "SOL" | "HYPE" => 2.0,
+        "AVAX" | "SUI" | "NEAR" => 2.5,
         _ => 1.5,
     }
 }

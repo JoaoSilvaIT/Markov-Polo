@@ -40,6 +40,7 @@ use crate::hyperliquid::{
 use crate::order::{emergency_flatten, place_ou_maker_entry};
 use crate::ou_process::{
     calculate_directional_edge_bps, calculate_features_with_funding, check_macro_calendar_veto,
+    compute_fee_adjusted_kelly_scalar,
 };
 use crate::state::{
     check_cluster_circuit_breaker, has_active_cluster_position, load_armed_signal,
@@ -274,7 +275,7 @@ async fn main() {
         let mut btc_bars_cache = crate::backtest::load_historical_bars("BTC");
         let mut loaded_portfolio: Vec<(&'static str, Vec<crate::backtest::HistoricalMarketBarRecord>, u32)> = Vec::new();
 
-        for &sym in &["BTC", "ETH", "SOL", "AVAX"] {
+        for &sym in &["BTC", "ETH", "SOL", "AVAX", "HYPE", "NEAR", "XRP", "SUI", "LINK"] {
             let mut bars = crate::backtest::load_historical_bars(sym);
             if bars.len() < 1200 {
                 println!(
@@ -396,9 +397,14 @@ async fn main() {
     let config = Config::from_env();
     let startup_stagger_ms: u64 = match config.trading_symbol.as_str() {
         "BTC" => 0,
-        "ETH" => 750,
-        "SOL" => 1500,
-        "AVAX" => 2250,
+        "ETH" => 400,
+        "SOL" => 800,
+        "AVAX" => 1200,
+        "HYPE" => 1600,
+        "NEAR" => 2000,
+        "XRP" => 2400,
+        "SUI" => 2800,
+        "LINK" => 3200,
         _ => 500,
     };
     if startup_stagger_ms > 0 {
@@ -3463,8 +3469,10 @@ async fn main() {
                                             let min_soft_inv_excursion_bps = match symbol_clone.as_str() {
                                                 "BTC" => 45.0,
                                                 "ETH" => 50.0,
-                                                "SOL" => 60.0,
-                                                "AVAX" => 62.0,
+                                                "XRP" | "LINK" => 58.0,
+                                                "SOL" | "HYPE" => 60.0,
+                                                "AVAX" | "SUI" => 62.0,
+                                                "NEAR" => 68.0,
                                                 _ => 50.0,
                                             };
                                             let (frozen_z_ou, eff_z_15) = if adverse_bps_from_entry >= min_soft_inv_excursion_bps {
@@ -3915,16 +3923,20 @@ async fn main() {
                                 match symbol_clone.as_str() {
                                     "BTC" => (0.0035, 0.0025, 0.0025, 0.0030),
                                     "ETH" => (0.0045, 0.0030, 0.0030, 0.0035),
-                                    "SOL" => (0.0052, 0.0045, 0.0045, 0.0055),
-                                    "AVAX" => (0.0065, 0.0050, 0.0060, 0.0075),
+                                    "XRP" | "LINK" => (0.0050, 0.0042, 0.0042, 0.0050),
+                                    "SOL" | "HYPE" => (0.0052, 0.0045, 0.0045, 0.0055),
+                                    "AVAX" | "SUI" => (0.0065, 0.0050, 0.0060, 0.0075),
+                                    "NEAR" => (0.0055, 0.0045, 0.0060, 0.0075),
                                     _ => (0.0045, 0.0030, 0.0030, 0.0035),
                                 };
-                            let (max_short_drift_120, max_short_drift_240) = match symbol_clone.as_str() {
-                                "BTC" => (0.0075, 0.0065),
-                                "ETH" => (0.0100, 0.0080),
-                                "SOL" => (0.0135, 0.0100),
-                                "AVAX" => (0.0160, 0.0140),
-                                _ => (0.0100, 0.0080),
+                            let (max_short_drift_60, max_short_drift_120, max_short_drift_240) = match symbol_clone.as_str() {
+                                "BTC" => (0.0085, 0.0075, 0.0065),
+                                "ETH" => (0.0095, 0.0100, 0.0080),
+                                "XRP" | "LINK" => (0.0110, 0.0125, 0.0095),
+                                "SOL" | "HYPE" => (0.0120, 0.0135, 0.0100),
+                                "AVAX" | "SUI" => (0.0135, 0.0160, 0.0140),
+                                "NEAR" => (0.0140, 0.0160, 0.0140),
+                                _ => (0.0095, 0.0100, 0.0080),
                             };
                             let n_rc_hist = rolling_closes.len();
                             let ret_60 = if n_rc_hist >= 60 && rolling_closes[n_rc_hist - 60] > 0.0 {
@@ -3972,6 +3984,7 @@ async fn main() {
                                 && (ma60_vs_240 >= -0.0008 || (symbol_clone == "BTC" && ma60_vs_240 >= -0.0022));
                             let kalman_short_ok = !kalman_waterfall_up
                                 && z_60 < 1.90
+                                && ret_60 < max_short_drift_60
                                 && ret_120 < max_short_drift_120
                                 && ret_240 < max_short_drift_240
                                 && (ma60_vs_240 <= 0.0040 || (ret_720 < -0.0150 && ma60_vs_240 <= 0.0080));
@@ -4190,14 +4203,20 @@ async fn main() {
                                                     } else {
                                                         live_feat.sigma_eq_log
                                                     };
-                                                    let risk_frac = 0.0075 * dd_mult;
+                                                    let kelly_scalar = compute_fee_adjusted_kelly_scalar(
+                                                        raw_edge_bps,
+                                                        ou_cfg.min_net_edge_bps,
+                                                        1.5,
+                                                        expected_funding_drag_bps,
+                                                    );
+                                                    let risk_frac = 0.0075 * dd_mult * kelly_scalar;
                                                     let max_asset_notional = config
                                                         .max_position_size_usdc
                                                         .min(ou_cfg.volatility_adjusted_notional_cap(live_eq, frozen_sig));
                                                     let trade_size_usdc = if config.sizing_mode == "dynamic" && live_eq > 0.0 {
                                                         calculate_risk_scaled_notional(
                                                             live_eq,
-                                                            trade_bank.min(max_asset_notional),
+                                                            (trade_bank * kelly_scalar).min(max_asset_notional),
                                                             risk_frac,
                                                             limit_price,
                                                             est_sl_px,
@@ -4207,7 +4226,7 @@ async fn main() {
                                                             max_asset_notional,
                                                         )
                                                     } else {
-                                                        trade_bank.min(max_asset_notional)
+                                                        (trade_bank * kelly_scalar).min(max_asset_notional)
                                                     };
 
                                                     if exceeds_micro_account_step_risk(live_eq, trade_size_usdc, limit_price, est_sl_px, 0.0175) {

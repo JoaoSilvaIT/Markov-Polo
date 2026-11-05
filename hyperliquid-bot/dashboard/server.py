@@ -901,7 +901,17 @@ def format_prometheus_metrics(data):
     )
 
     for sym, a in (data.get("assets") or {}).items():
-        if sym not in ("BTC", "ETH", "SOL", "AVAX"):
+        if sym not in (
+            "BTC",
+            "ETH",
+            "SOL",
+            "AVAX",
+            "HYPE",
+            "NEAR",
+            "XRP",
+            "SUI",
+            "LINK",
+        ):
             continue
         lines.append(
             f'markov_polo_asset_price{{symbol="{sym}"}} {float(a.get("price", 0.0) or 0.0)}'
