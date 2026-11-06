@@ -151,7 +151,8 @@ pub async fn place_ou_maker_entry(
     let ou_cfg = crate::ou_process::asset_ou_config(symbol);
     let hard_stop_frac = ou_cfg.hard_disaster_stop_bps * 1e-4;
     let edge_dist = (post_only_price - target_tp_quantized).abs();
-    let sl_dist = (2.0 * edge_dist).max(post_only_price * hard_stop_frac);
+    let calibrated_sl = (1.5 * edge_dist).max(post_only_price * 0.0035);
+    let sl_dist = calibrated_sl.min(post_only_price * hard_stop_frac);
     let raw_sl = if is_buy {
         post_only_price - sl_dist
     } else {
@@ -269,7 +270,8 @@ pub async fn place_ou_maker_entry(
     };
 
     let final_edge_dist = (current_price - target_tp_quantized).abs();
-    let final_sl_dist = (2.0 * final_edge_dist).max(current_price * hard_stop_frac);
+    let calibrated_final_sl = (1.5 * final_edge_dist).max(current_price * 0.0035);
+    let final_sl_dist = calibrated_final_sl.min(current_price * hard_stop_frac);
     let stop_loss_price = quantize_price(
         if is_buy {
             current_price - final_sl_dist

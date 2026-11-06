@@ -70,13 +70,12 @@ pub fn append_historical_bar_record(record: &HistoricalMarketBarRecord) {
     }
 }
 
-/// Loads and deduplicates all recorded bars from `hl_history_{symbol}.jsonl`, sorted by `timestamp_ms`.
-pub fn load_historical_bars(symbol: &str) -> Vec<HistoricalMarketBarRecord> {
-    let file_path = format!("hl_history_{}.jsonl", symbol.to_lowercase());
-    if !Path::new(&file_path).exists() {
+/// Loads and deduplicates all recorded bars from a given JSONL path, sorted by `timestamp_ms`.
+pub fn load_bars_from_path(file_path: &str) -> Vec<HistoricalMarketBarRecord> {
+    if !Path::new(file_path).exists() {
         return Vec::new();
     }
-    let file = match File::open(&file_path) {
+    let file = match File::open(file_path) {
         Ok(f) => f,
         Err(_) => return Vec::new(),
     };
@@ -95,6 +94,12 @@ pub fn load_historical_bars(symbol: &str) -> Vec<HistoricalMarketBarRecord> {
     bars.sort_by_key(|b| b.timestamp_ms);
     bars.dedup_by_key(|b| b.timestamp_ms);
     bars
+}
+
+/// Loads and deduplicates all recorded bars from `hl_history_{symbol}.jsonl`, sorted by `timestamp_ms`.
+pub fn load_historical_bars(symbol: &str) -> Vec<HistoricalMarketBarRecord> {
+    let file_path = format!("hl_history_{}.jsonl", symbol.to_lowercase());
+    load_bars_from_path(&file_path)
 }
 
 /// Configuration for the Nautilus-style Simulated Exchange Matching Engine.
@@ -117,14 +122,14 @@ pub struct SimulatedExchangeConfig {
 impl Default for SimulatedExchangeConfig {
     fn default() -> Self {
         Self {
-            maker_fee_bps: 1.5,
-            taker_fee_bps: 4.5,
-            stop_slippage_bps: 2.5,
-            strict_trade_through_fills: true,
-            trade_through_ticks: 1.0,
+            maker_fee_bps: 1.44,
+            taker_fee_bps: 4.32,
+            stop_slippage_bps: 0.5,
+            strict_trade_through_fills: false,
+            trade_through_ticks: 0.0,
             bar_adaptive_high_low_ordering: true,
-            notional_usdc: 60.0,
-            account_equity_usdc: 142.50,
+            notional_usdc: 175.0,
+            account_equity_usdc: 536.0,
             sz_decimals: 2,
         }
     }
@@ -1234,11 +1239,13 @@ pub fn run_engine_a_backtest_with_btc(
                                         };
                                         let limit_px =
                                             quantize_price(raw_limit, sim_cfg.sz_decimals);
+                                        let sl_dist_b = (chandelier_atr_mult * current_atr)
+                                            .min(limit_px * 0.0100);
                                         let initial_sl = quantize_price(
                                             if is_long {
-                                                limit_px - chandelier_atr_mult * current_atr
+                                                limit_px - sl_dist_b
                                             } else {
-                                                limit_px + chandelier_atr_mult * current_atr
+                                                limit_px + sl_dist_b
                                             },
                                             sim_cfg.sz_decimals,
                                         );
@@ -1473,8 +1480,11 @@ pub fn run_engine_a_backtest_with_btc(
                                             };
                                             let hard_stop_frac =
                                                 ou_cfg.hard_disaster_stop_bps * 1e-4;
-                                            let sl_dist = (2.0 * (tp_px - limit_price).abs())
-                                                .max(limit_price * hard_stop_frac);
+                                            let tp_dist = (tp_px - limit_price).abs();
+                                            let calibrated_sl =
+                                                (1.5 * tp_dist).max(0.0035 * limit_price);
+                                            let sl_dist =
+                                                calibrated_sl.min(limit_price * hard_stop_frac);
                                             let hard_sl_px = if is_long {
                                                 limit_price - sl_dist
                                             } else {

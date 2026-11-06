@@ -267,17 +267,41 @@ async fn main() {
         let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
         let start_ms = now_ms.saturating_sub(2400 * 60 * 1000); // 40 hours (2,400 x 1m bars)
 
+        let native_only = cli_args.iter().any(|a| a == "--native");
+        if native_only {
+            println!("🔬 [NAUTILUS-STYLE SIMULATED EXCHANGE BACKTESTER] Replaying captured native L1 Hyperliquid bars (with real L2 OBI & funding)...");
+        } else {
+            println!("🔬 [NAUTILUS-STYLE SIMULATED EXCHANGE BACKTESTER] Starting discrete-event replay...");
+        }
+
         let mut grand_wins = 0usize;
         let mut grand_losses = 0usize;
         let mut grand_net_usd = 0.0;
         let mut grand_net_bps = 0.0;
 
-        let mut btc_bars_cache = crate::backtest::load_historical_bars("BTC");
+        let all_symbols = ["BTC", "ETH", "SOL", "AVAX", "HYPE", "NEAR", "XRP", "SUI", "LINK"];
+        let native_symbols = ["BTC", "ETH", "SOL", "AVAX"];
+        let symbols: &[&str] = if native_only {
+            &native_symbols
+        } else {
+            &all_symbols
+        };
+
+        let mut btc_bars_cache = if native_only && std::path::Path::new("hl_history_native_btc.jsonl").exists() {
+            crate::backtest::load_bars_from_path("hl_history_native_btc.jsonl")
+        } else {
+            crate::backtest::load_historical_bars("BTC")
+        };
         let mut loaded_portfolio: Vec<(&'static str, Vec<crate::backtest::HistoricalMarketBarRecord>, u32)> = Vec::new();
 
-        for &sym in &["BTC", "ETH", "SOL", "AVAX", "HYPE", "NEAR", "XRP", "SUI", "LINK"] {
-            let mut bars = crate::backtest::load_historical_bars(sym);
-            if bars.len() < 1200 {
+        for &sym in symbols {
+            let native_file = format!("hl_history_native_{}.jsonl", sym.to_lowercase());
+            let mut bars = if native_only && std::path::Path::new(&native_file).exists() {
+                crate::backtest::load_bars_from_path(&native_file)
+            } else {
+                crate::backtest::load_historical_bars(sym)
+            };
+            if !native_only && bars.len() < 1200 {
                 println!(
                     "⏳ [BACKTEST INGESTION] Local NAS history for {} has {} bars; fetching 2,400 1m bars from Hyperliquid REST...",
                     sym,
@@ -328,8 +352,8 @@ async fn main() {
             let sz_dec = *sz_map.get(sym).unwrap_or(&2);
             let sim_cfg = crate::backtest::SimulatedExchangeConfig {
                 sz_decimals: sz_dec,
-                notional_usdc: 133.5,
-                account_equity_usdc: 534.0,
+                notional_usdc: 175.0,
+                account_equity_usdc: 536.0,
                 ..Default::default()
             };
             let res = crate::backtest::run_engine_a_backtest_with_btc(
@@ -2930,10 +2954,11 @@ async fn main() {
                                             if obi_favorable && btc_lead_veto.is_none() && crowding_mult >= 0.45 && residual_budget_ok {
                                                 funnel_counters.engine_b_orders_placed += 1;
                                                 let trade_bank = resolve_trade_bank(&info_clone, user_address, &config, &cached_equity_loop).await;
+                                                let sl_dist_b = (chandelier_atr_mult * current_atr).min(close_price * 0.0100);
                                                 let initial_sl = if side == Side::Long {
-                                                    close_price - chandelier_atr_mult * current_atr
+                                                    close_price - sl_dist_b
                                                 } else {
-                                                    close_price + chandelier_atr_mult * current_atr
+                                                    close_price + sl_dist_b
                                                 };
                                                 let live_eq = *cached_equity_loop.read().await;
                                                 let hwm_eq = *high_water_mark_equity.read().await;
@@ -4191,7 +4216,9 @@ async fn main() {
                                                     let hwm_eq = *high_water_mark_equity.read().await;
                                                     let dd_mult = compute_drawdown_risk_multiplier(live_eq, hwm_eq);
                                                     let hard_stop_frac = ou_cfg.hard_disaster_stop_bps * 1e-4;
-                                                    let est_sl_dist = (2.0 * (frozen_target - limit_price).abs()).max(limit_price * hard_stop_frac);
+                                                    let tp_dist = (frozen_target - limit_price).abs();
+                                                    let calibrated_sl = (1.5 * tp_dist).max(0.0035 * limit_price);
+                                                    let est_sl_dist = calibrated_sl.min(limit_price * hard_stop_frac);
                                                     let est_sl_px = if is_long_arm {
                                                         limit_price - est_sl_dist
                                                     } else {
