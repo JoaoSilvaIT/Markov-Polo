@@ -280,12 +280,19 @@ async fn main() {
         let mut grand_net_bps = 0.0;
 
         let all_symbols = ["BTC", "ETH", "SOL", "AVAX", "HYPE", "NEAR", "XRP", "SUI", "LINK"];
-        let native_symbols = ["BTC", "ETH", "SOL", "AVAX"];
-        let symbols: &[&str] = if native_only {
-            &native_symbols
+        let symbols_vec: Vec<&str> = if native_only {
+            all_symbols
+                .iter()
+                .filter(|&&sym| {
+                    let path = format!("hl_history_native_{}.jsonl", sym.to_lowercase());
+                    std::path::Path::new(&path).exists()
+                })
+                .copied()
+                .collect()
         } else {
-            &all_symbols
+            all_symbols.to_vec()
         };
+        let symbols: &[&str] = &symbols_vec;
 
         let mut btc_bars_cache = if native_only && std::path::Path::new("hl_history_native_btc.jsonl").exists() {
             crate::backtest::load_bars_from_path("hl_history_native_btc.jsonl")
