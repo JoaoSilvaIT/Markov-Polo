@@ -274,10 +274,14 @@ async fn main() {
             println!("🔬 [NAUTILUS-STYLE SIMULATED EXCHANGE BACKTESTER] Starting discrete-event replay...");
         }
 
+        use rayon::prelude::*;
+
         let mut grand_wins = 0usize;
         let mut grand_losses = 0usize;
         let mut grand_net_usd = 0.0;
         let mut grand_net_bps = 0.0;
+        let mut grand_fees_usd = 0.0;
+        let mut grand_gross_usd = 0.0;
 
         let all_symbols = ["BTC", "ETH", "SOL", "AVAX", "HYPE", "NEAR", "XRP", "SUI", "LINK"];
         let symbols_vec: Vec<&str> = if native_only {
@@ -294,81 +298,140 @@ async fn main() {
         };
         let symbols: &[&str] = &symbols_vec;
 
-        let mut btc_bars_cache = if native_only && std::path::Path::new("hl_history_native_btc.jsonl").exists() {
-            crate::backtest::load_bars_from_path("hl_history_native_btc.jsonl")
-        } else {
-            crate::backtest::load_historical_bars("BTC")
-        };
-        let mut loaded_portfolio: Vec<(&'static str, Vec<crate::backtest::HistoricalMarketBarRecord>, u32)> = Vec::new();
-
-        for &sym in symbols {
-            let native_file = format!("hl_history_native_{}.jsonl", sym.to_lowercase());
-            let mut bars = if native_only && std::path::Path::new(&native_file).exists() {
-                crate::backtest::load_bars_from_path(&native_file)
-            } else {
-                crate::backtest::load_historical_bars(sym)
-            };
-            if !native_only && bars.len() < 1200 {
-                println!(
-                    "⏳ [BACKTEST INGESTION] Local NAS history for {} has {} bars; fetching 2,400 1m bars from Hyperliquid REST...",
-                    sym,
-                    bars.len()
-                );
-                if let Ok(mut snaps) = info
-                    .candles_snapshot(sym.to_string(), "1m".to_string(), start_ms, now_ms)
-                    .await
-                {
-                    snaps.sort_by_key(|c| c.time_open);
-                    for c in snaps {
-                        let o = c.open.parse::<f64>().unwrap_or(0.0);
-                        let h = c.high.parse::<f64>().unwrap_or(0.0);
-                        let l = c.low.parse::<f64>().unwrap_or(0.0);
-                        let cl = c.close.parse::<f64>().unwrap_or(0.0);
-                        let v = c.vlm.parse::<f64>().unwrap_or(0.0);
-                        if cl > 0.0 && h >= l && l > 0.0 {
-                            let sz_dec = *sz_map.get(sym).unwrap_or(&2);
-                            let tick = effective_tick_size(cl, sz_dec);
-                            let rec = crate::backtest::HistoricalMarketBarRecord {
-                                symbol: sym.to_string(),
-                                timestamp_ms: c.time_open,
-                                open: o,
-                                high: h,
-                                low: l,
-                                close: cl,
-                                volume: v,
-                                best_bid: cl - 0.5 * tick,
-                                best_ask: cl + 0.5 * tick,
-                                obi_instant: 0.0,
-                                obi_1s: 0.0,
-                                obi_5s: 0.0,
-                                funding_1h: 0.0000125,
-                                open_interest: 0.0,
-                                mark_px: cl,
-                                oracle_px: cl,
-                            };
-                            crate::backtest::append_historical_bar_record(&rec);
+        if !native_only {
+            for &sym in symbols {
+                let file_path = format!("hl_history_{}.jsonl", sym.to_lowercase());
+                let is_sufficient = std::fs::metadata(&file_path)
+                    .map(|m| m.len() > 50_000)
+                    .unwrap_or(false);
+                if !is_sufficient {
+                    println!(
+                        "⏳ [BACKTEST INGESTION] Local NAS history for {} is missing or small; fetching 2,400 1m bars from Hyperliquid REST...",
+                        sym
+                    );
+                    if let Ok(mut snaps) = info
+                        .candles_snapshot(sym.to_string(), "1m".to_string(), start_ms, now_ms)
+                        .await
+                    {
+                        snaps.sort_by_key(|c| c.time_open);
+                        for c in snaps {
+                            let o = c.open.parse::<f64>().unwrap_or(0.0);
+                            let h = c.high.parse::<f64>().unwrap_or(0.0);
+                            let l = c.low.parse::<f64>().unwrap_or(0.0);
+                            let cl = c.close.parse::<f64>().unwrap_or(0.0);
+                            let v = c.vlm.parse::<f64>().unwrap_or(0.0);
+                            if cl > 0.0 && h >= l && l > 0.0 {
+                                let sz_dec = *sz_map.get(sym).unwrap_or(&2);
+                                let tick = effective_tick_size(cl, sz_dec);
+                                let rec = crate::backtest::HistoricalMarketBarRecord {
+                                    symbol: sym.to_string(),
+                                    timestamp_ms: c.time_open,
+                                    open: o,
+                                    high: h,
+                                    low: l,
+                                    close: cl,
+                                    volume: v,
+                                    best_bid: cl - 0.5 * tick,
+                                    best_ask: cl + 0.5 * tick,
+                                    obi_instant: 0.0,
+                                    obi_1s: 0.0,
+                                    obi_5s: 0.0,
+                                    funding_1h: 0.0000125,
+                                    open_interest: 0.0,
+                                    mark_px: cl,
+                                    oracle_px: cl,
+                                };
+                                crate::backtest::append_historical_bar_record(&rec);
+                            }
                         }
-                    }
-                    bars = crate::backtest::load_historical_bars(sym);
-                    if sym == "BTC" {
-                        btc_bars_cache = bars.clone();
                     }
                 }
             }
+        }
 
-            let sz_dec = *sz_map.get(sym).unwrap_or(&2);
-            let sim_cfg = crate::backtest::SimulatedExchangeConfig {
-                sz_decimals: sz_dec,
-                notional_usdc: 175.0,
-                account_equity_usdc: 536.0,
-                ..Default::default()
-            };
-            let res = crate::backtest::run_engine_a_backtest_with_btc(
-                sym,
-                &bars,
-                Some(&btc_bars_cache),
-                &sim_cfg,
-            );
+        println!(
+            "📂 [PARALLEL DATA INGESTION] Ingesting {} asset histories concurrently across 16 CPU cores...",
+            symbols.len()
+        );
+        let t_ingest = std::time::Instant::now();
+        let loaded_portfolio: Vec<(
+            &'static str,
+            Vec<crate::backtest::HistoricalMarketBarRecord>,
+            u32,
+        )> = symbols
+            .par_iter()
+            .map(|&sym| {
+                let t0 = std::time::Instant::now();
+                let native_file = format!("hl_history_native_{}.jsonl", sym.to_lowercase());
+                let bars = if native_only && std::path::Path::new(&native_file).exists() {
+                    crate::backtest::load_bars_from_path(&native_file)
+                } else {
+                    crate::backtest::load_historical_bars(sym)
+                };
+                let sz_dec = *sz_map.get(sym).unwrap_or(&2);
+                println!(
+                    "   ↳ [{}] Loaded {} bars from disk in {:.1}s",
+                    sym,
+                    bars.len(),
+                    t0.elapsed().as_secs_f64()
+                );
+                (sym, bars, sz_dec)
+            })
+            .collect();
+        println!(
+            "✅ [INGESTION COMPLETE] All assets loaded in {:.1}s",
+            t_ingest.elapsed().as_secs_f64()
+        );
+
+        let btc_idx = loaded_portfolio
+            .iter()
+            .position(|(s, _, _)| *s == "BTC")
+            .unwrap_or(0);
+        let btc_bars = &loaded_portfolio[btc_idx].1;
+
+        println!("🚀 [PARALLEL BACKTEST] Executing discrete-event engine across all {} assets simultaneously...", loaded_portfolio.len());
+        let t_bt = std::time::Instant::now();
+        let parallel_results: Vec<_> = loaded_portfolio
+            .par_iter()
+            .map(|&(sym, ref bars, sz_dec)| {
+                let t0 = std::time::Instant::now();
+                let sim_cfg = crate::backtest::SimulatedExchangeConfig {
+                    sz_decimals: sz_dec,
+                    notional_usdc: 175.0,
+                    account_equity_usdc: 536.0,
+                    ..Default::default()
+                };
+                let res = crate::backtest::run_engine_a_backtest_with_btc(
+                    sym,
+                    bars,
+                    Some(btc_bars),
+                    &sim_cfg,
+                );
+                println!(
+                    "   ↳ [{}] Finished replay of {} bars in {:.1}s",
+                    sym,
+                    bars.len(),
+                    t0.elapsed().as_secs_f64()
+                );
+                (sym, sz_dec, sim_cfg, res)
+            })
+            .collect();
+        println!(
+            "✅ [BACKTEST COMPLETE] All {} replays completed in {:.1}s",
+            parallel_results.len(),
+            t_bt.elapsed().as_secs_f64()
+        );
+
+        let precomputed_summaries: Vec<(
+            &'static str,
+            crate::backtest::BacktestSummary,
+            crate::backtest::SimulatedExchangeConfig,
+        )> = parallel_results
+            .into_iter()
+            .map(|(sym, _sz_dec, sim_cfg, res)| (sym, res, sim_cfg))
+            .collect();
+
+        for (sym, res, _sim_cfg) in &precomputed_summaries {
             grand_wins += res.wins;
             grand_losses += res.losses;
             grand_net_usd += res.net_pnl_usd;
@@ -391,16 +454,51 @@ async fn main() {
                 res.profit_factor,
                 res.max_drawdown_usd
             );
-            for t in &res.trades {
+            let win_trades: Vec<_> = res.trades.iter().filter(|t| t.net_bps > 0.0).collect();
+            let loss_trades: Vec<_> = res.trades.iter().filter(|t| t.net_bps <= 0.0).collect();
+            let avg_win_bps = if !win_trades.is_empty() {
+                win_trades.iter().map(|t| t.net_bps).sum::<f64>() / win_trades.len() as f64
+            } else {
+                0.0
+            };
+            let avg_loss_bps = if !loss_trades.is_empty() {
+                loss_trades.iter().map(|t| t.net_bps.abs()).sum::<f64>() / loss_trades.len() as f64
+            } else {
+                0.0
+            };
+            let payoff_ratio = if avg_loss_bps > 0.0 {
+                avg_win_bps / avg_loss_bps
+            } else {
+                0.0
+            };
+            let total_fees = res.total_fees_usd;
+            let gross_usd = res.net_pnl_usd + total_fees;
+            grand_fees_usd += total_fees;
+            grand_gross_usd += gross_usd;
+
+            println!(
+                "   ↳ Payoff: {:.2} (Avg Win: {:+.1} bps | Avg Loss: -{:.1} bps) | Gross PnL: ${:+.2} | Fees Paid: ${:.2}",
+                payoff_ratio, avg_win_bps, avg_loss_bps, gross_usd, total_fees
+            );
+
+            let trade_display = if res.trades.len() > 3 {
+                println!(
+                    "   ... [{} earlier trades omitted; showing latest 3]",
+                    res.trades.len() - 3
+                );
+                &res.trades[res.trades.len() - 3..]
+            } else {
+                &res.trades[..]
+            };
+            for t in trade_display {
                 let dt_str = chrono::DateTime::from_timestamp_millis(t.entry_time_ms as i64)
-                    .map(|d| d.format("%m-%d %H:%M").to_string())
+                    .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
                     .unwrap_or_default();
                 println!(
                     "   ↳ [{}] {} {:?} ({}) | Entry: ${:.4} -> Exit: ${:.4} | Net: {:+.1} bps (${:+.3}) | MFE: {:.1} / MAE: {:.1} bps | {}",
                     dt_str, t.symbol, t.side, t.entry_policy, t.entry_px, t.exit_px, t.net_bps, t.net_pnl_usd, t.mfe_bps, t.mae_bps, t.exit_reason
                 );
             }
-            loaded_portfolio.push((sym, bars, sz_dec));
         }
         let total_tr = grand_wins + grand_losses;
         let wr = if total_tr > 0 {
@@ -408,15 +506,86 @@ async fn main() {
         } else {
             0.0
         };
+        let expect_bps = if total_tr > 0 {
+            grand_net_bps / (total_tr as f64)
+        } else {
+            0.0
+        };
         println!(
-            "🏆 [PORTFOLIO BACKTEST TOTAL] Trades: {} ({}W / {}L, {:.1}% WR) | Total Net PnL: {:+.1} bps (${:+.2} USDC)",
-            total_tr, grand_wins, grand_losses, wr, grand_net_bps, grand_net_usd
+            "🏆 [PORTFOLIO BACKTEST TOTAL] Trades: {} ({}W / {}L, {:.1}% WR) | Net PnL: {:+.1} bps (${:+.2} USDC) | Expectancy: {:+.2} bps/trade | Gross PnL: ${:+.2} | Fees: ${:.2}",
+            total_tr, grand_wins, grand_losses, wr, grand_net_bps, grand_net_usd, expect_bps, grand_gross_usd, grand_fees_usd
         );
+
+        let all_trades: Vec<&crate::backtest::SimulatedTradeResult> = precomputed_summaries
+            .iter()
+            .flat_map(|(_, res, _)| res.trades.iter())
+            .collect();
+        let engine_a_trades: Vec<_> = all_trades
+            .iter()
+            .filter(|t| t.entry_policy == "JOIN_BOOK" || t.entry_policy == "RETEST_LIMIT")
+            .copied()
+            .collect();
+        let engine_b_trades: Vec<_> = all_trades
+            .iter()
+            .filter(|t| t.entry_policy == "ENGINE_B_TREND" || t.entry_policy == "ENGINE_B_HANDOFF")
+            .copied()
+            .collect();
+        let engine_cd_trades: Vec<_> = all_trades
+            .iter()
+            .filter(|t| t.entry_policy == "ENGINE_C_SQUEEZE" || t.entry_policy == "ENGINE_D_CASCADE")
+            .copied()
+            .collect();
+
+        for (name, trs) in [
+            ("Engine A (2-Tranche O-U Mean Reversion)", &engine_a_trades),
+            ("Engine B (Donchian Breakout + Handoffs)", &engine_b_trades),
+            ("Engine C/D (Funding Squeeze & Cascade)", &engine_cd_trades),
+        ] {
+            let n = trs.len();
+            let w = trs.iter().filter(|t| t.net_bps > 0.0).count();
+            let l = trs.iter().filter(|t| t.net_bps <= 0.0).count();
+            let wr = if n > 0 { (w as f64 / n as f64) * 100.0 } else { 0.0 };
+            let net_usd: f64 = trs.iter().map(|t| t.net_pnl_usd).sum();
+            let fees_usd: f64 = trs.iter().map(|t| t.fees_usd).sum();
+            let avg_win: f64 = if w > 0 {
+                trs.iter().filter(|t| t.net_bps > 0.0).map(|t| t.net_bps).sum::<f64>() / w as f64
+            } else {
+                0.0
+            };
+            let avg_loss: f64 = if l > 0 {
+                trs.iter().filter(|t| t.net_bps <= 0.0).map(|t| t.net_bps.abs()).sum::<f64>() / l as f64
+            } else {
+                0.0
+            };
+            let payoff = if avg_loss > 0.0 { avg_win / avg_loss } else { 0.0 };
+            println!(
+                "   ↳ {}: {} trades ({}W/{}L, {:.1}% WR) | Payoff: {:.2} (Avg W: +{:.1} / Avg L: -{:.1} bps) | Net: ${:+.2} | Fees: ${:.2}",
+                name, n, w, l, wr, payoff, avg_win, avg_loss, net_usd, fees_usd
+            );
+        }
+
+        use std::collections::HashMap;
+        let mut exit_counts: HashMap<&'static str, (usize, f64, f64)> = HashMap::new();
+        for t in &all_trades {
+            let entry = exit_counts.entry(t.exit_reason).or_insert((0, 0.0, 0.0));
+            entry.0 += 1;
+            entry.1 += t.net_pnl_usd;
+            entry.2 += t.net_bps;
+        }
+        let mut exit_vec: Vec<_> = exit_counts.into_iter().collect();
+        exit_vec.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        println!("   ↳ [EXIT REASONS BREAKDOWN]:");
+        for (reason, (cnt, net_usd, net_bps)) in exit_vec {
+            println!(
+                "      • {:<45} : {:4} trades | Net: ${:+.2} ({:+.1} bps)",
+                reason, cnt, net_usd, net_bps
+            );
+        }
 
         if run_mc {
             crate::monte_carlo::run_portfolio_monte_carlo_and_sensitivity(
                 &loaded_portfolio,
-                &btc_bars_cache,
+                btc_bars,
                 1000,
             );
         }
@@ -4008,18 +4177,20 @@ async fn main() {
                             let kalman_waterfall_up = (live_feat.kalman_drift_veto && live_feat.kalman_slope > 0.0)
                                 || live_feat.cusum_pos >= 8.0;
                             let kalman_long_ok = !kalman_waterfall_down
-                                && z_60 > -1.90
+                                && live_feat.lambda_dir_long > 0.0
+                                && z_60 > -2.15
                                 && !(ret_60 <= -max_drift_60 && ret_120 <= 0.0015)
-                                && ret_120 > -max_drift_120
-                                && ret_180 > -max_slow_drift_180
-                                && ret_240 > -max_slow_drift_240
-                                && (ma60_vs_240 >= -0.0008 || (symbol_clone == "BTC" && ma60_vs_240 >= -0.0022));
+                                && ret_120 > -max_drift_120 * 1.35
+                                && ret_180 > -max_slow_drift_180 * 1.35
+                                && ret_240 > -max_slow_drift_240 * 1.35
+                                && (ma60_vs_240 >= -0.0022 || live_feat.hurst_60m < 0.42);
                             let kalman_short_ok = !kalman_waterfall_up
-                                && z_60 < 1.90
-                                && ret_60 < max_short_drift_60
-                                && ret_120 < max_short_drift_120
-                                && ret_240 < max_short_drift_240
-                                && (ma60_vs_240 <= 0.0040 || (ret_720 < -0.0150 && ma60_vs_240 <= 0.0080));
+                                && live_feat.lambda_dir_short > 0.0
+                                && z_60 < 2.15
+                                && ret_60 < max_short_drift_60 * 1.25
+                                && ret_120 < max_short_drift_120 * 1.25
+                                && ret_240 < max_short_drift_240 * 1.25
+                                && (ma60_vs_240 <= 0.0055 || live_feat.hurst_60m < 0.42 || (ret_720 < -0.0150 && ma60_vs_240 <= 0.0080));
                             let macro_calendar_veto = check_macro_calendar_veto(now_ms_cb);
                             if let Some(ref m_veto) = macro_calendar_veto {
                                 println!(
@@ -4131,6 +4302,7 @@ async fn main() {
                                     let max_arm_bars = (arm_timeout_mins.round() as usize).clamp(10, 15);
                                     let side_enum = if is_long_arm { Side::Long } else { Side::Short };
 
+                                    let eff_min_edge_bps = (ou_cfg.min_net_edge_bps * 0.78).max(18.0);
                                     let placement_action = crate::ou_process::evaluate_armed_reversal_1m_step(
                                         &side_enum,
                                         armed_state.entry_threshold,
@@ -4142,8 +4314,8 @@ async fn main() {
                                         ou_cfg.rebound_gamma,
                                         ou_cfg.max_join_consumption_ratio,
                                         ou_cfg.max_retest_consumption_ratio,
-                                        ou_cfg.min_net_edge_bps,
-                                        1.5, // Hyperliquid base Maker fee (bps)
+                                        eff_min_edge_bps,
+                                        1.44, // Hyperliquid VIP0 Maker fee with referral discount (bps)
                                         expected_funding_drag_bps,
                                         high_price,
                                         low_price,
@@ -4207,13 +4379,13 @@ async fn main() {
                                                     frozen_target,
                                                     is_long_arm,
                                                 );
-                                                let net_edge_bps = raw_edge_bps - 3.0 - expected_funding_drag_bps;
+                                                let net_edge_bps = raw_edge_bps - 2.88 - expected_funding_drag_bps;
 
-                                                if net_edge_bps < ou_cfg.min_net_edge_bps {
+                                                if net_edge_bps < eff_min_edge_bps {
                                                     funnel_counters.engine_a_reversal_hurdle_veto += 1;
                                                     println!(
                                                         "⚠️ [{} HURDLE VETO] Carry-adjusted net edge too narrow for {}: {:.1} bps (raw: {:.1} bps, funding drag: {:.1} bps < {:.1} bps hurdle).",
-                                                        arm_side, symbol_clone, net_edge_bps, raw_edge_bps, expected_funding_drag_bps, ou_cfg.min_net_edge_bps
+                                                        arm_side, symbol_clone, net_edge_bps, raw_edge_bps, expected_funding_drag_bps, eff_min_edge_bps
                                                     );
                                                     armed_state.is_armed = false;
                                                     save_armed_signal(&arm_path_clone, &armed_state);
@@ -4237,12 +4409,17 @@ async fn main() {
                                                     } else {
                                                         live_feat.sigma_eq_log
                                                     };
+                                                    let lambda_dir = if is_long_arm {
+                                                        live_feat.lambda_dir_long
+                                                    } else {
+                                                        live_feat.lambda_dir_short
+                                                    };
                                                     let kelly_scalar = compute_fee_adjusted_kelly_scalar(
                                                         raw_edge_bps,
-                                                        ou_cfg.min_net_edge_bps,
-                                                        1.5,
+                                                        eff_min_edge_bps,
+                                                        1.44,
                                                         expected_funding_drag_bps,
-                                                    );
+                                                    ) * lambda_dir;
                                                     let risk_frac = 0.0075 * dd_mult * kelly_scalar;
                                                     let max_asset_notional = config
                                                         .max_position_size_usdc
@@ -4256,7 +4433,7 @@ async fn main() {
                                                             est_sl_px,
                                                             config.hl_leverage,
                                                             crate::state::max_concurrent_cluster_positions(),
-                                                            11.0,
+                                                            22.0,
                                                             max_asset_notional,
                                                         )
                                                     } else {

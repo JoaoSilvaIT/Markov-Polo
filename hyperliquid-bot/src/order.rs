@@ -109,30 +109,10 @@ pub async fn place_ou_maker_entry(
         ));
     }
 
-    // Dynamic Volatility- & Half-Life-Adaptive TP Shave (\eta^*):
+    // Unshaved Equilibrium Mean Target (Section 2.1 & 2.2 of Research Report):
+    // Eliminates the legacy adaptive TP shave (\eta^*) that compressed payoff geometry.
     let tick_sz = effective_tick_size(target_mu, sz_decimals);
-    let safe_offset_bps = match crate::ou_process::compute_adaptive_tp_offset_bps(
-        target_mu,
-        post_only_price,
-        tick_sz,
-        half_life_minutes,
-    ) {
-        Some(bps) => bps,
-        None => {
-            let _ = release_cluster_lease_authenticated(symbol, Some(&lease_uuid), Some(fencing_token));
-            return Err(format!(
-                "Remaining distance from ${:.4} to ${:.4} is too narrow for safe TP offset clamp (L > U) on {}",
-                post_only_price, target_mu, symbol
-            ));
-        }
-    };
-    let total_shave = target_mu * (safe_offset_bps * 1e-4);
-    let target_tp = if is_buy {
-        target_mu - total_shave
-    } else {
-        target_mu + total_shave
-    };
-    let target_tp_quantized = quantize_price(target_tp, sz_decimals);
+    let target_tp_quantized = target_mu_quantized;
     let min_profitable_tp = if is_buy {
         target_tp_quantized > post_only_price + tick_sz
     } else {

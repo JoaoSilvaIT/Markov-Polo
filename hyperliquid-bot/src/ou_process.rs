@@ -1026,6 +1026,7 @@ pub fn compute_safe_tp_offset_bps(target_mu: f64, entry_price: f64, tick_size: f
 /// Shaves a smaller fraction (~5.0 bps) when O-U half-life is fast (<= 35m), and scales up the shave
 /// toward 12-15% of `d_rem_bps` (up to 10.0 bps) when `half_life_m` is slow (> 55m), increasing maker
 /// TP fill rate before the Profit-Harvest Ratchet or HMM regime transitions occur.
+#[allow(dead_code)]
 pub fn compute_adaptive_tp_offset_bps(
     target_mu: f64,
     entry_price: f64,
@@ -2034,6 +2035,28 @@ pub struct FeatureSnapshot {
     /// One-step standardized innovation CUSUMs (upside and downside)
     pub cusum_pos: f64,
     pub cusum_neg: f64,
+    /// Rolling 60m Variance-Ratio Hurst Exponent H_t in [0.15, 0.85]
+    pub hurst_60m: f64,
+    /// 30-bar Kaufman Efficiency Ratio in [0.0, 1.0]
+    pub ker_30m: f64,
+    /// Composite Micro-Regime Index \Phi_{regime}(t) in [0.0, 1.0]
+    pub phi_regime: f64,
+    /// Multi-horizon macro drift score Z_{macro}(t)
+    pub z_macro: f64,
+    /// Dynamic regime-adaptive entry threshold for Longs (in \sigma_{eq} units)
+    pub dynamic_sigma_long: f64,
+    /// Dynamic regime-adaptive entry threshold for Shorts (in \sigma_{eq} units)
+    pub dynamic_sigma_short: f64,
+    /// Continuous directional bias multiplier \lambda_{dir} for Longs in [0.0, 1.0]
+    pub lambda_dir_long: f64,
+    /// Continuous directional bias multiplier \lambda_{dir} for Shorts in [0.0, 1.0]
+    pub lambda_dir_short: f64,
+    /// Causal Kalman LLT equilibrium log-price level g_{t|t}
+    pub kalman_level_log: f64,
+    /// Standardized 1-step Kalman innovation \tilde{\epsilon}_t
+    pub kalman_std_innov: f64,
+    /// Bias-corrected O-U mean-reversion rate \theta (per minute)
+    pub ou_theta: f64,
 }
 
 #[allow(dead_code)]
@@ -2261,6 +2284,53 @@ pub fn calculate_features_with_funding_at(
     let is_valid_half_life =
         half_life_m >= cfg.min_half_life_m && half_life_m <= cfg.max_half_life_m;
 
+    let cal = asset_calibration(symbol);
+    let hurst_60m = calculate_rolling_hurst_60m(closes_history);
+    let ker_30m = calculate_ker_30m(closes_history);
+    let z_macro = calculate_z_macro(closes_history, eval_close, sigma_mad, llt_out.updated_slope);
+    let gk_eff_15m = if n >= 15 {
+        (ret_15.abs() / (sigma_mad * (15.0_f64).sqrt()).max(1e-6)).clamp(0.0, 1.0)
+    } else {
+        0.35
+    };
+    let ou_theta = if half_life_m > 0.0 && half_life_m < 900.0 {
+        std::f64::consts::LN_2 / half_life_m
+    } else {
+        0.0
+    };
+    let kalman_level_log = if llt_out.updated_level.abs() > 1e-6 {
+        llt_out.updated_level
+    } else {
+        eval_close.ln()
+    };
+
+    let micro_regime = MicroRegimeState {
+        hurst_60m,
+        ker_30m,
+        gk_efficiency_15m: gk_eff_15m,
+        kalman_level: kalman_level_log,
+        kalman_slope: llt_out.updated_slope / 5.0, // convert 5m slope to 1m slope
+        sigma_1m: sigma_mad,
+        sigma_eq: sigma_eq_log,
+        z_macro,
+    };
+    let phi_regime = micro_regime.phi_regime();
+    let dynamic_sigma_long = micro_regime.dynamic_entry_sigma(&cal, Direction::Long);
+    let dynamic_sigma_short = micro_regime.dynamic_entry_sigma(&cal, Direction::Short);
+    let lambda_dir_long = micro_regime.directional_bias_multiplier(&cal, Direction::Long);
+    let lambda_dir_short = micro_regime.directional_bias_multiplier(&cal, Direction::Short);
+
+    // Modulate thresholds_opt with the quadratic Dynamic Entry Frontier penalty \Phi_{regime}(t)^2
+    // while preserving carry-adjusted baseline thresholds in calm/sideways regimes
+    let thresholds_opt = thresholds_opt.map(|mut th| {
+        if phi_regime > 0.35 && sigma_eq_log > 1e-6 {
+            let extra_sigma = 0.30 * (phi_regime * phi_regime);
+            th.entry_long *= (-extra_sigma * sigma_eq_log).exp();
+            th.entry_short *= (extra_sigma * sigma_eq_log).exp();
+        }
+        th
+    });
+
     Some(FeatureSnapshot {
         thresholds_opt,
         thresholds_175_opt,
@@ -2285,7 +2355,599 @@ pub fn calculate_features_with_funding_at(
         kalman_drift_veto: llt_out.drift_veto_active,
         cusum_pos: llt_out.cusum_pos,
         cusum_neg: llt_out.cusum_neg,
+        hurst_60m,
+        ker_30m,
+        phi_regime,
+        z_macro,
+        dynamic_sigma_long,
+        dynamic_sigma_short,
+        lambda_dir_long,
+        lambda_dir_short,
+        kalman_level_log,
+        kalman_std_innov: llt_out.std_innovation,
+        ou_theta,
     })
+}
+
+// ============================================================================
+// PHASE 1 & PHASE 2: O-U SCALE FUNCTION, DYNAMIC FRONTIER & SPRT MULTI-TRANCHE
+// ============================================================================
+
+/// Asset-specific quantitative calibration parameters from Section 7 of Research Report.
+#[derive(Debug, Clone, Copy)]
+pub struct AssetCalibration {
+    pub symbol: &'static str,
+    pub sz_decimals: u32,
+    pub sigma_min: f64,
+    pub sigma_max: f64,
+    pub beta_overshoot: f64,
+    pub sprt_delta: f64,
+    pub sprt_b_upper: f64,
+    pub k_dir: f64,
+    pub u_veto: f64,
+    pub tau_obi_eng_a: f64,
+    pub tau_obi_eng_b: f64,
+    pub funding_trigger_bps: f64,
+    pub oi_cascade_pct: f64,
+}
+
+/// Returns the institutional calibration from Section 7 for any of the 9 portfolio perpetuals.
+pub fn asset_calibration(symbol: &str) -> AssetCalibration {
+    match symbol.to_uppercase().as_str() {
+        "BTC" => AssetCalibration {
+            symbol: "BTC",
+            sz_decimals: 5,
+            sigma_min: 1.45,
+            sigma_max: 2.15,
+            beta_overshoot: 0.55,
+            sprt_delta: 0.85,
+            sprt_b_upper: 3.25,
+            k_dir: 1.60,
+            u_veto: -2.30,
+            tau_obi_eng_a: 0.28,
+            tau_obi_eng_b: 0.25,
+            funding_trigger_bps: 2.5,
+            oi_cascade_pct: 1.0,
+        },
+        "ETH" => AssetCalibration {
+            symbol: "ETH",
+            sz_decimals: 4,
+            sigma_min: 1.48,
+            sigma_max: 2.20,
+            beta_overshoot: 0.55,
+            sprt_delta: 0.85,
+            sprt_b_upper: 3.20,
+            k_dir: 1.65,
+            u_veto: -2.25,
+            tau_obi_eng_a: 0.30,
+            tau_obi_eng_b: 0.25,
+            funding_trigger_bps: 2.8,
+            oi_cascade_pct: 1.1,
+        },
+        "SOL" => AssetCalibration {
+            symbol: "SOL",
+            sz_decimals: 2,
+            sigma_min: 1.52,
+            sigma_max: 2.25,
+            beta_overshoot: 0.60,
+            sprt_delta: 0.80,
+            sprt_b_upper: 3.10,
+            k_dir: 1.75,
+            u_veto: -2.15,
+            tau_obi_eng_a: 0.32,
+            tau_obi_eng_b: 0.28,
+            funding_trigger_bps: 3.0,
+            oi_cascade_pct: 1.2,
+        },
+        "XRP" => AssetCalibration {
+            symbol: "XRP",
+            sz_decimals: 0,
+            sigma_min: 1.55,
+            sigma_max: 2.25,
+            beta_overshoot: 0.50,
+            sprt_delta: 0.85,
+            sprt_b_upper: 3.05,
+            k_dir: 1.80,
+            u_veto: -2.10,
+            tau_obi_eng_a: 0.35,
+            tau_obi_eng_b: 0.30,
+            funding_trigger_bps: 3.0,
+            oi_cascade_pct: 1.2,
+        },
+        "SUI" => AssetCalibration {
+            symbol: "SUI",
+            sz_decimals: 1,
+            sigma_min: 1.58,
+            sigma_max: 2.30,
+            beta_overshoot: 0.65,
+            sprt_delta: 0.78,
+            sprt_b_upper: 2.95,
+            k_dir: 1.90,
+            u_veto: -2.00,
+            tau_obi_eng_a: 0.35,
+            tau_obi_eng_b: 0.32,
+            funding_trigger_bps: 3.2,
+            oi_cascade_pct: 1.3,
+        },
+        "AVAX" => AssetCalibration {
+            symbol: "AVAX",
+            sz_decimals: 2,
+            sigma_min: 1.55,
+            sigma_max: 2.28,
+            beta_overshoot: 0.55,
+            sprt_delta: 0.82,
+            sprt_b_upper: 3.00,
+            k_dir: 1.85,
+            u_veto: -2.05,
+            tau_obi_eng_a: 0.35,
+            tau_obi_eng_b: 0.30,
+            funding_trigger_bps: 3.0,
+            oi_cascade_pct: 1.2,
+        },
+        "LINK" => AssetCalibration {
+            symbol: "LINK",
+            sz_decimals: 1,
+            sigma_min: 1.55,
+            sigma_max: 2.28,
+            beta_overshoot: 0.50,
+            sprt_delta: 0.82,
+            sprt_b_upper: 3.00,
+            k_dir: 1.85,
+            u_veto: -2.05,
+            tau_obi_eng_a: 0.35,
+            tau_obi_eng_b: 0.30,
+            funding_trigger_bps: 3.0,
+            oi_cascade_pct: 1.2,
+        },
+        "NEAR" => AssetCalibration {
+            symbol: "NEAR",
+            sz_decimals: 1,
+            sigma_min: 1.62,
+            sigma_max: 2.35,
+            beta_overshoot: 0.60,
+            sprt_delta: 0.72,
+            sprt_b_upper: 2.80,
+            k_dir: 2.05,
+            u_veto: -1.85,
+            tau_obi_eng_a: 0.40,
+            tau_obi_eng_b: 0.35,
+            funding_trigger_bps: 3.5,
+            oi_cascade_pct: 1.4,
+        },
+        "HYPE" => AssetCalibration {
+            symbol: "HYPE",
+            sz_decimals: 2,
+            sigma_min: 1.65,
+            sigma_max: 2.40,
+            beta_overshoot: 0.70,
+            sprt_delta: 0.70,
+            sprt_b_upper: 2.75,
+            k_dir: 2.10,
+            u_veto: -1.80,
+            tau_obi_eng_a: 0.42,
+            tau_obi_eng_b: 0.35,
+            funding_trigger_bps: 3.8,
+            oi_cascade_pct: 1.5,
+        },
+        _ => AssetCalibration {
+            symbol: "ETH",
+            sz_decimals: 4,
+            sigma_min: 1.48,
+            sigma_max: 2.20,
+            beta_overshoot: 0.55,
+            sprt_delta: 0.85,
+            sprt_b_upper: 3.20,
+            k_dir: 1.65,
+            u_veto: -2.25,
+            tau_obi_eng_a: 0.30,
+            tau_obi_eng_b: 0.25,
+            funding_trigger_bps: 2.8,
+            oi_cascade_pct: 1.1,
+        },
+    }
+}
+
+/// Trade direction enum: +1.0 for Long, -1.0 for Short.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Long,
+    Short,
+}
+
+impl Direction {
+    #[inline(always)]
+    pub fn sign(self) -> f64 {
+        match self {
+            Direction::Long => 1.0,
+            Direction::Short => -1.0,
+        }
+    }
+
+    #[inline(always)]
+    pub fn opposite(self) -> Self {
+        match self {
+            Direction::Long => Direction::Short,
+            Direction::Short => Direction::Long,
+        }
+    }
+
+    #[inline(always)]
+    pub fn from_side(side: &Side) -> Self {
+        match side {
+            Side::Long => Direction::Long,
+            Side::Short => Direction::Short,
+        }
+    }
+
+    #[inline(always)]
+    pub fn to_side(self) -> Side {
+        match self {
+            Direction::Long => Side::Long,
+            Direction::Short => Side::Short,
+        }
+    }
+}
+
+/// Fast composite Simpson quadrature of the imaginary error function erfi(x) = -i * erf(i*x)
+/// for |x| <= 3.8, used in the Ornstein-Uhlenbeck scale function S(z).
+#[inline]
+#[allow(dead_code)]
+pub fn erfi_approx(x: f64) -> f64 {
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let z = x.abs().min(3.8);
+    const N: usize = 16;
+    let h = z / (N as f64);
+    let mut sum = 1.0 + (z * z).exp();
+    for i in 1..N {
+        let t = (i as f64) * h;
+        let weight = if i % 2 == 1 { 4.0 } else { 2.0 };
+        sum += weight * (t * t).exp();
+    }
+    let integral = (h / 3.0) * (2.0 / std::f64::consts::PI.sqrt()) * sum;
+    sign * integral
+}
+
+/// Ornstein-Uhlenbeck natural scale function S(z) = sqrt(pi/2) * erfi(z / sqrt(2)).
+#[inline]
+#[allow(dead_code)]
+pub fn ou_scale_function(z: f64) -> f64 {
+    (std::f64::consts::PI / 2.0).sqrt() * erfi_approx(z / 2.0_f64.sqrt())
+}
+
+/// Exact two-sided First-Passage-Time probability P(tau_tp < tau_sl | z_0 = entry_z)
+/// for a normalized O-U residual process dz_t = -theta * z_t dt + sqrt(2*theta) dW_t.
+#[inline]
+#[allow(dead_code)]
+pub fn ou_first_passage_prob(entry_z: f64, tp_z: f64, sl_z: f64) -> f64 {
+    let s_entry = ou_scale_function(entry_z);
+    let s_tp = ou_scale_function(tp_z);
+    let s_sl = ou_scale_function(sl_z);
+    let denom = (s_tp - s_sl).abs().max(1e-12);
+    ((s_entry - s_sl).abs() / denom).clamp(0.0, 1.0)
+}
+
+/// Computes the Rolling Variance-Ratio Hurst Exponent H_t in [0.15, 0.85]
+/// over a rolling W=60-minute window comparing 5-minute return variance against 1-minute variance.
+pub fn calculate_rolling_hurst_60m(closes: &[f64]) -> f64 {
+    let n = closes.len();
+    if n < 61 {
+        return 0.45;
+    }
+    let w = 60usize;
+    let q = 5usize;
+    let start = n - w - 1;
+    let slice = &closes[start..];
+
+    let mut sum_sq_1m = 0.0;
+    let mut cnt_1m = 0usize;
+    for i in 1..slice.len() {
+        if slice[i] > 0.0 && slice[i - 1] > 0.0 {
+            let r = (slice[i] / slice[i - 1]).ln();
+            sum_sq_1m += r * r;
+            cnt_1m += 1;
+        }
+    }
+
+    let mut sum_sq_qm = 0.0;
+    let mut cnt_qm = 0usize;
+    for i in q..slice.len() {
+        if slice[i] > 0.0 && slice[i - q] > 0.0 {
+            let r_q = (slice[i] / slice[i - q]).ln();
+            sum_sq_qm += r_q * r_q;
+            cnt_qm += 1;
+        }
+    }
+
+    if cnt_1m == 0 || cnt_qm == 0 || sum_sq_1m <= 1e-16 || sum_sq_qm <= 1e-16 {
+        return 0.45;
+    }
+
+    let var_1m = sum_sq_1m / (cnt_1m as f64);
+    let var_qm = sum_sq_qm / (cnt_qm as f64);
+    let ratio = (var_qm / var_1m).max(1e-6);
+    let h = 0.5 * (ratio.ln() / (q as f64).ln());
+    h.clamp(0.15, 0.85)
+}
+
+/// Computes the 30-bar Kaufman Efficiency Ratio KER_t in [0.0, 1.0].
+pub fn calculate_ker_30m(closes: &[f64]) -> f64 {
+    let n = closes.len();
+    if n < 31 {
+        return 0.25;
+    }
+    let w = 30usize;
+    let slice = &closes[n - w - 1..];
+    let net_disp = (slice[w] - slice[0]).abs();
+    let mut path_sum = 0.0;
+    for i in 1..=w {
+        path_sum += (slice[i] - slice[i - 1]).abs();
+    }
+    if path_sum <= 1e-12 {
+        0.0
+    } else {
+        (net_disp / path_sum).clamp(0.0, 1.0)
+    }
+}
+
+/// Computes the Multi-Horizon Macro Drift Score Z_{macro}(t) from Section 4.3.
+pub fn calculate_z_macro(
+    closes: &[f64],
+    eval_close: f64,
+    sigma_1m: f64,
+    kalman_slope_5m: f64,
+) -> f64 {
+    let n = closes.len();
+    if n < 60 || eval_close <= 0.0 {
+        return 0.0;
+    }
+    let lookback_240 = n.min(240);
+    let alpha = 2.0 / (lookback_240 as f64 + 1.0);
+    let mut ema_240 = closes[n - lookback_240];
+    for &p in &closes[n - lookback_240 + 1..] {
+        ema_240 = alpha * p + (1.0 - alpha) * ema_240;
+    }
+
+    // Approximate 1-hour ATR in price units using 1m diffusive volatility * sqrt(60)
+    let atr_60_px = (eval_close * sigma_1m.max(1e-5) * (60.0_f64).sqrt()).max(eval_close * 0.0015);
+    let term1 = (eval_close - ema_240) / (atr_60_px * 2.0); // sqrt(4) = 2.0
+
+    // 60-minute net displacement of causal Kalman level (12 x 5m bars)
+    let g_disp_60m = kalman_slope_5m * 12.0;
+    let term2 = g_disp_60m / (sigma_1m.max(1e-5) * (60.0_f64).sqrt());
+
+    0.55 * term1 + 0.45 * term2
+}
+
+/// Real-time local micro-regime state inputs for the Dynamic Entry Frontier.
+#[derive(Debug, Clone, Copy)]
+pub struct MicroRegimeState {
+    pub hurst_60m: f64,         // Rolling variance-ratio Hurst exponent H_t in (0, 1)
+    pub ker_30m: f64,           // 30-bar Kaufman Efficiency Ratio in [0, 1]
+    pub gk_efficiency_15m: f64, // Garman-Klass body-to-volatility ratio rho_{GK, t}
+    pub kalman_level: f64,      // Causal Kalman LLT level g_{t|t} (in log-price space)
+    pub kalman_slope: f64,      // Causal Kalman LLT slope b_{t|t} (per 1m bar)
+    pub sigma_1m: f64,          // 1-minute return standard deviation
+    pub sigma_eq: f64,          // O-U stationary residual std dev: sigma / sqrt(2*theta)
+    pub z_macro: f64,           // Multi-horizon macro drift score Z_{macro}(t)
+}
+
+impl MicroRegimeState {
+    /// Computes the composite micro-regime index Phi_{regime}(t) in [0.0, 1.0].
+    #[inline]
+    pub fn phi_regime(&self) -> f64 {
+        let h_term = 0.45 * ((self.hurst_60m - 0.35) / 0.25);
+        let k_term = 0.35 * ((self.ker_30m - 0.20) / 0.40);
+        let gk_term = 0.20 * ((self.gk_efficiency_15m - 0.35) / 0.45);
+        (h_term + k_term + gk_term).clamp(0.0, 1.0)
+    }
+
+    /// Computes the dynamic regime-adaptive entry threshold sigma_{entry}(t, d) in units of sigma_eq.
+    #[inline]
+    pub fn dynamic_entry_sigma(&self, cal: &AssetCalibration, dir: Direction) -> f64 {
+        let phi = self.phi_regime();
+        let d = dir.sign();
+        let std_slope = self.kalman_slope / self.sigma_1m.max(1e-8);
+        let adverse_slope_penalty = 0.25 * (-d * std_slope).max(0.0);
+
+        // Minimum fee-adjusted volatility hurdle: 18.0 bps (3.0 bps maker RT + 15.0 bps min edge)
+        let min_hurdle_sigma = 0.0018 / self.sigma_eq.max(1e-6);
+
+        let adaptive_sigma =
+            cal.sigma_min + (cal.sigma_max - cal.sigma_min) * (phi * phi) + adverse_slope_penalty;
+
+        adaptive_sigma
+            .max(min_hurdle_sigma)
+            .min(cal.sigma_max + 0.35)
+    }
+
+    /// Computes the continuous directional bias multiplier lambda_{dir}(t, d) in [0.0, 1.0].
+    #[inline]
+    pub fn directional_bias_multiplier(&self, cal: &AssetCalibration, dir: Direction) -> f64 {
+        let u_t = dir.sign() * self.z_macro;
+        if u_t <= cal.u_veto {
+            return 0.0; // Parabolic runaway circuit breaker (prevents live NEAR short trap)
+        }
+        let lambda_floor = 0.25;
+        let u_0 = 0.60;
+        let logistic = 1.0 / (1.0 + (-cal.k_dir * (u_t + u_0)).exp());
+        (lambda_floor + (1.0 - lambda_floor) * logistic).clamp(0.0, 1.0)
+    }
+}
+
+/// Multi-Tranche Position & SPRT Dynamic Stop-Loss Manager for Engine A.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct AsymmetricExitManager {
+    pub dir: Direction,
+    pub entry_price: f64,
+    pub entry_log_px: f64,
+    pub entry_z: f64,
+    pub tranche1_filled: bool,
+    pub tranche2_filled: bool,
+    pub sprt_stat: f64,
+    pub sprt_history: [f64; 4],
+    pub innov_ring: [f64; 3],
+    pub step_count: usize,
+    pub trailing_stop_log_px: f64,
+    pub extreme_favorable_log_px: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ExitSignal {
+    Hold {
+        tp1_price: Option<f64>,
+        tp2_price: f64,
+        current_sl_price: f64,
+        trend_prob: f64,
+    },
+    FillTranche1AndRatchet {
+        tp2_price: f64,
+        new_lock_sl_price: f64,
+    },
+    FillTranche2Complete,
+    StopOutTranche2Trailing,
+    StopOutFullSprtBreak {
+        sprt_stat: f64,
+        avg_adverse_innov_3m: f64,
+    },
+}
+
+impl AsymmetricExitManager {
+    pub fn new(dir: Direction, entry_price: f64, entry_z: f64, sigma_eq: f64) -> Self {
+        let entry_log_px = entry_price.max(1e-9).ln();
+        let d = dir.sign();
+        let initial_sl_log_px = entry_log_px - d * (2.65 - entry_z.abs()).max(0.35) * sigma_eq;
+        Self {
+            dir,
+            entry_price,
+            entry_log_px,
+            entry_z,
+            tranche1_filled: false,
+            tranche2_filled: false,
+            sprt_stat: 0.0,
+            sprt_history: [0.0; 4],
+            innov_ring: [0.0; 3],
+            step_count: 0,
+            trailing_stop_log_px: initial_sl_log_px,
+            extreme_favorable_log_px: entry_log_px,
+        }
+    }
+
+    /// Updates the SPRT changepoint statistic and evaluates multi-tranche exit boundaries.
+    pub fn on_bar_or_sentinel_tick(
+        &mut self,
+        current_price: f64,
+        regime: &MicroRegimeState,
+        cal: &AssetCalibration,
+        std_kalman_innov: f64,
+        ou_step_innov: f64,
+        live_obi: f64,
+    ) -> ExitSignal {
+        let d = self.dir.sign();
+        let log_px = current_price.max(1e-9).ln();
+        let residual_x = log_px - regime.kalman_level;
+        let current_z = residual_x / regime.sigma_eq.max(1e-6);
+
+        // Update 3-bar innovation ring buffer for Handoff Gate 1
+        self.innov_ring[self.step_count % 3] = std_kalman_innov;
+        self.sprt_history[self.step_count % 4] = self.sprt_stat;
+        self.step_count += 1;
+
+        // 1. Update Sequential Probability Ratio Test (SPRT) log-likelihood statistic S_t
+        let composite_e = 0.60 * std_kalman_innov + 0.40 * ou_step_innov;
+        let obi_penalty = 0.45 * (-d * live_obi).max(0.0);
+        let s_increment =
+            -d * cal.sprt_delta * composite_e - 0.5 * cal.sprt_delta.powi(2) + obi_penalty;
+        self.sprt_stat = (self.sprt_stat + s_increment).max(0.0);
+
+        let trend_prob = 1.0 / (1.0 + (-2.0 * (self.sprt_stat - 0.5 * cal.sprt_b_upper)).exp());
+
+        // 2. Compute dynamic TP1 (at Kalman mean mu=0) and TP2 (overshoot into opposite band)
+        let beta_ov =
+            (cal.beta_overshoot - 0.60 * (regime.hurst_60m - 0.35).max(0.0)).clamp(0.35, 0.75);
+        let tp1_log_px = regime.kalman_level;
+        let tp2_log_px = regime.kalman_level + d * beta_ov * regime.sigma_eq;
+
+        // 3. Evaluate dynamic SPRT stop boundary contraction prior to Tranche 1 fill
+        if !self.tranche1_filled {
+            let z_sl_max = 2.65;
+            let delta_min = 0.15;
+            let contraction_ratio = (self.sprt_stat / cal.sprt_b_upper)
+                .clamp(0.0, 1.0)
+                .powf(1.25);
+            let dynamic_sl_z_mag =
+                z_sl_max - (z_sl_max - self.entry_z.abs() - delta_min).max(0.0) * contraction_ratio;
+            let dynamic_sl_log_px = regime.kalman_level - d * dynamic_sl_z_mag * regime.sigma_eq;
+
+            // Check if SPRT regime shift or dynamic stop boundary is breached
+            if self.sprt_stat >= cal.sprt_b_upper || d * (log_px - dynamic_sl_log_px) <= 0.0 {
+                let avg_adverse_innov = -d * (self.innov_ring.iter().sum::<f64>() / 3.0);
+                return ExitSignal::StopOutFullSprtBreak {
+                    sprt_stat: self.sprt_stat,
+                    avg_adverse_innov_3m: avg_adverse_innov,
+                };
+            }
+
+            // Check if Tranche 1 hits the Kalman equilibrium mean (z_TP1 = 0.00)
+            if d * current_z >= 0.0 {
+                self.tranche1_filled = true;
+                self.extreme_favorable_log_px = log_px;
+                // Jump stop-loss to Fee-Plus-Profit Lock-In Floor (+0.30 sigma_eq or +12 bps)
+                let lock_offset = (0.30 * regime.sigma_eq).max(0.0012);
+                self.trailing_stop_log_px = self.entry_log_px + d * lock_offset;
+                return ExitSignal::FillTranche1AndRatchet {
+                    tp2_price: tp2_log_px.exp(),
+                    new_lock_sl_price: self.trailing_stop_log_px.exp(),
+                };
+            }
+
+            return ExitSignal::Hold {
+                tp1_price: Some(tp1_log_px.exp()),
+                tp2_price: tp2_log_px.exp(),
+                current_sl_price: dynamic_sl_log_px.exp(),
+                trend_prob,
+            };
+        }
+
+        // 4. Tranche 1 is already filled: Manage Tranche 2 Runner & Micro-Chandelier Ratchet
+        if d * (log_px - self.extreme_favorable_log_px) > 0.0 {
+            self.extreme_favorable_log_px = log_px;
+        }
+        let lock_offset = (0.30 * regime.sigma_eq).max(0.0012);
+        let lock_log_px = self.entry_log_px + d * lock_offset;
+        if d * (self.extreme_favorable_log_px - lock_log_px) > 0.50 * regime.sigma_eq {
+            let candidate_trail = self.extreme_favorable_log_px - d * (0.30 * regime.sigma_eq);
+            if d * (candidate_trail - self.trailing_stop_log_px) > 0.0 {
+                self.trailing_stop_log_px = candidate_trail;
+            }
+        }
+
+        if d * (log_px - tp2_log_px) >= 0.0 {
+            self.tranche2_filled = true;
+            return ExitSignal::FillTranche2Complete;
+        }
+
+        if d * (log_px - self.trailing_stop_log_px) <= 0.0 {
+            return ExitSignal::StopOutTranche2Trailing;
+        }
+
+        ExitSignal::Hold {
+            tp1_price: None,
+            tp2_price: tp2_log_px.exp(),
+            current_sl_price: self.trailing_stop_log_px.exp(),
+            trend_prob,
+        }
+    }
+
+    /// Returns the SPRT statistic 3 bars ago for Handoff Gate 1 velocity calculation.
+    #[inline]
+    pub fn sprt_stat_3m_ago(&self) -> f64 {
+        if self.step_count < 3 {
+            0.0
+        } else {
+            self.sprt_history[(self.step_count - 3) % 4]
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2730,6 +3392,182 @@ mod tests {
         assert!(
             sig_d.is_some(),
             "Engine D must fire when all 4 HLP cascade exhaustion gates align"
+        );
+    }
+
+    #[test]
+    fn test_ou_scale_function_and_first_passage_hitting_probabilities() {
+        // Verify odd symmetry and monotonicity of O-U scale function S(z)
+        assert!((ou_scale_function(0.0)).abs() < 1e-12);
+        let s_pos = ou_scale_function(1.80);
+        let s_neg = ou_scale_function(-1.80);
+        assert!((s_pos + s_neg).abs() < 1e-10);
+        assert!(ou_scale_function(2.50) > s_pos);
+
+        // Verify exact First-Passage-Time table from Section 2.1 of Research Report:
+        // Entry z_0 = -1.80, Stop z_SL = -2.50:
+        // - Target z_TP = 0.00 (Strict Mean) -> ~69.33% hitting probability
+        // - Target z_TP = +0.50 (Optimal Runner) -> ~66.30% hitting probability (only ~3.03% drop for +27.78% gross lift!)
+        let p_mean = ou_first_passage_prob(-1.80, 0.00, -2.50);
+        let p_runner = ou_first_passage_prob(-1.80, 0.50, -2.50);
+        assert!(
+            (p_mean - 0.6933).abs() < 0.005,
+            "Expected ~69.33% hitting prob at mean, got {:.4}",
+            p_mean
+        );
+        assert!(
+            (p_runner - 0.6630).abs() < 0.005,
+            "Expected ~66.30% hitting prob at +0.50 overshoot, got {:.4}",
+            p_runner
+        );
+        assert!((p_mean - p_runner) < 0.035);
+    }
+
+    #[test]
+    fn test_dynamic_entry_frontier_relaxes_in_sideways_and_tightens_in_trend() {
+        let btc_cal = asset_calibration("BTC");
+        let calm_regime = MicroRegimeState {
+            hurst_60m: 0.34,
+            ker_30m: 0.18,
+            gk_efficiency_15m: 0.25,
+            kalman_level: 80_000.0_f64.ln(),
+            kalman_slope: 0.0,
+            sigma_1m: 0.0008,
+            sigma_eq: 0.0022,
+            z_macro: 0.0,
+        };
+        assert!(calm_regime.phi_regime() <= 0.18);
+        let sig_calm = calm_regime.dynamic_entry_sigma(&btc_cal, Direction::Long);
+        assert!(
+            sig_calm >= 1.45 && sig_calm <= 1.55,
+            "Expected calm sideways sigma in [1.45, 1.55], got {:.3}",
+            sig_calm
+        );
+
+        let storm_regime = MicroRegimeState {
+            hurst_60m: 0.68,
+            ker_30m: 0.72,
+            gk_efficiency_15m: 0.85,
+            kalman_level: 80_000.0_f64.ln(),
+            kalman_slope: -0.0012,
+            sigma_1m: 0.0008,
+            sigma_eq: 0.0022,
+            z_macro: -1.8,
+        };
+        assert!((storm_regime.phi_regime() - 1.0).abs() < 1e-6);
+        let sig_storm = storm_regime.dynamic_entry_sigma(&btc_cal, Direction::Long);
+        assert!(
+            sig_storm >= 2.15,
+            "Expected turbulent adverse trend sigma >= 2.15, got {:.3}",
+            sig_storm
+        );
+    }
+
+    #[test]
+    fn test_continuous_directional_bias_multiplier_neutralizes_parabolic_near_trap() {
+        let near_cal = asset_calibration("NEAR");
+        // Parabolic runaway pump on NEAR (Z_macro = +1.90): shorting (d = -1) gives u_t = -1.90 <= u_veto (-1.85) -> 0.0!
+        let pump_regime = MicroRegimeState {
+            hurst_60m: 0.55,
+            ker_30m: 0.50,
+            gk_efficiency_15m: 0.60,
+            kalman_level: 3.65_f64.ln(),
+            kalman_slope: 0.001,
+            sigma_1m: 0.0015,
+            sigma_eq: 0.0038,
+            z_macro: 1.90,
+        };
+        let mult_short = pump_regime.directional_bias_multiplier(&near_cal, Direction::Short);
+        let mult_long = pump_regime.directional_bias_multiplier(&near_cal, Direction::Long);
+        assert_eq!(
+            mult_short, 0.0,
+            "Counter-trend short during parabolic NEAR pump must be hard-vetoed (0.0)"
+        );
+        assert!(
+            mult_long >= 0.90,
+            "Trend-aligned dip buy must receive >= 90% size allocation, got {:.3}",
+            mult_long
+        );
+    }
+
+    #[test]
+    fn test_asymmetric_two_tranche_exit_ratchets_lock_floor_and_harvests_overshoot() {
+        let sol_cal = asset_calibration("SOL");
+        let regime = MicroRegimeState {
+            hurst_60m: 0.35,
+            ker_30m: 0.20,
+            gk_efficiency_15m: 0.30,
+            kalman_level: 100.0_f64.ln(),
+            kalman_slope: 0.0,
+            sigma_1m: 0.0010,
+            sigma_eq: 0.0040, // 40 bps sigma_eq
+            z_macro: 0.0,
+        };
+        // Enter Long at -1.80 sigma_eq ($99.2826)
+        let entry_px = 100.0 * (-1.80 * 0.0040_f64).exp();
+        let mut mgr = AsymmetricExitManager::new(Direction::Long, entry_px, -1.80, 0.0040);
+
+        // Step 1: Price reaches Kalman equilibrium mean ($100.00) -> fills Tranche 1 and jumps stop to Lock Floor!
+        let sig1 = mgr.on_bar_or_sentinel_tick(100.00, &regime, &sol_cal, 0.2, 0.2, 0.15);
+        match sig1 {
+            ExitSignal::FillTranche1AndRatchet {
+                tp2_price,
+                new_lock_sl_price,
+            } => {
+                assert!(mgr.tranche1_filled);
+                assert!(
+                    new_lock_sl_price > entry_px * 1.0011,
+                    "Lock-in floor must be strictly above entry + 12 bps"
+                );
+                assert!(
+                    tp2_price > 100.20,
+                    "Tranche 2 overshoot target must lie in the opposite band above mean"
+                );
+            }
+            other => panic!("Expected FillTranche1AndRatchet, got {:?}", other),
+        }
+
+        // Step 2: Price overshoots into opposite band ($100.25) -> fills Tranche 2!
+        let sig2 = mgr.on_bar_or_sentinel_tick(100.25, &regime, &sol_cal, 0.3, 0.3, 0.20);
+        assert_eq!(sig2, ExitSignal::FillTranche2Complete);
+        assert!(mgr.tranche2_filled);
+    }
+
+    #[test]
+    fn test_sprt_changepoint_stop_contracts_and_terminates_waterfall_within_3_bars() {
+        let near_cal = asset_calibration("NEAR");
+        let regime = MicroRegimeState {
+            hurst_60m: 0.45,
+            ker_30m: 0.35,
+            gk_efficiency_15m: 0.40,
+            kalman_level: 100.0_f64.ln(),
+            kalman_slope: 0.0,
+            sigma_1m: 0.0015,
+            sigma_eq: 0.0040,
+            z_macro: 0.0,
+        };
+        let entry_px = 100.0 * (1.80 * 0.0040_f64).exp();
+        let mut mgr = AsymmetricExitManager::new(Direction::Short, entry_px, 1.80, 0.0040);
+
+        // Inject 3 consecutive adverse upward innovations (+2.2 sigma) + bullish OBI (+0.50) against Short
+        let mut triggered = false;
+        for step in 1..=3 {
+            let px = entry_px * (1.0 + 0.0015 * (step as f64));
+            let sig = mgr.on_bar_or_sentinel_tick(px, &regime, &near_cal, 2.2, 2.0, 0.50);
+            if let ExitSignal::StopOutFullSprtBreak {
+                sprt_stat,
+                avg_adverse_innov_3m,
+            } = sig
+            {
+                assert!(sprt_stat >= near_cal.sprt_b_upper);
+                assert!(avg_adverse_innov_3m >= 1.40);
+                triggered = true;
+                break;
+            }
+        }
+        assert!(
+            triggered,
+            "SPRT must detect structural breakout against Short within 3 bars"
         );
     }
 }

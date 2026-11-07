@@ -11,11 +11,26 @@ pub struct GaussianHMM {
     pub eff_sample_sizes: Array1<f64>,
 }
 
-fn logsumexp(arr: &Array1<f64>) -> f64 {
-    let max = arr.fold(f64::NEG_INFINITY, |m, &v| m.max(v));
-    if max == f64::NEG_INFINITY { return max; }
-    let sum: f64 = arr.iter().map(|&x| (x - max).exp()).sum();
+#[inline(always)]
+fn logsumexp_slice(arr: &[f64]) -> f64 {
+    let mut max = f64::NEG_INFINITY;
+    for &v in arr {
+        if v > max {
+            max = v;
+        }
+    }
+    if max.is_infinite() {
+        return max;
+    }
+    let mut sum = 0.0;
+    for &x in arr {
+        sum += (x - max).exp();
+    }
     max + sum.ln()
+}
+
+fn logsumexp(arr: &Array1<f64>) -> f64 {
+    logsumexp_slice(arr.as_slice().unwrap_or(&[]))
 }
 
 impl GaussianHMM {
@@ -96,6 +111,8 @@ impl GaussianHMM {
         }
 
         let mut final_n_eff = Array1::zeros(self.n_components);
+        let mut buf_k = vec![0.0_f64; self.n_components];
+        let mut joint_terms = vec![0.0_f64; self.n_components * self.n_components];
 
         for _ in 0..n_iter {
             let log_emiss = self.log_gaussian_prob(x);
@@ -109,37 +126,35 @@ impl GaussianHMM {
 
             for t in 1..n_samples {
                 for c in 0..self.n_components {
-                    let mut prev = Array1::zeros(self.n_components);
                     for i in 0..self.n_components {
-                        prev[i] = log_alpha[[t - 1, i]] + log_transmat[[i, c]];
+                        buf_k[i] = log_alpha[[t - 1, i]] + log_transmat[[i, c]];
                     }
-                    log_alpha[[t, c]] = logsumexp(&prev) + log_emiss[[t, c]];
+                    log_alpha[[t, c]] = logsumexp_slice(&buf_k) + log_emiss[[t, c]];
                 }
             }
 
             let mut log_beta = Array2::zeros((n_samples, self.n_components));
             for t in (0..n_samples - 1).rev() {
                 for c in 0..self.n_components {
-                    let mut next = Array1::zeros(self.n_components);
                     for i in 0..self.n_components {
-                        next[i] = log_transmat[[c, i]] + log_emiss[[t + 1, i]] + log_beta[[t + 1, i]];
+                        buf_k[i] =
+                            log_transmat[[c, i]] + log_emiss[[t + 1, i]] + log_beta[[t + 1, i]];
                     }
-                    log_beta[[t, c]] = logsumexp(&next);
+                    log_beta[[t, c]] = logsumexp_slice(&buf_k);
                 }
             }
 
             let mut log_gamma = Array2::zeros((n_samples, self.n_components));
             for t in 0..n_samples {
-                let mut row = Array1::zeros(self.n_components);
                 for c in 0..self.n_components {
-                    row[c] = log_alpha[[t, c]] + log_beta[[t, c]];
+                    buf_k[c] = log_alpha[[t, c]] + log_beta[[t, c]];
                 }
-                let denom = logsumexp(&row);
+                let denom = logsumexp_slice(&buf_k);
                 for c in 0..self.n_components {
-                    log_gamma[[t, c]] = row[c] - denom;
+                    log_gamma[[t, c]] = buf_k[c] - denom;
                 }
             }
-            
+
             let gamma = log_gamma.mapv(|v| v.exp());
 
             // M-Step
@@ -153,20 +168,25 @@ impl GaussianHMM {
             // transmat: Calculate normalized xi_t(i, j) in log space before exponentiation
             let mut xi_sum = Array2::<f64>::zeros((self.n_components, self.n_components));
             for t in 0..n_samples - 1 {
-                // Compute normalization constant C_t = logsumexp_{i, j}(...)
-                let mut joint_terms = Vec::with_capacity(self.n_components * self.n_components);
+                let mut idx_j = 0;
                 for i in 0..self.n_components {
                     for j in 0..self.n_components {
-                        let term = log_alpha[[t, i]] + log_transmat[[i, j]] + log_emiss[[t + 1, j]] + log_beta[[t + 1, j]];
-                        joint_terms.push(term);
+                        joint_terms[idx_j] = log_alpha[[t, i]]
+                            + log_transmat[[i, j]]
+                            + log_emiss[[t + 1, j]]
+                            + log_beta[[t + 1, j]];
+                        idx_j += 1;
                     }
                 }
-                let joint_arr = Array1::from_vec(joint_terms);
-                let c_t = logsumexp(&joint_arr);
+                let c_t = logsumexp_slice(&joint_terms);
 
                 for i in 0..self.n_components {
                     for j in 0..self.n_components {
-                        let log_xi = log_alpha[[t, i]] + log_transmat[[i, j]] + log_emiss[[t + 1, j]] + log_beta[[t + 1, j]] - c_t;
+                        let log_xi = log_alpha[[t, i]]
+                            + log_transmat[[i, j]]
+                            + log_emiss[[t + 1, j]]
+                            + log_beta[[t + 1, j]]
+                            - c_t;
                         xi_sum[[i, j]] += log_xi.exp();
                     }
                 }
@@ -201,7 +221,9 @@ impl GaussianHMM {
             // Means and Covars with State-Weighted Ledoit-Wolf Linear Shrinkage
             for c in 0..self.n_components {
                 let mut denom = 0.0;
-                for t in 0..n_samples { denom += gamma[[t, c]]; }
+                for t in 0..n_samples {
+                    denom += gamma[[t, c]];
+                }
                 if denom > 1e-10 {
                     // Effective sample size Neff_k = (sum gamma)^2 / (sum gamma^2)
                     let mut sum_sq_gamma = 0.0;
@@ -220,7 +242,9 @@ impl GaussianHMM {
 
                     for d in 0..n_features {
                         let mut num_mean = 0.0;
-                        for t in 0..n_samples { num_mean += gamma[[t, c]] * x[[t, d]]; }
+                        for t in 0..n_samples {
+                            num_mean += gamma[[t, c]] * x[[t, d]];
+                        }
                         self.means[[c, d]] = num_mean / denom;
 
                         let mut num_var = 0.0;
@@ -241,8 +265,12 @@ impl GaussianHMM {
 
             // Condition number guard: ensure max_var / min_var <= 1e4
             for c in 0..self.n_components {
-                let min_v = (0..n_features).map(|d| self.covars[[c, d]]).fold(f64::INFINITY, f64::min);
-                let max_v = (0..n_features).map(|d| self.covars[[c, d]]).fold(f64::NEG_INFINITY, f64::max);
+                let min_v = (0..n_features)
+                    .map(|d| self.covars[[c, d]])
+                    .fold(f64::INFINITY, f64::min);
+                let max_v = (0..n_features)
+                    .map(|d| self.covars[[c, d]])
+                    .fold(f64::NEG_INFINITY, f64::max);
                 if min_v > 0.0 && (max_v / min_v) > 1e4 {
                     let floor_v = max_v / 1e4;
                     for d in 0..n_features {
@@ -387,7 +415,9 @@ impl GaussianHMM {
 
         for (new_idx, &old_idx) in order.iter().enumerate() {
             new_means.row_mut(new_idx).assign(&self.means.row(old_idx));
-            new_covars.row_mut(new_idx).assign(&self.covars.row(old_idx));
+            new_covars
+                .row_mut(new_idx)
+                .assign(&self.covars.row(old_idx));
             new_startprob[new_idx] = self.startprob[old_idx];
             if old_idx < self.eff_sample_sizes.len() && new_idx < new_eff.len() {
                 new_eff[new_idx] = self.eff_sample_sizes[old_idx];
@@ -412,7 +442,7 @@ impl GaussianHMM {
     }
 }
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::fs;
 
 #[derive(Serialize, Deserialize)]
@@ -464,7 +494,9 @@ impl GaussianHMM {
         let json = fs::read_to_string(path)?;
         let weights: HmmWeights = serde_json::from_str(&json)?;
         if weights.n_features != 4 || weights.n_components != 3 {
-            return Err("Incompatible HMM weights shape: requires 3 components and 4 features".into());
+            return Err(
+                "Incompatible HMM weights shape: requires 3 components and 4 features".into(),
+            );
         }
 
         let mut hmm = Self::new(weights.n_components, weights.n_features);
@@ -514,7 +546,10 @@ pub fn extract_4d_features(closes: &[f64], n_lookback: usize) -> Option<Array2<f
         let start_idx = t + 1 - n_lookback;
         let ret_slice = &returns[start_idx..=t];
         let mean_ret: f64 = ret_slice.iter().sum::<f64>() / ret_slice.len() as f64;
-        let var_ret: f64 = ret_slice.iter().map(|&r| (r - mean_ret).powi(2)).sum::<f64>()
+        let var_ret: f64 = ret_slice
+            .iter()
+            .map(|&r| (r - mean_ret).powi(2))
+            .sum::<f64>()
             / (ret_slice.len() - 1).max(1) as f64;
         let sigma = var_ret.sqrt().max(1e-6);
 
@@ -553,7 +588,7 @@ pub fn train_hmm_offline(closes: &[f64]) -> Option<GaussianHMM> {
     }
 
     let mut hmm = GaussianHMM::new(3, 4);
-    hmm.fit(&x, 100);
+    hmm.fit(&x, 35);
     if !hmm.sort_semantically() {
         // Degenerate state moments: fail safe
         return None;
@@ -566,7 +601,6 @@ pub fn train_hmm_offline(closes: &[f64]) -> Option<GaussianHMM> {
         || !hmm.transmat.iter().all(|v| v.is_finite())
         || !hmm.startprob.iter().all(|v| v.is_finite())
     {
-        println!("⚠️ [COLD-PATH] HMM model candidate rejected: Non-finite numerical parameter detected (NaN/Inf)");
         return None;
     }
 
@@ -577,10 +611,6 @@ pub fn train_hmm_offline(closes: &[f64]) -> Option<GaussianHMM> {
     for (state_idx, &n_eff) in hmm.eff_sample_sizes.iter().enumerate() {
         let min_n_eff = if state_idx == 2 { 10.0 } else { 25.0 };
         if n_eff < min_n_eff {
-            println!(
-                "⚠️ [COLD-PATH] HMM candidate rejected: State {} has insufficient effective sample size (N_eff = {:.1} < {:.1})",
-                state_idx, n_eff, min_n_eff
-            );
             return None;
         }
     }
@@ -668,7 +698,8 @@ pub fn compute_hmm_posteriors(hmm: &GaussianHMM, closes: &[f64]) -> Option<(f64,
         };
         // A true 16-bar trend spreads movement across bars (max_bar_share ~ 0.08-0.25);
         // a single jump bar followed by flat range has max_bar_share > 0.45.
-        let multi_bar_trend_factor = (1.0 - ((max_bar_share - 0.35) / 0.30).clamp(0.0, 1.0)).clamp(0.0, 1.0);
+        let multi_bar_trend_factor =
+            (1.0 - ((max_bar_share - 0.35) / 0.30).clamp(0.0, 1.0)).clamp(0.0, 1.0);
 
         // Guard against 4-hour (16-bar) trend echo:
         // If a trend happened 2-4 hours ago but the most recent 60 minutes (4 fifteen-minute bars)
@@ -729,7 +760,10 @@ mod tests {
         }
 
         let hmm_opt = train_hmm_offline(&closes);
-        assert!(hmm_opt.is_some(), "HMM training should succeed on structured series");
+        assert!(
+            hmm_opt.is_some(),
+            "HMM training should succeed on structured series"
+        );
         let hmm = hmm_opt.unwrap();
         assert_eq!(hmm.means.ncols(), 4, "Should have 4 feature dimensions");
 
@@ -737,7 +771,11 @@ mod tests {
         assert!(posteriors.is_some());
         let (p_c, p_t, p_s) = posteriors.unwrap();
         let sum = p_c + p_t + p_s;
-        assert!((sum - 1.0).abs() < 1e-4, "Posteriors should sum to 1.0: {}", sum);
+        assert!(
+            (sum - 1.0).abs() < 1e-4,
+            "Posteriors should sum to 1.0: {}",
+            sum
+        );
         assert!(p_c >= 0.0 && p_c <= 1.0);
         assert!(p_t >= 0.0 && p_t <= 1.0);
         assert!(p_s >= 0.0 && p_s <= 1.0);
@@ -753,7 +791,10 @@ mod tests {
             closes.push(p);
         }
         let hmm_opt = train_hmm_offline(&closes);
-        assert!(hmm_opt.is_none(), "Under-identified series must be rejected by rare-state gate");
+        assert!(
+            hmm_opt.is_none(),
+            "Under-identified series must be rejected by rare-state gate"
+        );
     }
 
     #[test]

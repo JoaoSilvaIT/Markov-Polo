@@ -11,6 +11,7 @@
 //! - Continuous, deduplicated NAS recording (`hl_history_{symbol}.jsonl`).
 
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -19,11 +20,12 @@ use crate::controller::{ControllerMode, RegimeController};
 use crate::hmm::{compute_hmm_posteriors, train_hmm_offline, GaussianHMM};
 use crate::hyperliquid::{effective_tick_size, optimal_engine_b_tp_atr_multiple, quantize_price};
 use crate::ou_process::{
-    asset_ou_config, calculate_directional_edge_bps, calculate_features_with_funding_at,
-    calculate_mad_sigma, check_macro_calendar_veto, compute_adaptive_tp_offset_bps,
+    asset_calibration, asset_ou_config, calculate_directional_edge_bps,
+    calculate_features_with_funding_at, calculate_mad_sigma, check_macro_calendar_veto,
     compute_fee_adjusted_kelly_scalar, evaluate_armed_reversal_1m_step,
-    evaluate_engine_c_hourly_squeeze, evaluate_engine_d_cascade_reversal, InvalidationDecision,
-    OrderPlacementAction, TwoTierInvalidationManager,
+    evaluate_engine_c_hourly_squeeze, evaluate_engine_d_cascade_reversal, AssetCalibration,
+    AsymmetricExitManager, Direction, ExitSignal, MicroRegimeState, OrderPlacementAction,
+    TwoTierInvalidationManager,
 };
 use crate::state::{ClusterCircuitBreaker, Side, DEFAULT_MAX_DAILY_CLUSTER_DD_FRAC};
 use crate::telemetry::{evaluate_btc_impulse_veto, BtcImpulseSnapshot};
@@ -268,10 +270,12 @@ struct RestingMakerEntry {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct OpenSimulatedPosition {
     side: Side,
     entry_px: f64,
     qty: f64,
+    initial_qty: f64,
     entry_time_ms: u64,
     initial_tp_px: f64,
     tp_limit_px: f64,
@@ -287,6 +291,10 @@ struct OpenSimulatedPosition {
     reprice_count: u32,
     last_reprice_time_ms: u64,
     inv_mgr: TwoTierInvalidationManager,
+    asym_mgr: AsymmetricExitManager,
+    tranche1_realized_pnl_usd: f64,
+    tranche1_exit_fee_usd: f64,
+    prev_residual_x: f64,
     policy: &'static str,
     is_engine_b: bool,
     chandelier_opt: Option<ChandelierExitState>,
@@ -332,14 +340,30 @@ pub fn run_engine_a_backtest_with_btc(
     };
 
     let ou_cfg = asset_ou_config(symbol);
+    let asset_cal = asset_calibration(symbol);
+    let arbiter = UnifiedPortfolioArbiter {
+        base_tranche_usdc: sim_cfg.notional_usdc,
+    };
+    let mut enricher = SyntheticMicrostructureEnricher::new();
     let warmup = 720usize.min(bars.len().saturating_sub(30));
     let mut closes_history: Vec<f64> = bars[..warmup].iter().map(|b| b.close).collect();
 
-    // Pre-aggregate 15m bars from warmup history for Dual-Engine (Engine B & HMM Controller)
+    // Pre-aggregate 15m bars & warm up SyntheticMicrostructureEnricher from warmup history
     let mut rolling_15m_bars: Vec<CandleBar> = Vec::with_capacity(120);
     let mut current_15m_bar: Option<CandleBar> = None;
     let mut all_15m_closes: Vec<f64> = Vec::with_capacity(1024);
     for b in &bars[..warmup] {
+        let _ = enricher.enrich_next_bar(
+            RawOhlcvBar {
+                timestamp_ms: b.timestamp_ms,
+                open: b.open,
+                high: b.high,
+                low: b.low,
+                close: b.close,
+                volume: b.volume,
+            },
+            0.0,
+        );
         let bucket_15m = (b.timestamp_ms / (15 * 60 * 1000)) * (15 * 60 * 1000);
         let is_last_1m = b.timestamp_ms + 60_000 >= bucket_15m + 15 * 60 * 1000;
         if let Some(mut cur) = current_15m_bar.take() {
@@ -455,6 +479,12 @@ pub fn run_engine_a_backtest_with_btc(
             _ => (0.0095, 0.0100, 0.0080),
         };
 
+    let retrain_cadence_15m = if bars.len() > 50_000 {
+        672usize
+    } else {
+        96usize
+    };
+
     for idx in warmup..bars.len() {
         summary.bars_evaluated += 1;
         let bar = &bars[idx];
@@ -465,9 +495,56 @@ pub fn run_engine_a_backtest_with_btc(
             0.0
         };
 
+        // Quick 15m Z-score estimate for causal SyntheticMicrostructureEnricher
+        let z_15_quick =
+            if closes_history.len() >= 15 && closes_history[closes_history.len() - 15] > 0.0 {
+                (bar.close / closes_history[closes_history.len() - 15]).ln()
+                    / (0.0010 * (15.0_f64).sqrt())
+            } else {
+                0.0
+            };
+        let enriched = enricher.enrich_next_bar(
+            RawOhlcvBar {
+                timestamp_ms: bar.timestamp_ms,
+                open: bar.open,
+                high: bar.high,
+                low: bar.low,
+                close: bar.close,
+                volume: bar.volume,
+            },
+            z_15_quick,
+        );
+        let has_native_l2 = bar.obi_instant.abs() > 1e-6 || bar.obi_1s.abs() > 1e-6;
+        let eff_obi_inst = if has_native_l2 {
+            bar.obi_instant
+        } else {
+            enriched.synthetic_obi
+        };
+        let eff_obi_1s = if has_native_l2 {
+            bar.obi_1s
+        } else {
+            enriched.synthetic_obi
+        };
+        let eff_obi_5s = if has_native_l2 {
+            bar.obi_5s
+        } else {
+            enriched.synthetic_obi * 0.85
+        };
+        let eff_funding_1h = if has_native_l2 || (bar.funding_1h - 0.0000125).abs() > 1e-9 {
+            bar.funding_1h
+        } else {
+            enriched.synthetic_funding_1h_bps * 1e-4
+        };
+        let eff_dlog_oi_3m =
+            if idx >= 3 && bars[idx - 3].open_interest > 0.0 && bar.open_interest > 0.0 {
+                (bar.open_interest / bars[idx - 3].open_interest).ln()
+            } else {
+                enriched.synthetic_oi_delta_3m_pct * 1e-2
+            };
+
         // Update 15m bar aggregation & crowding tracker
         crowding_tracker.update(
-            bar.funding_1h,
+            eff_funding_1h,
             bar.open_interest,
             bar.mark_px,
             bar.oracle_px,
@@ -565,10 +642,23 @@ pub fn run_engine_a_backtest_with_btc(
                 } else {
                     None
                 };
+                let entry_z =
+                    if entry_ord.frozen_center_px > 0.0 && entry_ord.frozen_sigma_eq_log > 1e-6 {
+                        (entry_ord.limit_px / entry_ord.frozen_center_px).ln()
+                            / entry_ord.frozen_sigma_eq_log
+                    } else {
+                        -1.65 * Direction::from_side(&entry_ord.side).sign()
+                    };
+                let init_res_x = if entry_ord.frozen_center_px > 0.0 {
+                    (entry_ord.limit_px / entry_ord.frozen_center_px).ln()
+                } else {
+                    0.0
+                };
                 open_pos = Some(OpenSimulatedPosition {
                     side: entry_ord.side.clone(),
                     entry_px: entry_ord.limit_px,
                     qty: entry_ord.qty,
+                    initial_qty: entry_ord.qty,
                     entry_time_ms: bar.timestamp_ms,
                     initial_tp_px: entry_ord.target_tp_px,
                     tp_limit_px: entry_ord.target_tp_px,
@@ -584,13 +674,22 @@ pub fn run_engine_a_backtest_with_btc(
                     reprice_count: 0,
                     last_reprice_time_ms: bar.timestamp_ms,
                     inv_mgr: TwoTierInvalidationManager::new(
-                        entry_ord.side,
+                        entry_ord.side.clone(),
                         entry_ord.limit_px,
                         ou_cfg.hard_disaster_stop_bps,
                         ou_cfg.soft_z_ou_threshold,
                         ou_cfg.soft_z15_shock_threshold,
                         entry_ord.half_life_m,
                     ),
+                    asym_mgr: AsymmetricExitManager::new(
+                        Direction::from_side(&entry_ord.side),
+                        entry_ord.limit_px,
+                        entry_z,
+                        entry_ord.frozen_sigma_eq_log,
+                    ),
+                    tranche1_realized_pnl_usd: 0.0,
+                    tranche1_exit_fee_usd: 0.0,
+                    prev_residual_x: init_res_x,
                     policy: entry_ord.policy,
                     is_engine_b: entry_ord.is_engine_b,
                     chandelier_opt,
@@ -624,13 +723,13 @@ pub fn run_engine_a_backtest_with_btc(
         }
 
         // ------------------------------------------------------------------
-        // 2. MATCHING ENGINE: Process Open Position (Stops, TPs, Funding, 5m Soft Invalidation)
+        // 2. MATCHING ENGINE: Process Open Position (Two-Tranche + SPRT + Handoff)
         // ------------------------------------------------------------------
         let live_feat_opt = calculate_features_with_funding_at(
             &closes_history,
             bar.close,
             symbol,
-            bar.funding_1h,
+            eff_funding_1h,
             Some(bar.timestamp_ms),
         );
 
@@ -642,7 +741,7 @@ pub fn run_engine_a_backtest_with_btc(
                 controller.force_shock_cooldown(feat.z_15, feat.z_60, bar.timestamp_ms);
             }
             if let Some(ref closed_15m) = finalized_15m_bar {
-                if all_15m_closes.len() >= 140 && all_15m_closes.len() % 96 == 0 {
+                if all_15m_closes.len() >= 140 && all_15m_closes.len() % retrain_cadence_15m == 0 {
                     let window_start = all_15m_closes.len().saturating_sub(1000);
                     if let Some(new_hmm) = train_hmm_offline(&all_15m_closes[window_start..]) {
                         hmm_model = new_hmm;
@@ -702,17 +801,16 @@ pub fn run_engine_a_backtest_with_btc(
             pos.mae_bps = pos.mae_bps.max(adv_bps);
 
             // Hourly funding settlement at :00 UTC boundary
-            if (bar.timestamp_ms / 60_000) % 60 == 0 && bar.funding_1h.abs() > 1e-9 {
+            if (bar.timestamp_ms / 60_000) % 60 == 0 && eff_funding_1h.abs() > 1e-9 {
                 let oracle_ref = if bar.oracle_px > 0.0 {
                     bar.oracle_px
                 } else {
                     bar.close
                 };
                 let signed_carry = match pos.side {
-                    Side::Long => -bar.funding_1h,
-                    Side::Short => bar.funding_1h,
+                    Side::Long => -eff_funding_1h,
+                    Side::Short => eff_funding_1h,
                 };
-                // Positive accrued_funding_usd means cost paid; negative means credit received
                 pos.accrued_funding_usd -= pos.qty * oracle_ref * signed_carry;
             }
 
@@ -725,7 +823,6 @@ pub fn run_engine_a_backtest_with_btc(
                 Side::Short => bar.high >= pos.hard_stop_px,
             };
 
-            // Adaptive intrabar ordering (Nautilus `bar_adaptive_high_low_ordering`)
             let check_tp_first = if sim_cfg.bar_adaptive_high_low_ordering {
                 match pos.side {
                     Side::Long => bar.close < bar.open,
@@ -736,6 +833,7 @@ pub fn run_engine_a_backtest_with_btc(
             };
 
             let mut closed_outcome: Option<(f64, bool, &'static str)> = None;
+            let mut sprt_handoff_candidate: Option<(f64, f64, f64)> = None;
             let elapsed_mins_1m =
                 bar.timestamp_ms.saturating_sub(pos.entry_time_ms) as f64 / 60_000.0;
 
@@ -824,227 +922,270 @@ pub fn run_engine_a_backtest_with_btc(
                     closed_outcome = Some((bar.close * slip, false, "TIME_DECAY_STOP"));
                 }
             } else {
-                if tp_hit && hard_sl_hit {
-                    if check_tp_first {
-                        closed_outcome = Some((pos.tp_limit_px, true, "MAKER_TP"));
-                    } else {
+                // =========================================================================
+                // ENGINE A: TWO-TRANCHE EXIT POLICY + SPRT STOP + MICRO-CHANDELIER RATCHET
+                // =========================================================================
+                let d_sign = Direction::from_side(&pos.side).sign();
+                let hurst_now = live_feat_opt.as_ref().map(|f| f.hurst_60m).unwrap_or(0.42);
+                let beta_ov = (asset_cal.beta_overshoot - 0.60 * (hurst_now - 0.35).max(0.0))
+                    .clamp(0.35, 0.75);
+                let tp2_overshoot_px = quantize_price(
+                    pos.frozen_center_px * (d_sign * beta_ov * pos.frozen_sigma_eq_log).exp(),
+                    sim_cfg.sz_decimals,
+                );
+
+                if !pos.asym_mgr.tranche1_filled {
+                    // Tranche 1 (50%) rests at Kalman mean (pos.tp_limit_px)
+                    if tp_hit && (!hard_sl_hit || check_tp_first) {
+                        // Tranche 1 (50% of position) fills as a passive Maker at equilibrium mean!
+                        let t1_qty = 0.50 * pos.initial_qty;
+                        let t1_exit_px = pos.tp_limit_px;
+                        let t1_raw_pnl = match pos.side {
+                            Side::Long => t1_qty * (t1_exit_px - pos.entry_px),
+                            Side::Short => t1_qty * (pos.entry_px - t1_exit_px),
+                        };
+                        let t1_fee = (t1_qty * t1_exit_px) * (sim_cfg.maker_fee_bps * 1e-4);
+                        pos.tranche1_realized_pnl_usd = t1_raw_pnl;
+                        pos.tranche1_exit_fee_usd = t1_fee;
+                        pos.qty = 0.50 * pos.initial_qty;
+                        pos.asym_mgr.tranche1_filled = true;
+                        pos.asym_mgr.extreme_favorable_log_px = fav_px.max(1e-9).ln();
+
+                        // Immediately jump Stop-Loss for Tranche 2 to Fee-Plus-Profit Lock-In Floor
+                        let lock_offset = (0.30 * pos.frozen_sigma_eq_log).max(0.0012);
+                        let lock_px = quantize_price(
+                            pos.entry_px * (d_sign * lock_offset).exp(),
+                            sim_cfg.sz_decimals,
+                        );
+                        pos.hard_stop_px = lock_px;
+                        pos.asym_mgr.trailing_stop_log_px = lock_px.max(1e-9).ln();
+                        pos.tp_limit_px = tp2_overshoot_px;
+
+                        // Check if the same bar ALSO reached Tranche 2 Overshoot Target!
+                        let tp2_also_hit = match pos.side {
+                            Side::Long => bar.high >= tp2_overshoot_px + fill_pad,
+                            Side::Short => bar.low <= tp2_overshoot_px - fill_pad,
+                        };
+                        if tp2_also_hit {
+                            pos.asym_mgr.tranche2_filled = true;
+                            closed_outcome =
+                                Some((tp2_overshoot_px, true, "FULL_2TRANCHE_MAKER_TP"));
+                        }
+                    } else if hard_sl_hit {
                         let slip = match pos.side {
                             Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
                             Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
                         };
                         closed_outcome = Some((pos.hard_stop_px * slip, false, "DISASTER_STOP"));
+                    } else if let Some(ref feat) = live_feat_opt {
+                        // 1. Check 75% MFE Giveback Ratchet prior to Tranche 1 fill so near-mean stalls lock profit
+                        let d_0 = match pos.side {
+                            Side::Long => pos.initial_tp_px - pos.entry_px,
+                            Side::Short => pos.entry_px - pos.initial_tp_px,
+                        };
+                        if d_0 > 0.0 {
+                            let q_t = match pos.side {
+                                Side::Long => (bar.close - pos.entry_px) / d_0,
+                                Side::Short => (pos.entry_px - bar.close) / d_0,
+                            };
+                            if q_t > pos.max_progress {
+                                pos.max_progress = q_t;
+                            }
+                            let abs_arm_bps = 1.6 * ou_cfg.min_net_edge_bps;
+                            let arm_q_thresh =
+                                (abs_arm_bps / (d_0 / pos.entry_px * 1e4).max(1e-6)).min(0.75);
+                            if pos.max_progress >= arm_q_thresh
+                                && q_t <= (pos.max_progress - 0.20).max(0.15)
+                            {
+                                let slip = match pos.side {
+                                    Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
+                                    Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
+                                };
+                                closed_outcome =
+                                    Some((bar.close * slip, false, "GIVEBACK_RATCHET"));
+                            }
+                        }
+
+                        // 2. Evaluate Wald Sequential Probability Ratio Test (SPRT) Regime-Break Stop & Time Ratchet on 5m steps
+                        if closed_outcome.is_none() && (bar.timestamp_ms / 60_000) % 5 == 4 {
+                            let breakeven_ratchet_mins =
+                                (1.15 * pos.inv_mgr.half_life_minutes).clamp(38.0, 90.0);
+                            if (elapsed_mins_1m - 5.0).max(0.0) >= breakeven_ratchet_mins {
+                                let min_harvest_margin =
+                                    (2.0 * sim_cfg.maker_fee_bps + 12.0) * 1e-4;
+                                let be_px = match pos.side {
+                                    Side::Long => {
+                                        let raw = pos.entry_px * (1.0 + min_harvest_margin);
+                                        (raw / tick_sz.max(1e-9)).ceil() * tick_sz.max(1e-9)
+                                    }
+                                    Side::Short => {
+                                        let raw = pos.entry_px * (1.0 - min_harvest_margin);
+                                        (raw / tick_sz.max(1e-9)).floor() * tick_sz.max(1e-9)
+                                    }
+                                };
+                                match pos.side {
+                                    Side::Long if be_px < pos.tp_limit_px && be_px > bar.close => {
+                                        pos.tp_limit_px = be_px;
+                                    }
+                                    Side::Short if be_px > pos.tp_limit_px && be_px < bar.close => {
+                                        pos.tp_limit_px = be_px;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            let curr_res_x = (bar.close / pos.frozen_center_px.max(1e-9)).ln();
+                            let theta_step = (feat.ou_theta * 5.0).max(0.05);
+                            let exp_th = (-theta_step).exp();
+                            let denom_ou = (pos.frozen_sigma_eq_log
+                                * (1.0 - (-2.0 * theta_step).exp()).max(1e-6).sqrt())
+                            .max(1e-6);
+                            let ou_step_innov =
+                                (curr_res_x - pos.prev_residual_x * exp_th) / denom_ou;
+                            pos.prev_residual_x = curr_res_x;
+
+                            let micro_state = MicroRegimeState {
+                                hurst_60m: feat.hurst_60m,
+                                ker_30m: feat.ker_30m,
+                                gk_efficiency_15m: 0.35,
+                                kalman_level: pos.frozen_center_px.max(1e-9).ln(),
+                                kalman_slope: feat.kalman_slope / 5.0,
+                                sigma_1m: feat.sigma_1m_prev,
+                                sigma_eq: pos.frozen_sigma_eq_log,
+                                z_macro: feat.z_macro,
+                            };
+                            let sprt_3m_ago = pos.asym_mgr.sprt_stat_3m_ago();
+                            let sig = pos.asym_mgr.on_bar_or_sentinel_tick(
+                                bar.close,
+                                &micro_state,
+                                &asset_cal,
+                                feat.kalman_std_innov,
+                                ou_step_innov,
+                                eff_obi_inst,
+                            );
+                            let adv_close_bps = match pos.side {
+                                Side::Long => {
+                                    ((pos.entry_px - bar.close) / pos.entry_px * 1e4).max(0.0)
+                                }
+                                Side::Short => {
+                                    ((bar.close - pos.entry_px) / pos.entry_px * 1e4).max(0.0)
+                                }
+                            };
+                            match sig {
+                                ExitSignal::StopOutFullSprtBreak {
+                                    sprt_stat,
+                                    avg_adverse_innov_3m,
+                                } if adv_close_bps >= 28.0 => {
+                                    let slip = match pos.side {
+                                        Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
+                                        Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
+                                    };
+                                    let sprt_exit_px = match pos.side {
+                                        Side::Long => bar.close.max(pos.hard_stop_px) * slip,
+                                        Side::Short => bar.close.min(pos.hard_stop_px) * slip,
+                                    };
+                                    closed_outcome =
+                                        Some((sprt_exit_px, false, "SPRT_REGIME_STOP"));
+                                    sprt_handoff_candidate =
+                                        Some((sprt_stat, sprt_3m_ago, avg_adverse_innov_3m));
+                                }
+                                ExitSignal::FillTranche1AndRatchet {
+                                    tp2_price,
+                                    new_lock_sl_price,
+                                } => {
+                                    let t1_qty = 0.50 * pos.initial_qty;
+                                    let t1_exit_px = pos.tp_limit_px;
+                                    let t1_raw_pnl = match pos.side {
+                                        Side::Long => t1_qty * (t1_exit_px - pos.entry_px),
+                                        Side::Short => t1_qty * (pos.entry_px - t1_exit_px),
+                                    };
+                                    let t1_fee =
+                                        (t1_qty * t1_exit_px) * (sim_cfg.maker_fee_bps * 1e-4);
+                                    pos.tranche1_realized_pnl_usd = t1_raw_pnl;
+                                    pos.tranche1_exit_fee_usd = t1_fee;
+                                    pos.qty = 0.50 * pos.initial_qty;
+                                    pos.hard_stop_px =
+                                        quantize_price(new_lock_sl_price, sim_cfg.sz_decimals);
+                                    pos.tp_limit_px =
+                                        quantize_price(tp2_price, sim_cfg.sz_decimals);
+                                }
+                                ExitSignal::Hold {
+                                    current_sl_price, ..
+                                } => match pos.side {
+                                    Side::Long
+                                        if current_sl_price > pos.hard_stop_px
+                                            && current_sl_price < pos.entry_px * 0.9972 =>
+                                    {
+                                        pos.hard_stop_px =
+                                            quantize_price(current_sl_price, sim_cfg.sz_decimals);
+                                    }
+                                    Side::Short
+                                        if current_sl_price < pos.hard_stop_px
+                                            && current_sl_price > pos.entry_px * 1.0028 =>
+                                    {
+                                        pos.hard_stop_px =
+                                            quantize_price(current_sl_price, sim_cfg.sz_decimals);
+                                    }
+                                    _ => {}
+                                },
+                                _ => {}
+                            }
+                        }
                     }
-                } else if hard_sl_hit {
-                    let slip = match pos.side {
-                        Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
-                        Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
+                } else {
+                    // Tranche 1 is already filled! Manage Tranche 2 Overshoot Runner & Micro-Chandelier Ratchet
+                    let fav_log = fav_px.max(1e-9).ln();
+                    if d_sign * (fav_log - pos.asym_mgr.extreme_favorable_log_px) > 0.0 {
+                        pos.asym_mgr.extreme_favorable_log_px = fav_log;
+                    }
+                    let lock_offset = (0.30 * pos.frozen_sigma_eq_log).max(0.0012);
+                    let lock_log_px = pos.asym_mgr.entry_log_px + d_sign * lock_offset;
+                    if d_sign * (pos.asym_mgr.extreme_favorable_log_px - lock_log_px)
+                        > 0.50 * pos.frozen_sigma_eq_log
+                    {
+                        let cand_trail_log = pos.asym_mgr.extreme_favorable_log_px
+                            - d_sign * (0.30 * pos.frozen_sigma_eq_log);
+                        if d_sign * (cand_trail_log - pos.asym_mgr.trailing_stop_log_px) > 0.0 {
+                            pos.asym_mgr.trailing_stop_log_px = cand_trail_log;
+                            pos.hard_stop_px =
+                                quantize_price(cand_trail_log.exp(), sim_cfg.sz_decimals);
+                        }
+                    }
+
+                    let tp2_hit = match pos.side {
+                        Side::Long => bar.high >= pos.tp_limit_px + fill_pad,
+                        Side::Short => bar.low <= pos.tp_limit_px - fill_pad,
                     };
-                    closed_outcome = Some((pos.hard_stop_px * slip, false, "DISASTER_STOP"));
-                } else if tp_hit {
-                    closed_outcome = Some((pos.tp_limit_px, true, "MAKER_TP"));
+                    let trail_sl_hit = match pos.side {
+                        Side::Long => bar.low <= pos.hard_stop_px,
+                        Side::Short => bar.high >= pos.hard_stop_px,
+                    };
+
+                    if tp2_hit && (!trail_sl_hit || check_tp_first) {
+                        pos.asym_mgr.tranche2_filled = true;
+                        closed_outcome = Some((pos.tp_limit_px, true, "FULL_2TRANCHE_MAKER_TP"));
+                    } else if trail_sl_hit {
+                        let slip = match pos.side {
+                            Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
+                            Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
+                        };
+                        closed_outcome =
+                            Some((pos.hard_stop_px * slip, false, "PARTIAL_T1_MAKER_T2_TRAIL"));
+                    }
                 }
 
-                // Evaluate 1m Time-Decay Max Hold Stop (matches `src/main.rs` 1m check)
+                // Evaluate 1m Time-Decay Max Hold Stop
                 let max_hold_1m = (3.5 * pos.inv_mgr.half_life_minutes).clamp(90.0, 360.0);
                 if closed_outcome.is_none() && elapsed_mins_1m >= max_hold_1m {
                     let slip = match pos.side {
                         Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
                         Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
                     };
-                    closed_outcome = Some((bar.close * slip, false, "TIME_DECAY_STOP"));
-                }
-
-                // Evaluate 5m Two-Tier Soft Structural Invalidation on completed 5-minute bars
-                if closed_outcome.is_none() && (bar.timestamp_ms / 60_000) % 5 == 4 {
-                    if let Some(ref feat) = live_feat_opt {
-                        let raw_frozen_z_ou =
-                            if pos.frozen_center_px > 0.0 && pos.frozen_sigma_eq_log > 1e-6 {
-                                (bar.close / pos.frozen_center_px).ln() / pos.frozen_sigma_eq_log
-                            } else {
-                                feat.z_ou
-                            };
-                        let adverse_bps_from_entry = match pos.side {
-                            Side::Long => {
-                                ((pos.entry_px - bar.close) / pos.entry_px * 1e4).max(0.0)
-                            }
-                            Side::Short => {
-                                ((bar.close - pos.entry_px) / pos.entry_px * 1e4).max(0.0)
-                            }
-                        };
-                        let min_soft_inv_excursion_bps = match symbol.to_uppercase().as_str() {
-                            "BTC" => 45.0,
-                            "ETH" => 50.0,
-                            "XRP" | "LINK" => 58.0,
-                            "SOL" | "HYPE" => 60.0,
-                            "AVAX" | "SUI" => 62.0,
-                            "NEAR" => 68.0,
-                            _ => 50.0,
-                        };
-                        let (frozen_z_ou, eff_z_15) =
-                            if adverse_bps_from_entry >= min_soft_inv_excursion_bps {
-                                (raw_frozen_z_ou, feat.z_15)
-                            } else {
-                                (0.0, 0.0)
-                            };
-                        let kalman_against = match pos.side {
-                            Side::Long => {
-                                (feat.kalman_drift_veto && feat.kalman_slope < 0.0)
-                                    || feat.cusum_neg >= 8.0
-                                    || adverse_bps_from_entry >= min_soft_inv_excursion_bps
-                            }
-                            Side::Short => {
-                                (feat.kalman_drift_veto && feat.kalman_slope > 0.0)
-                                    || feat.cusum_pos >= 8.0
-                                    || adverse_bps_from_entry >= min_soft_inv_excursion_bps
-                            }
-                        };
-                        let elapsed_mins =
-                            bar.timestamp_ms.saturating_sub(pos.entry_time_ms) as f64 / 60_000.0;
-                        pos.inv_mgr.elapsed_minutes = (elapsed_mins - 5.0).max(0.0);
-                        match pos.inv_mgr.on_5m_bar_close(
-                            frozen_z_ou,
-                            eff_z_15,
-                            kalman_against,
-                            sim_cfg.maker_fee_bps,
-                            tick_sz,
-                        ) {
-                            InvalidationDecision::TriggerSoftInvalidationFlatten { reason } => {
-                                let slip = match pos.side {
-                                    Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
-                                    Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
-                                };
-                                closed_outcome = Some((bar.close * slip, false, reason));
-                            }
-                            InvalidationDecision::TriggerTimeDecayExit => {
-                                let slip = match pos.side {
-                                    Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
-                                    Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
-                                };
-                                closed_outcome = Some((bar.close * slip, false, "TIME_DECAY_STOP"));
-                            }
-                            InvalidationDecision::HoldPosition {
-                                updated_tp_price: Some(be_px),
-                            } => match pos.side {
-                                Side::Long if be_px < pos.tp_limit_px && be_px > bar.close => {
-                                    pos.tp_limit_px = be_px;
-                                }
-                                Side::Short if be_px > pos.tp_limit_px && be_px < bar.close => {
-                                    pos.tp_limit_px = be_px;
-                                }
-                                _ => {}
-                            },
-                            InvalidationDecision::HoldPosition {
-                                updated_tp_price: None,
-                            } => {}
-                        }
-                    }
-                }
-
-                // Normalized Progress & 20% Giveback Ratchet + One-Way Adaptive Ratchet (`OU Exit Management and Maker Execution Review.md`)
-                if closed_outcome.is_none() {
-                    let d_0 = match pos.side {
-                        Side::Long => pos.initial_tp_px - pos.entry_px,
-                        Side::Short => pos.entry_px - pos.initial_tp_px,
+                    let reason = if pos.asym_mgr.tranche1_filled {
+                        "PARTIAL_T1_MAKER_T2_TIMEOUT"
+                    } else {
+                        "TIME_DECAY_STOP"
                     };
-                    if d_0 > 0.0 {
-                        let q_t = match pos.side {
-                            Side::Long => (bar.close - pos.entry_px) / d_0,
-                            Side::Short => (pos.entry_px - bar.close) / d_0,
-                        };
-                        if q_t > pos.max_progress {
-                            pos.max_progress = q_t;
-                        }
-                        let fav_close_bps = match pos.side {
-                            Side::Long => {
-                                ((bar.close - pos.entry_px) / pos.entry_px * 1e4).max(0.0)
-                            }
-                            Side::Short => {
-                                ((pos.entry_px - bar.close) / pos.entry_px * 1e4).max(0.0)
-                            }
-                        };
-                        let abs_arm_bps = 1.8 * ou_cfg.min_net_edge_bps;
-                        let arm_q_thresh =
-                            (abs_arm_bps / (d_0 / pos.entry_px * 1e4).max(1e-6)).min(0.75);
-                        let _ = fav_close_bps;
-                        if pos.max_progress >= arm_q_thresh
-                            && q_t <= (pos.max_progress - 0.20).max(0.15)
-                        {
-                            let slip = match pos.side {
-                                Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
-                                Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
-                            };
-                            closed_outcome = Some((bar.close * slip, false, "GIVEBACK_RATCHET"));
-                        } else if let Some(ref feat) = live_feat_opt {
-                            if let Some(ref th) = feat.thresholds_opt {
-                                let entry_tick =
-                                    effective_tick_size(pos.entry_px, sim_cfg.sz_decimals);
-                                let delta_reprice = (pos.entry_px * 0.0005)
-                                    .max(0.10 * d_0)
-                                    .max(3.0 * entry_tick);
-                                let cooldown_ok =
-                                    bar.timestamp_ms.saturating_sub(pos.last_reprice_time_ms)
-                                        >= 180_000;
-                                match pos.side {
-                                    Side::Long => {
-                                        let live_mu = th.exit_long;
-                                        let mu_tick =
-                                            effective_tick_size(live_mu, sim_cfg.sz_decimals);
-                                        let eps_shave = (live_mu * 0.0005).max(2.0 * mu_tick);
-                                        let b_cand = crate::hyperliquid::quantize_price(
-                                            live_mu - eps_shave,
-                                            sim_cfg.sz_decimals,
-                                        );
-                                        let p_min = pos.entry_px * 1.0020;
-                                        if b_cand <= pos.tp_limit_px - delta_reprice
-                                            && b_cand >= p_min
-                                            && b_cand > bar.close
-                                        {
-                                            pos.candidate_lower_count += 1;
-                                            if pos.candidate_lower_count >= 3
-                                                && cooldown_ok
-                                                && pos.reprice_count < 3
-                                            {
-                                                pos.tp_limit_px = b_cand;
-                                                pos.last_reprice_time_ms = bar.timestamp_ms;
-                                                pos.reprice_count += 1;
-                                                pos.candidate_lower_count = 0;
-                                            }
-                                        } else if b_cand > pos.tp_limit_px {
-                                            pos.candidate_lower_count = 0;
-                                        }
-                                    }
-                                    Side::Short => {
-                                        let live_mu = th.exit_short;
-                                        let mu_tick =
-                                            effective_tick_size(live_mu, sim_cfg.sz_decimals);
-                                        let eps_shave = (live_mu * 0.0005).max(2.0 * mu_tick);
-                                        let b_cand = crate::hyperliquid::quantize_price(
-                                            live_mu + eps_shave,
-                                            sim_cfg.sz_decimals,
-                                        );
-                                        let p_max = pos.entry_px * 0.9980;
-                                        if b_cand >= pos.tp_limit_px + delta_reprice
-                                            && b_cand <= p_max
-                                            && b_cand < bar.close
-                                        {
-                                            pos.candidate_lower_count += 1;
-                                            if pos.candidate_lower_count >= 3
-                                                && cooldown_ok
-                                                && pos.reprice_count < 3
-                                            {
-                                                pos.tp_limit_px = b_cand;
-                                                pos.last_reprice_time_ms = bar.timestamp_ms;
-                                                pos.reprice_count += 1;
-                                                pos.candidate_lower_count = 0;
-                                            }
-                                        } else if b_cand < pos.tp_limit_px {
-                                            pos.candidate_lower_count = 0;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    closed_outcome = Some((bar.close * slip, false, reason));
                 }
             }
 
@@ -1056,13 +1197,14 @@ pub fn run_engine_a_backtest_with_btc(
                     sim_cfg.taker_fee_bps
                 };
                 let exit_fee_usd = exit_notional * (exit_fee_bps * 1e-4);
-                let total_fees_usd = pos.entry_fee_usd + exit_fee_usd;
-                let raw_pnl_usd = match pos.side {
+                let total_fees_usd = pos.entry_fee_usd + pos.tranche1_exit_fee_usd + exit_fee_usd;
+                let rem_raw_pnl_usd = match pos.side {
                     Side::Long => pos.qty * (exit_px - pos.entry_px),
                     Side::Short => pos.qty * (pos.entry_px - exit_px),
                 };
+                let raw_pnl_usd = pos.tranche1_realized_pnl_usd + rem_raw_pnl_usd;
                 let net_pnl_usd = raw_pnl_usd - total_fees_usd - pos.accrued_funding_usd;
-                let entry_notional = (pos.qty * pos.entry_px).max(1e-9);
+                let entry_notional = (pos.initial_qty * pos.entry_px).max(1e-9);
                 let gross_bps = (raw_pnl_usd / entry_notional) * 1e4;
                 let net_bps = (net_pnl_usd / entry_notional) * 1e4;
 
@@ -1094,6 +1236,7 @@ pub fn run_engine_a_backtest_with_btc(
                     DEFAULT_MAX_DAILY_CLUSTER_DD_FRAC,
                 );
 
+                let stopped_side = pos.side.clone();
                 summary.trades.push(SimulatedTradeResult {
                     symbol: symbol.to_uppercase(),
                     side: pos.side,
@@ -1101,7 +1244,7 @@ pub fn run_engine_a_backtest_with_btc(
                     exit_time_ms: bar.timestamp_ms,
                     entry_px: pos.entry_px,
                     exit_px,
-                    qty: pos.qty,
+                    qty: pos.initial_qty,
                     gross_bps,
                     net_bps,
                     net_pnl_usd,
@@ -1112,6 +1255,93 @@ pub fn run_engine_a_backtest_with_btc(
                     exit_reason: reason,
                     entry_policy: pos.policy,
                 });
+
+                // ------------------------------------------------------------------
+                // 4-GATE STATE-MACHINE HANDOFF: Engine A SPRT Stop -> Engine B Runner
+                // ------------------------------------------------------------------
+                if let (Some((sprt_stat, sprt_3m_ago, avg_adv_innov)), Some(ref feat)) =
+                    (sprt_handoff_candidate, &live_feat_opt)
+                {
+                    if let Some(current_atr) =
+                        calculate_atr(&rolling_15m_bars, 20).filter(|&a| a > 0.0)
+                    {
+                        let pre_travel_atr = if closes_history.len() >= 25 {
+                            let p_3 = closes_history[closes_history.len() - 3];
+                            let p_23 = closes_history[closes_history.len() - 23];
+                            (p_3 - p_23).abs() / current_atr
+                        } else {
+                            1.0
+                        };
+                        let mkt_tel = MarketTelemetry {
+                            timestamp_sec: bar.timestamp_ms / 1000,
+                            mid_price: bar.close,
+                            spread_bps: enriched.effective_spread_bps,
+                            obi: eff_obi_inst,
+                            funding_1h_bps: eff_funding_1h * 1e4,
+                            oi_delta_3m_pct: eff_dlog_oi_3m * 100.0,
+                            oi_accel_1m_pct: 0.0,
+                            oi_delta_15m_pct: eff_dlog_oi_3m * 100.0,
+                            z_15m: feat.z_15,
+                            z_60m_pre_impulse: feat.z_60 * 0.75,
+                            pre_breakout_travel_atr20: pre_travel_atr,
+                            ker_15m: feat.ker_30m,
+                            atr_5m: current_atr / (3.0_f64).sqrt(),
+                        };
+                        if let ArbiterAction::PostMakerAloOrder {
+                            direction,
+                            limit_price,
+                            size_coins,
+                            ..
+                        } = arbiter.evaluate_engine_a_to_b_handoff(
+                            &asset_cal,
+                            &mkt_tel,
+                            Direction::from_side(&stopped_side),
+                            sprt_stat,
+                            sprt_3m_ago,
+                            avg_adv_innov,
+                        ) {
+                            let new_side = direction.to_side();
+                            let is_long_b = new_side == Side::Long;
+                            let sl_dist_b =
+                                (chandelier_atr_mult * current_atr).min(limit_price * 0.0100);
+                            let initial_sl = quantize_price(
+                                if is_long_b {
+                                    limit_price - sl_dist_b
+                                } else {
+                                    limit_price + sl_dist_b
+                                },
+                                sim_cfg.sz_decimals,
+                            );
+                            let k_tp = optimal_engine_b_tp_atr_multiple(symbol);
+                            let tp_dist = (k_tp * current_atr).max(limit_price * 0.0045);
+                            let tp_px = quantize_price(
+                                if is_long_b {
+                                    limit_price + tp_dist
+                                } else {
+                                    (limit_price - tp_dist).max(tick_sz)
+                                },
+                                sim_cfg.sz_decimals,
+                            );
+                            summary.signals_armed += 1;
+                            summary.orders_submitted += 1;
+                            resting_entry = Some(RestingMakerEntry {
+                                side: new_side,
+                                limit_px: limit_price,
+                                qty: size_coins,
+                                target_tp_px: tp_px,
+                                hard_stop_px: initial_sl,
+                                frozen_center_px: tp_px,
+                                frozen_sigma_eq_log: feat.sigma_eq_log,
+                                half_life_m: 45.0,
+                                submitted_bar_idx: idx,
+                                ttl_bars: 2,
+                                policy: "ENGINE_B_HANDOFF",
+                                is_engine_b: true,
+                                entry_atr: current_atr,
+                            });
+                        }
+                    }
+                }
             } else {
                 open_pos = Some(pos);
             }
@@ -1175,14 +1405,22 @@ pub fn run_engine_a_backtest_with_btc(
                                         Side::Short
                                     };
                                     let is_long = side == Side::Long;
-                                    let obi_ok = if is_long {
-                                        bar.obi_instant >= -0.18
-                                            && bar.obi_1s >= -0.15
-                                            && bar.obi_5s >= -0.12
+                                    // Engine D vs. Engine B Veto (Section 5.2): block breakouts driven by collapsing OI
+                                    let oi_health_ok = eff_dlog_oi_3m >= -0.0020;
+                                    let obi_ok = if has_native_l2 {
+                                        if is_long {
+                                            eff_obi_inst >= -0.18
+                                                && eff_obi_1s >= -0.15
+                                                && eff_obi_5s >= -0.12
+                                        } else {
+                                            eff_obi_inst <= 0.18
+                                                && eff_obi_1s <= 0.15
+                                                && eff_obi_5s <= 0.12
+                                        }
+                                    } else if is_long {
+                                        eff_obi_inst >= asset_cal.tau_obi_eng_b
                                     } else {
-                                        bar.obi_instant <= 0.18
-                                            && bar.obi_1s <= 0.15
-                                            && bar.obi_5s <= 0.12
+                                        eff_obi_inst <= -asset_cal.tau_obi_eng_b
                                     };
                                     let btc_veto = eff_btc_bars
                                         .and_then(|bb| {
@@ -1208,6 +1446,7 @@ pub fn run_engine_a_backtest_with_btc(
                                     if btc_veto.is_some() {
                                         summary.btc_impulse_vetoes += 1;
                                     } else if obi_ok
+                                        && oi_health_ok
                                         && crowding_mult >= 0.45
                                         && budget_verdict.approved
                                     {
@@ -1347,6 +1586,7 @@ pub fn run_engine_a_backtest_with_btc(
                 let kalman_waterfall_up =
                     (feat.kalman_drift_veto && feat.kalman_slope > 0.0) || feat.cusum_pos >= 8.0;
                 let kalman_long_ok = !kalman_waterfall_down
+                    && feat.lambda_dir_long > 0.0
                     && feat.z_60 > -1.90
                     && !(ret_60 <= -max_drift_60 && ret_120 <= 0.0015)
                     && ret_120 > -max_drift_120
@@ -1355,6 +1595,7 @@ pub fn run_engine_a_backtest_with_btc(
                     && (ma60_vs_240 >= -0.0008
                         || symbol.eq_ignore_ascii_case("BTC") && ma60_vs_240 >= -0.0022);
                 let kalman_short_ok = !kalman_waterfall_up
+                    && feat.lambda_dir_short > 0.0
                     && feat.z_60 < 1.90
                     && ret_60 < max_short_drift_60
                     && ret_120 < max_short_drift_120
@@ -1368,8 +1609,16 @@ pub fn run_engine_a_backtest_with_btc(
 
                 if is_armed {
                     let shock_vetoed = match arm_side {
-                        Side::Long => feat.is_downside_shock || kalman_waterfall_down,
-                        Side::Short => feat.is_upside_shock || kalman_waterfall_up,
+                        Side::Long => {
+                            feat.is_downside_shock
+                                || kalman_waterfall_down
+                                || feat.lambda_dir_long <= 0.0
+                        }
+                        Side::Short => {
+                            feat.is_upside_shock
+                                || kalman_waterfall_up
+                                || feat.lambda_dir_short <= 0.0
+                        }
                     };
                     if macro_veto.is_some() {
                         summary.macro_calendar_vetoes += 1;
@@ -1396,10 +1645,11 @@ pub fn run_engine_a_backtest_with_btc(
                             bar.close + 0.5 * tick_sz
                         };
                         let funding_drag_bps = match arm_side {
-                            Side::Long => (bar.funding_1h * 1e4) * (arm_half_life / 60.0),
-                            Side::Short => (-bar.funding_1h * 1e4) * (arm_half_life / 60.0),
+                            Side::Long => (eff_funding_1h * 1e4) * (arm_half_life / 60.0),
+                            Side::Short => (-eff_funding_1h * 1e4) * (arm_half_life / 60.0),
                         };
                         let max_arm_bars = ((0.5 * arm_half_life).round() as usize).clamp(10, 15);
+                        let eff_min_edge_bps = ou_cfg.min_net_edge_bps;
 
                         let action = evaluate_armed_reversal_1m_step(
                             &arm_side,
@@ -1412,7 +1662,7 @@ pub fn run_engine_a_backtest_with_btc(
                             ou_cfg.rebound_gamma,
                             ou_cfg.max_join_consumption_ratio,
                             ou_cfg.max_retest_consumption_ratio,
-                            ou_cfg.min_net_edge_bps,
+                            eff_min_edge_bps,
                             sim_cfg.maker_fee_bps,
                             funding_drag_bps,
                             bar.high,
@@ -1451,8 +1701,23 @@ pub fn run_engine_a_backtest_with_btc(
                                         evaluate_btc_impulse_veto(symbol, is_long, false, &snap)
                                     });
 
+                                // Priority 1 & 2 Preemption Check via UnifiedPortfolioArbiter
+                                let dir_cand = Direction::from_side(&side);
+                                let lambda_dir = if is_long {
+                                    feat.lambda_dir_long
+                                } else {
+                                    feat.lambda_dir_short
+                                };
+                                let obi_confirm_ok = if has_native_l2 {
+                                    dir_cand.sign() * eff_obi_inst >= -0.20
+                                } else {
+                                    dir_cand.sign() * eff_obi_inst >= -0.05
+                                };
+
                                 if btc_veto.is_some() {
                                     summary.btc_impulse_vetoes += 1;
+                                    is_armed = false;
+                                } else if !obi_confirm_ok || lambda_dir <= 0.0 {
                                     is_armed = false;
                                 } else {
                                     is_armed = false;
@@ -1465,26 +1730,23 @@ pub fn run_engine_a_backtest_with_btc(
                                         - 2.0 * sim_cfg.maker_fee_bps
                                         - funding_drag_bps;
 
-                                    if net_edge_bps >= ou_cfg.min_net_edge_bps {
-                                        if let Some(off_bps) = compute_adaptive_tp_offset_bps(
-                                            arm_exit_px,
-                                            limit_price,
-                                            tick_sz,
-                                            arm_half_life,
-                                        ) {
-                                            let shave = arm_exit_px * (off_bps * 1e-4);
-                                            let tp_px = if is_long {
-                                                arm_exit_px - shave
-                                            } else {
-                                                arm_exit_px + shave
-                                            };
+                                    if net_edge_bps >= eff_min_edge_bps {
+                                        let tp1_px =
+                                            quantize_price(arm_exit_px, sim_cfg.sz_decimals);
+                                        let min_profitable = if is_long {
+                                            tp1_px > limit_price + tick_sz
+                                        } else {
+                                            tp1_px + tick_sz < limit_price
+                                        };
+                                        if min_profitable {
                                             let hard_stop_frac =
                                                 ou_cfg.hard_disaster_stop_bps * 1e-4;
-                                            let tp_dist = (tp_px - limit_price).abs();
+                                            let tp_dist = (tp1_px - limit_price).abs();
                                             let calibrated_sl =
                                                 (1.5 * tp_dist).max(0.0035 * limit_price);
-                                            let sl_dist =
-                                                calibrated_sl.min(limit_price * hard_stop_frac);
+                                            let sl_dist = calibrated_sl
+                                                .min(limit_price * 0.0085)
+                                                .min(limit_price * hard_stop_frac);
                                             let hard_sl_px = if is_long {
                                                 limit_price - sl_dist
                                             } else {
@@ -1497,10 +1759,10 @@ pub fn run_engine_a_backtest_with_btc(
                                                 );
                                             let kelly_scalar = compute_fee_adjusted_kelly_scalar(
                                                 raw_edge_bps,
-                                                ou_cfg.min_net_edge_bps,
+                                                eff_min_edge_bps,
                                                 sim_cfg.maker_fee_bps,
                                                 funding_drag_bps,
-                                            );
+                                            ) * lambda_dir;
                                             let notional =
                                                 crate::hyperliquid::calculate_risk_scaled_notional(
                                                     sim_cfg.account_equity_usdc,
@@ -1511,7 +1773,7 @@ pub fn run_engine_a_backtest_with_btc(
                                                     hard_sl_px,
                                                     3,
                                                     2,
-                                                    11.0,
+                                                    22.0, // Minimum $22 total ($11 per 50% tranche)
                                                     vol_adj_cap,
                                                 );
                                             let qty = notional / limit_price.max(1e-9);
@@ -1525,7 +1787,7 @@ pub fn run_engine_a_backtest_with_btc(
                                                 side,
                                                 limit_px: limit_price,
                                                 qty,
-                                                target_tp_px: tp_px,
+                                                target_tp_px: tp1_px,
                                                 hard_stop_px: hard_sl_px,
                                                 frozen_center_px: arm_exit_px,
                                                 frozen_sigma_eq_log: arm_sigma_eq_log,
@@ -1590,16 +1852,9 @@ pub fn run_engine_a_backtest_with_btc(
                         .iter()
                         .map(|b| b.low)
                         .fold(bar.low, f64::min);
-                    let dlog_oi_3m =
-                        if idx >= 3 && bars[idx - 3].open_interest > 0.0 && bar.open_interest > 0.0
-                        {
-                            (bar.open_interest / bars[idx - 3].open_interest).ln()
-                        } else {
-                            0.0
-                        };
                     if let Some(sq) = evaluate_engine_c_hourly_squeeze(
                         bar.timestamp_ms,
-                        bar.funding_1h,
+                        eff_funding_1h,
                         bar.close,
                         bar.best_bid,
                         bar.oracle_px,
@@ -1625,7 +1880,7 @@ pub fn run_engine_a_backtest_with_btc(
                             sl_px,
                             3,
                             2,
-                            11.0,
+                            22.0,
                             vol_adj_cap,
                         );
                         summary.signals_armed += 1;
@@ -1651,9 +1906,9 @@ pub fn run_engine_a_backtest_with_btc(
                         bar.low,
                         bar.best_bid,
                         bar.oracle_px,
-                        dlog_oi_3m,
+                        eff_dlog_oi_3m,
                         feat.z_15,
-                        bar.obi_instant,
+                        eff_obi_inst,
                         ou_cfg.min_net_edge_bps,
                         tick_sz,
                     ) {
@@ -1672,7 +1927,7 @@ pub fn run_engine_a_backtest_with_btc(
                             sl_px,
                             3,
                             2,
-                            11.0,
+                            22.0,
                             vol_adj_cap,
                         );
                         summary.signals_armed += 1;
@@ -1716,6 +1971,449 @@ pub fn run_engine_a_backtest_with_btc(
     };
 
     summary
+}
+
+// ============================================================================
+// PHASE 3 & PHASE 4: SYNTHETIC L2 MICROSTRUCTURE ENRICHER & 4-ENGINE ARBITER
+// ============================================================================
+
+/// Raw 1-minute historical OHLCV bar from Binance Data Vision or Hyperliquid REST.
+#[derive(Debug, Clone, Copy)]
+pub struct RawOhlcvBar {
+    pub timestamp_ms: u64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: f64,
+}
+
+/// Enriched 1-minute bar with synthetic L2 microstructure observables (Section 6.1 & 8.2).
+#[derive(Debug, Clone, Copy)]
+pub struct EnrichedMicrostructureBar {
+    pub raw: RawOhlcvBar,
+    pub effective_spread_bps: f64,
+    pub synthetic_obi: f64,
+    pub synthetic_funding_1h_bps: f64,
+    pub synthetic_oi_delta_3m_pct: f64,
+}
+
+/// Causal rolling state machine enriching flat OHLCV bars into L2/Funding/OI observables.
+pub struct SyntheticMicrostructureEnricher {
+    window_60: VecDeque<RawOhlcvBar>,
+    window_240_high_low: VecDeque<(f64, f64)>,
+    ema_vol_60: f64,
+    ema_close_240: f64,
+    ema_atr_60: f64,
+    ema_cvd_60: f64,
+    ema_clv_3: f64,
+    initialized: bool,
+}
+
+impl Default for SyntheticMicrostructureEnricher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SyntheticMicrostructureEnricher {
+    pub fn new() -> Self {
+        Self {
+            window_60: VecDeque::with_capacity(64),
+            window_240_high_low: VecDeque::with_capacity(244),
+            ema_vol_60: 0.0,
+            ema_close_240: 0.0,
+            ema_atr_60: 0.0,
+            ema_cvd_60: 0.0,
+            ema_clv_3: 0.0,
+            initialized: false,
+        }
+    }
+
+    /// Student-t CDF approximation with nu = 0.25 degrees of freedom for fat-tailed crypto BVC.
+    #[inline(always)]
+    fn student_t_cdf_nu025(z: f64) -> f64 {
+        let scaled = z / (1.0 + 1.85 * z * z).powf(0.375);
+        (0.5 + 0.5 * (1.25 * scaled).tanh()).clamp(0.0, 1.0)
+    }
+
+    /// Processes a single 1-minute OHLCV bar causally and outputs synthetic L2/Funding/OI fields.
+    pub fn enrich_next_bar(&mut self, bar: RawOhlcvBar, z_15m: f64) -> EnrichedMicrostructureBar {
+        let tr = (bar.high - bar.low).max(1e-12);
+        let clv = ((2.0 * bar.close - bar.high - bar.low) / tr).clamp(-1.0, 1.0);
+        let wick_abs = (((bar.close - bar.low) - (bar.high - bar.close)) / tr).clamp(-1.0, 1.0);
+
+        if !self.initialized {
+            self.ema_vol_60 = bar.volume.max(1.0);
+            self.ema_close_240 = bar.close;
+            self.ema_atr_60 = tr;
+            self.ema_clv_3 = clv;
+            self.initialized = true;
+        } else {
+            self.ema_vol_60 = (2.0 / 61.0) * bar.volume + (59.0 / 61.0) * self.ema_vol_60;
+            self.ema_close_240 = (2.0 / 241.0) * bar.close + (239.0 / 241.0) * self.ema_close_240;
+            self.ema_atr_60 = (2.0 / 61.0) * tr + (59.0 / 61.0) * self.ema_atr_60;
+            self.ema_clv_3 = 0.50 * clv + 0.50 * self.ema_clv_3;
+        }
+
+        let prev_donchian_low = self
+            .window_240_high_low
+            .iter()
+            .fold(f64::MAX, |acc, &(_, l)| acc.min(l));
+        let prev_donchian_high = self
+            .window_240_high_low
+            .iter()
+            .fold(f64::MIN, |acc, &(h, _)| acc.max(h));
+
+        self.window_60.push_back(bar);
+        if self.window_60.len() > 60 {
+            self.window_60.pop_front();
+        }
+        self.window_240_high_low.push_back((bar.high, bar.low));
+        if self.window_240_high_low.len() > 240 {
+            self.window_240_high_low.pop_front();
+        }
+
+        // 1. Compute Ardia-Guidotti-Kroencke (2024) EDGE Effective Spread Estimator
+        let effective_spread_bps = self.compute_edge_spread_bps();
+
+        // 2. Compute Bulk Volume Classification (BVC) and Synthetic L2 OBI
+        let sigma_ret_60 = self.compute_return_std_60();
+        let log_ret = (bar.close / bar.open.max(1e-12)).ln();
+        let bvc = 2.0 * Self::student_t_cdf_nu025(log_ret / sigma_ret_60.max(1e-6)) - 1.0;
+        let rel_vol = (bar.volume / self.ema_vol_60.max(1e-9)).clamp(0.2, 4.0);
+
+        let synthetic_obi = (0.65 * bvc * rel_vol.sqrt()
+            + 0.55 * wick_abs * rel_vol.sqrt()
+            + 0.30 * self.ema_clv_3)
+            .tanh()
+            .clamp(-1.0, 1.0);
+
+        // 3. Compute Synthetic Hourly Funding Rate (bps/hr)
+        self.ema_cvd_60 = (2.0 / 61.0) * (bvc * rel_vol) + (59.0 / 61.0) * self.ema_cvd_60;
+        let macro_ext = ((bar.close - self.ema_close_240) / self.ema_atr_60.max(1e-8)).abs();
+        let premium_bps = (4.80 * self.ema_cvd_60 * macro_ext.powf(0.75)).clamp(-12.0, 12.0);
+        let synthetic_funding_1h_bps = 0.125 + premium_bps;
+
+        // 4. Compute Synthetic 3-Minute Open Interest Liquidation Flush (%)
+        let synthetic_oi_delta_3m_pct = self.compute_synthetic_oi_delta_3m(
+            prev_donchian_high,
+            prev_donchian_low,
+            z_15m,
+            wick_abs,
+        );
+
+        EnrichedMicrostructureBar {
+            raw: bar,
+            effective_spread_bps,
+            synthetic_obi,
+            synthetic_funding_1h_bps,
+            synthetic_oi_delta_3m_pct,
+        }
+    }
+
+    fn compute_edge_spread_bps(&self) -> f64 {
+        let n = self.window_60.len();
+        if n < 5 {
+            return 2.0;
+        }
+        let mut cov_sum = 0.0;
+        let mut p_neq_h = 0.0;
+        let mut p_neq_l = 0.0;
+        let count = (n - 1) as f64;
+
+        for i in 1..n {
+            let prev = &self.window_60[i - 1];
+            let curr = &self.window_60[i];
+            let o_t = curr.open.max(1e-12).ln();
+            let h_t = curr.high.max(1e-12).ln();
+            let l_t = curr.low.max(1e-12).ln();
+            let c_prev = prev.close.max(1e-12).ln();
+            let eta_t = 0.5 * (h_t + l_t);
+
+            cov_sum += (eta_t - o_t) * (o_t - c_prev);
+            if (curr.open - curr.high).abs() > 1e-10 {
+                p_neq_h += 1.0;
+            }
+            if (curr.open - curr.low).abs() > 1e-10 {
+                p_neq_l += 1.0;
+            }
+        }
+        let cov = cov_sum / count;
+        let denom = ((p_neq_h + p_neq_l) / count).max(0.10);
+        let s_sq = (-8.0 * cov / denom).max(0.0);
+        (s_sq.sqrt() * 10_000.0).clamp(1.0, 35.0)
+    }
+
+    fn compute_return_std_60(&self) -> f64 {
+        let n = self.window_60.len();
+        if n < 3 {
+            return 0.0015;
+        }
+        let sum_sq: f64 = self
+            .window_60
+            .iter()
+            .map(|b| (b.close / b.open.max(1e-12)).ln().powi(2))
+            .sum();
+        (sum_sq / (n as f64)).sqrt().max(1e-5)
+    }
+
+    fn compute_synthetic_oi_delta_3m(
+        &self,
+        prev_high_240: f64,
+        prev_low_240: f64,
+        z_15m: f64,
+        wick_abs: f64,
+    ) -> f64 {
+        let n = self.window_60.len();
+        if n < 3 {
+            return 0.0;
+        }
+        let b0 = &self.window_60[n - 1];
+        let b1 = &self.window_60[n - 2];
+        let b2 = &self.window_60[n - 3];
+
+        let high_3m = b0.high.max(b1.high).max(b2.high);
+        let low_3m = b0.low.min(b1.low).min(b2.low);
+        let vol_3m_avg = (b0.volume + b1.volume + b2.volume) / 3.0;
+        let rel_vol_3m = vol_3m_avg / self.ema_vol_60.max(1e-9);
+
+        let is_donchian_break = low_3m < prev_low_240 || high_3m > prev_high_240;
+        let break_mult = if is_donchian_break { 1.0 } else { 0.35 };
+        let vol_surge = (rel_vol_3m - 1.8).max(0.0);
+        let z_factor = (z_15m.abs() / 2.5).powi(2);
+
+        (-0.48 * break_mult * vol_surge * z_factor * (0.5 + 0.5 * wick_abs.abs())).clamp(-6.0, 0.5)
+    }
+}
+
+/// Formats a perpetual limit price to strictly comply with Hyperliquid L1 rules:
+/// at most 5 significant figures and at most (6 - szDecimals) decimal places.
+#[inline]
+pub fn format_hyperliquid_perp_price(raw_px: f64, sz_decimals: u32) -> f64 {
+    if raw_px <= 0.0 {
+        return 0.0;
+    }
+    let max_decimals = 6_i32.saturating_sub(sz_decimals as i32).max(0);
+    let log10_px = raw_px.log10().floor() as i32;
+    let sig_fig_decimals = (4 - log10_px).max(0); // 5 significant figures
+    let decimals = max_decimals.min(sig_fig_decimals);
+    let factor = 10_f64.powi(decimals);
+    (raw_px * factor).round() / factor
+}
+
+/// Formats order size to the exact lot size increment 10^(-szDecimals).
+#[inline]
+pub fn format_hyperliquid_size(raw_sz: f64, sz_decimals: u32) -> f64 {
+    let factor = 10_f64.powi(sz_decimals as i32);
+    (raw_sz * factor).floor() / factor
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveEngine {
+    Idle,
+    EngineA(Direction),
+    EngineB(Direction),
+    EngineC(Direction),
+    EngineD(Direction),
+}
+
+/// Snapshot of real-time or enriched market observables for the 4-Engine Arbiter.
+#[derive(Debug, Clone, Copy)]
+pub struct MarketTelemetry {
+    pub timestamp_sec: u64,
+    pub mid_price: f64,
+    pub spread_bps: f64,
+    pub obi: f64,
+    pub funding_1h_bps: f64,
+    pub oi_delta_3m_pct: f64,
+    pub oi_accel_1m_pct: f64,
+    pub oi_delta_15m_pct: f64,
+    pub z_15m: f64,
+    pub z_60m_pre_impulse: f64,
+    pub pre_breakout_travel_atr20: f64,
+    pub ker_15m: f64,
+    pub atr_5m: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ArbiterAction {
+    NoAction,
+    VetoAndHold {
+        reason: &'static str,
+    },
+    PostMakerAloOrder {
+        engine: ActiveEngine,
+        direction: Direction,
+        limit_price: f64,
+        size_coins: f64,
+        notional_usdc: f64,
+        ttl_seconds: u64,
+    },
+}
+
+pub struct UnifiedPortfolioArbiter {
+    pub base_tranche_usdc: f64,
+}
+
+impl UnifiedPortfolioArbiter {
+    /// Evaluates Priority 1 (Engine D) and Priority 2 (Engine C) preemption vetoes
+    /// before permitting Priority 3 (Engine B) or Priority 4 (Engine A) entries.
+    pub fn evaluate_entry_hierarchy(
+        &self,
+        cal: &AssetCalibration,
+        mkt: &MarketTelemetry,
+        regime: &MicroRegimeState,
+        candidate_eng: ActiveEngine,
+    ) -> ArbiterAction {
+        let minute_of_hour = (mkt.timestamp_sec / 60) % 60;
+
+        // 1. PRIORITY 1 PREEMPTION: Engine D (Liquidation Cascade Absorption)
+        let is_oi_flushing = mkt.oi_delta_3m_pct <= -0.75 * cal.oi_cascade_pct.abs();
+        if is_oi_flushing && mkt.z_15m.abs() >= 2.1 {
+            if mkt.oi_accel_1m_pct < -0.15 {
+                return ArbiterAction::VetoAndHold {
+                    reason: "Engine D Watch: OI liquidation cascade still accelerating",
+                };
+            }
+            if mkt.oi_delta_3m_pct <= -cal.oi_cascade_pct.abs()
+                && mkt.z_15m.abs() >= 2.5
+                && mkt.obi.abs() >= 0.40
+            {
+                let dir = if mkt.z_15m < 0.0 {
+                    Direction::Long
+                } else {
+                    Direction::Short
+                };
+                let px = format_hyperliquid_perp_price(mkt.mid_price, cal.sz_decimals);
+                let sz = format_hyperliquid_size(self.base_tranche_usdc / px, cal.sz_decimals);
+                return ArbiterAction::PostMakerAloOrder {
+                    engine: ActiveEngine::EngineD(dir),
+                    direction: dir,
+                    limit_price: px,
+                    size_coins: sz,
+                    notional_usdc: sz * px,
+                    ttl_seconds: 45,
+                };
+            }
+        }
+
+        // 2. PRIORITY 2 PREEMPTION: Engine C (Hourly Funding Settlement Window)
+        if minute_of_hour <= 5 && mkt.funding_1h_bps.abs() >= cal.funding_trigger_bps {
+            return ArbiterAction::VetoAndHold {
+                reason: "Engine C Post-Settlement 6-minute liquidity vacuum cooldown",
+            };
+        }
+
+        // 3. Evaluate Candidate Engine A or B against Preemption & Microstructure Gates
+        match candidate_eng {
+            ActiveEngine::EngineB(dir) => {
+                if mkt.oi_delta_15m_pct < -0.20 {
+                    return ArbiterAction::VetoAndHold {
+                        reason: "Engine D Veto on Engine B: Breakout accompanied by collapsing OI",
+                    };
+                }
+                if dir.sign() * mkt.obi < cal.tau_obi_eng_b {
+                    return ArbiterAction::VetoAndHold {
+                        reason: "Engine B Veto: Insufficient L2 OBI confirmation",
+                    };
+                }
+                let px = format_hyperliquid_perp_price(mkt.mid_price, cal.sz_decimals);
+                let sz = format_hyperliquid_size(self.base_tranche_usdc / px, cal.sz_decimals);
+                ArbiterAction::PostMakerAloOrder {
+                    engine: ActiveEngine::EngineB(dir),
+                    direction: dir,
+                    limit_price: px,
+                    size_coins: sz,
+                    notional_usdc: sz * px,
+                    ttl_seconds: 120,
+                }
+            }
+            ActiveEngine::EngineA(dir) => {
+                if minute_of_hour >= 40
+                    && mkt.funding_1h_bps.abs() >= cal.funding_trigger_bps
+                    && dir.sign() * mkt.funding_1h_bps > 0.0
+                {
+                    return ArbiterAction::VetoAndHold {
+                        reason: "Engine C Veto on Engine A: Refusing to pay extreme hourly funding",
+                    };
+                }
+                if dir.sign() * mkt.obi < cal.tau_obi_eng_a {
+                    return ArbiterAction::VetoAndHold {
+                        reason: "Engine A Veto: L2 OBI below resting absorption threshold",
+                    };
+                }
+                let lambda_dir = regime.directional_bias_multiplier(cal, dir);
+                let scaled_notional = self.base_tranche_usdc * lambda_dir;
+                if scaled_notional < 22.0 {
+                    return ArbiterAction::VetoAndHold {
+                        reason: "Engine A Veto: Macro directional bias multiplier zeroed position",
+                    };
+                }
+                let px = format_hyperliquid_perp_price(mkt.mid_price, cal.sz_decimals);
+                let sz = format_hyperliquid_size(scaled_notional / px, cal.sz_decimals);
+                ArbiterAction::PostMakerAloOrder {
+                    engine: ActiveEngine::EngineA(dir),
+                    direction: dir,
+                    limit_price: px,
+                    size_coins: sz,
+                    notional_usdc: sz * px,
+                    ttl_seconds: 60,
+                }
+            }
+            _ => ArbiterAction::NoAction,
+        }
+    }
+
+    /// Evaluates the 4-Gate State-Machine Handoff when Engine A is stopped out via SPRT break.
+    /// If all 4 gates pass, immediately promotes the cluster lease into an Engine B Trend Runner.
+    pub fn evaluate_engine_a_to_b_handoff(
+        &self,
+        cal: &AssetCalibration,
+        mkt: &MarketTelemetry,
+        stopped_eng_a_dir: Direction,
+        sprt_stat_at_stop: f64,
+        sprt_stat_3m_ago: f64,
+        avg_adverse_innov_3m: f64,
+    ) -> ArbiterAction {
+        let new_trend_dir = stopped_eng_a_dir.opposite();
+        let d_b = new_trend_dir.sign();
+
+        // Gate 1: SPRT Impulse Velocity & 3-bar Standardized Innovation Persistence
+        let sprt_velocity = (sprt_stat_at_stop - sprt_stat_3m_ago) / 3.0;
+        let gate1_pass = sprt_velocity >= 0.35 * cal.sprt_b_upper && avg_adverse_innov_3m >= 1.60;
+
+        // Gate 2: Coiled-Spring Pre-Breakout Consolidation Budget
+        let gate2_pass =
+            mkt.pre_breakout_travel_atr20 <= 1.85 && mkt.z_60m_pre_impulse.abs() < 1.65;
+
+        // Gate 3: L2 Order Book Imbalance & 15m Kaufman Efficiency Alignment
+        let gate3_pass = d_b * mkt.obi >= cal.tau_obi_eng_b && mkt.ker_15m >= 0.42;
+
+        // Gate 4: Non-Exhaustion of Open Interest & Funding
+        let gate4_pass = mkt.oi_delta_15m_pct >= -0.25 && d_b * mkt.funding_1h_bps < 4.5;
+
+        if !(gate1_pass && gate2_pass && gate3_pass && gate4_pass) {
+            return ArbiterAction::NoAction;
+        }
+
+        // All 4 gates passed: Promote lease to Engine B via RETEST_LIMIT Alo Maker Order
+        let pullback_offset = (mkt.mid_price * mkt.spread_bps * 1e-4).max(0.15 * mkt.atr_5m);
+        let raw_retest_px = mkt.mid_price - d_b * pullback_offset;
+        let limit_px = format_hyperliquid_perp_price(raw_retest_px, cal.sz_decimals);
+
+        let handoff_notional = 0.85 * self.base_tranche_usdc;
+        let sz = format_hyperliquid_size(handoff_notional / limit_px, cal.sz_decimals);
+
+        ArbiterAction::PostMakerAloOrder {
+            engine: ActiveEngine::EngineB(new_trend_dir),
+            direction: new_trend_dir,
+            limit_price: limit_px,
+            size_coins: sz,
+            notional_usdc: sz * limit_px,
+            ttl_seconds: 90,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1852,5 +2550,168 @@ mod tests {
             res.macro_calendar_vetoes >= 1 && res.signals_armed == 0,
             "Expected FOMC macro calendar shield to veto all excursions during 18:45-20:00 UTC"
         );
+    }
+
+    #[test]
+    fn test_synthetic_microstructure_enricher_edge_bvc_funding_and_oi_cascade() {
+        let mut enricher = SyntheticMicrostructureEnricher::new();
+        let base_ts = 1_760_000_000_000u64;
+        // Feed 65 calm bars around $100.0
+        for i in 0..65 {
+            let px = 100.0 + ((i as f64) * 0.25).sin() * 0.15;
+            let _ = enricher.enrich_next_bar(
+                RawOhlcvBar {
+                    timestamp_ms: base_ts + (i as u64) * 60_000,
+                    open: px - 0.02,
+                    high: px + 0.08,
+                    low: px - 0.08,
+                    close: px + 0.02,
+                    volume: 1000.0,
+                },
+                0.2,
+            );
+        }
+
+        // Inject a 3-bar high-volume downward flush breaking the 4-hour low ($98.50) with a strong bullish rejection wick
+        let _ = enricher.enrich_next_bar(
+            RawOhlcvBar {
+                timestamp_ms: base_ts + 65 * 60_000,
+                open: 99.80,
+                high: 99.85,
+                low: 99.10,
+                close: 99.20,
+                volume: 3500.0,
+            },
+            -2.6,
+        );
+        let _ = enricher.enrich_next_bar(
+            RawOhlcvBar {
+                timestamp_ms: base_ts + 66 * 60_000,
+                open: 99.20,
+                high: 99.25,
+                low: 98.40,
+                close: 98.60,
+                volume: 4200.0,
+            },
+            -3.0,
+        );
+        let flush_bar = enricher.enrich_next_bar(
+            RawOhlcvBar {
+                timestamp_ms: base_ts + 67 * 60_000,
+                open: 98.60,
+                high: 99.15,
+                low: 98.10,   // Sweeps far below prior low
+                close: 99.10, // Strong lower-wick absorption closing near high!
+                volume: 5000.0,
+            },
+            -3.2,
+        );
+
+        assert!(
+            flush_bar.effective_spread_bps >= 1.0 && flush_bar.effective_spread_bps <= 35.0,
+            "EDGE spread must be bounded in [1.0, 35.0] bps"
+        );
+        assert!(
+            flush_bar.synthetic_obi > 0.35,
+            "Strong lower-wick absorption on high volume must produce positive synthetic OBI > +0.35, got {:.3}",
+            flush_bar.synthetic_obi
+        );
+        assert!(
+            flush_bar.synthetic_oi_delta_3m_pct <= -1.0,
+            "3-bar volume surge breaking Donchian low with |Z_15|=3.2 must synthesize OI cascade <= -1.0%, got {:.3}%",
+            flush_bar.synthetic_oi_delta_3m_pct
+        );
+    }
+
+    #[test]
+    fn test_unified_portfolio_arbiter_preemption_hierarchy_and_4gate_handoff() {
+        let sol_cal = asset_calibration("SOL");
+        let arbiter = UnifiedPortfolioArbiter {
+            base_tranche_usdc: 175.0,
+        };
+        let regime = MicroRegimeState {
+            hurst_60m: 0.36,
+            ker_30m: 0.22,
+            gk_efficiency_15m: 0.30,
+            kalman_level: 100.0_f64.ln(),
+            kalman_slope: 0.0,
+            sigma_1m: 0.0010,
+            sigma_eq: 0.0035,
+            z_macro: 0.20,
+        };
+
+        // 1. Priority 1 Preemption: When OI is flushing (-1.5% <= -1.2%) with |Z_15| = 2.8 and |OBI| = 0.45,
+        //    Engine D preempts a candidate Engine A entry and seizes the slot!
+        let cascade_mkt = MarketTelemetry {
+            timestamp_sec: 1500, // minute 25
+            mid_price: 95.40,
+            spread_bps: 2.0,
+            obi: 0.48,
+            funding_1h_bps: -1.5,
+            oi_delta_3m_pct: -1.50,
+            oi_accel_1m_pct: -0.05, // deceleration (exhaustion)
+            oi_delta_15m_pct: -1.80,
+            z_15m: -2.85,
+            z_60m_pre_impulse: -0.80,
+            pre_breakout_travel_atr20: 1.10,
+            ker_15m: 0.50,
+            atr_5m: 0.35,
+        };
+        let act_d = arbiter.evaluate_entry_hierarchy(
+            &sol_cal,
+            &cascade_mkt,
+            &regime,
+            ActiveEngine::EngineA(Direction::Long),
+        );
+        match act_d {
+            ArbiterAction::PostMakerAloOrder {
+                engine, direction, ..
+            } => {
+                assert_eq!(engine, ActiveEngine::EngineD(Direction::Long));
+                assert_eq!(direction, Direction::Long);
+            }
+            other => panic!("Expected Engine D preemption, got {:?}", other),
+        }
+
+        // 2. Engine A -> Engine B 4-Gate Handoff on SPRT Regime Break:
+        let breakout_mkt = MarketTelemetry {
+            timestamp_sec: 1800,
+            mid_price: 101.50,
+            spread_bps: 1.5,
+            obi: 0.42,           // Bullish OBI >= tau_obi_eng_b (0.28)
+            funding_1h_bps: 1.2, // Healthy funding < 4.5 bps/hr
+            oi_delta_3m_pct: 0.35,
+            oi_accel_1m_pct: 0.10,
+            oi_delta_15m_pct: 0.45, // Expanding OI >= -0.25%
+            z_15m: 2.10,
+            z_60m_pre_impulse: 0.85,         // < 1.65 pre-impulse
+            pre_breakout_travel_atr20: 1.20, // Coiled spring <= 1.85 ATR
+            ker_15m: 0.55,                   // Clean directional efficiency >= 0.42
+            atr_5m: 0.30,
+        };
+        // Engine A Short was stopped out by SPRT (S_t jumped from 0.0 to 3.60 in 3 bars, avg_adverse_innov = 1.95)
+        let handoff_act = arbiter.evaluate_engine_a_to_b_handoff(
+            &sol_cal,
+            &breakout_mkt,
+            Direction::Short,
+            3.60,
+            0.0,
+            1.95,
+        );
+        match handoff_act {
+            ArbiterAction::PostMakerAloOrder {
+                engine,
+                direction,
+                limit_price,
+                ttl_seconds,
+                ..
+            } => {
+                assert_eq!(engine, ActiveEngine::EngineB(Direction::Long));
+                assert_eq!(direction, Direction::Long);
+                assert!(limit_price < 101.50);
+                assert_eq!(ttl_seconds, 90);
+            }
+            other => panic!("Expected Engine B Handoff order, got {:?}", other),
+        }
     }
 }
