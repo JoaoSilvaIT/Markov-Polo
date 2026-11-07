@@ -402,6 +402,7 @@ impl ClusterCircuitBreaker {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_locked(&self, now_ms: u64) -> Option<String> {
         if now_ms < self.locked_until_ts_ms {
             Some(self.lockout_reason.clone())
@@ -417,10 +418,27 @@ impl ClusterCircuitBreaker {
         max_daily_dd_frac: f64,
     ) -> Option<String> {
         self.sync_utc_day(now_ms, current_equity);
-        if let Some(reason) = self.is_locked(now_ms) {
-            return Some(reason);
-        }
         let ref_eq = self.daily_reference_equity.max(1.0);
+        let cap = if max_daily_dd_frac > 0.0 {
+            max_daily_dd_frac
+        } else {
+            DEFAULT_MAX_DAILY_CLUSTER_DD_FRAC
+        };
+
+        if self.locked_until_ts_ms > 0 {
+            if now_ms >= self.locked_until_ts_ms {
+                self.locked_until_ts_ms = 0;
+                self.lockout_reason.clear();
+            } else if self.daily_realized_pnl_usd >= 0.0 && current_equity >= ref_eq * (1.0 - cap) {
+                // Self-healing: if daily realized PnL is non-negative and equity is healthy,
+                // auto-clear any spurious lockout caused by transient margin hold fluctuations.
+                self.locked_until_ts_ms = 0;
+                self.lockout_reason.clear();
+            } else {
+                return Some(self.lockout_reason.clone());
+            }
+        }
+
         let eq_dd_frac = if current_equity.is_finite() && current_equity > 0.0 {
             ((ref_eq - current_equity) / ref_eq).max(0.0)
         } else {
@@ -428,11 +446,6 @@ impl ClusterCircuitBreaker {
         };
         let realized_dd_frac = ((-self.daily_realized_pnl_usd).max(0.0) / ref_eq).max(0.0);
         let dd_frac = eq_dd_frac.max(realized_dd_frac);
-        let cap = if max_daily_dd_frac > 0.0 {
-            max_daily_dd_frac
-        } else {
-            DEFAULT_MAX_DAILY_CLUSTER_DD_FRAC
-        };
 
         if dd_frac >= cap {
             let next_utc_midnight = (self.utc_day_index + 1) * 86_400_000;

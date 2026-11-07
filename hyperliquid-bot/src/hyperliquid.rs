@@ -424,8 +424,10 @@ pub async fn get_account_value(
         for b in token_balances.balances {
             if b.coin == "USDC" {
                 let total = b.total.parse::<f64>().unwrap_or(0.0);
-                let hold = b.hold.parse::<f64>().unwrap_or(0.0);
-                free_spot_usdc += (total - hold).max(0.0);
+                // In Hyperliquid unified accounts, cross-margin perp position requirements
+                // are reflected in b.hold. We use b.total so active trade margin does not falsely
+                // deflate total account equity and trip drawdown circuit breakers.
+                free_spot_usdc += total.max(0.0);
             }
         }
     }
