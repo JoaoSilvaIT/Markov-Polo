@@ -522,12 +522,20 @@ async fn main() {
             .collect();
         let engine_a_trades: Vec<_> = all_trades
             .iter()
-            .filter(|t| t.entry_policy == "JOIN_BOOK" || t.entry_policy == "RETEST_LIMIT")
+            .filter(|t| {
+                t.entry_policy == "JOIN_BOOK"
+                    || t.entry_policy == "RETEST_LIMIT"
+                    || t.entry_policy == "JUDAS_SWING_REVERSAL"
+            })
             .copied()
             .collect();
         let engine_b_trades: Vec<_> = all_trades
             .iter()
-            .filter(|t| t.entry_policy == "ENGINE_B_TREND" || t.entry_policy == "ENGINE_B_HANDOFF")
+            .filter(|t| {
+                t.entry_policy == "ENGINE_B_TREND"
+                    || t.entry_policy == "ENGINE_B_HANDOFF"
+                    || t.entry_policy == "ENGINE_B_US_OPEN_ORB"
+            })
             .copied()
             .collect();
         let engine_cd_trades: Vec<_> = all_trades
@@ -1382,13 +1390,18 @@ async fn main() {
                     // Check if disaster stop ratchet should trigger
                     let mut dr = false;
                     let mut rp = None;
-                    if p.max_progress >= 0.75 && !p.disaster_stop_ratcheted_to_be {
+                    if p.max_progress >= 0.55 && !p.disaster_stop_ratcheted_to_be {
                         if let Some(oid) = p.disaster_stop_oid {
                             let is_long = p.side == "LONG";
-                            let be_trigger = if is_long {
-                                p.entry_price * (1.0 + 2.0 * 1.5 * 1e-4)
+                            let lock_frac = if p.max_progress >= 0.75 {
+                                0.00115
                             } else {
-                                p.entry_price * (1.0 - 2.0 * 1.5 * 1e-4)
+                                0.00075
+                            };
+                            let be_trigger = if is_long {
+                                p.entry_price * (1.0 + lock_frac)
+                            } else {
+                                p.entry_price * (1.0 - lock_frac)
                             };
                             dr = true;
                             rp = Some((oid, !is_long, be_trigger));

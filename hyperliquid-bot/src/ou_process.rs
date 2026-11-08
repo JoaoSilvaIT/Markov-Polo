@@ -1771,6 +1771,21 @@ pub fn is_us_daylight_saving_date(year: i32, month: u32, day: u32) -> bool {
     false
 }
 
+/// Returns the NYSE / US Equity Cash Open bell minute of the UTC day:
+/// 810 (13:30 UTC) during US Daylight Saving Time (EDT), or 870 (14:30 UTC) during Standard Time (EST).
+pub fn us_equity_bell_minute_utc(timestamp_ms: u64) -> u64 {
+    use chrono::{Datelike, TimeZone, Utc};
+    if let chrono::LocalResult::Single(dt) = Utc.timestamp_millis_opt(timestamp_ms as i64) {
+        if is_us_daylight_saving_date(dt.year(), dt.month(), dt.day()) {
+            810
+        } else {
+            870
+        }
+    } else {
+        870
+    }
+}
+
 fn days_in_month(year: i32, month: u32) -> u32 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
@@ -2321,12 +2336,23 @@ pub fn calculate_features_with_funding_at(
     let lambda_dir_short = micro_regime.directional_bias_multiplier(&cal, Direction::Short);
 
     // Modulate thresholds_opt with the quadratic Dynamic Entry Frontier penalty \Phi_{regime}(t)^2
-    // while preserving carry-adjusted baseline thresholds in calm/sideways regimes
+    // and enforce Horizon Scaling Law \tau_H^* & Minimum Gross Entry Floor \Delta_{floor, bps} (Section 4.2)
+    let horizon_scale = if eval_timestamp_ms.is_some() && cal.ou_horizon_mins > 5 {
+        (cal.ou_horizon_mins as f64 / 5.0).powf(hurst_60m.clamp(0.35, 0.55))
+    } else {
+        1.0
+    };
+    let eff_sigma_eq_log = sigma_eq_log * horizon_scale;
     let thresholds_opt = thresholds_opt.map(|mut th| {
-        if phi_regime > 0.35 && sigma_eq_log > 1e-6 {
+        if phi_regime > 0.35 && eff_sigma_eq_log > 1e-6 {
             let extra_sigma = 0.30 * (phi_regime * phi_regime);
-            th.entry_long *= (-extra_sigma * sigma_eq_log).exp();
-            th.entry_short *= (extra_sigma * sigma_eq_log).exp();
+            th.entry_long *= (-extra_sigma * eff_sigma_eq_log).exp();
+            th.entry_short *= (extra_sigma * eff_sigma_eq_log).exp();
+        }
+        if eval_timestamp_ms.is_some() {
+            let min_floor_frac = cal.min_gross_entry_bps * 1e-4;
+            th.entry_long = th.entry_long.min(th.exit_long * (1.0 - min_floor_frac));
+            th.entry_short = th.entry_short.max(th.exit_short * (1.0 + min_floor_frac));
         }
         th
     });
@@ -2348,7 +2374,7 @@ pub fn calculate_features_with_funding_at(
         is_consolidation,
         is_valid_half_life,
         z_ou,
-        sigma_eq_log,
+        sigma_eq_log: eff_sigma_eq_log,
         sigma_1m_prev: sigma_mad,
         kalman_std_slope: llt_out.standardized_slope,
         kalman_slope: llt_out.updated_slope,
@@ -2373,176 +2399,321 @@ pub fn calculate_features_with_funding_at(
 // PHASE 1 & PHASE 2: O-U SCALE FUNCTION, DYNAMIC FRONTIER & SPRT MULTI-TRANCHE
 // ============================================================================
 
-/// Asset-specific quantitative calibration parameters from Section 7 of Research Report.
+/// Asset-specific quantitative calibration parameters from Section 5 of Follow-Up Research Reports.
 #[derive(Debug, Clone, Copy)]
 pub struct AssetCalibration {
     pub symbol: &'static str,
     pub sz_decimals: u32,
+    pub ou_horizon_mins: usize,
+    pub min_gross_entry_bps: f64,
     pub sigma_min: f64,
     pub sigma_max: f64,
     pub beta_overshoot: f64,
-    pub sprt_delta: f64,
+    pub w2_min: f64,
+    pub w2_max: f64,
+    pub stall_trigger_mins: usize,
+    pub cusum_delta_1m: f64,
+    pub cusum_b_1m_star: f64,
+    pub sprt_min_loss_gate_bps: f64,
+    pub touch_rebound_min: f64,
+    pub squeeze_ratio_max: f64,
+    pub sprt_delta: f64, // 5m drift parameter (scaled by 1/sqrt(5) for native 1m bars)
     pub sprt_b_upper: f64,
+    pub z_disaster_offset: f64, // Offset beyond |entry_z| for intrabar High/Low catastrophe guard
     pub k_dir: f64,
     pub u_veto: f64,
     pub tau_obi_eng_a: f64,
     pub tau_obi_eng_b: f64,
     pub funding_trigger_bps: f64,
+    pub funding_z24h_min: f64,
     pub oi_cascade_pct: f64,
+    pub orb_min_range_bps: f64,
 }
 
-/// Returns the institutional calibration from Section 7 for any of the 9 portfolio perpetuals.
+pub type HardenedAssetCalibration = AssetCalibration;
+
+/// Returns the revised institutional calibration from Section 5 for any of the 9 portfolio perpetuals.
 pub fn asset_calibration(symbol: &str) -> AssetCalibration {
     match symbol.to_uppercase().as_str() {
         "BTC" => AssetCalibration {
             symbol: "BTC",
             sz_decimals: 5,
-            sigma_min: 1.45,
-            sigma_max: 2.15,
-            beta_overshoot: 0.55,
+            ou_horizon_mins: 15,
+            min_gross_entry_bps: 26.0,
+            sigma_min: 1.60,
+            sigma_max: 2.20,
+            beta_overshoot: 0.58,
+            w2_min: 0.35,
+            w2_max: 0.65,
+            stall_trigger_mins: 4,
+            cusum_delta_1m: 0.34,
+            cusum_b_1m_star: 4.10,
+            sprt_min_loss_gate_bps: -18.0,
+            touch_rebound_min: 0.32,
+            squeeze_ratio_max: 0.92,
             sprt_delta: 0.85,
             sprt_b_upper: 3.25,
+            z_disaster_offset: 1.85,
             k_dir: 1.60,
             u_veto: -2.30,
             tau_obi_eng_a: 0.28,
             tau_obi_eng_b: 0.25,
-            funding_trigger_bps: 2.5,
+            funding_trigger_bps: 3.2,
+            funding_z24h_min: 2.25,
             oi_cascade_pct: 1.0,
+            orb_min_range_bps: 42.0,
         },
         "ETH" => AssetCalibration {
             symbol: "ETH",
             sz_decimals: 4,
-            sigma_min: 1.48,
+            ou_horizon_mins: 10,
+            min_gross_entry_bps: 24.0,
+            sigma_min: 1.58,
             sigma_max: 2.20,
-            beta_overshoot: 0.55,
+            beta_overshoot: 0.58,
+            w2_min: 0.35,
+            w2_max: 0.65,
+            stall_trigger_mins: 4,
+            cusum_delta_1m: 0.35,
+            cusum_b_1m_star: 4.00,
+            sprt_min_loss_gate_bps: -18.0,
+            touch_rebound_min: 0.34,
+            squeeze_ratio_max: 0.92,
             sprt_delta: 0.85,
             sprt_b_upper: 3.20,
+            z_disaster_offset: 1.85,
             k_dir: 1.65,
             u_veto: -2.25,
             tau_obi_eng_a: 0.30,
             tau_obi_eng_b: 0.25,
-            funding_trigger_bps: 2.8,
+            funding_trigger_bps: 3.5,
+            funding_z24h_min: 2.25,
             oi_cascade_pct: 1.1,
+            orb_min_range_bps: 48.0,
         },
         "SOL" => AssetCalibration {
             symbol: "SOL",
             sz_decimals: 2,
-            sigma_min: 1.52,
+            ou_horizon_mins: 5,
+            min_gross_entry_bps: 22.0,
+            sigma_min: 1.55,
             sigma_max: 2.25,
-            beta_overshoot: 0.60,
+            beta_overshoot: 0.62,
+            w2_min: 0.35,
+            w2_max: 0.65,
+            stall_trigger_mins: 3,
+            cusum_delta_1m: 0.36,
+            cusum_b_1m_star: 3.85,
+            sprt_min_loss_gate_bps: -19.0,
+            touch_rebound_min: 0.35,
+            squeeze_ratio_max: 0.90,
             sprt_delta: 0.80,
             sprt_b_upper: 3.10,
+            z_disaster_offset: 1.90,
             k_dir: 1.75,
             u_veto: -2.15,
             tau_obi_eng_a: 0.32,
             tau_obi_eng_b: 0.28,
-            funding_trigger_bps: 3.0,
+            funding_trigger_bps: 3.8,
+            funding_z24h_min: 2.30,
             oi_cascade_pct: 1.2,
+            orb_min_range_bps: 58.0,
         },
         "XRP" => AssetCalibration {
             symbol: "XRP",
             sz_decimals: 0,
-            sigma_min: 1.55,
-            sigma_max: 2.25,
-            beta_overshoot: 0.50,
+            ou_horizon_mins: 5,
+            min_gross_entry_bps: 22.0,
+            sigma_min: 1.58,
+            sigma_max: 2.28,
+            beta_overshoot: 0.55,
+            w2_min: 0.35,
+            w2_max: 0.62,
+            stall_trigger_mins: 3,
+            cusum_delta_1m: 0.36,
+            cusum_b_1m_star: 3.85,
+            sprt_min_loss_gate_bps: -19.0,
+            touch_rebound_min: 0.35,
+            squeeze_ratio_max: 0.90,
             sprt_delta: 0.85,
             sprt_b_upper: 3.05,
+            z_disaster_offset: 1.90,
             k_dir: 1.80,
             u_veto: -2.10,
             tau_obi_eng_a: 0.35,
             tau_obi_eng_b: 0.30,
-            funding_trigger_bps: 3.0,
+            funding_trigger_bps: 4.0,
+            funding_z24h_min: 2.30,
             oi_cascade_pct: 1.2,
+            orb_min_range_bps: 60.0,
         },
         "SUI" => AssetCalibration {
             symbol: "SUI",
             sz_decimals: 1,
-            sigma_min: 1.58,
-            sigma_max: 2.30,
+            ou_horizon_mins: 5,
+            min_gross_entry_bps: 24.0,
+            sigma_min: 1.60,
+            sigma_max: 2.32,
             beta_overshoot: 0.65,
+            w2_min: 0.35,
+            w2_max: 0.65,
+            stall_trigger_mins: 3,
+            cusum_delta_1m: 0.35,
+            cusum_b_1m_star: 3.80,
+            sprt_min_loss_gate_bps: -20.0,
+            touch_rebound_min: 0.36,
+            squeeze_ratio_max: 0.88,
             sprt_delta: 0.78,
             sprt_b_upper: 2.95,
+            z_disaster_offset: 1.95,
             k_dir: 1.90,
             u_veto: -2.00,
             tau_obi_eng_a: 0.35,
             tau_obi_eng_b: 0.32,
-            funding_trigger_bps: 3.2,
+            funding_trigger_bps: 4.2,
+            funding_z24h_min: 2.35,
             oi_cascade_pct: 1.3,
+            orb_min_range_bps: 68.0,
         },
         "AVAX" => AssetCalibration {
             symbol: "AVAX",
             sz_decimals: 2,
-            sigma_min: 1.55,
+            ou_horizon_mins: 5,
+            min_gross_entry_bps: 22.0,
+            sigma_min: 1.58,
             sigma_max: 2.28,
-            beta_overshoot: 0.55,
+            beta_overshoot: 0.58,
+            w2_min: 0.35,
+            w2_max: 0.62,
+            stall_trigger_mins: 3,
+            cusum_delta_1m: 0.36,
+            cusum_b_1m_star: 3.85,
+            sprt_min_loss_gate_bps: -19.0,
+            touch_rebound_min: 0.35,
+            squeeze_ratio_max: 0.90,
             sprt_delta: 0.82,
             sprt_b_upper: 3.00,
+            z_disaster_offset: 1.90,
             k_dir: 1.85,
             u_veto: -2.05,
             tau_obi_eng_a: 0.35,
             tau_obi_eng_b: 0.30,
-            funding_trigger_bps: 3.0,
+            funding_trigger_bps: 4.0,
+            funding_z24h_min: 2.30,
             oi_cascade_pct: 1.2,
+            orb_min_range_bps: 62.0,
         },
         "LINK" => AssetCalibration {
             symbol: "LINK",
             sz_decimals: 1,
-            sigma_min: 1.55,
+            ou_horizon_mins: 5,
+            min_gross_entry_bps: 22.0,
+            sigma_min: 1.58,
             sigma_max: 2.28,
-            beta_overshoot: 0.50,
+            beta_overshoot: 0.55,
+            w2_min: 0.35,
+            w2_max: 0.62,
+            stall_trigger_mins: 3,
+            cusum_delta_1m: 0.36,
+            cusum_b_1m_star: 3.85,
+            sprt_min_loss_gate_bps: -19.0,
+            touch_rebound_min: 0.35,
+            squeeze_ratio_max: 0.90,
             sprt_delta: 0.82,
             sprt_b_upper: 3.00,
+            z_disaster_offset: 1.90,
             k_dir: 1.85,
             u_veto: -2.05,
             tau_obi_eng_a: 0.35,
             tau_obi_eng_b: 0.30,
-            funding_trigger_bps: 3.0,
+            funding_trigger_bps: 4.0,
+            funding_z24h_min: 2.30,
             oi_cascade_pct: 1.2,
+            orb_min_range_bps: 62.0,
         },
         "NEAR" => AssetCalibration {
             symbol: "NEAR",
             sz_decimals: 1,
-            sigma_min: 1.62,
-            sigma_max: 2.35,
-            beta_overshoot: 0.60,
+            ou_horizon_mins: 5,
+            min_gross_entry_bps: 25.0,
+            sigma_min: 1.64,
+            sigma_max: 2.38,
+            beta_overshoot: 0.62,
+            w2_min: 0.35,
+            w2_max: 0.60,
+            stall_trigger_mins: 3,
+            cusum_delta_1m: 0.33,
+            cusum_b_1m_star: 3.75,
+            sprt_min_loss_gate_bps: -20.0,
+            touch_rebound_min: 0.38,
+            squeeze_ratio_max: 0.88,
             sprt_delta: 0.72,
-            sprt_b_upper: 2.80,
+            sprt_b_upper: 2.85,
+            z_disaster_offset: 2.00,
             k_dir: 2.05,
             u_veto: -1.85,
             tau_obi_eng_a: 0.40,
             tau_obi_eng_b: 0.35,
-            funding_trigger_bps: 3.5,
+            funding_trigger_bps: 4.5,
+            funding_z24h_min: 2.40,
             oi_cascade_pct: 1.4,
+            orb_min_range_bps: 75.0,
         },
         "HYPE" => AssetCalibration {
             symbol: "HYPE",
             sz_decimals: 2,
-            sigma_min: 1.65,
-            sigma_max: 2.40,
-            beta_overshoot: 0.70,
+            ou_horizon_mins: 5,
+            min_gross_entry_bps: 26.0,
+            sigma_min: 1.66,
+            sigma_max: 2.42,
+            beta_overshoot: 0.68,
+            w2_min: 0.35,
+            w2_max: 0.65,
+            stall_trigger_mins: 3,
+            cusum_delta_1m: 0.32,
+            cusum_b_1m_star: 3.75,
+            sprt_min_loss_gate_bps: -21.0,
+            touch_rebound_min: 0.38,
+            squeeze_ratio_max: 0.88,
             sprt_delta: 0.70,
-            sprt_b_upper: 2.75,
+            sprt_b_upper: 2.80,
+            z_disaster_offset: 2.05,
             k_dir: 2.10,
             u_veto: -1.80,
             tau_obi_eng_a: 0.42,
             tau_obi_eng_b: 0.35,
-            funding_trigger_bps: 3.8,
+            funding_trigger_bps: 4.8,
+            funding_z24h_min: 2.45,
             oi_cascade_pct: 1.5,
+            orb_min_range_bps: 82.0,
         },
         _ => AssetCalibration {
             symbol: "ETH",
             sz_decimals: 4,
-            sigma_min: 1.48,
+            ou_horizon_mins: 10,
+            min_gross_entry_bps: 24.0,
+            sigma_min: 1.58,
             sigma_max: 2.20,
-            beta_overshoot: 0.55,
+            beta_overshoot: 0.58,
+            w2_min: 0.35,
+            w2_max: 0.65,
+            stall_trigger_mins: 4,
+            cusum_delta_1m: 0.35,
+            cusum_b_1m_star: 4.00,
+            sprt_min_loss_gate_bps: -18.0,
+            touch_rebound_min: 0.34,
+            squeeze_ratio_max: 0.92,
             sprt_delta: 0.85,
             sprt_b_upper: 3.20,
+            z_disaster_offset: 1.85,
             k_dir: 1.65,
             u_veto: -2.25,
             tau_obi_eng_a: 0.30,
             tau_obi_eng_b: 0.25,
-            funding_trigger_bps: 2.8,
+            funding_trigger_bps: 3.5,
+            funding_z24h_min: 2.25,
             oi_cascade_pct: 1.1,
+            orb_min_range_bps: 48.0,
         },
     }
 }
@@ -2772,6 +2943,67 @@ impl MicroRegimeState {
         let logistic = 1.0 / (1.0 + (-cal.k_dir * (u_t + u_0)).exp());
         (lambda_floor + (1.0 - lambda_floor) * logistic).clamp(0.0, 1.0)
     }
+
+    /// Computes the Closed-Form Kelly-Optimal Tranche Split (w_1*, w_2*) and Overshoot Ratio beta_ov*(t).
+    #[inline]
+    pub fn compute_optimal_tranche_split(
+        &self,
+        cal: &AssetCalibration,
+        entry_z_abs: f64,
+    ) -> TrancheAllocation {
+        let phi = self.phi_regime();
+        let beta_ov = (cal.beta_overshoot + 0.15 * (0.42 - self.hurst_60m)
+            - 0.25 * (self.gk_efficiency_15m - 0.35).max(0.0))
+        .clamp(0.35, 0.78);
+
+        // Conditional probability q_ov(t) of hitting +beta_ov from z=0 before hitting the lock-in floor -(entry_z_abs - 0.30)
+        let gamma_ratchet = 0.30;
+        let z_lock_dist = (entry_z_abs - gamma_ratchet).max(0.50);
+        let q_raw = ou_first_passage_prob(0.0, beta_ov, -z_lock_dist);
+        let q_ov = (q_raw * (1.0 - 0.45 * phi)).clamp(0.10, 0.85);
+
+        // Reward-to-giveback ratio Lambda(t) at stopping time tau_0 with Micro-Chandelier trailing (VIP0 fees: C_MM=2.88 bps, C_MT=6.26 bps)
+        let fee_diff = 0.000626 - 0.000288;
+        let gain_extra = beta_ov * self.sigma_eq;
+        let giveback_risk = (0.45 * z_lock_dist * self.sigma_eq) + fee_diff;
+        let lambda_ratio = gain_extra / giveback_risk.max(1e-6);
+
+        let kelly_num = q_ov * lambda_ratio - (1.0 - q_ov);
+        let kelly_den = q_ov * (1.0 - q_ov) * (1.0 + lambda_ratio).powi(2);
+        let kelly_signal = (kelly_num / kelly_den.max(1e-6)).clamp(0.0, 1.0);
+
+        let w2 = (cal.w2_min + (cal.w2_max - cal.w2_min) * kelly_signal * (1.0 - phi))
+            .clamp(cal.w2_min, cal.w2_max);
+        let w1 = 1.0 - w2;
+
+        TrancheAllocation {
+            w1_mean_fraction: w1,
+            w2_runner_fraction: w2,
+            beta_overshoot: beta_ov,
+            conditional_overshoot_prob: q_ov,
+        }
+    }
+}
+
+/// Dynamic Tranche Allocation output (w_1, w_2, and adaptive overshoot ratio beta_ov).
+#[derive(Debug, Clone, Copy)]
+pub struct TrancheAllocation {
+    pub w1_mean_fraction: f64,
+    pub w2_runner_fraction: f64,
+    pub beta_overshoot: f64,
+    pub conditional_overshoot_prob: f64,
+}
+
+/// 1-Minute Bar Telemetry passed to the Wick-Filtered SPRT Stop Manager.
+#[derive(Debug, Clone, Copy)]
+pub struct OneMinBarTick {
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub std_kalman_innov_1m: f64,
+    pub ou_step_innov_1m: f64,
+    pub smoothed_obi: f64,
 }
 
 /// Multi-Tranche Position & SPRT Dynamic Stop-Loss Manager for Engine A.
@@ -2782,6 +3014,8 @@ pub struct AsymmetricExitManager {
     pub entry_price: f64,
     pub entry_log_px: f64,
     pub entry_z: f64,
+    pub w1_fraction: f64,
+    pub w2_fraction: f64,
     pub tranche1_filled: bool,
     pub tranche2_filled: bool,
     pub sprt_stat: f64,
@@ -2789,6 +3023,7 @@ pub struct AsymmetricExitManager {
     pub innov_ring: [f64; 3],
     pub step_count: usize,
     pub trailing_stop_log_px: f64,
+    pub hard_disaster_stop_log_px: f64,
     pub extreme_favorable_log_px: f64,
 }
 
@@ -2810,26 +3045,194 @@ pub enum ExitSignal {
         sprt_stat: f64,
         avg_adverse_innov_3m: f64,
     },
+    StopOutIntrabarDisaster {
+        exit_price: f64,
+    },
 }
 
+#[allow(dead_code)]
 impl AsymmetricExitManager {
     pub fn new(dir: Direction, entry_price: f64, entry_z: f64, sigma_eq: f64) -> Self {
         let entry_log_px = entry_price.max(1e-9).ln();
         let d = dir.sign();
-        let initial_sl_log_px = entry_log_px - d * (2.65 - entry_z.abs()).max(0.35) * sigma_eq;
+        let disaster_offset = (1.90 * sigma_eq).max(0.0068);
+        let hard_disaster_stop_log_px = entry_log_px - d * disaster_offset;
         Self {
             dir,
             entry_price,
             entry_log_px,
             entry_z,
+            w1_fraction: 0.50,
+            w2_fraction: 0.50,
             tranche1_filled: false,
             tranche2_filled: false,
             sprt_stat: 0.0,
             sprt_history: [0.0; 4],
             innov_ring: [0.0; 3],
             step_count: 0,
-            trailing_stop_log_px: initial_sl_log_px,
+            trailing_stop_log_px: hard_disaster_stop_log_px,
+            hard_disaster_stop_log_px,
             extreme_favorable_log_px: entry_log_px,
+        }
+    }
+
+    pub fn new_with_alloc(
+        dir: Direction,
+        entry_price: f64,
+        entry_z: f64,
+        sigma_eq: f64,
+        cal: &AssetCalibration,
+        alloc: TrancheAllocation,
+    ) -> Self {
+        let entry_log_px = entry_price.max(1e-9).ln();
+        let d = dir.sign();
+        let disaster_offset = (cal.z_disaster_offset * sigma_eq).max(0.0068);
+        let hard_disaster_stop_log_px = entry_log_px - d * disaster_offset;
+        Self {
+            dir,
+            entry_price,
+            entry_log_px,
+            entry_z,
+            w1_fraction: alloc.w1_mean_fraction,
+            w2_fraction: alloc.w2_runner_fraction,
+            tranche1_filled: false,
+            tranche2_filled: false,
+            sprt_stat: 0.0,
+            sprt_history: [0.0; 4],
+            innov_ring: [0.0; 3],
+            step_count: 0,
+            trailing_stop_log_px: hard_disaster_stop_log_px,
+            hard_disaster_stop_log_px,
+            extreme_favorable_log_px: entry_log_px,
+        }
+    }
+
+    /// Evaluates the Two-Layer Stop Architecture & Multi-Tranche Exits at native 1-minute resolution
+    /// with Wick-Absorption Deflation (\psi_{wick}) and Huber Saturation (Section 2.2 & 6.1).
+    pub fn on_1m_bar(
+        &mut self,
+        bar: &OneMinBarTick,
+        regime: &MicroRegimeState,
+        cal: &AssetCalibration,
+        ou_half_life_mins: f64,
+    ) -> ExitSignal {
+        let d = self.dir.sign();
+        let close_log_px = bar.close.max(1e-9).ln();
+        let high_log_px = bar.high.max(1e-9).ln();
+        let low_log_px = bar.low.max(1e-9).ln();
+        let range = (bar.high - bar.low).max(1e-12);
+        let clv = ((2.0 * bar.close - bar.high - bar.low) / range).clamp(-1.0, 1.0);
+
+        // 1. Compute Wick-Absorption Deflator psi_{wick, t} in [0.15, 1.00]
+        let adverse_body_ratio = (-d * (bar.close - bar.open) / range).max(0.0);
+        let adverse_clv = (-d * clv).max(0.0);
+        let psi_wick = (adverse_body_ratio + 0.45 * adverse_clv).clamp(0.15, 1.00);
+
+        // 2. Huber-saturated 1-minute composite innovation & sqrt(5) time-scaled SPRT update
+        let raw_e = 0.60 * bar.std_kalman_innov_1m + 0.40 * bar.ou_step_innov_1m;
+        let huber_c = 2.40;
+        let eff_e = psi_wick * huber_c * (raw_e / huber_c).tanh();
+
+        let delta_1m = cal.sprt_delta / 5.0_f64.sqrt();
+        let obi_penalty = 0.10 * psi_wick * (-d * bar.smoothed_obi).max(0.0);
+        let s_inc = -d * delta_1m * eff_e - 0.5 * delta_1m.powi(2) + obi_penalty;
+
+        let decay = if s_inc >= 0.0 { 1.00 } else { 0.92 };
+        self.sprt_stat = (decay * self.sprt_stat + s_inc).max(0.0);
+
+        self.innov_ring[self.step_count % 3] = bar.std_kalman_innov_1m;
+        self.sprt_history[self.step_count % 4] = self.sprt_stat;
+        self.step_count += 1;
+
+        let time_decay_mult = if (self.step_count as f64) > 1.5 * ou_half_life_mins.max(5.0) {
+            0.72
+        } else {
+            1.00
+        };
+        let eff_b_upper = cal.sprt_b_upper * time_decay_mult;
+        let trend_prob = 1.0 / (1.0 + (-2.0 * (self.sprt_stat - 0.5 * eff_b_upper)).exp());
+
+        let alloc = regime.compute_optimal_tranche_split(cal, self.entry_z.abs());
+        let tp1_log_px = regime.kalman_level;
+        let tp2_log_px = regime.kalman_level + d * alloc.beta_overshoot * regime.sigma_eq;
+
+        if !self.tranche1_filled {
+            // Layer 1: Check Unconditioned Intrabar Catastrophe Guard on bar.low / bar.high
+            let intrabar_adverse_log_px = if d > 0.0 { low_log_px } else { high_log_px };
+            if d * (intrabar_adverse_log_px - self.hard_disaster_stop_log_px) <= 0.0 {
+                return ExitSignal::StopOutIntrabarDisaster {
+                    exit_price: self.hard_disaster_stop_log_px.exp(),
+                };
+            }
+
+            // Layer 2: Check 1-Minute Close-Confirmed Dynamic SPRT Stop on bar.close
+            let z_disaster_mag = self.entry_z.abs() + cal.z_disaster_offset;
+            let contraction = (self.sprt_stat / eff_b_upper).clamp(0.0, 1.0).powf(1.20);
+            let dyn_sl_z_mag = z_disaster_mag
+                - (z_disaster_mag - self.entry_z.abs() - 0.15).max(0.0) * contraction;
+            let sprt_close_sl_log_px = regime.kalman_level - d * dyn_sl_z_mag * regime.sigma_eq;
+
+            if self.sprt_stat >= eff_b_upper || d * (close_log_px - sprt_close_sl_log_px) <= 0.0 {
+                let avg_adverse_innov = -d * (self.innov_ring.iter().sum::<f64>() / 3.0);
+                return ExitSignal::StopOutFullSprtBreak {
+                    sprt_stat: self.sprt_stat,
+                    avg_adverse_innov_3m: avg_adverse_innov,
+                };
+            }
+
+            // Check Maker Touch-Fill on Tranche 1 at Kalman Mean mu
+            let intrabar_fav_log_px = if d > 0.0 { high_log_px } else { low_log_px };
+            if d * (intrabar_fav_log_px - tp1_log_px) >= 0.0 {
+                self.tranche1_filled = true;
+                self.extreme_favorable_log_px = intrabar_fav_log_px;
+                let lock_offset = (0.30 * regime.sigma_eq).max(0.0012);
+                self.trailing_stop_log_px = self.entry_log_px + d * lock_offset;
+                return ExitSignal::FillTranche1AndRatchet {
+                    tp2_price: tp2_log_px.exp(),
+                    new_lock_sl_price: self.trailing_stop_log_px.exp(),
+                };
+            }
+
+            return ExitSignal::Hold {
+                tp1_price: Some(tp1_log_px.exp()),
+                tp2_price: tp2_log_px.exp(),
+                current_sl_price: sprt_close_sl_log_px.exp(),
+                trend_prob,
+            };
+        }
+
+        // Tranche 1 already filled: Manage Tranche 2 Runner & Micro-Chandelier Ratchet
+        let intrabar_fav_log_px = if d > 0.0 { high_log_px } else { low_log_px };
+        if d * (intrabar_fav_log_px - self.extreme_favorable_log_px) > 0.0 {
+            self.extreme_favorable_log_px = intrabar_fav_log_px;
+        }
+
+        let lock_offset = (0.30 * regime.sigma_eq).max(0.0012);
+        let lock_log_px = self.entry_log_px + d * lock_offset;
+        if d * (self.extreme_favorable_log_px - lock_log_px) > 0.45 * regime.sigma_eq {
+            let candidate_trail = self.extreme_favorable_log_px - d * (0.30 * regime.sigma_eq);
+            if d * (candidate_trail - self.trailing_stop_log_px) > 0.0 {
+                self.trailing_stop_log_px = candidate_trail;
+            }
+        }
+
+        if d * (intrabar_fav_log_px - tp2_log_px) >= 0.0 {
+            self.tranche2_filled = true;
+            return ExitSignal::FillTranche2Complete;
+        }
+
+        let intrabar_adverse_log_px = if d > 0.0 { low_log_px } else { high_log_px };
+        if d * (close_log_px - self.trailing_stop_log_px) <= 0.0
+            || d * (intrabar_adverse_log_px - self.hard_disaster_stop_log_px) <= 0.0
+        {
+            return ExitSignal::StopOutTranche2Trailing;
+        }
+
+        ExitSignal::Hold {
+            tp1_price: None,
+            tp2_price: tp2_log_px.exp(),
+            current_sl_price: self.trailing_stop_log_px.exp(),
+            trend_prob,
         }
     }
 
@@ -2946,6 +3349,247 @@ impl AsymmetricExitManager {
             0.0
         } else {
             self.sprt_history[(self.step_count - 3) % 4]
+        }
+    }
+}
+
+/// Evaluates the Post-Touch Intrabar Rebound Ratio R_touch(t, d) on bar t when a resting
+/// Alo Maker order at `limit_px` is touched. Fixes the 75% synchronous OBI abort bottleneck!
+#[inline]
+pub fn verify_maker_touch_absorption(
+    dir: Direction,
+    limit_px: f64,
+    bar_high: f64,
+    bar_low: f64,
+    bar_close: f64,
+    atr_1m: f64,
+    prev_bar_obi_smooth: f64,
+    cal: &HardenedAssetCalibration,
+) -> bool {
+    let d = dir.sign();
+    // 1. Pre-touch bar must not be in an extreme adverse waterfall
+    if d * prev_bar_obi_smooth < -0.28 {
+        return false;
+    }
+    // 2. Post-touch intrabar rebound ratio
+    let denom_pad = (0.30 * atr_1m).max(1e-10);
+    let r_touch = match dir {
+        Direction::Long => {
+            let overshoot = (limit_px - bar_low).max(0.0);
+            (bar_close - bar_low).max(0.0) / (overshoot + denom_pad)
+        }
+        Direction::Short => {
+            let overshoot = (bar_high - limit_px).max(0.0);
+            (bar_high - bar_close).max(0.0) / (overshoot + denom_pad)
+        }
+    };
+    r_touch >= cal.touch_rebound_min
+}
+
+/// State-Contingent MFE Stall-Hazard & Siegmund-Corrected 1m CUSUM Exit Manager.
+#[derive(Debug, Clone)]
+pub struct StallHazardExitManager {
+    pub dir: Direction,
+    pub entry_px: f64,
+    pub mfe_bps: f64,
+    pub elapsed_mins: usize,
+    pub last_peak_min: usize,
+    pub tranche1_filled: bool,
+    pub tranche2_filled: bool,
+    pub cusum_stat_1m: f64,
+    pub hard_disaster_stop_px: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HardenedExitDecision {
+    Hold {
+        tp1_maker_px: Option<f64>,
+        tp2_maker_px: f64,
+        hard_stop_px: f64,
+    },
+    FillTranche1Maker {
+        fill_px: f64,
+        new_tp2_maker_px: f64,
+    },
+    FillTranche2Maker {
+        fill_px: f64,
+        is_pegged_profit_lock: bool,
+    },
+    StopOutSprt1mClose {
+        exit_px: f64,
+        cusum_val: f64,
+    },
+    StopOutIntrabarDisaster {
+        exit_px: f64,
+    },
+}
+
+impl StallHazardExitManager {
+    pub fn new(dir: Direction, entry_px: f64, disaster_stop_bps: f64) -> Self {
+        let d = dir.sign();
+        let hard_disaster_stop_px = entry_px * (1.0 - d * (disaster_stop_bps.max(42.0) * 1e-4));
+        Self {
+            dir,
+            entry_px,
+            mfe_bps: 0.0,
+            elapsed_mins: 0,
+            last_peak_min: 0,
+            tranche1_filled: false,
+            tranche2_filled: false,
+            cusum_stat_1m: 0.0,
+            hard_disaster_stop_px,
+        }
+    }
+
+    /// Evaluates 1-minute bar using:
+    /// 1) Velocity-Gated MFE Stall-Hazard Maker TP trajectory (never caps expanding winners),
+    /// 2) Passive Alo Inside-Peg Profit Lock (avoids 6.26 bps Maker-Taker stop-market fee drag),
+    /// 3) Siegmund/Wald AR(1) + Kurtosis-corrected 1m CUSUM stop gated at -18 to -21 bps.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_1m_bar(
+        &mut self,
+        bar_open: f64,
+        bar_high: f64,
+        bar_low: f64,
+        bar_close: f64,
+        prev_close: f64,
+        kalman_mean_px: f64,
+        sigma_eq_bps: f64,
+        std_innov_1m: f64,
+        obi_smooth: f64,
+        spread_bps: f64,
+        cal: &HardenedAssetCalibration,
+    ) -> HardenedExitDecision {
+        let d = self.dir.sign();
+        self.elapsed_mins += 1;
+
+        // 1. Update Intratrade MFE (in bps) and Stall Clock tau_stall(t)
+        let fav_px = if d > 0.0 { bar_high } else { bar_low };
+        let bar_fav_bps = d * ((fav_px - self.entry_px) / self.entry_px) * 10_000.0;
+        if bar_fav_bps > self.mfe_bps + 0.5 {
+            self.mfe_bps = bar_fav_bps;
+            self.last_peak_min = self.elapsed_mins;
+        }
+        let tau_stall = self.elapsed_mins.saturating_sub(self.last_peak_min);
+
+        let curr_unreal_bps = d * ((bar_close - self.entry_px) / self.entry_px) * 10_000.0;
+        let range = (bar_high - bar_low).max(1e-12);
+        let clv = ((2.0 * bar_close - bar_high - bar_low) / range).clamp(-1.0, 1.0);
+        let price_vel_sign = (d * (bar_close - prev_close)).signum();
+
+        // Reversion Momentum Score M_rev(t) in [-1.0, +1.0]
+        let m_rev = 0.50 * (d * clv) + 0.30 * (d * obi_smooth) + 0.20 * price_vel_sign;
+
+        // 2. Compute Target Mean Distance and Runner Overshoot Target
+        let mean_dist_bps = (d * ((kalman_mean_px - self.entry_px) / self.entry_px) * 10_000.0)
+            .max(cal.min_gross_entry_bps * 0.85);
+        let tp2_overshoot_bps = mean_dist_bps + cal.beta_overshoot * sigma_eq_bps;
+
+        // 3. State-Contingent Stall-Hazard Trajectory for Tranche 1 Maker Limit
+        let is_expanding = tau_stall < cal.stall_trigger_mins || m_rev >= 0.22;
+        let tp1_target_bps = if is_expanding || self.mfe_bps < 9.5 {
+            // Active expansion: DO NOT CAP WINNER! Keep TP1 at full Kalman equilibrium mean.
+            mean_dist_bps
+        } else {
+            // Verified mid-air stall: Harvest passively at upper-quartile of achieved MFE
+            let stall_steps = (tau_stall.saturating_sub(cal.stall_trigger_mins - 1)).min(12) as f64;
+            let mfe_retention = 0.88 - 0.045 * stall_steps;
+            let stalled_bps = (self.mfe_bps * mfe_retention).max(2.88 + 3.8); // Min +3.8 bps net after 2.88 bps MM fee
+            stalled_bps.min(mean_dist_bps)
+        };
+
+        let tp1_px = self.entry_px * (1.0 + d * tp1_target_bps * 1e-4);
+        let mut tp2_px = self.entry_px * (1.0 + d * tp2_overshoot_bps * 1e-4);
+
+        // 4. Check Intrabar Catastrophe Guard on bar_low / bar_high
+        let adv_px = if d > 0.0 { bar_low } else { bar_high };
+        if d * (adv_px - self.hard_disaster_stop_px) <= 0.0 {
+            return HardenedExitDecision::StopOutIntrabarDisaster {
+                exit_px: self.hard_disaster_stop_px.clamp(bar_low, bar_high),
+            };
+        }
+
+        // 5. Siegmund/Wald AR(1) + Kurtosis-Corrected 1m Page-CUSUM Update
+        if curr_unreal_bps >= 0.0 {
+            // Reset CUSUM when trade is in profit so noise never builds up prior to drawdown
+            self.cusum_stat_1m = 0.0;
+        } else {
+            let adv_body = (-d * (bar_close - bar_open) / range).max(0.0);
+            let adv_clv = (-d * clv).max(0.0);
+            let psi_wick = (adv_body + 0.45 * adv_clv).clamp(0.15, 1.00);
+
+            let huber_c = 2.40;
+            let eff_e = psi_wick * huber_c * (std_innov_1m / huber_c).tanh();
+            let d1 = cal.cusum_delta_1m;
+
+            // Exact AR(1) (rho_1 = -0.06 -> gamma = 0.8868) + Fourth-Cumulant Kurtosis Drift k_ref*
+            let k_ref_star = 0.4434 * d1 * d1 + 0.50 * d1.powi(3);
+            // Mean-centered OBI term (-d * obi - 0.15) prevents positive drift under H0!
+            let obi_centered = 0.08 * psi_wick * (-d * obi_smooth - 0.15);
+            let s_inc = -d * d1 * eff_e - k_ref_star + obi_centered;
+
+            // Only accumulate positive increments when drawdown exceeds -6.0 bps
+            if s_inc < 0.0 || curr_unreal_bps <= -6.0 {
+                let decay = if s_inc >= 0.0 { 1.00 } else { 0.90 };
+                self.cusum_stat_1m = (decay * self.cusum_stat_1m + s_inc).max(0.0);
+            }
+        }
+
+        // Check 1m Close-Confirmed SPRT Stop (Gated at cal.sprt_min_loss_gate_bps = -18 to -21 bps)
+        if !self.tranche1_filled
+            && self.cusum_stat_1m >= cal.cusum_b_1m_star
+            && curr_unreal_bps <= cal.sprt_min_loss_gate_bps
+            && d * clv <= -0.20
+        {
+            return HardenedExitDecision::StopOutSprt1mClose {
+                exit_px: bar_close,
+                cusum_val: self.cusum_stat_1m,
+            };
+        }
+
+        // 6. Check Tranche 1 Maker Touch-Fill
+        if !self.tranche1_filled && d * (fav_px - tp1_px) >= 0.0 {
+            self.tranche1_filled = true;
+            return HardenedExitDecision::FillTranche1Maker {
+                fill_px: tp1_px.clamp(bar_low, bar_high),
+                new_tp2_maker_px: tp2_px,
+            };
+        }
+
+        // 7. Manage Tranche 2: Check Overshoot Fill OR Passive Alo Inside-Peg Profit Lock
+        if self.tranche1_filled {
+            if d * (fav_px - tp2_px) >= 0.0 {
+                self.tranche2_filled = true;
+                return HardenedExitDecision::FillTranche2Maker {
+                    fill_px: tp2_px.clamp(bar_low, bar_high),
+                    is_pegged_profit_lock: false,
+                };
+            }
+
+            // Passive Alo Inside-Peg Conversion: Avoids 6.26 bps Maker-Taker stop-market fee!
+            let lock_floor_bps = (0.58 * self.mfe_bps).max(6.5);
+            if curr_unreal_bps <= lock_floor_bps && m_rev <= -0.15 {
+                let passive_peg_offset = (spread_bps * 0.35).max(0.5) * 1e-4;
+                let pegged_maker_px = bar_close * (1.0 + d * passive_peg_offset);
+                if d * (fav_px - pegged_maker_px) >= 0.0 || curr_unreal_bps >= 4.5 {
+                    self.tranche2_filled = true;
+                    return HardenedExitDecision::FillTranche2Maker {
+                        fill_px: pegged_maker_px.clamp(bar_low, bar_high),
+                        is_pegged_profit_lock: true,
+                    };
+                }
+                tp2_px = pegged_maker_px;
+            }
+        }
+
+        HardenedExitDecision::Hold {
+            tp1_maker_px: if self.tranche1_filled {
+                None
+            } else {
+                Some(tp1_px)
+            },
+            tp2_maker_px: tp2_px,
+            hard_stop_px: self.hard_disaster_stop_px,
         }
     }
 }
@@ -3439,8 +4083,8 @@ mod tests {
         assert!(calm_regime.phi_regime() <= 0.18);
         let sig_calm = calm_regime.dynamic_entry_sigma(&btc_cal, Direction::Long);
         assert!(
-            sig_calm >= 1.45 && sig_calm <= 1.55,
-            "Expected calm sideways sigma in [1.45, 1.55], got {:.3}",
+            sig_calm >= 1.45 && sig_calm <= 1.66,
+            "Expected calm sideways sigma in [1.45, 1.66], got {:.3}",
             sig_calm
         );
 
@@ -3569,5 +4213,146 @@ mod tests {
             triggered,
             "SPRT must detect structural breakout against Short within 3 bars"
         );
+    }
+
+    #[test]
+    fn test_kelly_tranche_allocation_and_1m_wick_filtered_sprt() {
+        let btc_cal = asset_calibration("BTC");
+        let calm_regime = MicroRegimeState {
+            hurst_60m: 0.30,
+            ker_30m: 0.15,
+            gk_efficiency_15m: 0.25,
+            kalman_level: 100.0_f64.ln(),
+            kalman_slope: 0.0,
+            sigma_1m: 0.0008,
+            sigma_eq: 0.0030,
+            z_macro: 0.0,
+        };
+        let alloc_calm = calm_regime.compute_optimal_tranche_split(&btc_cal, 1.80);
+        assert!(
+            alloc_calm.w2_runner_fraction > 0.35 && alloc_calm.w2_runner_fraction <= 0.65,
+            "Anti-persistent regime must tilt allocation toward Tranche 2 runner, got {:.3}",
+            alloc_calm.w2_runner_fraction
+        );
+        assert!((alloc_calm.w1_mean_fraction + alloc_calm.w2_runner_fraction - 1.0).abs() < 1e-9);
+
+        let noisy_regime = MicroRegimeState {
+            hurst_60m: 0.62,
+            ker_30m: 0.65,
+            gk_efficiency_15m: 0.80,
+            kalman_level: 100.0_f64.ln(),
+            kalman_slope: 0.0,
+            sigma_1m: 0.0008,
+            sigma_eq: 0.0030,
+            z_macro: 0.0,
+        };
+        let alloc_noisy = noisy_regime.compute_optimal_tranche_split(&btc_cal, 1.80);
+        assert!(
+            (alloc_noisy.w2_runner_fraction - 0.35).abs() < 1e-6,
+            "Noisy trend regime must clamp Tranche 2 runner to defensive 35% floor"
+        );
+
+        // Verify 1m Wick-Absorption Deflator (\psi_{wick} = 0.15) ignores a 1m lower wick that closes green!
+        let entry_px = 100.0 * (-1.80 * 0.0030_f64).exp();
+        let mut mgr = AsymmetricExitManager::new_with_alloc(
+            Direction::Long,
+            entry_px,
+            -1.80,
+            0.0030,
+            &btc_cal,
+            alloc_calm,
+        );
+        // Bar wicks down -45 bps to 99.01, but rebounds to close green above open (99.48 > 99.45)
+        let wick_tick = OneMinBarTick {
+            open: 99.45,
+            high: 99.50,
+            low: 99.01,
+            close: 99.48,
+            std_kalman_innov_1m: -2.0,
+            ou_step_innov_1m: -2.0,
+            smoothed_obi: 0.25,
+        };
+        let sig_wick = mgr.on_1m_bar(&wick_tick, &calm_regime, &btc_cal, 30.0);
+        assert!(
+            matches!(sig_wick, ExitSignal::Hold { .. }),
+            "1m absorbed wick closing green must be deflated by psi_wick=0.15 and NOT stop out!"
+        );
+    }
+
+    #[test]
+    fn test_stall_hazard_maker_policy_and_siegmund_cusum_and_touch_absorption() {
+        let sol_cal = asset_calibration("SOL");
+
+        // 1. Verify R_touch post-touch rebound absorption
+        assert!(
+            !verify_maker_touch_absorption(
+                Direction::Long,
+                100.00,
+                100.10,
+                99.50,
+                99.50, // closes on dead low -> falling knife!
+                0.20,
+                0.0,
+                &sol_cal,
+            ),
+            "Falling knife closing on dead low must be rejected by R_touch"
+        );
+        assert!(
+            verify_maker_touch_absorption(
+                Direction::Long,
+                100.00,
+                100.10,
+                99.80,
+                99.96, // dips to 99.80 and rebounds to 99.96 -> absorbed!
+                0.20,
+                0.05,
+                &sol_cal,
+            ),
+            "Intrabar bounce off low must pass R_touch absorption check"
+        );
+
+        // 2. Verify StallHazardExitManager keeps TP1 at full Kalman mean during active expansion,
+        // then ratchets to Upper-Quartile MFE Re-Touch Price after tau_stall >= 3 mins!
+        let mut stall_mgr = StallHazardExitManager::new(Direction::Long, 100.00, 42.0);
+        // Minute 1: expands to +18 bps (100.18), Kalman mean is at 100.35 (+35 bps)
+        let d1 = stall_mgr.on_1m_bar(
+            100.00, 100.18, 99.98, 100.16, 100.00, 100.35, 25.0, 0.5, 0.25, 1.5, &sol_cal,
+        );
+        match d1 {
+            HardenedExitDecision::Hold {
+                tp1_maker_px: Some(tp1),
+                ..
+            } => {
+                assert!(
+                    (tp1 - 100.35).abs() < 1e-4,
+                    "During active expansion, TP1 must remain unshaved at full Kalman mean 100.35, got {:.4}",
+                    tp1
+                );
+            }
+            other => panic!("Expected Hold at full mean, got {:?}", other),
+        }
+        // Minutes 2, 3, 4: trade stalls below 100.18 with waning momentum -> tau_stall reaches 3 mins!
+        let _ = stall_mgr.on_1m_bar(
+            100.16, 100.17, 100.10, 100.12, 100.16, 100.35, 25.0, -0.2, -0.05, 1.5, &sol_cal,
+        );
+        let _ = stall_mgr.on_1m_bar(
+            100.12, 100.14, 100.08, 100.10, 100.12, 100.35, 25.0, -0.2, -0.05, 1.5, &sol_cal,
+        );
+        let d4 = stall_mgr.on_1m_bar(
+            100.10, 100.12, 100.07, 100.08, 100.10, 100.35, 25.0, -0.3, -0.10, 1.5, &sol_cal,
+        );
+        match d4 {
+            HardenedExitDecision::Hold {
+                tp1_maker_px: Some(tp1_stalled),
+                ..
+            } => {
+                assert!(
+                    tp1_stalled < 100.20 && tp1_stalled > 100.12,
+                    "After 3m stall, TP1 must ratchet down to upper-quartile of MFE (~100.142), got {:.4}",
+                    tp1_stalled
+                );
+            }
+            other => panic!("Expected Hold with ratcheted TP1, got {:?}", other),
+        }
     }
 }
