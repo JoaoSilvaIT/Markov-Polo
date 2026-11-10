@@ -272,6 +272,78 @@ pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
             soft_z15_shock_threshold: 3.20,
             hard_disaster_stop_bps: 210.0,
         },
+        "XYZ:NVDA" | "NVDA" => AssetOuConfig {
+            symbol: "xyz:NVDA",
+            lookback_5m_bars: 120,
+            min_half_life_m: 8.0,
+            max_half_life_m: 60.0,
+            min_sigma_eq_bps: 20.0,
+            base_entry_sigma: 1.55,
+            min_entry_sigma: 1.40,
+            max_entry_sigma: 1.85,
+            rebound_gamma: 0.35,
+            max_join_consumption_ratio: 0.25,
+            max_retest_consumption_ratio: 0.50,
+            min_net_edge_bps: 18.0,
+            target_notional_cap_usdc: 65.0,
+            soft_z_ou_threshold: 2.50,
+            soft_z15_shock_threshold: 2.80,
+            hard_disaster_stop_bps: 140.0,
+        },
+        "XYZ:GOLD" | "GOLD" => AssetOuConfig {
+            symbol: "xyz:GOLD",
+            lookback_5m_bars: 144,
+            min_half_life_m: 15.0,
+            max_half_life_m: 90.0,
+            min_sigma_eq_bps: 15.0,
+            base_entry_sigma: 1.52,
+            min_entry_sigma: 1.38,
+            max_entry_sigma: 1.80,
+            rebound_gamma: 0.35,
+            max_join_consumption_ratio: 0.25,
+            max_retest_consumption_ratio: 0.50,
+            min_net_edge_bps: 15.0,
+            target_notional_cap_usdc: 75.0,
+            soft_z_ou_threshold: 2.40,
+            soft_z15_shock_threshold: 2.70,
+            hard_disaster_stop_bps: 120.0,
+        },
+        "XYZ:TSLA" | "TSLA" => AssetOuConfig {
+            symbol: "xyz:TSLA",
+            lookback_5m_bars: 120,
+            min_half_life_m: 8.0,
+            max_half_life_m: 60.0,
+            min_sigma_eq_bps: 22.0,
+            base_entry_sigma: 1.62,
+            min_entry_sigma: 1.42,
+            max_entry_sigma: 1.90,
+            rebound_gamma: 0.32,
+            max_join_consumption_ratio: 0.22,
+            max_retest_consumption_ratio: 0.48,
+            min_net_edge_bps: 20.0,
+            target_notional_cap_usdc: 60.0,
+            soft_z_ou_threshold: 2.60,
+            soft_z15_shock_threshold: 2.90,
+            hard_disaster_stop_bps: 150.0,
+        },
+        "ZEC" => AssetOuConfig {
+            symbol: "ZEC",
+            lookback_5m_bars: 120,
+            min_half_life_m: 8.0,
+            max_half_life_m: 75.0,
+            min_sigma_eq_bps: 26.0,
+            base_entry_sigma: 1.60,
+            min_entry_sigma: 1.42,
+            max_entry_sigma: 1.90,
+            rebound_gamma: 0.34,
+            max_join_consumption_ratio: 0.22,
+            max_retest_consumption_ratio: 0.48,
+            min_net_edge_bps: 24.0,
+            target_notional_cap_usdc: 65.0,
+            soft_z_ou_threshold: 2.70,
+            soft_z15_shock_threshold: 3.00,
+            hard_disaster_stop_bps: 180.0,
+        },
         _ => AssetOuConfig {
             symbol: "ETH",
             lookback_5m_bars: 144,
@@ -2687,6 +2759,118 @@ pub fn asset_calibration(symbol: &str) -> AssetCalibration {
             oi_cascade_pct: 1.5,
             orb_min_range_bps: 82.0,
         },
+        "XYZ:NVDA" | "NVDA" => AssetCalibration {
+            symbol: "xyz:NVDA",
+            sz_decimals: 3,
+            ou_horizon_mins: 5,
+            min_gross_entry_bps: 18.0,
+            sigma_min: 1.55,
+            sigma_max: 2.25,
+            beta_overshoot: 0.55,
+            w2_min: 0.35,
+            w2_max: 0.65,
+            stall_trigger_mins: 3,
+            cusum_delta_1m: 0.35,
+            cusum_b_1m_star: 3.85,
+            sprt_min_loss_gate_bps: -18.0,
+            touch_rebound_min: 0.35,
+            squeeze_ratio_max: 0.90,
+            sprt_delta: 0.82,
+            sprt_b_upper: 3.10,
+            z_disaster_offset: 1.80,
+            k_dir: 1.75,
+            u_veto: -2.00,
+            tau_obi_eng_a: 0.30,
+            tau_obi_eng_b: 0.25,
+            funding_trigger_bps: 3.0,
+            funding_z24h_min: 2.20,
+            oi_cascade_pct: 1.0,
+            orb_min_range_bps: 40.0,
+        },
+        "XYZ:GOLD" | "GOLD" => AssetCalibration {
+            symbol: "xyz:GOLD",
+            sz_decimals: 4,
+            ou_horizon_mins: 15,
+            min_gross_entry_bps: 15.0,
+            sigma_min: 1.52,
+            sigma_max: 2.15,
+            beta_overshoot: 0.50,
+            w2_min: 0.35,
+            w2_max: 0.65,
+            stall_trigger_mins: 4,
+            cusum_delta_1m: 0.38,
+            cusum_b_1m_star: 4.15,
+            sprt_min_loss_gate_bps: -16.0,
+            touch_rebound_min: 0.32,
+            squeeze_ratio_max: 0.92,
+            sprt_delta: 0.80,
+            sprt_b_upper: 3.15,
+            z_disaster_offset: 1.75,
+            k_dir: 1.50,
+            u_veto: -2.30,
+            tau_obi_eng_a: 0.25,
+            tau_obi_eng_b: 0.20,
+            funding_trigger_bps: 2.5,
+            funding_z24h_min: 2.10,
+            oi_cascade_pct: 0.8,
+            orb_min_range_bps: 30.0,
+        },
+        "XYZ:TSLA" | "TSLA" => AssetCalibration {
+            symbol: "xyz:TSLA",
+            sz_decimals: 3,
+            ou_horizon_mins: 5,
+            min_gross_entry_bps: 20.0,
+            sigma_min: 1.62,
+            sigma_max: 2.35,
+            beta_overshoot: 0.58,
+            w2_min: 0.35,
+            w2_max: 0.65,
+            stall_trigger_mins: 3,
+            cusum_delta_1m: 0.34,
+            cusum_b_1m_star: 3.80,
+            sprt_min_loss_gate_bps: -19.0,
+            touch_rebound_min: 0.36,
+            squeeze_ratio_max: 0.88,
+            sprt_delta: 0.84,
+            sprt_b_upper: 3.15,
+            z_disaster_offset: 1.85,
+            k_dir: 1.80,
+            u_veto: -2.05,
+            tau_obi_eng_a: 0.32,
+            tau_obi_eng_b: 0.28,
+            funding_trigger_bps: 3.5,
+            funding_z24h_min: 2.25,
+            oi_cascade_pct: 1.1,
+            orb_min_range_bps: 50.0,
+        },
+        "ZEC" => AssetCalibration {
+            symbol: "ZEC",
+            sz_decimals: 3,
+            ou_horizon_mins: 5,
+            min_gross_entry_bps: 24.0,
+            sigma_min: 1.60,
+            sigma_max: 2.32,
+            beta_overshoot: 0.60,
+            w2_min: 0.35,
+            w2_max: 0.65,
+            stall_trigger_mins: 3,
+            cusum_delta_1m: 0.34,
+            cusum_b_1m_star: 3.80,
+            sprt_min_loss_gate_bps: -20.0,
+            touch_rebound_min: 0.36,
+            squeeze_ratio_max: 0.90,
+            sprt_delta: 0.83,
+            sprt_b_upper: 3.10,
+            z_disaster_offset: 1.95,
+            k_dir: 1.80,
+            u_veto: -2.10,
+            tau_obi_eng_a: 0.32,
+            tau_obi_eng_b: 0.28,
+            funding_trigger_bps: 3.8,
+            funding_z24h_min: 2.25,
+            oi_cascade_pct: 1.2,
+            orb_min_range_bps: 55.0,
+        },
         _ => AssetCalibration {
             symbol: "ETH",
             sz_decimals: 4,
@@ -3594,6 +3778,503 @@ impl StallHazardExitManager {
     }
 }
 
+// =========================================================================
+// SECTION: HIP-3 BUILDER PERPETUALS & MULTI-ASSET CROSS-UNIVERSE EXTENSIONS
+// =========================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum AssetClass {
+    CryptoMajor,
+    CryptoAlt,
+    UsEquityHip3,
+    EquityIndexHip3,
+    CommodityHip3,
+    ForexHip3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum ClearinghouseDex {
+    NativeMain, // "" (default cross-margin clearinghouse)
+    Hip3Xyz,    // "xyz" (Trade.xyz isolated-margin clearinghouse)
+}
+
+#[allow(dead_code)]
+impl ClearinghouseDex {
+    #[inline(always)]
+    pub fn as_api_str(self) -> &'static str {
+        match self {
+            ClearinghouseDex::NativeMain => "",
+            ClearinghouseDex::Hip3Xyz => "xyz",
+        }
+    }
+}
+
+/// Session schedule governing trading windows, US Open ORB phase, and mandatory Flat-at-Close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum TradingSessionSchedule {
+    Continuous24x7,
+    UsEquityRth {
+        open_min_utc: u16,          // 870 (14:30 UTC EST) or 810 (13:30 UTC EDT)
+        orb_end_min_utc: u16,       // open + 60m (15:30 UTC EST / 14:30 UTC EDT)
+        entry_freeze_min_utc: u16,  // close - 25m (20:35 UTC EST / 19:35 UTC EDT)
+        maker_flatten_min_utc: u16, // close - 10m (20:50 UTC EST / 19:50 UTC EDT)
+        hard_flat_min_utc: u16,     // close - 5m  (20:55 UTC EST / 19:55 UTC EDT)
+    },
+    CmeGlobex24x5 {
+        daily_maint_start_min_utc: u16, // 1315 (21:55 UTC)
+        daily_maint_end_min_utc: u16,   // 1390 (23:10 UTC)
+        friday_flat_min_utc: u16,       // 1245 (20:45 UTC Friday)
+        sunday_open_min_utc: u16,       // 1395 (23:15 UTC Sunday)
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum SessionState {
+    ActiveNormal,
+    ActiveOpeningMomentum, // 14:35 - 15:30 UTC: Engine B prioritized, Engine A +0.35 sigma wider
+    EntryFrozenHoldOnly,   // 20:35 - 20:50 UTC: Manage open trades, no new entries
+    MandatoryMakerFlatten, // 20:50 - 20:55 UTC: Peg Alo limit at inside spread to exit
+    MandatoryHardFlat,     // >= 20:55 UTC or Weekend: Immediate IOC reduce-only close
+    Closed,
+}
+
+#[allow(dead_code)]
+impl TradingSessionSchedule {
+    /// Evaluates current UTC timestamp (seconds) into a deterministic SessionState.
+    /// weekday_utc: 0 = Sunday, 1 = Monday, ..., 5 = Friday, 6 = Saturday.
+    pub fn evaluate_session(&self, timestamp_sec: u64, weekday_utc: u8) -> SessionState {
+        let min_of_day = ((timestamp_sec / 60) % 1440) as u16;
+
+        match *self {
+            TradingSessionSchedule::Continuous24x7 => SessionState::ActiveNormal,
+
+            TradingSessionSchedule::UsEquityRth {
+                open_min_utc,
+                orb_end_min_utc,
+                entry_freeze_min_utc,
+                maker_flatten_min_utc,
+                hard_flat_min_utc,
+            } => {
+                if weekday_utc == 0 || weekday_utc == 6 {
+                    return SessionState::Closed;
+                }
+                // Lock out first 5 minutes after 09:30 ET bell (opening auction stabilization)
+                if min_of_day < open_min_utc + 5 || min_of_day > hard_flat_min_utc + 5 {
+                    SessionState::Closed
+                } else if min_of_day >= hard_flat_min_utc {
+                    SessionState::MandatoryHardFlat
+                } else if min_of_day >= maker_flatten_min_utc {
+                    SessionState::MandatoryMakerFlatten
+                } else if min_of_day >= entry_freeze_min_utc {
+                    SessionState::EntryFrozenHoldOnly
+                } else if min_of_day < orb_end_min_utc {
+                    SessionState::ActiveOpeningMomentum
+                } else {
+                    SessionState::ActiveNormal
+                }
+            }
+
+            TradingSessionSchedule::CmeGlobex24x5 {
+                daily_maint_start_min_utc,
+                daily_maint_end_min_utc,
+                friday_flat_min_utc,
+                sunday_open_min_utc,
+            } => {
+                if weekday_utc == 6 {
+                    return SessionState::Closed;
+                }
+                if weekday_utc == 0 && min_of_day < sunday_open_min_utc {
+                    return SessionState::Closed;
+                }
+                if weekday_utc == 5 && min_of_day >= friday_flat_min_utc {
+                    return SessionState::MandatoryHardFlat;
+                }
+                if min_of_day >= daily_maint_start_min_utc && min_of_day <= daily_maint_end_min_utc
+                {
+                    return SessionState::EntryFrozenHoldOnly;
+                }
+                SessionState::ActiveNormal
+            }
+        }
+    }
+}
+
+/// Complete configuration for both Native Perps and HIP-3 Builder Perps.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct HIP3PerpConfig {
+    pub ticker: &'static str, // e.g. "xyz:NVDA", "xyz:GOLD", "BTC"
+    pub dex: ClearinghouseDex,
+    pub asset_class: AssetClass,
+    pub sz_decimals: u32,
+    pub isolated_only: bool,
+    pub target_leverage: u32,
+    pub growth_mode_enabled: bool,
+    pub deployer_fee_scale: f64, // 1.0 = 100% standard share
+    pub schedule: TradingSessionSchedule,
+    pub ou_horizon_mins: usize,
+    pub half_life_mins: f64,
+    pub min_gross_floor_growth_bps: f64,
+    pub min_gross_floor_std_bps: f64,
+    pub sigma_min: f64,
+    pub sigma_max: f64,
+    pub cusum_b_1m_star: f64,
+    pub max_spread_bps: f64,
+    pub beta_to_index: f64, // Beta to xyz:XYZ100 for equities, or BTC for crypto alts
+}
+
+#[allow(dead_code)]
+impl HIP3PerpConfig {
+    /// Computes exact VIP0 (with 4% referral discount) round-trip Maker-Maker and Maker-Taker
+    /// fees in basis points, accounting for HIP-3 `growthMode` and `deployer_fee_scale`.
+    #[inline]
+    pub fn effective_fees_bps(&self) -> (f64, f64) {
+        let base_maker_bps = 1.44;
+        let base_taker_bps = 4.32;
+        let stop_slippage_bps = 0.50;
+
+        let fee_mult = match self.dex {
+            ClearinghouseDex::NativeMain => 1.0,
+            ClearinghouseDex::Hip3Xyz => {
+                if self.growth_mode_enabled {
+                    0.15 * (1.0 + self.deployer_fee_scale)
+                } else {
+                    1.0 + self.deployer_fee_scale
+                }
+            }
+        };
+
+        let eff_maker = base_maker_bps * fee_mult;
+        let eff_taker = base_taker_bps * fee_mult;
+        let rt_maker_maker = 2.0 * eff_maker;
+        let rt_maker_taker = eff_maker + eff_taker + stop_slippage_bps;
+        (rt_maker_maker, rt_maker_taker)
+    }
+
+    #[inline]
+    pub fn active_min_gross_floor_bps(&self) -> f64 {
+        if self.dex == ClearinghouseDex::Hip3Xyz && self.growth_mode_enabled {
+            self.min_gross_floor_growth_bps
+        } else {
+            self.min_gross_floor_std_bps
+        }
+    }
+}
+
+/// Registry of calibrated HIP-3 and Expansion Perpetuals
+#[allow(dead_code)]
+pub fn hip3_asset_config(symbol: &str) -> Option<HIP3PerpConfig> {
+    let s_upper = symbol.to_uppercase();
+    let s = s_upper.as_str();
+    match s {
+        "XYZ:NVDA" | "NVDA" => Some(HIP3PerpConfig {
+            ticker: "xyz:NVDA",
+            dex: ClearinghouseDex::Hip3Xyz,
+            asset_class: AssetClass::UsEquityHip3,
+            sz_decimals: 3,
+            isolated_only: true,
+            target_leverage: 3,
+            growth_mode_enabled: true,
+            deployer_fee_scale: 1.0,
+            schedule: TradingSessionSchedule::UsEquityRth {
+                open_min_utc: 870,
+                orb_end_min_utc: 930,
+                entry_freeze_min_utc: 1235,
+                maker_flatten_min_utc: 1250,
+                hard_flat_min_utc: 1255,
+            },
+            ou_horizon_mins: 5,
+            half_life_mins: 11.5,
+            min_gross_floor_growth_bps: 18.0,
+            min_gross_floor_std_bps: 28.0,
+            sigma_min: 1.55,
+            sigma_max: 2.25,
+            cusum_b_1m_star: 3.85,
+            max_spread_bps: 1.80,
+            beta_to_index: 1.45,
+        }),
+        "XYZ:TSLA" | "TSLA" => Some(HIP3PerpConfig {
+            ticker: "xyz:TSLA",
+            dex: ClearinghouseDex::Hip3Xyz,
+            asset_class: AssetClass::UsEquityHip3,
+            sz_decimals: 3,
+            isolated_only: true,
+            target_leverage: 3,
+            growth_mode_enabled: true,
+            deployer_fee_scale: 1.0,
+            schedule: TradingSessionSchedule::UsEquityRth {
+                open_min_utc: 870,
+                orb_end_min_utc: 930,
+                entry_freeze_min_utc: 1235,
+                maker_flatten_min_utc: 1250,
+                hard_flat_min_utc: 1255,
+            },
+            ou_horizon_mins: 5,
+            half_life_mins: 13.0,
+            min_gross_floor_growth_bps: 20.0,
+            min_gross_floor_std_bps: 30.0,
+            sigma_min: 1.62,
+            sigma_max: 2.35,
+            cusum_b_1m_star: 3.80,
+            max_spread_bps: 2.20,
+            beta_to_index: 1.60,
+        }),
+        "XYZ:AAPL" | "AAPL" => Some(HIP3PerpConfig {
+            ticker: "xyz:AAPL",
+            dex: ClearinghouseDex::Hip3Xyz,
+            asset_class: AssetClass::UsEquityHip3,
+            sz_decimals: 3,
+            isolated_only: true,
+            target_leverage: 3,
+            growth_mode_enabled: true,
+            deployer_fee_scale: 1.0,
+            schedule: TradingSessionSchedule::UsEquityRth {
+                open_min_utc: 870,
+                orb_end_min_utc: 930,
+                entry_freeze_min_utc: 1235,
+                maker_flatten_min_utc: 1250,
+                hard_flat_min_utc: 1255,
+            },
+            ou_horizon_mins: 15,
+            half_life_mins: 18.0,
+            min_gross_floor_growth_bps: 16.0,
+            min_gross_floor_std_bps: 26.0,
+            sigma_min: 1.58,
+            sigma_max: 2.20,
+            cusum_b_1m_star: 4.00,
+            max_spread_bps: 1.60,
+            beta_to_index: 1.05,
+        }),
+        "XYZ:XYZ100" | "XYZ100" => Some(HIP3PerpConfig {
+            ticker: "xyz:XYZ100",
+            dex: ClearinghouseDex::Hip3Xyz,
+            asset_class: AssetClass::EquityIndexHip3,
+            sz_decimals: 4,
+            isolated_only: true,
+            target_leverage: 3,
+            growth_mode_enabled: true,
+            deployer_fee_scale: 1.0,
+            schedule: TradingSessionSchedule::UsEquityRth {
+                open_min_utc: 870,
+                orb_end_min_utc: 930,
+                entry_freeze_min_utc: 1235,
+                maker_flatten_min_utc: 1250,
+                hard_flat_min_utc: 1255,
+            },
+            ou_horizon_mins: 10,
+            half_life_mins: 14.5,
+            min_gross_floor_growth_bps: 16.0,
+            min_gross_floor_std_bps: 25.0,
+            sigma_min: 1.55,
+            sigma_max: 2.20,
+            cusum_b_1m_star: 4.05,
+            max_spread_bps: 1.20,
+            beta_to_index: 1.00,
+        }),
+        "XYZ:GOLD" | "GOLD" => Some(HIP3PerpConfig {
+            ticker: "xyz:GOLD",
+            dex: ClearinghouseDex::Hip3Xyz,
+            asset_class: AssetClass::CommodityHip3,
+            sz_decimals: 4,
+            isolated_only: true,
+            target_leverage: 3,
+            growth_mode_enabled: false,
+            deployer_fee_scale: 1.0,
+            schedule: TradingSessionSchedule::CmeGlobex24x5 {
+                daily_maint_start_min_utc: 1315,
+                daily_maint_end_min_utc: 1390,
+                friday_flat_min_utc: 1245,
+                sunday_open_min_utc: 1395,
+            },
+            ou_horizon_mins: 15,
+            half_life_mins: 22.0,
+            min_gross_floor_growth_bps: 15.0,
+            min_gross_floor_std_bps: 24.0,
+            sigma_min: 1.52,
+            sigma_max: 2.15,
+            cusum_b_1m_star: 4.15,
+            max_spread_bps: 0.80,
+            beta_to_index: 0.0,
+        }),
+        "XYZ:SILVER" | "SILVER" => Some(HIP3PerpConfig {
+            ticker: "xyz:SILVER",
+            dex: ClearinghouseDex::Hip3Xyz,
+            asset_class: AssetClass::CommodityHip3,
+            sz_decimals: 2,
+            isolated_only: true,
+            target_leverage: 3,
+            growth_mode_enabled: false,
+            deployer_fee_scale: 1.0,
+            schedule: TradingSessionSchedule::CmeGlobex24x5 {
+                daily_maint_start_min_utc: 1315,
+                daily_maint_end_min_utc: 1390,
+                friday_flat_min_utc: 1245,
+                sunday_open_min_utc: 1395,
+            },
+            ou_horizon_mins: 10,
+            half_life_mins: 16.0,
+            min_gross_floor_growth_bps: 18.0,
+            min_gross_floor_std_bps: 27.0,
+            sigma_min: 1.56,
+            sigma_max: 2.25,
+            cusum_b_1m_star: 3.90,
+            max_spread_bps: 1.50,
+            beta_to_index: 0.0,
+        }),
+        "ZEC" => Some(HIP3PerpConfig {
+            ticker: "ZEC",
+            dex: ClearinghouseDex::NativeMain,
+            asset_class: AssetClass::CryptoAlt,
+            sz_decimals: 3,
+            isolated_only: false,
+            target_leverage: 3,
+            growth_mode_enabled: false,
+            deployer_fee_scale: 0.0,
+            schedule: TradingSessionSchedule::Continuous24x7,
+            ou_horizon_mins: 5,
+            half_life_mins: 9.5,
+            min_gross_floor_growth_bps: 24.0,
+            min_gross_floor_std_bps: 24.0,
+            sigma_min: 1.60,
+            sigma_max: 2.32,
+            cusum_b_1m_star: 3.80,
+            max_spread_bps: 2.80,
+            beta_to_index: 0.85,
+        }),
+        _ => None,
+    }
+}
+
+/// Evaluates asset-class-specific systematic macro lead-lag vetoes:
+/// - Crypto Alts -> BTC Z_15m & velocity veto
+/// - US Equities -> xyz:XYZ100 Z_15m, Kalman slope, and L2 OBI veto
+/// - Commodities/FX -> Co-movement USD shock veto
+#[inline]
+#[allow(dead_code)]
+pub fn passes_systematic_lead_lag_filter(
+    cfg: &HIP3PerpConfig,
+    dir_sign: f64,
+    btc_z15m: f64,
+    xyz100_z15m: f64,
+    xyz100_std_slope: f64,
+    xyz100_obi: f64,
+    gold_z15m: f64,
+    eur_z15m: f64,
+) -> bool {
+    match cfg.asset_class {
+        AssetClass::CryptoMajor => true,
+        AssetClass::CryptoAlt => dir_sign * btc_z15m > -1.80,
+        AssetClass::UsEquityHip3 | AssetClass::EquityIndexHip3 => {
+            let eq_impulse = dir_sign * xyz100_z15m;
+            let eq_velocity = dir_sign * xyz100_std_slope + 0.50 * (dir_sign * xyz100_obi);
+            eq_impulse > -1.65 && eq_velocity > -1.40
+        }
+        AssetClass::CommodityHip3 | AssetClass::ForexHip3 => {
+            let gold_adverse = dir_sign * gold_z15m <= -1.75;
+            let eur_adverse = dir_sign * eur_z15m <= -1.75;
+            !(gold_adverse && eur_adverse)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct CandidateSignal {
+    pub cfg: &'static HIP3PerpConfig,
+    pub dir_sign: f64,
+    pub expected_gross_bps: f64,
+    pub sigma_eq_bps: f64,
+    pub lambda_dir: f64,
+    pub spread_bps: f64,
+    pub top5_depth_usdc: f64,
+    pub corr_with_active_slot: f64,
+}
+
+#[allow(dead_code)]
+pub struct DualClearinghouseSlotArbiter {
+    pub native_slot_active: bool,
+    pub xyz_slot_active: bool,
+    pub target_notional_usdc: f64, // $175.00 USDC
+}
+
+#[allow(dead_code)]
+impl DualClearinghouseSlotArbiter {
+    pub fn new(target_notional_usdc: f64) -> Self {
+        Self {
+            native_slot_active: false,
+            xyz_slot_active: false,
+            target_notional_usdc,
+        }
+    }
+
+    /// Selects the highest risk-adjusted candidate for available clearinghouse slots,
+    /// enforcing liquidity screening, session schedules, and cross-correlation penalties.
+    pub fn select_next_execution<'a>(
+        &self,
+        candidates: &'a [CandidateSignal],
+        timestamp_sec: u64,
+        weekday_utc: u8,
+    ) -> Option<&'a CandidateSignal> {
+        let mut best_candidate: Option<&'a CandidateSignal> = None;
+        let mut best_score = 0.0_f64;
+
+        for cand in candidates {
+            // 1. Check Clearinghouse Slot Availability (Slot 1: NativeMain, Slot 2: Hip3Xyz)
+            match cand.cfg.dex {
+                ClearinghouseDex::NativeMain if self.native_slot_active => continue,
+                ClearinghouseDex::Hip3Xyz if self.xyz_slot_active => continue,
+                _ => {}
+            }
+
+            // 2. Check Session Schedule Gate
+            let session = cand
+                .cfg
+                .schedule
+                .evaluate_session(timestamp_sec, weekday_utc);
+            if session != SessionState::ActiveNormal
+                && session != SessionState::ActiveOpeningMomentum
+            {
+                continue;
+            }
+
+            // 3. Enforce Microstructure Liquidity & Spread Rubric
+            if cand.spread_bps > cand.cfg.max_spread_bps {
+                continue;
+            }
+            if cand.top5_depth_usdc < 1_000.0 * self.target_notional_usdc {
+                continue;
+            }
+
+            // 4. Compute Fee- and Correlation-Penalized Utility Score U_i(t)
+            let (rt_mm_fee_bps, _) = cand.cfg.effective_fees_bps();
+            let min_floor = cand.cfg.active_min_gross_floor_bps();
+            if cand.expected_gross_bps < min_floor {
+                continue;
+            }
+
+            let net_edge_bps = cand.expected_gross_bps - rt_mm_fee_bps;
+            if net_edge_bps <= 4.0 {
+                continue;
+            }
+
+            let corr_penalty = 1.0 + cand.corr_with_active_slot.max(0.0);
+            let score =
+                (net_edge_bps / cand.sigma_eq_bps.max(5.0)) * cand.lambda_dir / corr_penalty;
+
+            if score > best_score {
+                best_score = score;
+                best_candidate = Some(cand);
+            }
+        }
+
+        best_candidate
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4354,5 +5035,111 @@ mod tests {
             }
             other => panic!("Expected Hold with ratcheted TP1, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_hip3_session_schedule_and_slot_arbiter() {
+        let nvda_cfg = hip3_asset_config("xyz:NVDA").expect("NVDA config");
+        assert_eq!(nvda_cfg.asset_class, AssetClass::UsEquityHip3);
+        assert_eq!(nvda_cfg.dex, ClearinghouseDex::Hip3Xyz);
+        assert_eq!(nvda_cfg.sz_decimals, 3);
+        assert!(nvda_cfg.growth_mode_enabled);
+
+        // 1. Fee calculation: growthMode enabled slashes fees by ~80-90%
+        let (mm_fee, mt_fee) = nvda_cfg.effective_fees_bps();
+        assert!(
+            mm_fee < 1.0,
+            "Growth mode maker-maker fee must be < 1 bps, got {:.3}",
+            mm_fee
+        );
+        assert!(
+            mt_fee < 3.0,
+            "Growth mode maker-taker fee must be < 3 bps, got {:.3}",
+            mt_fee
+        );
+
+        // 2. US Equity Session Schedule:
+        // Weekday 2 (Tuesday):
+        // 14:00 UTC (840 min) -> Closed (Pre-market)
+        let s_pre = nvda_cfg.schedule.evaluate_session(840 * 60, 2);
+        assert_eq!(s_pre, SessionState::Closed);
+
+        // 14:32 UTC (872 min) -> Closed (First 5m auction stabilization)
+        let s_auc = nvda_cfg.schedule.evaluate_session(872 * 60, 2);
+        assert_eq!(s_auc, SessionState::Closed);
+
+        // 15:00 UTC (900 min) -> ActiveOpeningMomentum (14:35 - 15:30 UTC)
+        let s_orb = nvda_cfg.schedule.evaluate_session(900 * 60, 2);
+        assert_eq!(s_orb, SessionState::ActiveOpeningMomentum);
+
+        // 16:30 UTC (990 min) -> ActiveNormal (Midday stationary core)
+        let s_mid = nvda_cfg.schedule.evaluate_session(990 * 60, 2);
+        assert_eq!(s_mid, SessionState::ActiveNormal);
+
+        // 20:38 UTC (1238 min) -> EntryFrozenHoldOnly (close - 25m)
+        let s_freeze = nvda_cfg.schedule.evaluate_session(1238 * 60, 2);
+        assert_eq!(s_freeze, SessionState::EntryFrozenHoldOnly);
+
+        // 20:52 UTC (1252 min) -> MandatoryMakerFlatten (close - 10m)
+        let s_flat_maker = nvda_cfg.schedule.evaluate_session(1252 * 60, 2);
+        assert_eq!(s_flat_maker, SessionState::MandatoryMakerFlatten);
+
+        // 20:56 UTC (1256 min) -> MandatoryHardFlat (close - 5m)
+        let s_flat_hard = nvda_cfg.schedule.evaluate_session(1256 * 60, 2);
+        assert_eq!(s_flat_hard, SessionState::MandatoryHardFlat);
+
+        // Weekend (Saturday, weekday 6) -> Closed
+        let s_wknd = nvda_cfg.schedule.evaluate_session(990 * 60, 6);
+        assert_eq!(s_wknd, SessionState::Closed);
+
+        // 3. Systematic macro veto:
+        // xyz:NVDA Long (dir = +1.0) vetoed when xyz:XYZ100 is plunging (Z_15m <= -1.65)
+        assert!(!passes_systematic_lead_lag_filter(
+            &nvda_cfg, 1.0, 0.0, -1.85, 0.0, 0.0, 0.0, 0.0
+        ));
+        // Passes when XYZ100 is healthy (Z_15m = 0.20)
+        assert!(passes_systematic_lead_lag_filter(
+            &nvda_cfg, 1.0, 0.0, 0.20, 0.0, 0.0, 0.0, 0.0
+        ));
+
+        // 4. DualClearinghouseSlotArbiter:
+        let mut arbiter = DualClearinghouseSlotArbiter::new(175.0);
+        let zec_cfg = hip3_asset_config("ZEC").expect("ZEC config");
+
+        let cands = vec![
+            CandidateSignal {
+                cfg: Box::leak(Box::new(nvda_cfg)),
+                dir_sign: 1.0,
+                expected_gross_bps: 22.0,
+                sigma_eq_bps: 20.0,
+                lambda_dir: 1.0,
+                spread_bps: 0.60,
+                top5_depth_usdc: 300_000.0,
+                corr_with_active_slot: 0.10,
+            },
+            CandidateSignal {
+                cfg: Box::leak(Box::new(zec_cfg)),
+                dir_sign: 1.0,
+                expected_gross_bps: 26.0,
+                sigma_eq_bps: 24.0,
+                lambda_dir: 1.0,
+                spread_bps: 1.20,
+                top5_depth_usdc: 250_000.0,
+                corr_with_active_slot: 0.15,
+            },
+        ];
+
+        // Midday Tuesday: both slots empty -> picks candidate with highest risk-adjusted edge
+        let chosen = arbiter.select_next_execution(&cands, 990 * 60, 2);
+        assert!(chosen.is_some());
+
+        // Fill xyz slot: only NativeMain candidate can now be selected
+        arbiter.xyz_slot_active = true;
+        let chosen_slot2_full = arbiter.select_next_execution(&cands, 990 * 60, 2);
+        assert!(chosen_slot2_full.is_some());
+        assert_eq!(
+            chosen_slot2_full.unwrap().cfg.dex,
+            ClearinghouseDex::NativeMain
+        );
     }
 }
