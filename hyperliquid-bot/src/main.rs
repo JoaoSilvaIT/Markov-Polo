@@ -648,11 +648,9 @@ async fn main() {
         config.hl_is_mainnet
     );
 
-    let exchange = Arc::new(
-        ExchangeClient::new(None, wallet, Some(base_url.clone()), None, None)
-            .await
-            .expect("Failed to create ExchangeClient"),
-    );
+    let mut exchange_raw = ExchangeClient::new(None, wallet, Some(base_url.clone()), None, None)
+        .await
+        .expect("Failed to create ExchangeClient");
 
     let info_client = Arc::new(
         InfoClient::new(None, Some(base_url.clone()))
@@ -660,8 +658,11 @@ async fn main() {
             .expect("Failed to create InfoClient"),
     );
 
-    // Fetch size decimals lookup
-    let sz_decimals_map = Arc::new(RwLock::new(fetch_sz_decimals_map(&info_client).await));
+    // Fetch size decimals lookup and dynamically register HIP-3 Builder DEX assets (xyz:NVDA, xyz:GOLD, etc.)
+    let mut sz_map = fetch_sz_decimals_map(&info_client).await;
+    crate::hyperliquid::register_hip3_dex_assets(&mut exchange_raw.coin_to_asset, &mut sz_map, "xyz", 0).await;
+    let exchange = Arc::new(exchange_raw);
+    let sz_decimals_map = Arc::new(RwLock::new(sz_map));
     let trading_symbol = config.trading_symbol.clone();
     let trading_sz_decimals = {
         let lock = sz_decimals_map.read().await;

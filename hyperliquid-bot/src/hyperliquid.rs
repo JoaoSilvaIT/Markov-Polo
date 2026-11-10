@@ -49,8 +49,59 @@ pub async fn fetch_sz_decimals_map(info: &InfoClient) -> HashMap<String, u32> {
         map.insert("XRP".to_string(), 0);
         map.insert("SUI".to_string(), 1);
         map.insert("LINK".to_string(), 1);
+        map.insert("ZEC".to_string(), 2);
     }
     map
+}
+
+/// Dynamically fetches and registers HIP-3 builder perpetuals (e.g. dex="xyz") into `coin_to_asset` and `sz_decimals_map`
+pub async fn register_hip3_dex_assets(
+    coin_to_asset: &mut HashMap<String, u32>,
+    sz_map: &mut HashMap<String, u32>,
+    dex_name: &str,
+    dex_index: u32,
+) {
+    // 1. Static fallbacks for top HIP-3 assets (dex="xyz", index 0)
+    coin_to_asset.insert("xyz:XYZ100".to_string(), 100000);
+    coin_to_asset.insert("xyz:TSLA".to_string(), 100001);
+    coin_to_asset.insert("xyz:NVDA".to_string(), 100002);
+    coin_to_asset.insert("xyz:GOLD".to_string(), 100003);
+    coin_to_asset.insert("xyz:SILVER".to_string(), 100026);
+
+    sz_map.insert("xyz:XYZ100".to_string(), 4);
+    sz_map.insert("xyz:TSLA".to_string(), 3);
+    sz_map.insert("xyz:NVDA".to_string(), 3);
+    sz_map.insert("xyz:GOLD".to_string(), 4);
+    sz_map.insert("xyz:SILVER".to_string(), 2);
+
+    // 2. Dynamic live query from Hyperliquid info API
+    let client = reqwest::Client::new();
+    let payload = serde_json::json!({
+        "type": "metaAndAssetCtxs",
+        "dex": dex_name
+    });
+
+    if let Ok(resp) = client
+        .post("https://api.hyperliquid.xyz/info")
+        .json(&payload)
+        .send()
+        .await
+    {
+        if let Ok(data) = resp.json::<serde_json::Value>().await {
+            if let Some(universe) = data.get(0).and_then(|v| v.get("universe")).and_then(|u| u.as_array()) {
+                let base_offset = 100_000 + (dex_index * 10_000);
+                for (idx, u) in universe.iter().enumerate() {
+                    if let Some(name) = u.get("name").and_then(|n| n.as_str()) {
+                        let asset_id = base_offset + (idx as u32);
+                        coin_to_asset.insert(name.to_string(), asset_id);
+                        if let Some(sz_dec) = u.get("szDecimals").and_then(|s| s.as_u64()) {
+                            sz_map.insert(name.to_string(), sz_dec as u32);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub fn round_to_decimals(value: f64, decimals: u32) -> f64 {
@@ -397,6 +448,31 @@ pub async fn get_user_position(
             return Ok((szi, entry_px));
         }
     }
+
+    if coin.starts_with("xyz:") {
+        let client = reqwest::Client::new();
+        let payload = serde_json::json!({
+            "type": "clearinghouseState",
+            "user": format!("{:?}", address),
+            "dex": "xyz"
+        });
+        if let Ok(resp) = client.post("https://api.hyperliquid.xyz/info").json(&payload).send().await {
+            if let Ok(data) = resp.json::<serde_json::Value>().await {
+                if let Some(pos_list) = data.get("assetPositions").and_then(|v| v.as_array()) {
+                    for p in pos_list {
+                        if let Some(pos) = p.get("position") {
+                            if pos.get("coin").and_then(|c| c.as_str()) == Some(coin) {
+                                let szi = pos.get("szi").and_then(|s| s.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                                let entry_px = pos.get("entryPx").and_then(|s| s.as_str()).and_then(|s| s.parse::<f64>().ok());
+                                return Ok((szi, entry_px));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok((0.0, None))
 }
 
@@ -642,6 +718,22 @@ pub mod tests {
         let val = get_account_value(&info, addr).await.unwrap();
         println!("LIVE VAL: {}", val);
         assert!(val >= 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_register_hip3_dex_assets_mapping() {
+        let mut coin_to_asset = HashMap::new();
+        let mut sz_map = HashMap::new();
+        register_hip3_dex_assets(&mut coin_to_asset, &mut sz_map, "xyz", 0).await;
+
+        assert_eq!(*coin_to_asset.get("xyz:NVDA").expect("NVDA asset id"), 100002);
+        assert_eq!(*coin_to_asset.get("xyz:GOLD").expect("GOLD asset id"), 100003);
+        assert_eq!(*coin_to_asset.get("xyz:XYZ100").expect("XYZ100 asset id"), 100000);
+        assert_eq!(*coin_to_asset.get("xyz:TSLA").expect("TSLA asset id"), 100001);
+        assert_eq!(*coin_to_asset.get("xyz:SILVER").expect("SILVER asset id"), 100026);
+
+        assert_eq!(*sz_map.get("xyz:NVDA").expect("NVDA decimals"), 3);
+        assert_eq!(*sz_map.get("xyz:GOLD").expect("GOLD decimals"), 4);
     }
 }
 
