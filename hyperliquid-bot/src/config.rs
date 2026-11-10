@@ -94,7 +94,7 @@ impl Config {
         let equity_fraction = env::var("HL_EQUITY_FRACTION")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.25); // Default: 0.25 (1/4 of total account equity)
+            .unwrap_or(0.35); // Default: 0.35 (35% of total account equity per position)
         let max_size_usdc = env::var("HL_MAX_POSITION_SIZE_USDC")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
