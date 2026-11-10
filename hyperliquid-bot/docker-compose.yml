@@ -2,7 +2,7 @@ x-bot-env: &bot-env
   HL_LEVERAGE: ${HL_LEVERAGE:-3}
   HL_IS_CROSS: ${HL_IS_CROSS:-true}
   HL_TREND_ENGINE_MODE: ${HL_TREND_ENGINE_MODE:-live}
-  HL_PORTFOLIO_SYMBOLS: ${HL_PORTFOLIO_SYMBOLS:-BTC,ETH,SOL,AVAX,HYPE,NEAR,XRP,SUI,LINK}
+  HL_PORTFOLIO_SYMBOLS: ${HL_PORTFOLIO_SYMBOLS:-BTC,ETH,SOL,AVAX,HYPE,NEAR,XRP,SUI,LINK,xyz:NVDA,xyz:GOLD,xyz:XYZ100,xyz:TSLA,xyz:SILVER,ZEC}
   HL_MAX_CONCURRENT_POSITIONS: ${HL_MAX_CONCURRENT_POSITIONS:-2}
   HL_DONCHIAN_PERIOD: ${HL_DONCHIAN_PERIOD:-12}
   HL_CHANDELIER_ATR_MULT: ${HL_CHANDELIER_ATR_MULT:-2.0}
@@ -111,6 +111,48 @@ services:
     environment:
       <<: *bot-env
       HL_TRADING_SYMBOL: LINK
+
+  hl_bot_nvda:
+    <<: *bot-common
+    container_name: hl_bot_nvda
+    environment:
+      <<: *bot-env
+      HL_TRADING_SYMBOL: xyz:NVDA
+
+  hl_bot_gold:
+    <<: *bot-common
+    container_name: hl_bot_gold
+    environment:
+      <<: *bot-env
+      HL_TRADING_SYMBOL: xyz:GOLD
+
+  hl_bot_xyz100:
+    <<: *bot-common
+    container_name: hl_bot_xyz100
+    environment:
+      <<: *bot-env
+      HL_TRADING_SYMBOL: xyz:XYZ100
+
+  hl_bot_tsla:
+    <<: *bot-common
+    container_name: hl_bot_tsla
+    environment:
+      <<: *bot-env
+      HL_TRADING_SYMBOL: xyz:TSLA
+
+  hl_bot_silver:
+    <<: *bot-common
+    container_name: hl_bot_silver
+    environment:
+      <<: *bot-env
+      HL_TRADING_SYMBOL: xyz:SILVER
+
+  hl_bot_zec:
+    <<: *bot-common
+    container_name: hl_bot_zec
+    environment:
+      <<: *bot-env
+      HL_TRADING_SYMBOL: ZEC
 
   hl_dashboard:
     image: python:3.11-alpine

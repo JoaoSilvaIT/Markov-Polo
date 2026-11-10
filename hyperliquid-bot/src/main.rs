@@ -613,6 +613,12 @@ async fn main() {
         "XRP" => 2400,
         "SUI" => 2800,
         "LINK" => 3200,
+        "xyz:NVDA" => 3600,
+        "xyz:GOLD" => 4000,
+        "xyz:XYZ100" => 4400,
+        "xyz:TSLA" => 4800,
+        "xyz:SILVER" => 5200,
+        "ZEC" => 5600,
         _ => 500,
     };
     if startup_stagger_ms > 0 {

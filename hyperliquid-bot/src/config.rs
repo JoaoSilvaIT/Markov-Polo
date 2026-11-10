@@ -26,14 +26,19 @@ impl Config {
     pub fn from_env() -> Self {
         dotenv().ok(); // Load .env if present
 
-        let symbol = env::var("HL_TRADING_SYMBOL")
+        let raw_symbol = env::var("HL_TRADING_SYMBOL")
             .or_else(|_| env::var("TRADING_SYMBOL"))
             .unwrap_or_else(|_| "BTC".to_string())
             // Normalize symbol: remove USDC or /USDC if provided
             .replace("USDC", "")
             .replace("USDT", "")
-            .replace("/", "")
-            .to_uppercase();
+            .replace("/", "");
+
+        let symbol = if raw_symbol.to_lowercase().starts_with("xyz:") {
+            format!("xyz:{}", raw_symbol[4..].to_uppercase())
+        } else {
+            raw_symbol.to_uppercase()
+        };
 
         let is_mainnet = env::var("HL_IS_MAINNET")
             .map(|v| v.to_lowercase() != "false" && v != "0")
@@ -62,8 +67,15 @@ impl Config {
             .or_else(|_| env::var("HL_TREND_MODE"))
             .unwrap_or_else(|_| "live".to_string())
             .to_lowercase();
-        let is_live_trend = matches!(raw_trend_mode.trim(), "live" | "libe" | "true" | "1" | "prod");
-        let trend_mode = if is_live_trend { "live".to_string() } else { "shadow".to_string() };
+        let is_live_trend = matches!(
+            raw_trend_mode.trim(),
+            "live" | "libe" | "true" | "1" | "prod"
+        );
+        let trend_mode = if is_live_trend {
+            "live".to_string()
+        } else {
+            "shadow".to_string()
+        };
         let trend_risk = env::var("HL_TREND_RISK_FRACTION")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())

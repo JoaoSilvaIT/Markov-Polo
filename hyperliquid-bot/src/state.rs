@@ -1205,6 +1205,12 @@ pub fn configured_portfolio_symbols() -> Vec<String> {
         "XRP".to_string(),
         "SUI".to_string(),
         "LINK".to_string(),
+        "xyz:NVDA".to_string(),
+        "xyz:GOLD".to_string(),
+        "xyz:XYZ100".to_string(),
+        "xyz:TSLA".to_string(),
+        "xyz:SILVER".to_string(),
+        "ZEC".to_string(),
     ]
 }
 
