@@ -40,7 +40,8 @@ use crate::hyperliquid::{
 use crate::order::{emergency_flatten, place_ou_maker_entry};
 use crate::ou_process::{
     asset_calibration, calculate_directional_edge_bps, calculate_features_with_funding,
-    check_macro_calendar_veto, compute_engine_a_disaster_stop_distance,
+    check_macro_calendar_veto, check_single_bar_adverse_acceleration_override,
+    compute_engine_a_disaster_stop_distance, compute_engine_a_soft_risk_capped_notional,
     compute_fee_adjusted_kelly_scalar, engine_a_min_soft_inv_excursion_bps,
     evaluate_session_lifecycle_gate, verify_maker_touch_absorption, AssetFeeSchedule, Direction,
     SessionLifecycleAction,
@@ -52,8 +53,8 @@ use crate::state::{
     StateMap,
 };
 use crate::trend::{
-    append_candidate_log, calculate_atr, calculate_donchian, calculate_ker_n,
-    calculate_min_squeeze_ratio_90m, calculate_rel_vol_15m, check_trend_alignment,
+    append_candidate_log, calculate_atr, calculate_donchian, calculate_flag_compression_ratio_60m,
+    calculate_ker_n, calculate_min_squeeze_ratio_90m, calculate_rel_vol_15m, check_trend_alignment,
     load_shadow_trade, record_shadow_entry, record_shadow_exit, save_shadow_trade,
     BreakoutTelemetry, CandleBar, ChandelierExitState, EngineBCandidateLog, EngineBTrendManager,
     L2ObiTracker, MarketCrowdingTracker, TrendAlignment, TrendEngineConfig, TrendOrderAction,
@@ -3962,6 +3963,7 @@ async fn main() {
                                     let _ = l2_age_ms_b;
 
                                     let min_squeeze_ratio_90m = calculate_min_squeeze_ratio_90m(&rolling_15m_bars);
+                                    let flag_compression_ratio_60m = calculate_flag_compression_ratio_60m(&rolling_15m_bars, current_atr);
                                     let rel_vol_15m = calculate_rel_vol_15m(
                                         engine_b_donchian_bars,
                                         &rolling_5m_bars,
@@ -3998,6 +4000,10 @@ async fn main() {
                                         hurst_60m: live_feat.hurst_60m,
                                         l2_obi: eff_l2_obi,
                                         oi_delta_15m_pct,
+                                        flag_compression_ratio_60m,
+                                        p_trend: current_p_t,
+                                        ker_15m,
+                                        enable_flag_compression_branch_b: false, // Keep live production (<= 0.90) untouched for 10-14 days on xyz:GOLD
                                     };
 
                                     let live_eq_pre = *cached_equity_loop.read().await;
@@ -4026,13 +4032,14 @@ async fn main() {
                                                 funnel_counters.engine_b_alignment_veto += 1;
                                             }
                                             println!(
-                                                "🟣 [POLICY C SHADOW GATE] {} {:?} breakout routed to SHADOW ({}) | Px: ${:.2} | Squeeze: {:.2} (<= {:.2}) | RelVol: {:.2}x (>= {:.2}x) | Hurst: {:.2} | OBI: {:.2} | KER: {:.2}",
+                                                "🟣 [POLICY C SHADOW GATE] {} {:?} breakout routed to SHADOW ({}) | Px: ${:.2} | Squeeze: {:.2} (<= {:.2}, Flag: {:.2}) | RelVol: {:.2}x (>= {:.2}x) | Hurst: {:.2} | OBI: {:.2} | KER: {:.2}",
                                                 symbol_clone,
                                                 side,
                                                 reason,
                                                 virtual_entry_px,
                                                 min_squeeze_ratio_90m,
                                                 trend_cfg.max_squeeze_ratio,
+                                                flag_compression_ratio_60m,
                                                 rel_vol_15m,
                                                 trend_cfg.min_rel_volume,
                                                 live_feat.hurst_60m,
@@ -4691,8 +4698,21 @@ async fn main() {
                                                     || adverse_bps_from_entry >= min_soft_inv_excursion_bps
                                             };
 
+                                            let ret_60m_bps = live_feat.ret_60 * 1e4;
+                                            let side_enum = if is_long { Side::Long } else { Side::Short };
+                                            let eff_l2_obi = 0.20 * l2_instant + 0.45 * l2_250ms + 0.35 * l2_1s;
+                                            let single_bar_override = check_single_bar_adverse_acceleration_override(
+                                                &side_enum,
+                                                adverse_bps_from_entry,
+                                                min_soft_inv_excursion_bps,
+                                                ret_60m_bps,
+                                                live_feat.kalman_slope,
+                                                live_feat.kalman_std_slope,
+                                                eff_l2_obi,
+                                            );
+
                                             let mut inv_mgr = crate::ou_process::TwoTierInvalidationManager {
-                                                side: if is_long { Side::Long } else { Side::Short },
+                                                side: side_enum,
                                                 entry_price: pos.entry_price,
                                                 hard_stop_bps: ou_cfg.hard_disaster_stop_bps,
                                                 z_ou_soft_threshold: ou_cfg.soft_z_ou_threshold,
@@ -4705,10 +4725,11 @@ async fn main() {
                                                 breakeven_ratchet_armed: pos.breakeven_ratchet_armed,
                                             };
 
-                                            let decision = inv_mgr.on_5m_bar_close(
+                                            let decision = inv_mgr.on_5m_bar_close_with_override(
                                                 frozen_z_ou,
                                                 eff_z_15,
                                                 kalman_drift_against_pos,
+                                                single_bar_override,
                                                 fee_sched.maker_bps,
                                                 entry_tick,
                                             );
@@ -5586,20 +5607,27 @@ async fn main() {
                                                     } else {
                                                         live_feat.lambda_dir_short
                                                     };
-                                                    let kelly_scalar = compute_fee_adjusted_kelly_scalar(
+                                                    let fee_kelly = compute_fee_adjusted_kelly_scalar(
                                                         raw_edge_bps,
                                                         eff_min_edge_bps,
                                                         fee_sched.maker_bps,
                                                         expected_funding_drag_bps,
-                                                    ) * lambda_dir;
-                                                    let risk_frac = 0.0075 * dd_mult * kelly_scalar;
+                                                    );
+                                                    // Package 4: Strictly clamp kelly_scalar <= 1.0 (functions purely as a haircut, never expands notional)
+                                                    let clamped_kelly = (fee_kelly * lambda_dir.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+                                                    let kelly_notional = (trade_bank * clamped_kelly).min(trade_bank);
+                                                    let risk_frac = 0.0075 * dd_mult * clamped_kelly;
                                                     let max_asset_notional = config
                                                         .max_position_size_usdc
-                                                        .min(ou_cfg.volatility_adjusted_notional_cap(live_eq, frozen_sig));
-                                                    let trade_size_usdc = if config.sizing_mode == "dynamic" && live_eq > 0.0 {
+                                                        .min(ou_cfg.volatility_adjusted_notional_cap(live_eq, frozen_sig))
+                                                        .min(kelly_notional);
+
+                                                    // Package 4: Soft-invalidation dollar risk budget (~$0.70 / 0.125% equity)
+                                                    let soft_risk_capped_notional = compute_engine_a_soft_risk_capped_notional(&symbol_clone, live_eq, dd_mult);
+                                                    let disaster_risk_scaled_notional = if config.sizing_mode == "dynamic" && live_eq > 0.0 {
                                                         calculate_risk_scaled_notional(
                                                             live_eq,
-                                                            (trade_bank * kelly_scalar).min(max_asset_notional),
+                                                            kelly_notional.min(max_asset_notional),
                                                             risk_frac,
                                                             limit_price,
                                                             est_sl_px,
@@ -5609,8 +5637,14 @@ async fn main() {
                                                             max_asset_notional,
                                                         )
                                                     } else {
-                                                        (trade_bank * kelly_scalar).min(max_asset_notional)
+                                                        kelly_notional.min(max_asset_notional)
                                                     };
+
+                                                    let trade_size_usdc = kelly_notional
+                                                        .min(soft_risk_capped_notional)
+                                                        .min(disaster_risk_scaled_notional)
+                                                        .min(max_asset_notional)
+                                                        .max(22.0);
 
                                                     if exceeds_micro_account_step_risk(live_eq, trade_size_usdc, limit_price, est_sl_px, 0.0175) {
                                                         println!(

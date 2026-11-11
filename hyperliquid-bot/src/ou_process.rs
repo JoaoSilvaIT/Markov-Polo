@@ -1379,7 +1379,34 @@ impl TwoTierInvalidationManager {
         maker_fee_bps: f64,
         tick_size: f64,
     ) -> InvalidationDecision {
+        self.on_5m_bar_close_with_override(
+            current_z_ou,
+            z_15_mad_shock,
+            kalman_drift_veto_against_position,
+            false,
+            maker_fee_bps,
+            tick_size,
+        )
+    }
+
+    /// Evaluates Tier 1 Soft Invalidation on each completed 5m bar with optional Package 4 Single-Bar (K=1) Adverse Acceleration Override.
+    pub fn on_5m_bar_close_with_override(
+        &mut self,
+        current_z_ou: f64,
+        z_15_mad_shock: f64,
+        kalman_drift_veto_against_position: bool,
+        adverse_acceleration_override: bool,
+        maker_fee_bps: f64,
+        tick_size: f64,
+    ) -> InvalidationDecision {
         self.elapsed_minutes += 5.0;
+
+        // 0. Package 4: Single-Bar (K=1) Adverse Acceleration Override
+        if adverse_acceleration_override {
+            return InvalidationDecision::TriggerSoftInvalidationFlatten {
+                reason: "K=1 Single-Bar Adverse Acceleration Override (Adverse Excursion + 60m Drift + Kalman + OBI)",
+            };
+        }
 
         // 1. Check adverse O-U Z-score breach on completed 5m bar (adverse direction only)
         let ou_breached = match self.side {
@@ -4400,10 +4427,11 @@ impl DualClearinghouseSlotArbiter {
 pub fn engine_a_min_soft_inv_excursion_bps(symbol: &str) -> f64 {
     match symbol.to_uppercase().as_str() {
         "XYZ:GOLD" | "GOLD" => 32.0,
-        "XYZ:XYZ100" | "XYZ100" => 35.0,
+        "XYZ:XYZ100" | "XYZ100" => 32.0,
+        "BTC" => 36.0,
+        "ETH" => 40.0,
         "XYZ:SILVER" | "SILVER" => 42.0,
-        "BTC" => 45.0,
-        "ETH" | "XYZ:NVDA" | "NVDA" => 48.0,
+        "XYZ:NVDA" | "NVDA" => 48.0,
         "XRP" | "LINK" | "XYZ:TSLA" | "TSLA" => 58.0,
         "SOL" => 55.0,
         "AVAX" => 60.0,
@@ -4412,6 +4440,55 @@ pub fn engine_a_min_soft_inv_excursion_bps(symbol: &str) -> f64 {
         "HYPE" => 68.0,
         _ => 50.0,
     }
+}
+
+/// Computes the Engine A Soft-Invalidation Dollar Risk Capped Notional (Package 4):
+/// Enforces max dollar risk at 0.125% of account equity (~$0.70 on $559 equity)
+/// when exiting at min_soft_inv_excursion_bps + round-trip MT fee friction.
+#[inline]
+pub fn compute_engine_a_soft_risk_capped_notional(
+    symbol: &str,
+    live_equity: f64,
+    drawdown_multiplier: f64,
+) -> f64 {
+    if !live_equity.is_finite() || live_equity <= 0.0 {
+        return 0.0;
+    }
+    let soft_inv_bps = engine_a_min_soft_inv_excursion_bps(symbol);
+    let mt_fee_bps = AssetFeeSchedule::for_symbol(symbol).maker_taker_rt_bps();
+    let expected_soft_stop_bps = (soft_inv_bps + mt_fee_bps).max(30.0);
+    let dd_mult = drawdown_multiplier.clamp(0.40, 1.0);
+    let max_soft_inv_loss_usd = live_equity * 0.00125 * dd_mult;
+    (max_soft_inv_loss_usd / (expected_soft_stop_bps * 1e-4)).max(0.0)
+}
+
+/// Evaluates the Package 4 Single-Bar (K=1) Adverse Acceleration Override inside the 5m invalidation check:
+/// If a single 5m bar closes with adverse_bps >= 0.85 * min_soft_inv_excursion_bps (>= 30.6 bps on BTC)
+/// while 60m directional drift is accelerating against the trade (-d * ret_60m_bps >= 60.0 bps)
+/// and both Kalman slope velocity and L2 OBI oppose the position (d * eff_l2_obi <= -0.25),
+/// triggers soft invalidation on K=1 instead of waiting 5 more minutes for K=2.
+#[inline]
+pub fn check_single_bar_adverse_acceleration_override(
+    side: &Side,
+    adverse_bps_from_entry: f64,
+    min_soft_inv_bps: f64,
+    ret_60m_bps: f64,
+    kalman_slope: f64,
+    kalman_std_slope: f64,
+    eff_l2_obi: f64,
+) -> bool {
+    let d = match side {
+        Side::Long => 1.0,
+        Side::Short => -1.0,
+    };
+    let adverse_hurdle = 0.85 * min_soft_inv_bps;
+    let adverse_excursion_ok = adverse_bps_from_entry >= adverse_hurdle;
+    let drift_accelerating_against_pos = -d * ret_60m_bps >= 60.0;
+    let kalman_opposes =
+        -d * kalman_slope > 0.0 && (kalman_std_slope >= 0.35 || kalman_slope.abs() > 0.0005);
+    let obi_opposes = d * eff_l2_obi <= -0.25;
+
+    adverse_excursion_ok && drift_accelerating_against_pos && kalman_opposes && obi_opposes
 }
 
 /// Computes the Engine A Exchange-Native / Fast-Sentinel catastrophic disaster stop distance
@@ -5561,9 +5638,53 @@ mod tests {
         let btc_sl_bps = (btc_sl_dist / 70_000.0) * 1e4;
         assert!(
             btc_sl_bps >= 85.0 - 1e-6,
-            "BTC disaster stop must be >= 85 bps so 5m invalidation (45 bps) runs first; got {:.1}",
+            "BTC disaster stop must be >= 85 bps so 5m invalidation (36 bps) runs first; got {:.1}",
             btc_sl_bps
         );
+
+        // Package 4: Tightened soft invalidation thresholds (BTC: 36, ETH: 40, XYZ100: 32)
+        assert_eq!(engine_a_min_soft_inv_excursion_bps("BTC"), 36.0);
+        assert_eq!(engine_a_min_soft_inv_excursion_bps("ETH"), 40.0);
+        assert_eq!(engine_a_min_soft_inv_excursion_bps("xyz:XYZ100"), 32.0);
+
+        // Package 4: Soft-invalidation risk budget (~$0.70 / 0.125% equity)
+        let btc_soft_cap = compute_engine_a_soft_risk_capped_notional("BTC", 559.04, 1.0);
+        // expected stop: 36.0 + 6.26 = 42.26 bps -> $559.04 * 0.00125 / 0.004226 = $165.36
+        assert!((btc_soft_cap - 165.36).abs() < 0.10);
+
+        // Package 4: Single-bar adverse acceleration override
+        let override_triggered = check_single_bar_adverse_acceleration_override(
+            &Side::Short,
+            31.0, // >= 30.6 bps (0.85 * 36)
+            36.0,
+            65.0,   // ret_60m accelerating against short (+65 bps)
+            0.0006, // kalman slope positive (rising against short)
+            0.48,   // kalman std slope >= 0.35
+            0.30,   // eff_l2_obi positive (buying pressure pushing up against short)
+        );
+        assert!(override_triggered);
+
+        let override_blocked_by_vol = check_single_bar_adverse_acceleration_override(
+            &Side::Short,
+            25.0, // < 30.6 bps
+            36.0,
+            65.0,
+            0.0006,
+            0.48,
+            0.30,
+        );
+        assert!(!override_blocked_by_vol);
+
+        let override_blocked_by_obi = check_single_bar_adverse_acceleration_override(
+            &Side::Short,
+            31.0,
+            36.0,
+            65.0,
+            0.0006,
+            0.48,
+            0.10, // d * obi = -0.10 > -0.25
+        );
+        assert!(!override_blocked_by_obi);
 
         // 4. Post-Package2 calibration: ZEC step-trend window [96 bars, 10..135m] & GOLD tail-only (>=2.05σ)
         let zec_ou = asset_ou_config("ZEC");

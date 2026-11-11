@@ -22,20 +22,21 @@ use crate::hyperliquid::{effective_tick_size, optimal_engine_b_tp_atr_multiple, 
 use crate::ou_process::{
     asset_calibration, asset_ou_config, calculate_directional_edge_bps,
     calculate_features_with_funding_at, calculate_mad_sigma, check_macro_calendar_veto,
-    compute_engine_a_disaster_stop_distance, compute_fee_adjusted_kelly_scalar,
-    evaluate_armed_reversal_1m_step, evaluate_engine_c_hourly_squeeze,
-    evaluate_engine_d_cascade_reversal, evaluate_session_lifecycle_gate,
-    verify_maker_touch_absorption, AssetCalibration, AsymmetricExitManager, Direction, ExitSignal,
-    HardenedAssetCalibration, HardenedExitDecision, MicroRegimeState, OneMinBarTick,
-    OrderPlacementAction, SessionLifecycleAction, StallHazardExitManager,
-    TwoTierInvalidationManager,
+    compute_engine_a_disaster_stop_distance, compute_engine_a_soft_risk_capped_notional,
+    compute_fee_adjusted_kelly_scalar, evaluate_armed_reversal_1m_step,
+    evaluate_engine_c_hourly_squeeze, evaluate_engine_d_cascade_reversal,
+    evaluate_session_lifecycle_gate, verify_maker_touch_absorption, AssetCalibration,
+    AsymmetricExitManager, Direction, ExitSignal, HardenedAssetCalibration, HardenedExitDecision,
+    MicroRegimeState, OneMinBarTick, OrderPlacementAction, SessionLifecycleAction,
+    StallHazardExitManager, TwoTierInvalidationManager,
 };
 use crate::state::{ClusterCircuitBreaker, Side, DEFAULT_MAX_DAILY_CLUSTER_DD_FRAC};
 use crate::telemetry::{evaluate_btc_impulse_veto, BtcImpulseSnapshot};
 use crate::trend::{
-    calculate_atr, calculate_donchian, calculate_ker_n, calculate_min_squeeze_ratio_90m,
-    calculate_rel_vol_15m, BreakoutTelemetry, CandleBar, ChandelierExitState, EngineBTrendManager,
-    MarketCrowdingTracker, TrendEngineConfig, TrendOrderAction,
+    calculate_atr, calculate_donchian, calculate_flag_compression_ratio_60m, calculate_ker_n,
+    calculate_min_squeeze_ratio_90m, calculate_rel_vol_15m, BreakoutTelemetry, CandleBar,
+    ChandelierExitState, EngineBTrendManager, MarketCrowdingTracker, TrendEngineConfig,
+    TrendOrderAction,
 };
 
 /// Single 1-minute historical market bar + L2 microstructure + derivatives context record
@@ -2055,6 +2056,10 @@ pub fn run_engine_a_backtest_with_btc(
                             } else {
                                 0.0
                             };
+                            let flag_comp_60m = calculate_flag_compression_ratio_60m(
+                                &rolling_15m_bars,
+                                current_atr,
+                            );
                             let tel = BreakoutTelemetry {
                                 bar_open: closed_5m.open,
                                 bar_high: closed_5m.high,
@@ -2069,6 +2074,10 @@ pub fn run_engine_a_backtest_with_btc(
                                 l2_obi: eff_l2_obi,
                                 oi_delta_15m_pct: crowding_tracker
                                     .oi_delta_15m_pct(bar.timestamp_ms),
+                                flag_compression_ratio_60m: flag_comp_60m,
+                                p_trend: current_p_t,
+                                ker_15m,
+                                enable_flag_compression_branch_b: true, // Package 4 Branch B active in native backtest
                             };
                             let is_mode_mr =
                                 controller.current_mode == ControllerMode::MeanReversion;
@@ -2454,28 +2463,44 @@ pub fn run_engine_a_backtest_with_btc(
                                                     arm_sigma_eq_log,
                                                 );
                                             let kelly_scalar = if has_native_l2 {
-                                                compute_fee_adjusted_kelly_scalar(
+                                                let fee_k = compute_fee_adjusted_kelly_scalar(
                                                     raw_edge_bps,
                                                     eff_min_edge_bps,
                                                     sim_cfg.maker_fee_bps,
                                                     funding_drag_bps,
-                                                ) * lambda_dir
+                                                );
+                                                (fee_k * lambda_dir.clamp(0.0, 1.0)).clamp(0.0, 1.0)
                                             } else {
                                                 1.0
                                             };
-                                            let notional =
+                                            let kelly_notional = (sim_cfg.notional_usdc
+                                                * kelly_scalar)
+                                                .min(sim_cfg.notional_usdc);
+                                            let max_asset_notional =
+                                                vol_adj_cap.min(kelly_notional);
+                                            let soft_risk_capped_notional =
+                                                compute_engine_a_soft_risk_capped_notional(
+                                                    symbol,
+                                                    sim_cfg.account_equity_usdc,
+                                                    1.0,
+                                                );
+                                            let disaster_risk_scaled_notional =
                                                 crate::hyperliquid::calculate_risk_scaled_notional(
                                                     sim_cfg.account_equity_usdc,
-                                                    (sim_cfg.notional_usdc * kelly_scalar)
-                                                        .min(vol_adj_cap),
+                                                    kelly_notional.min(max_asset_notional),
                                                     0.0075 * kelly_scalar,
                                                     limit_price,
                                                     sizing_sl_px,
                                                     3,
                                                     2,
                                                     22.0, // Minimum $22 total ($11 per 50% tranche)
-                                                    vol_adj_cap,
+                                                    max_asset_notional,
                                                 );
+                                            let notional = kelly_notional
+                                                .min(soft_risk_capped_notional)
+                                                .min(disaster_risk_scaled_notional)
+                                                .min(max_asset_notional)
+                                                .max(22.0);
                                             let qty = notional / limit_price.max(1e-9);
                                             let policy = if (entry_ttl_mins - 2.0).abs() < 1e-6 {
                                                 "JOIN_BOOK"

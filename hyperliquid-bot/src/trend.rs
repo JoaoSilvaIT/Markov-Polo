@@ -1887,6 +1887,10 @@ pub struct BreakoutTelemetry {
     pub hurst_60m: f64,
     pub l2_obi: f64,
     pub oi_delta_15m_pct: f64,
+    pub flag_compression_ratio_60m: f64,
+    pub p_trend: f64,
+    pub ker_15m: f64,
+    pub enable_flag_compression_branch_b: bool,
 }
 
 impl BreakoutFilter {
@@ -1904,7 +1908,19 @@ impl BreakoutFilter {
         {
             return Err("REJECT_INVALID_TELEMETRY");
         }
-        if !t.min_squeeze_ratio_90m.is_finite() || t.min_squeeze_ratio_90m > cfg.max_squeeze_ratio {
+
+        // Branch A: Primary 5h Coiled Spring (min_squeeze_ratio_90m <= max_squeeze_ratio)
+        // Branch B: Package 4 60m Tight Continuation Flag After Leg 1:
+        // Pass if P_T >= 0.85 && KER_15m >= 0.70 && flag_compression_ratio_60m <= 1.45 (enabled in --backtest --native)
+        let primary_squeeze_ok =
+            t.min_squeeze_ratio_90m.is_finite() && t.min_squeeze_ratio_90m <= cfg.max_squeeze_ratio;
+        let flag_compression_branch_b_ok = t.enable_flag_compression_branch_b
+            && t.p_trend >= 0.85
+            && t.ker_15m >= 0.70
+            && t.flag_compression_ratio_60m.is_finite()
+            && t.flag_compression_ratio_60m <= 1.45;
+
+        if !primary_squeeze_ok && !flag_compression_branch_b_ok {
             return Err("REJECT_NO_PRE_BREAKOUT_SQUEEZE");
         }
         if !t.rel_vol_15m.is_finite() || t.rel_vol_15m < cfg.min_rel_volume {
@@ -2283,6 +2299,24 @@ pub fn calculate_min_squeeze_ratio_90m(bars_15m: &[CandleBar]) -> f64 {
     } else {
         1.0
     }
+}
+
+/// Computes the Package 4 4-bar (60-minute) continuation flag compression ratio relative to ATR_20:
+/// `(max_{i in [t-4, t-1]}(H_i) - min_{i in [t-4, t-1]}(L_i)) / ATR_{20, 15m}`
+/// Used by Policy C Branch B to identify tight horizontal consolidation shelves after Leg 1.
+pub fn calculate_flag_compression_ratio_60m(bars_15m: &[CandleBar], atr_15m: f64) -> f64 {
+    let n = bars_15m.len();
+    if n < 5 || atr_15m <= 1e-9 {
+        return f64::MAX;
+    }
+    // Bars [t-4, t-1] are the 4 completed 15m bars immediately preceding candidate bar t (bars_15m[n-1])
+    let shelf_bars = &bars_15m[n - 5..n - 1];
+    let max_h = shelf_bars.iter().map(|b| b.high).fold(f64::MIN, f64::max);
+    let min_l = shelf_bars.iter().map(|b| b.low).fold(f64::MAX, f64::min);
+    if max_h <= min_l || !max_h.is_finite() || !min_l.is_finite() {
+        return f64::MAX;
+    }
+    (max_h - min_l) / atr_15m
 }
 
 /// Computes the causal 15-minute relative volume impulse `R_V = V_15m / EMA_20(V_15m)`.
@@ -3066,6 +3100,10 @@ mod tests {
             hurst_60m: 0.54,
             l2_obi: 0.34,
             oi_delta_15m_pct: 0.15,
+            flag_compression_ratio_60m: 1.10,
+            p_trend: 0.90,
+            ker_15m: 0.75,
+            enable_flag_compression_branch_b: false,
         }
     }
 
@@ -3454,6 +3492,10 @@ mod tests {
             hurst_60m: 0.56,
             l2_obi: 0.35,
             oi_delta_15m_pct: 0.25,
+            flag_compression_ratio_60m: 1.10,
+            p_trend: 0.90,
+            ker_15m: 0.75,
+            enable_flag_compression_branch_b: false,
         };
         assert_eq!(
             mgr.on_5m_bar_close(&cfg, &bar1, t0, 3, 560.0, false, 0.50, 0.005),
@@ -3526,6 +3568,10 @@ mod tests {
             hurst_60m: 0.56,
             l2_obi: 0.13, // post-sweep depleted below 0.22, above 0.11 relaxed hurdle!
             oi_delta_15m_pct: 0.20,
+            flag_compression_ratio_60m: 1.10,
+            p_trend: 0.90,
+            ker_15m: 0.75,
+            enable_flag_compression_branch_b: false,
         };
         assert_eq!(
             mgr.on_5m_bar_close(&cfg, &bar1, t_ts, 3, 560.0, false, 0.55, 0.005),
@@ -3539,5 +3585,49 @@ mod tests {
             "Volume-conditioned hurdle relaxation must accept post-sweep OBI 0.13; got {:?}",
             act
         );
+    }
+
+    #[test]
+    fn test_policy_c_branch_b_flag_compression_gate() {
+        let cfg = TrendEngineConfig::for_symbol("XYZ:GOLD", 0.35, 0.28);
+        assert_eq!(cfg.max_squeeze_ratio, 0.90);
+
+        // Case 1: Un-detrended squeeze is elevated (2.77 > 0.90), but Branch B flag compression is tight (1.20 <= 1.45)
+        // with P_T = 1.0 >= 0.85 and KER = 0.85 >= 0.70.
+        // If enable_flag_compression_branch_b is false (live default for 10-14 days), REJECT_NO_PRE_BREAKOUT_SQUEEZE.
+        let mut tel = BreakoutTelemetry {
+            bar_open: 4004.0,
+            bar_high: 4005.0,
+            bar_low: 4001.0,
+            bar_close: 4002.0,
+            donchian_high_12_15m: 4040.0,
+            donchian_low_12_15m: 4003.0,
+            atr_15m: 5.0,
+            min_squeeze_ratio_90m: 2.77, // > 0.90
+            rel_vol_15m: 1.85,
+            hurst_60m: 0.55,
+            l2_obi: -0.35,
+            oi_delta_15m_pct: 0.10,
+            flag_compression_ratio_60m: 1.20, // <= 1.45
+            p_trend: 1.0,
+            ker_15m: 0.85,
+            enable_flag_compression_branch_b: false,
+        };
+
+        let res_live = BreakoutFilter::check_coiled_spring_gates(&cfg, &tel, TrendDirection::Short);
+        assert_eq!(res_live, Err("REJECT_NO_PRE_BREAKOUT_SQUEEZE"));
+
+        // Case 2: When enable_flag_compression_branch_b is true (--backtest --native), Branch B passes!
+        tel.enable_flag_compression_branch_b = true;
+        let res_bt = BreakoutFilter::check_coiled_spring_gates(&cfg, &tel, TrendDirection::Short);
+        assert!(
+            res_bt.is_ok(),
+            "Branch B must pass tight flag compression during established trend"
+        );
+
+        // Case 3: If flag compression is wide (e.g. 2.10 > 1.45), even with Branch B enabled it must reject!
+        tel.flag_compression_ratio_60m = 2.10;
+        let res_wide = BreakoutFilter::check_coiled_spring_gates(&cfg, &tel, TrendDirection::Short);
+        assert_eq!(res_wide, Err("REJECT_NO_PRE_BREAKOUT_SQUEEZE"));
     }
 }
