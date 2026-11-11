@@ -46,7 +46,7 @@ x-bot-common: &bot-common
       hard: 65535
   volumes:
     - ./hl_bot_data:/app
-    - /dev/shm/hl_bot_lock:/var/run/hl_cluster_lock
+    - hl_cluster_shm:/var/run/hl_cluster_lock
   logging:
     driver: "json-file"
     options:
@@ -85,7 +85,7 @@ services:
         soft: 65535
         hard: 65535
     volumes:
-      - /dev/shm/hl_bot_lock:/var/run/hl_cluster_lock
+      - hl_cluster_shm:/var/run/hl_cluster_lock
     environment:
       HL_IS_MAINNET: ${HL_IS_MAINNET:-true}
       HL_PORTFOLIO_SYMBOLS: ${HL_PORTFOLIO_SYMBOLS:-BTC,ETH,SOL,AVAX,HYPE,NEAR,XRP,SUI,LINK,xyz:NVDA,xyz:GOLD,xyz:XYZ100,xyz:TSLA,xyz:SILVER,ZEC}
@@ -237,3 +237,11 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  hl_cluster_shm:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=16m,mode=1777
