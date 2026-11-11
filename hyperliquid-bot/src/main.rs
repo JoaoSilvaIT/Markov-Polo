@@ -15,6 +15,7 @@ mod discord;
 mod hmm;
 mod hyperliquid;
 pub mod monte_carlo;
+pub mod mux;
 mod order;
 mod ou_process;
 mod state;
@@ -339,6 +340,10 @@ pub fn compute_tp_order_plan(
 #[tokio::main]
 async fn main() {
     let cli_args: Vec<String> = std::env::args().collect();
+    if cli_args.iter().any(|a| a == "--mux") {
+        mux::run_mux_server().await;
+        return;
+    }
     let run_bt = cli_args.iter().any(|a| a == "--backtest");
     let run_mc = cli_args.iter().any(|a| a == "--monte-carlo");
     if run_bt || run_mc {
@@ -2682,67 +2687,110 @@ async fn main() {
     let state_bg = active_state.clone();
     let symbol_bg = trading_symbol.clone();
     let base_url_bg = base_url.clone();
+    let ws_endpoint_opt = std::env::var("HL_WS_ENDPOINT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let ws_endpoint_bg = ws_endpoint_opt.clone();
 
     tokio::spawn(async move {
+        let mut mux_failures: u32 = 0;
         loop {
             let (l2_sender, mut l2_receiver) = unbounded_channel();
-            let mut l2_client = match InfoClient::new(None, Some(base_url_bg.clone())).await {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("❌ [L2 WS ERROR] Failed to connect InfoClient: {}. Retrying in 5s...", e);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    continue;
-                }
-            };
+            let mut _direct_client_guard: Option<InfoClient> = None;
+            let mut mux_task_handle: Option<tokio::task::JoinHandle<()>> = None;
+            let used_mux = ws_endpoint_bg.is_some() && mux_failures < 3;
 
-            if let Err(e) = l2_client
-                .subscribe(
+            if used_mux {
+                let ep = ws_endpoint_bg.as_ref().unwrap().clone();
+                let subs = vec![
                     Subscription::L2Book {
                         coin: symbol_bg.clone(),
                     },
-                    l2_sender.clone(),
-                )
-                .await
-            {
-                eprintln!("❌ [L2 WS ERROR] Subscription failed: {}. Retrying in 5s...", e);
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
-            }
-
-            // Subscribe to real-time Asset Context (hourly funding rate & mark price)
-            let _ = l2_client
-                .subscribe(
                     Subscription::ActiveAssetCtx {
                         coin: symbol_bg.clone(),
                     },
-                    l2_sender.clone(),
-                )
-                .await;
+                    Subscription::OrderUpdates { user: user_address },
+                    Subscription::UserFills { user: user_address },
+                ];
+                let sym_log = symbol_bg.clone();
+                mux_task_handle = Some(tokio::spawn(async move {
+                    if let Err(e) =
+                        crate::mux::stream_via_ws_endpoint(&ep, &subs, l2_sender, 60, "L2+USER")
+                            .await
+                    {
+                        eprintln!("⚠️ [L2+USER MUX WS] {} stream ended: {}", sym_log, e);
+                    }
+                }));
+                println!(
+                    "📡 [L2 + USER WEBSOCKET (MUX)] Subscribed to L2Book, ActiveAssetCtx, OrderUpdates & UserFills for {} via {}.",
+                    symbol_bg,
+                    ws_endpoint_bg.as_deref().unwrap_or("")
+                );
+            } else {
+                let mut l2_client = match InfoClient::new(None, Some(base_url_bg.clone())).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("❌ [L2 WS ERROR] Failed to connect InfoClient: {}. Retrying in 5s...", e);
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
 
-            // Subscribe to private OrderUpdates & UserFills for sub-50ms Fast-Sentinel wakeup
-            let _ = l2_client
-                .subscribe(
-                    Subscription::OrderUpdates {
-                        user: user_address,
-                    },
-                    l2_sender.clone(),
-                )
-                .await;
-            let _ = l2_client
-                .subscribe(
-                    Subscription::UserFills {
-                        user: user_address,
-                    },
-                    l2_sender,
-                )
-                .await;
+                if let Err(e) = l2_client
+                    .subscribe(
+                        Subscription::L2Book {
+                            coin: symbol_bg.clone(),
+                        },
+                        l2_sender.clone(),
+                    )
+                    .await
+                {
+                    eprintln!("❌ [L2 WS ERROR] Subscription failed: {}. Retrying in 5s...", e);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
 
-            println!("📡 [L2 + USER WEBSOCKET] Subscribed to continuous L2Book, ActiveAssetCtx, OrderUpdates & UserFills for {}.", symbol_bg);
+                // Subscribe to real-time Asset Context (hourly funding rate & mark price)
+                let _ = l2_client
+                    .subscribe(
+                        Subscription::ActiveAssetCtx {
+                            coin: symbol_bg.clone(),
+                        },
+                        l2_sender.clone(),
+                    )
+                    .await;
 
+                // Subscribe to private OrderUpdates & UserFills for sub-50ms Fast-Sentinel wakeup
+                let _ = l2_client
+                    .subscribe(
+                        Subscription::OrderUpdates {
+                            user: user_address,
+                        },
+                        l2_sender.clone(),
+                    )
+                    .await;
+                let _ = l2_client
+                    .subscribe(
+                        Subscription::UserFills {
+                            user: user_address,
+                        },
+                        l2_sender,
+                    )
+                    .await;
+
+                _direct_client_guard = Some(l2_client);
+                println!("📡 [L2 + USER WEBSOCKET] Subscribed to continuous L2Book, ActiveAssetCtx, OrderUpdates & UserFills for {}.", symbol_bg);
+            }
+
+            let mut received_any_l2_msg = false;
             loop {
                 let msg_res = tokio::time::timeout(Duration::from_secs(60), l2_receiver.recv()).await;
                 let msg = match msg_res {
-                    Ok(Some(m)) => m,
+                    Ok(Some(m)) => {
+                        received_any_l2_msg = true;
+                        m
+                    }
                     Ok(None) => break,
                     Err(_) => {
                         eprintln!("⚠️ [L2 WEBSOCKET WATCHDOG] No L2 book update received for 60s on {}. Stalled connection detected! Reconnecting...", symbol_bg);
@@ -2818,10 +2866,22 @@ async fn main() {
                     _ => {}
                 }
             }
-            eprintln!("⚠️ [L2 WEBSOCKET] Disconnected. Reconnecting in 3s...");
+            if let Some(h) = mux_task_handle {
+                h.abort();
+            }
+            if used_mux {
+                if received_any_l2_msg {
+                    mux_failures = 0;
+                } else {
+                    mux_failures = mux_failures.saturating_add(1);
+                }
+            } else {
+                mux_failures = 0;
+            }
+            eprintln!("⚠️ [L2 WEBSOCKET] Disconnected. Reconnecting in 2s...");
             let reconn_now = chrono::Utc::now().timestamp_millis().max(0) as u64;
             obi_tracker_bg.write().await.on_l2_reconnect(reconn_now);
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
     });
 
@@ -2830,39 +2890,70 @@ async fn main() {
     let mut candle_feed_degraded: bool = false;
     let mut funnel_counters = load_funnel_counters(&trading_symbol);
     let mut cf_tracker = crate::counterfactual::CounterfactualTracker::new(crate::counterfactual::COUNTERFACTUAL_JOURNAL);
+    let mut candle_mux_failures: u32 = 0;
 
     loop {
         let (sender, mut receiver) = unbounded_channel();
-        let mut ws_info_client = match InfoClient::new(None, Some(base_url.clone())).await {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("❌ [WS ERROR] Failed to connect InfoClient: {}. Retrying in 5s...", e);
+        let mut _ws_info_client_guard: Option<InfoClient> = None;
+        let mut candle_mux_handle: Option<tokio::task::JoinHandle<()>> = None;
+        let used_candle_mux = ws_endpoint_opt.is_some() && candle_mux_failures < 3;
+
+        if used_candle_mux {
+            let ep = ws_endpoint_opt.as_ref().unwrap().clone();
+            let subs = vec![Subscription::Candle {
+                coin: trading_symbol.clone(),
+                interval: "1m".to_string(),
+            }];
+            let sym_log = trading_symbol.clone();
+            candle_mux_handle = Some(tokio::spawn(async move {
+                if let Err(e) =
+                    crate::mux::stream_via_ws_endpoint(&ep, &subs, sender, 150, "CANDLE").await
+                {
+                    eprintln!("⚠️ [CANDLE MUX WS] {} stream ended: {}", sym_log, e);
+                }
+            }));
+            println!(
+                "📡 [WEBSOCKET (MUX)] Subscribed to 1m candles for {} via {}.",
+                trading_symbol,
+                ws_endpoint_opt.as_deref().unwrap_or("")
+            );
+        } else {
+            let mut ws_info_client = match InfoClient::new(None, Some(base_url.clone())).await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("❌ [WS ERROR] Failed to connect InfoClient: {}. Retrying in 5s...", e);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+
+            if let Err(e) = ws_info_client
+                .subscribe(
+                    Subscription::Candle {
+                        coin: trading_symbol.clone(),
+                        interval: "1m".to_string(),
+                    },
+                    sender,
+                )
+                .await
+            {
+                eprintln!("❌ [WS ERROR] Subscription failed: {}. Retrying in 5s...", e);
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
-        };
 
-        if let Err(e) = ws_info_client
-            .subscribe(
-                Subscription::Candle {
-                    coin: trading_symbol.clone(),
-                    interval: "1m".to_string(),
-                },
-                sender,
-            )
-            .await
-        {
-            eprintln!("❌ [WS ERROR] Subscription failed: {}. Retrying in 5s...", e);
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            continue;
+            _ws_info_client_guard = Some(ws_info_client);
+            println!("📡 [WEBSOCKET] Successfully subscribed to 1m candles for {}.", trading_symbol);
         }
 
-        println!("📡 [WEBSOCKET] Successfully subscribed to 1m candles for {}.", trading_symbol);
-
+        let mut received_any_candle = false;
         loop {
             let recv_res = tokio::time::timeout(Duration::from_secs(150), receiver.recv()).await;
             let msg = match recv_res {
-                Ok(Some(m)) => m,
+                Ok(Some(m)) => {
+                    received_any_candle = true;
+                    m
+                }
                 Ok(None) => {
                     eprintln!("⚠️ [WEBSOCKET] Candle stream channel closed for {}. Reconnecting in 3s...", trading_symbol);
                     break;
@@ -5902,8 +5993,20 @@ async fn main() {
                 }
             }
 
-        eprintln!("⚠️ [WEBSOCKET] Stream ended or dropped. Reconnecting in 3s...");
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        if let Some(h) = candle_mux_handle {
+            h.abort();
+        }
+        if used_candle_mux {
+            if received_any_candle {
+                candle_mux_failures = 0;
+            } else {
+                candle_mux_failures = candle_mux_failures.saturating_add(1);
+            }
+        } else {
+            candle_mux_failures = 0;
+        }
+        eprintln!("⚠️ [WEBSOCKET] Stream ended or dropped. Reconnecting in 2s...");
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 

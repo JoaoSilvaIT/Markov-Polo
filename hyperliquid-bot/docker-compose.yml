@@ -11,12 +11,15 @@ x-bot-env: &bot-env
   HL_TREND_RISK_FRACTION: ${HL_TREND_RISK_FRACTION:-0.28}
   HL_MAX_POSITION_SIZE_USDC: ${HL_MAX_POSITION_SIZE_USDC:-500.0}
   HL_CLUSTER_LOCK_DIR: /var/run/hl_cluster_lock
+  HL_WS_ENDPOINT: ${HL_WS_ENDPOINT:-ws://hl_mux:9001/ws}
 
 x-bot-common: &bot-common
   image: hyperliquid-bot:latest
   build:
     context: .
     dockerfile: Dockerfile
+  depends_on:
+    - hl_mux
   init: true
   restart: unless-stopped
   stop_grace_period: 15s
@@ -51,6 +54,50 @@ x-bot-common: &bot-common
       max-file: "3"
 
 services:
+  hl_mux:
+    image: hyperliquid-bot:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hl_mux
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 10s
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 64
+    mem_limit: 128m
+    memswap_limit: 128m
+    cpus: "0.5"
+    env_file:
+      - path: .env
+        required: false
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    volumes:
+      - /dev/shm/hl_bot_lock:/var/run/hl_cluster_lock
+    environment:
+      HL_IS_MAINNET: ${HL_IS_MAINNET:-true}
+      HL_PORTFOLIO_SYMBOLS: ${HL_PORTFOLIO_SYMBOLS:-BTC,ETH,SOL,AVAX,HYPE,NEAR,XRP,SUI,LINK,xyz:NVDA,xyz:GOLD,xyz:XYZ100,xyz:TSLA,xyz:SILVER,ZEC}
+      HL_CLUSTER_LOCK_DIR: /var/run/hl_cluster_lock
+      HL_MUX_BIND: 0.0.0.0:9001
+    command: ["hyperliquid-bot", "--mux"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   hl_bot_btc:
     <<: *bot-common
     container_name: hl_bot_btc
