@@ -284,8 +284,8 @@ pub async fn place_disaster_stop_trigger_order(
 pub fn optimal_engine_b_tp_atr_multiple(symbol: &str) -> f64 {
     match symbol.to_uppercase().as_str() {
         "BTC" => 1.0,
-        "ETH" => 1.5,
-        "XRP" | "LINK" => 1.8,
+        "ETH" | "XYZ:NVDA" | "XYZ:TSLA" | "XYZ:XYZ100" | "XYZ:GOLD" | "XYZ:SILVER" => 1.5,
+        "XRP" | "LINK" | "ZEC" => 1.8,
         "SOL" | "HYPE" => 2.0,
         "AVAX" | "SUI" | "NEAR" => 2.5,
         _ => 1.5,
@@ -474,6 +474,53 @@ pub async fn get_user_position(
     }
 
     Ok((0.0, None))
+}
+
+/// Queries open orders for a coin across both the native Hyperliquid clearinghouse
+/// and the HIP-3 `"xyz"` builder DEX when `coin` starts with `"xyz:"`.
+/// Fails closed (returns `Err`) if the exchange query fails or times out.
+pub async fn fetch_open_orders_for_coin(
+    info: &InfoClient,
+    address: H160,
+    coin: &str,
+) -> Result<Vec<hyperliquid_rust_sdk::OpenOrdersResponse>, String> {
+    if coin.starts_with("xyz:") {
+        let client = reqwest::Client::builder()
+            .timeout(HL_REST_TIMEOUT)
+            .build()
+            .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+        let payload = serde_json::json!({
+            "type": "openOrders",
+            "user": format!("{:?}", address),
+            "dex": "xyz"
+        });
+        let resp = tokio::time::timeout(
+            HL_REST_TIMEOUT,
+            client.post("https://api.hyperliquid.xyz/info").json(&payload).send(),
+        )
+        .await
+        .map_err(|_| format!("Timed out querying xyz openOrders for {}", coin))?
+        .map_err(|e| format!("Failed querying xyz openOrders for {}: {}", coin, e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!(
+                "HTTP {} querying xyz openOrders for {}",
+                resp.status(),
+                coin
+            ));
+        }
+
+        let orders = resp
+            .json::<Vec<hyperliquid_rust_sdk::OpenOrdersResponse>>()
+            .await
+            .map_err(|e| format!("Invalid xyz openOrders JSON for {}: {}", coin, e))?;
+        Ok(orders)
+    } else {
+        tokio::time::timeout(HL_REST_TIMEOUT, info.open_orders(address))
+            .await
+            .map_err(|_| format!("Timed out querying open_orders for {}", coin))?
+            .map_err(|e| format!("Failed to query open_orders for {}: {}", coin, e))
+    }
 }
 
 /// Queries user's total account equity value in USDC across clearinghouse perps and spot balances

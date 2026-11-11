@@ -22,23 +22,27 @@ pub struct Config {
     pub max_position_size_usdc: f64,
 }
 
+pub fn normalize_trading_symbol(raw_symbol: &str) -> String {
+    let cleaned = raw_symbol
+        .trim()
+        .replace("USDC", "")
+        .replace("USDT", "")
+        .replace("/", "");
+    if cleaned.to_lowercase().starts_with("xyz:") {
+        format!("xyz:{}", cleaned[4..].to_uppercase())
+    } else {
+        cleaned.to_uppercase()
+    }
+}
+
 impl Config {
     pub fn from_env() -> Self {
         dotenv().ok(); // Load .env if present
 
         let raw_symbol = env::var("HL_TRADING_SYMBOL")
             .or_else(|_| env::var("TRADING_SYMBOL"))
-            .unwrap_or_else(|_| "BTC".to_string())
-            // Normalize symbol: remove USDC or /USDC if provided
-            .replace("USDC", "")
-            .replace("USDT", "")
-            .replace("/", "");
-
-        let symbol = if raw_symbol.to_lowercase().starts_with("xyz:") {
-            format!("xyz:{}", raw_symbol[4..].to_uppercase())
-        } else {
-            raw_symbol.to_uppercase()
-        };
+            .unwrap_or_else(|_| "BTC".to_string());
+        let symbol = normalize_trading_symbol(&raw_symbol);
 
         let is_mainnet = env::var("HL_IS_MAINNET")
             .map(|v| v.to_lowercase() != "false" && v != "0")
@@ -79,7 +83,7 @@ impl Config {
         let trend_risk = env::var("HL_TREND_RISK_FRACTION")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(1.0); // Default: 1.0 (allocate full trade bank to trend trades)
+            .unwrap_or(0.28); // Policy C default: 0.28x Engine A risk parity (~$55 cap)
         let donchian_period = env::var("HL_DONCHIAN_PERIOD")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -121,6 +125,30 @@ impl Config {
             sizing_mode,
             equity_fraction,
             max_position_size_usdc: max_size_usdc,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_policy_c_defaults_and_hip3_symbol_normalization() {
+        assert_eq!(normalize_trading_symbol("XYZ:nvda"), "xyz:NVDA");
+        assert_eq!(normalize_trading_symbol("xyz:gold/USDC"), "xyz:GOLD");
+        assert_eq!(
+            normalize_trading_symbol("btc/usdc".to_uppercase().as_str()),
+            "BTC"
+        );
+        assert_eq!(normalize_trading_symbol("zec"), "ZEC");
+
+        // When env vars are unset in test sandbox, verify Policy C defaults
+        if env::var("HL_TREND_RISK_FRACTION").is_err() && env::var("HL_EQUITY_FRACTION").is_err() {
+            let cfg = Config::from_env();
+            assert!((cfg.trend_risk_fraction - 0.28).abs() < 1e-9);
+            assert!((cfg.equity_fraction - 0.35).abs() < 1e-9);
+            assert_eq!(cfg.trend_engine_mode, "live");
         }
     }
 }

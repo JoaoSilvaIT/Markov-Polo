@@ -1,7 +1,7 @@
 use crate::hyperliquid::{
     cancel_order, close_market_position, effective_tick_size, fetch_book_ticker,
-    get_user_position, optimal_engine_b_tp_atr_multiple, place_post_only_order, quantize_price,
-    quantize_size_for_notional,
+    fetch_open_orders_for_coin, get_user_position, optimal_engine_b_tp_atr_multiple,
+    place_post_only_order, quantize_price, quantize_size_for_notional,
 };
 use crate::state::{
     assert_current_lease, clear_order_intent, release_cluster_lease_authenticated, save_order_intent_atomic,
@@ -328,13 +328,20 @@ pub async fn place_trend_breakout_entry(
     symbol: &str,
     side: Side,
     breakout_price: f64,
+    retest_limit_px: Option<f64>,
     initial_stop: f64,
     current_atr: f64,
     position_size_usdc: f64,
+    entry_ttl_mins: f64,
     sz_decimals: u32,
     discord_url: Option<String>,
 ) -> Result<Value, String> {
     let position_size_usdc = position_size_usdc.max(11.0);
+    let eff_ttl_mins = if entry_ttl_mins.is_finite() && entry_ttl_mins > 0.0 {
+        entry_ttl_mins
+    } else {
+        12.0
+    };
     if state.len() >= crate::state::max_concurrent_cluster_positions() {
         return Ok(json!({"status": "REJECTED", "reason": "Max concurrent trades reached."}));
     }
@@ -380,9 +387,26 @@ pub async fn place_trend_breakout_entry(
     let is_buy = side == Side::Long;
     let book_tick = effective_tick_size(top_bid, sz_decimals);
     let spread = top_ask - top_bid;
-    // Spread-Inside Queue Priority Optimization for Engine B:
-    // Step 1 tick inside a multi-tick spread to secure FIFO Queue Rank #1 on momentum breakouts.
-    let raw_post_only_price = if is_buy {
+    // Policy C Stage 2 Alo Maker Retest Placement:
+    // Anchor passively at `retest_limit_px` when provided, clamped strictly inside/on the passive side
+    // of the live order book so Post-Only (`Alo`) never crosses the spread.
+    let raw_post_only_price = if let Some(target_px) = retest_limit_px.filter(|&p| p.is_finite() && p > 0.0) {
+        if is_buy {
+            let max_passive_bid = if spread >= 2.0 * book_tick - 1e-9 && top_ask - book_tick > top_bid {
+                top_ask - book_tick
+            } else {
+                top_bid
+            };
+            target_px.min(max_passive_bid)
+        } else {
+            let min_passive_ask = if spread >= 2.0 * book_tick - 1e-9 && top_bid + book_tick < top_ask {
+                top_bid + book_tick
+            } else {
+                top_ask
+            };
+            target_px.max(min_passive_ask)
+        }
+    } else if is_buy {
         if spread >= 2.0 * book_tick - 1e-9 && top_bid + book_tick < top_ask - 1e-9 {
             top_bid + book_tick
         } else {
@@ -404,7 +428,13 @@ pub async fn place_trend_breakout_entry(
         ));
     }
 
-    let stop_loss_price = quantize_price(initial_stop, sz_decimals);
+    // Ensure stop loss stays safely on the adverse side of post_only_price by at least 25 bps
+    let safe_stop_raw = if is_buy {
+        initial_stop.min(post_only_price * 0.9975)
+    } else {
+        initial_stop.max(post_only_price * 1.0025)
+    };
+    let stop_loss_price = quantize_price(safe_stop_raw, sz_decimals);
     let k_tp = optimal_engine_b_tp_atr_multiple(symbol);
     let tp_dist = (k_tp * current_atr).max(post_only_price * 0.0045);
     let raw_tp = if is_buy {
@@ -456,7 +486,17 @@ pub async fn place_trend_breakout_entry(
         if attempt > 0 {
             if let Ok((fresh_bid, fresh_ask)) = fetch_book_ticker(info, symbol).await {
                 if fresh_bid > 0.0 && fresh_ask > fresh_bid {
-                    let fresh_raw = if is_buy { fresh_bid } else { fresh_ask };
+                    let fresh_raw = if let Some(target_px) = retest_limit_px.filter(|&p| p.is_finite() && p > 0.0) {
+                        if is_buy {
+                            target_px.min(fresh_bid)
+                        } else {
+                            target_px.max(fresh_ask)
+                        }
+                    } else if is_buy {
+                        fresh_bid
+                    } else {
+                        fresh_ask
+                    };
                     current_price = quantize_price(fresh_raw, sz_decimals);
                     current_amount = quantize_size_for_notional(position_size_usdc, current_price, sz_decimals);
                     order_intent.limit_px = current_price;
@@ -511,6 +551,12 @@ pub async fn place_trend_breakout_entry(
         }
     };
 
+    let final_stop_loss_price = if is_buy {
+        stop_loss_price.min(quantize_price(current_price * 0.9975, sz_decimals))
+    } else {
+        stop_loss_price.max(quantize_price(current_price * 1.0025, sz_decimals))
+    };
+
     let new_state = PositionState {
         symbol: symbol.to_string(),
         side: side.to_string(),
@@ -518,7 +564,7 @@ pub async fn place_trend_breakout_entry(
         tp_order_id: "".to_string(),
         entry_price: current_price,
         amount: current_amount,
-        stop_loss_price,
+        stop_loss_price: final_stop_loss_price,
         take_profit_price,
         opened_at: Utc::now().to_rfc3339(),
         risk_amount_usdc: position_size_usdc,
@@ -532,7 +578,7 @@ pub async fn place_trend_breakout_entry(
         reprice_count: 0,
         candidate_lower_count: 0,
         engine_type: "EngineB".to_string(),
-        chandelier_stop: stop_loss_price,
+        chandelier_stop: final_stop_loss_price,
         active_multiplier: 2.0,
         current_atr,
         lease_fencing_token: fencing_token,
@@ -543,7 +589,7 @@ pub async fn place_trend_breakout_entry(
         consecutive_ou_breach_5m_bars: 0,
         consecutive_shock_bars: 0,
         breakeven_ratchet_armed: false,
-        entry_ttl_mins: 5.0,
+        entry_ttl_mins: eff_ttl_mins,
         disaster_stop_oid: None,
         disaster_stop_ratcheted_to_be: false,
         last_fill_check: 0,
@@ -560,8 +606,8 @@ pub async fn place_trend_breakout_entry(
     let side_emoji = if is_buy { "🟢" } else { "🔴" };
 
     let msg = format!(
-        "{} **ENGINE B {} BREAKOUT ENTRY (MAKER):** {}\n**Limit Maker {}:** ${:.2} (Breakout: ${:.2})\n**Initial Chandelier Stop:** ${:.2}\n**Size:** {:.5} (${:.2})\n**ATR:** ${:.2}",
-        side_emoji, side_label, symbol, side_label, current_price, breakout_price, stop_loss_price, current_amount, position_size_usdc, current_atr
+        "{} **ENGINE B {} BREAKOUT RETEST (POLICY C ALO MAKER):** {}\n**Retest Limit {}:** ${:.2} (Breakout: ${:.2})\n**Initial Stop:** ${:.2}\n**Size:** {:.5} (${:.2}) | **TTL:** {:.0}m | **ATR:** ${:.2}",
+        side_emoji, side_label, symbol, side_label, current_price, breakout_price, final_stop_loss_price, current_amount, position_size_usdc, eff_ttl_mins, current_atr
     );
     crate::discord::send_alert(discord_url.as_deref(), &msg).await;
 
@@ -603,13 +649,7 @@ pub async fn emergency_flatten(
     }
 
     // 3. Reconcile open orders on exchange: cancel any sibling orders and confirm entry order is no longer resting
-    let open_orders = tokio::time::timeout(
-        tokio::time::Duration::from_secs(10),
-        info.open_orders(wallet_address),
-    )
-    .await
-    .map_err(|_| "Timed out querying open_orders in emergency_flatten".to_string())?
-    .map_err(|e| format!("Failed to query open_orders in emergency_flatten: {}", e))?;
+    let open_orders = fetch_open_orders_for_coin(info, wallet_address, symbol).await?;
     for sym_ord in open_orders.iter().filter(|o| o.coin == symbol) {
         let _ = cancel_order(exchange, symbol, sym_ord.oid).await;
     }
@@ -618,13 +658,7 @@ pub async fn emergency_flatten(
             if open_orders.iter().any(|o| o.oid == entry_oid) {
                 tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
                 let _ = cancel_order(exchange, symbol, entry_oid).await;
-                let post_cancel_orders = tokio::time::timeout(
-                    tokio::time::Duration::from_secs(10),
-                    info.open_orders(wallet_address),
-                )
-                .await
-                .map_err(|_| "Timed out querying post-cancel open_orders".to_string())?
-                .map_err(|e| format!("Failed to query post-cancel open_orders: {}", e))?;
+                let post_cancel_orders = fetch_open_orders_for_coin(info, wallet_address, symbol).await?;
                 if post_cancel_orders.iter().any(|o| o.oid == entry_oid) {
                     let err = format!(
                         "Emergency flatten failed: entry order {} still active on exchange. Retaining state and lease.",
@@ -665,13 +699,7 @@ pub async fn emergency_flatten(
 
     // 5. Final multi-step verification: position == 0 AND no orders remain for symbol
     let (mut final_szi, _) = get_user_position(info, wallet_address, symbol).await?;
-    let mut final_orders = tokio::time::timeout(
-        tokio::time::Duration::from_secs(10),
-        info.open_orders(wallet_address),
-    )
-    .await
-    .map_err(|_| "Timed out querying final open_orders".to_string())?
-    .map_err(|e| format!("Failed to query final open_orders: {}", e))?;
+    let mut final_orders = fetch_open_orders_for_coin(info, wallet_address, symbol).await?;
     for rem in final_orders.iter().filter(|o| o.coin == symbol) {
         let _ = cancel_order(exchange, symbol, rem.oid).await;
     }
@@ -680,12 +708,7 @@ pub async fn emergency_flatten(
         if let Ok((recheck_szi, _)) = get_user_position(info, wallet_address, symbol).await {
             final_szi = recheck_szi;
         }
-        if let Ok(Ok(recheck_orders)) = tokio::time::timeout(
-            tokio::time::Duration::from_secs(10),
-            info.open_orders(wallet_address),
-        )
-        .await
-        {
+        if let Ok(recheck_orders) = fetch_open_orders_for_coin(info, wallet_address, symbol).await {
             final_orders = recheck_orders;
         }
     }

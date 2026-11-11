@@ -31,8 +31,9 @@ use crate::ou_process::{
 use crate::state::{ClusterCircuitBreaker, Side, DEFAULT_MAX_DAILY_CLUSTER_DD_FRAC};
 use crate::telemetry::{evaluate_btc_impulse_veto, BtcImpulseSnapshot};
 use crate::trend::{
-    calculate_atr, calculate_donchian, check_trend_alignment, evaluate_pre_breakout_budget,
-    CandleBar, ChandelierExitState, MarketCrowdingTracker, TrendAlignment,
+    calculate_atr, calculate_donchian, calculate_ker_n, calculate_min_squeeze_ratio_90m,
+    calculate_rel_vol_15m, BreakoutTelemetry, CandleBar, ChandelierExitState, EngineBTrendManager,
+    MarketCrowdingTracker, TrendEngineConfig, TrendOrderAction,
 };
 
 /// Single 1-minute historical market bar + L2 microstructure + derivatives context record
@@ -350,8 +351,10 @@ pub fn run_engine_a_backtest_with_btc(
     let warmup = 720usize.min(bars.len().saturating_sub(30));
     let mut closes_history: Vec<f64> = bars[..warmup].iter().map(|b| b.close).collect();
 
-    // Pre-aggregate 15m bars & warm up SyntheticMicrostructureEnricher from warmup history
-    let mut rolling_15m_bars: Vec<CandleBar> = Vec::with_capacity(120);
+    // Pre-aggregate 5m/15m bars & warm up SyntheticMicrostructureEnricher from warmup history
+    let mut rolling_5m_bars: Vec<CandleBar> = Vec::with_capacity(300);
+    let mut current_5m_bar: Option<CandleBar> = None;
+    let mut rolling_15m_bars: Vec<CandleBar> = Vec::with_capacity(100);
     let mut current_15m_bar: Option<CandleBar> = None;
     let mut all_15m_closes: Vec<f64> = Vec::with_capacity(1024);
     for b in &bars[..warmup] {
@@ -366,6 +369,63 @@ pub fn run_engine_a_backtest_with_btc(
             },
             0.0,
         );
+        let bucket_5m = (b.timestamp_ms / (5 * 60 * 1000)) * (5 * 60 * 1000);
+        let is_last_1m_5m = b.timestamp_ms + 60_000 >= bucket_5m + 5 * 60 * 1000;
+        if let Some(mut cur_5m) = current_5m_bar.take() {
+            if cur_5m.time_open == bucket_5m {
+                cur_5m.high = cur_5m.high.max(b.high);
+                cur_5m.low = cur_5m.low.min(b.low);
+                cur_5m.close = b.close;
+                cur_5m.volume += b.volume;
+                if is_last_1m_5m {
+                    rolling_5m_bars.push(cur_5m);
+                    if rolling_5m_bars.len() > 300 {
+                        rolling_5m_bars.remove(0);
+                    }
+                } else {
+                    current_5m_bar = Some(cur_5m);
+                }
+            } else {
+                rolling_5m_bars.push(cur_5m);
+                if rolling_5m_bars.len() > 300 {
+                    rolling_5m_bars.remove(0);
+                }
+                let nb5 = CandleBar {
+                    time_open: bucket_5m,
+                    open: b.open,
+                    high: b.high,
+                    low: b.low,
+                    close: b.close,
+                    volume: b.volume,
+                };
+                if is_last_1m_5m {
+                    rolling_5m_bars.push(nb5);
+                    if rolling_5m_bars.len() > 300 {
+                        rolling_5m_bars.remove(0);
+                    }
+                } else {
+                    current_5m_bar = Some(nb5);
+                }
+            }
+        } else {
+            let nb5 = CandleBar {
+                time_open: bucket_5m,
+                open: b.open,
+                high: b.high,
+                low: b.low,
+                close: b.close,
+                volume: b.volume,
+            };
+            if is_last_1m_5m {
+                rolling_5m_bars.push(nb5);
+                if rolling_5m_bars.len() > 300 {
+                    rolling_5m_bars.remove(0);
+                }
+            } else {
+                current_5m_bar = Some(nb5);
+            }
+        }
+
         let bucket_15m = (b.timestamp_ms / (15 * 60 * 1000)) * (15 * 60 * 1000);
         let is_last_1m = b.timestamp_ms + 60_000 >= bucket_15m + 15 * 60 * 1000;
         if let Some(mut cur) = current_15m_bar.take() {
@@ -436,6 +496,8 @@ pub fn run_engine_a_backtest_with_btc(
     let mut current_p_t = 0.25;
     let mut current_p_s = 0.15;
     let mut crowding_tracker = MarketCrowdingTracker::default();
+    let trend_cfg = TrendEngineConfig::for_symbol(symbol, 0.35, 0.28);
+    let mut engine_b_mgr = EngineBTrendManager::new();
     let donchian_period = 12usize;
     let chandelier_atr_mult = 2.0_f64;
 
@@ -567,13 +629,76 @@ pub fn run_engine_a_backtest_with_btc(
             median_15m_vol,
         );
 
-        // Update 15m bar aggregation & crowding tracker
-        crowding_tracker.update(
+        // Update 5m & 15m bar aggregation & crowding tracker
+        crowding_tracker.update_with_time(
             eff_funding_1h,
             bar.open_interest,
             bar.mark_px,
             bar.oracle_px,
+            bar.timestamp_ms,
         );
+        let candle_bucket_5m = (bar.timestamp_ms / (5 * 60 * 1000)) * (5 * 60 * 1000);
+        let is_last_1m_of_5m = bar.timestamp_ms + 60_000 >= candle_bucket_5m + 5 * 60 * 1000;
+        let mut finalized_5m_bar: Option<CandleBar> = None;
+        if let Some(mut cur_5m) = current_5m_bar.take() {
+            if cur_5m.time_open == candle_bucket_5m {
+                cur_5m.high = cur_5m.high.max(bar.high);
+                cur_5m.low = cur_5m.low.min(bar.low);
+                cur_5m.close = bar.close;
+                cur_5m.volume += bar.volume;
+                if is_last_1m_of_5m {
+                    rolling_5m_bars.push(cur_5m.clone());
+                    if rolling_5m_bars.len() > 300 {
+                        rolling_5m_bars.remove(0);
+                    }
+                    finalized_5m_bar = Some(cur_5m);
+                } else {
+                    current_5m_bar = Some(cur_5m);
+                }
+            } else {
+                rolling_5m_bars.push(cur_5m.clone());
+                if rolling_5m_bars.len() > 300 {
+                    rolling_5m_bars.remove(0);
+                }
+                finalized_5m_bar = Some(cur_5m);
+                let nb5 = CandleBar {
+                    time_open: candle_bucket_5m,
+                    open: bar.open,
+                    high: bar.high,
+                    low: bar.low,
+                    close: bar.close,
+                    volume: bar.volume,
+                };
+                if is_last_1m_of_5m {
+                    rolling_5m_bars.push(nb5.clone());
+                    if rolling_5m_bars.len() > 300 {
+                        rolling_5m_bars.remove(0);
+                    }
+                    finalized_5m_bar = Some(nb5);
+                } else {
+                    current_5m_bar = Some(nb5);
+                }
+            }
+        } else {
+            let nb5 = CandleBar {
+                time_open: candle_bucket_5m,
+                open: bar.open,
+                high: bar.high,
+                low: bar.low,
+                close: bar.close,
+                volume: bar.volume,
+            };
+            if is_last_1m_of_5m {
+                rolling_5m_bars.push(nb5.clone());
+                if rolling_5m_bars.len() > 300 {
+                    rolling_5m_bars.remove(0);
+                }
+                finalized_5m_bar = Some(nb5);
+            } else {
+                current_5m_bar = Some(nb5);
+            }
+        }
+
         let candle_bucket_15m = (bar.timestamp_ms / (15 * 60 * 1000)) * (15 * 60 * 1000);
         let is_last_1m_of_15m = bar.timestamp_ms + 60_000 >= candle_bucket_15m + 15 * 60 * 1000;
         let mut finalized_15m_bar: Option<CandleBar> = None;
@@ -678,12 +803,24 @@ pub fn run_engine_a_backtest_with_btc(
             if macro_abort.is_some() {
                 summary.macro_calendar_vetoes += 1;
                 summary.orders_expired_unfilled += 1;
+                if entry_ord.is_engine_b {
+                    engine_b_mgr.on_order_cancelled_or_rejected();
+                }
             } else if btc_abort.is_some() {
                 summary.btc_impulse_vetoes += 1;
                 summary.orders_expired_unfilled += 1;
+                if entry_ord.is_engine_b {
+                    engine_b_mgr.on_order_cancelled_or_rejected();
+                }
             } else if filled && !touch_absorbed {
                 summary.orders_expired_unfilled += 1;
+                if entry_ord.is_engine_b {
+                    engine_b_mgr.on_order_cancelled_or_rejected();
+                }
             } else if filled {
+                if entry_ord.is_engine_b {
+                    engine_b_mgr.on_order_filled();
+                }
                 summary.orders_filled += 1;
                 let entry_notional = entry_ord.qty * entry_ord.limit_px;
                 let entry_fee = entry_notional * (sim_cfg.maker_fee_bps * 1e-4);
@@ -781,6 +918,9 @@ pub fn run_engine_a_backtest_with_btc(
                 });
             } else if age_bars >= entry_ord.ttl_bars {
                 summary.orders_expired_unfilled += 1;
+                if entry_ord.is_engine_b {
+                    engine_b_mgr.on_order_cancelled_or_rejected();
+                }
             } else {
                 resting_entry = Some(entry_ord);
             }
@@ -863,29 +1003,7 @@ pub fn run_engine_a_backtest_with_btc(
                     cached_donchian_high_12 = d12.upper;
                     cached_donchian_low_12 = d12.lower;
                 }
-                if rolling_15m_bars.len() >= 26 {
-                    let n15 = rolling_15m_bars.len();
-                    let mut min_sq = f64::MAX;
-                    for k in 1..=6 {
-                        let end = n15.saturating_sub(k);
-                        if end >= 20 {
-                            let sub = &rolling_15m_bars[end - 20..end];
-                            let mean_c = sub.iter().map(|b| b.close).sum::<f64>() / 20.0;
-                            let var_c =
-                                sub.iter().map(|b| (b.close - mean_c).powi(2)).sum::<f64>() / 20.0;
-                            let std_20 = var_c.sqrt();
-                            if let Some(atr_sub) = calculate_atr(sub, 19).filter(|&a| a > 1e-9) {
-                                let sq = (2.0 * std_20) / (1.5 * atr_sub);
-                                if sq < min_sq {
-                                    min_sq = sq;
-                                }
-                            }
-                        }
-                    }
-                    if min_sq < f64::MAX {
-                        cached_min_squeeze_90m = min_sq;
-                    }
-                }
+                cached_min_squeeze_90m = calculate_min_squeeze_ratio_90m(&rolling_15m_bars);
                 let has_donchian_breakout = calculate_donchian(prior_bars, donchian_period)
                     .map(|d| closed_15m.close > d.upper || closed_15m.close < d.lower)
                     .unwrap_or(false);
@@ -1714,7 +1832,7 @@ pub fn run_engine_a_backtest_with_btc(
         // ------------------------------------------------------------------
         // 3. DUAL-ENGINE EVALUATION: Engine B (15m Donchian Trend) & Engine A (5m O-U Mean Reversion)
         // ------------------------------------------------------------------
-        if open_pos.is_none() && resting_entry.is_none() {
+        if open_pos.is_none() && !is_armed {
             if let Some(ref feat) = live_feat_opt {
                 let macro_veto = check_macro_calendar_veto(bar.timestamp_ms);
                 let cb_veto = cluster_cb.evaluate_equity_drawdown(
@@ -1722,70 +1840,112 @@ pub fn run_engine_a_backtest_with_btc(
                     sim_cfg.account_equity_usdc + cumulative_pnl_usd,
                     DEFAULT_MAX_DAILY_CLUSTER_DD_FRAC,
                 );
+                let is_resting_b = resting_entry
+                    .as_ref()
+                    .map(|r| r.policy == "ENGINE_B_TREND")
+                    .unwrap_or(false);
 
-                // 3A. ENGINE B: Evaluate on completed 15m candle close when Controller is in Trend mode
-                if !is_armed && controller.current_mode == ControllerMode::Trend {
-                    if let Some(ref closed_15m) = finalized_15m_bar {
-                        let prior_15m = if rolling_15m_bars.len() > 1 {
+                // 3A. ENGINE B (Policy C): Session Gating, Squeeze Filter & Two-Stage Alo Retest
+                if resting_entry.is_none() || is_resting_b {
+                    if controller.current_mode == ControllerMode::Neutral {
+                        if engine_b_mgr.is_stage1_armed() {
+                            engine_b_mgr.disarm();
+                        }
+                        if is_resting_b {
+                            resting_entry = None;
+                            engine_b_mgr.on_order_cancelled_or_rejected();
+                        }
+                    } else if let Some(ref closed_5m) = finalized_5m_bar {
+                        let prior_15m = if finalized_15m_bar.is_some() && rolling_15m_bars.len() > 1
+                        {
                             &rolling_15m_bars[..rolling_15m_bars.len() - 1]
                         } else {
                             &rolling_15m_bars[..]
                         };
-                        if let Some(ref donchian) = calculate_donchian(prior_15m, donchian_period) {
-                            let closes_15m: Vec<f64> =
-                                rolling_15m_bars.iter().map(|b| b.close).collect();
-                            let alignment = check_trend_alignment(&closes_15m);
-                            let rng_15m = (closed_15m.high - closed_15m.low).max(1e-9);
-                            let is_15m_bull_close = closed_15m.close > closed_15m.open
-                                && (closed_15m.close - closed_15m.low) / rng_15m >= 0.65;
-                            let is_15m_bear_close = closed_15m.close < closed_15m.open
-                                && (closed_15m.high - closed_15m.close) / rng_15m >= 0.65;
-                            let is_long_breakout = is_15m_bull_close
-                                && !feat.is_upside_shock
-                                && feat.z_60 < 2.5
-                                && feat.z_15 < 3.0
-                                && bar.close > donchian.upper
-                                && bar.close >= bar.open
-                                && alignment == TrendAlignment::Bullish;
-                            let is_short_breakout = is_15m_bear_close
-                                && !feat.is_downside_shock
-                                && feat.z_60 > -2.5
-                                && feat.z_15 > -3.0
-                                && bar.close < donchian.lower
-                                && bar.close <= bar.open
-                                && alignment == TrendAlignment::Bearish;
-
-                            if is_long_breakout || is_short_breakout {
-                                if macro_veto.is_some() {
-                                    summary.macro_calendar_vetoes += 1;
-                                } else if cb_veto.is_some() {
-                                    summary.cluster_cb_vetoes += 1;
-                                } else if let Some(current_atr) =
-                                    calculate_atr(&rolling_15m_bars, 20).filter(|&a| a > 0.0)
+                        if let (Some(ref donchian), Some(current_atr)) = (
+                            calculate_donchian(prior_15m, donchian_period),
+                            calculate_atr(&rolling_15m_bars, 20).filter(|&a| a > 0.0),
+                        ) {
+                            use chrono::Datelike;
+                            let ts_sec = bar.timestamp_ms / 1000;
+                            let wd_utc = chrono::DateTime::from_timestamp(ts_sec as i64, 0)
+                                .map(|d| d.weekday().num_days_from_sunday() as u8)
+                                .unwrap_or(1);
+                            let rel_vol_15m = calculate_rel_vol_15m(
+                                prior_15m,
+                                &rolling_5m_bars,
+                                finalized_15m_bar.as_ref(),
+                            );
+                            let ker_15m = calculate_ker_n(&rolling_15m_bars, 6);
+                            let min_sq_90m = calculate_min_squeeze_ratio_90m(&rolling_15m_bars);
+                            let eff_l2_obi = if has_native_l2 {
+                                0.40 * eff_obi_inst + 0.35 * eff_obi_1s + 0.25 * eff_obi_5s
+                            } else {
+                                eff_obi_inst
+                            };
+                            let btc_ret_60m_abs = if symbol.eq_ignore_ascii_case("BTC") {
+                                if closes_history.len() >= 61
+                                    && closes_history[closes_history.len() - 61] > 0.0
                                 {
-                                    let side = if is_long_breakout {
-                                        Side::Long
-                                    } else {
-                                        Side::Short
-                                    };
+                                    (bar.close / closes_history[closes_history.len() - 61])
+                                        .ln()
+                                        .abs()
+                                } else {
+                                    0.0
+                                }
+                            } else if let Some(bb) = eff_btc_bars {
+                                let p_now =
+                                    bb.partition_point(|x| x.timestamp_ms <= bar.timestamp_ms);
+                                let p_1h = bb.partition_point(|x| {
+                                    x.timestamp_ms
+                                        <= bar.timestamp_ms.saturating_sub(60 * 60 * 1000)
+                                });
+                                if p_now > 0 && p_1h > 0 && bb[p_1h - 1].close > 0.0 {
+                                    (bb[p_now - 1].close / bb[p_1h - 1].close).ln().abs()
+                                } else {
+                                    0.0
+                                }
+                            } else {
+                                0.0
+                            };
+                            let tel = BreakoutTelemetry {
+                                bar_open: closed_5m.open,
+                                bar_high: closed_5m.high,
+                                bar_low: closed_5m.low,
+                                bar_close: closed_5m.close,
+                                donchian_high_12_15m: donchian.upper,
+                                donchian_low_12_15m: donchian.lower,
+                                atr_15m: current_atr,
+                                min_squeeze_ratio_90m: min_sq_90m,
+                                rel_vol_15m,
+                                hurst_60m: feat.hurst_60m,
+                                l2_obi: eff_l2_obi,
+                                oi_delta_15m_pct: crowding_tracker
+                                    .oi_delta_15m_pct(bar.timestamp_ms),
+                            };
+                            let is_mode_mr =
+                                controller.current_mode == ControllerMode::MeanReversion;
+                            let eq_now = sim_cfg.account_equity_usdc + cumulative_pnl_usd;
+                            match engine_b_mgr.on_5m_bar_close(
+                                &trend_cfg,
+                                &tel,
+                                ts_sec,
+                                wd_utc,
+                                eq_now,
+                                is_mode_mr,
+                                ker_15m,
+                                btc_ret_60m_abs,
+                            ) {
+                                TrendOrderAction::PostAloMakerRetestOrder {
+                                    dir,
+                                    limit_px,
+                                    stop_loss_px,
+                                    notional_usdc,
+                                    ttl_secs,
+                                    ..
+                                } => {
+                                    let side = dir.to_side();
                                     let is_long = side == Side::Long;
-                                    // Engine D vs. Engine B Veto (Section 5.2): block breakouts driven by collapsing OI
-                                    let oi_health_ok = eff_dlog_oi_3m >= -0.0020;
-                                    let obi_ok = if has_native_l2 {
-                                        if is_long {
-                                            eff_obi_inst >= -0.18
-                                                && eff_obi_1s >= -0.15
-                                                && eff_obi_5s >= -0.12
-                                        } else {
-                                            eff_obi_inst <= 0.18
-                                                && eff_obi_1s <= 0.15
-                                                && eff_obi_5s <= 0.12
-                                        }
-                                    } else if is_long {
-                                        eff_obi_inst >= asset_cal.tau_obi_eng_b
-                                    } else {
-                                        eff_obi_inst <= -asset_cal.tau_obi_eng_b
-                                    };
                                     let btc_veto = eff_btc_bars
                                         .and_then(|bb| {
                                             build_historical_btc_impulse_snapshot(
@@ -1798,27 +1958,22 @@ pub fn run_engine_a_backtest_with_btc(
                                         });
                                     let crowding_mult =
                                         crowding_tracker.directional_trend_multiplier(&side);
-                                    let budget_verdict = evaluate_pre_breakout_budget(
-                                        symbol,
-                                        &rolling_15m_bars,
-                                        donchian,
-                                        current_atr,
-                                        bar.close,
-                                        feat.z_60,
-                                        &side,
-                                    );
-                                    let trend_micro_ok = has_native_l2
-                                        || (feat.hurst_60m >= 0.52
-                                            && feat.ker_30m >= 0.35
-                                            && current_p_t >= 0.75);
-                                    if btc_veto.is_some() {
+                                    let adverse_shock = (is_long
+                                        && (feat.is_upside_shock || feat.z_60 >= 2.5))
+                                        || (!is_long
+                                            && (feat.is_downside_shock || feat.z_60 <= -2.5));
+                                    if macro_veto.is_some() {
+                                        summary.macro_calendar_vetoes += 1;
+                                        engine_b_mgr.on_order_cancelled_or_rejected();
+                                    } else if cb_veto.is_some() {
+                                        summary.cluster_cb_vetoes += 1;
+                                        engine_b_mgr.on_order_cancelled_or_rejected();
+                                    } else if btc_veto.is_some() {
                                         summary.btc_impulse_vetoes += 1;
-                                    } else if obi_ok
-                                        && oi_health_ok
-                                        && trend_micro_ok
-                                        && crowding_mult >= 0.45
-                                        && budget_verdict.approved
-                                    {
+                                        engine_b_mgr.on_order_cancelled_or_rejected();
+                                    } else if adverse_shock || crowding_mult < 0.45 {
+                                        engine_b_mgr.on_order_cancelled_or_rejected();
+                                    } else {
                                         let eff_bid = if bar.best_bid > 0.0 {
                                             bar.best_bid
                                         } else {
@@ -1831,69 +1986,53 @@ pub fn run_engine_a_backtest_with_btc(
                                         };
                                         let spread = eff_ask - eff_bid;
                                         let raw_limit = if is_long {
-                                            if spread >= 2.0 * tick_sz - 1e-9
-                                                && eff_bid + tick_sz < eff_ask - 1e-9
+                                            let max_bid = if spread >= 2.0 * tick_sz - 1e-9
+                                                && eff_ask - tick_sz > eff_bid
+                                            {
+                                                eff_ask - tick_sz
+                                            } else {
+                                                eff_bid
+                                            };
+                                            limit_px.min(max_bid)
+                                        } else {
+                                            let min_ask = if spread >= 2.0 * tick_sz - 1e-9
+                                                && eff_bid + tick_sz < eff_ask
                                             {
                                                 eff_bid + tick_sz
                                             } else {
-                                                eff_bid
-                                            }
-                                        } else if spread >= 2.0 * tick_sz - 1e-9
-                                            && eff_ask - tick_sz > eff_bid + 1e-9
-                                        {
-                                            eff_ask - tick_sz
-                                        } else {
-                                            eff_ask
+                                                eff_ask
+                                            };
+                                            limit_px.max(min_ask)
                                         };
-                                        let limit_px =
+                                        let q_limit_px =
                                             quantize_price(raw_limit, sim_cfg.sz_decimals);
-                                        let max_sl_b_frac =
-                                            if has_native_l2 { 0.0085 } else { 0.0055 };
-                                        let sl_dist_b = (chandelier_atr_mult * current_atr)
-                                            .min(limit_px * max_sl_b_frac);
-                                        let initial_sl = quantize_price(
-                                            if is_long {
-                                                limit_px - sl_dist_b
-                                            } else {
-                                                limit_px + sl_dist_b
-                                            },
-                                            sim_cfg.sz_decimals,
-                                        );
+                                        let safe_sl = if is_long {
+                                            stop_loss_px.min(q_limit_px * 0.9975)
+                                        } else {
+                                            stop_loss_px.max(q_limit_px * 1.0025)
+                                        };
+                                        let initial_sl =
+                                            quantize_price(safe_sl, sim_cfg.sz_decimals);
                                         let k_tp = optimal_engine_b_tp_atr_multiple(symbol);
-                                        let tp_dist = (k_tp * current_atr).max(limit_px * 0.0045);
+                                        let tp_dist = (k_tp * current_atr).max(q_limit_px * 0.0045);
                                         let tp_px = quantize_price(
                                             if is_long {
-                                                limit_px + tp_dist
+                                                q_limit_px + tp_dist
                                             } else {
-                                                (limit_px - tp_dist).max(tick_sz)
+                                                (q_limit_px - tp_dist).max(tick_sz)
                                             },
                                             sim_cfg.sz_decimals,
                                         );
-                                        let max_b_notional = ou_cfg
-                                            .volatility_adjusted_trend_notional_cap(
-                                                sim_cfg.account_equity_usdc,
-                                                limit_px,
-                                                current_atr,
-                                            );
-                                        let notional =
-                                            crate::hyperliquid::calculate_risk_scaled_notional(
-                                                sim_cfg.account_equity_usdc,
-                                                (sim_cfg.notional_usdc * crowding_mult)
-                                                    .min(max_b_notional),
-                                                0.0060 * crowding_mult,
-                                                limit_px,
-                                                initial_sl,
-                                                3,
-                                                2,
-                                                11.0,
-                                                max_b_notional,
-                                            );
-                                        let qty = notional / limit_px.max(1e-9);
+                                        let notional = (notional_usdc * crowding_mult).clamp(
+                                            trend_cfg.min_trade_notional_usdc,
+                                            trend_cfg.max_trend_notional_usdc,
+                                        );
+                                        let qty = notional / q_limit_px.max(1e-9);
                                         summary.signals_armed += 1;
                                         summary.orders_submitted += 1;
                                         resting_entry = Some(RestingMakerEntry {
                                             side,
-                                            limit_px,
+                                            limit_px: q_limit_px,
                                             qty,
                                             target_tp_px: tp_px,
                                             hard_stop_px: initial_sl,
@@ -1901,17 +2040,36 @@ pub fn run_engine_a_backtest_with_btc(
                                             frozen_sigma_eq_log: feat.sigma_eq_log,
                                             half_life_m: 45.0,
                                             submitted_bar_idx: idx,
-                                            ttl_bars: 5,
+                                            ttl_bars: ((ttl_secs / 60).max(1)) as usize,
                                             policy: "ENGINE_B_TREND",
                                             is_engine_b: true,
                                             entry_atr: current_atr,
                                         });
                                     }
                                 }
+                                TrendOrderAction::CancelRestingRetestOrder { .. } => {
+                                    if is_resting_b {
+                                        resting_entry = None;
+                                        summary.orders_expired_unfilled += 1;
+                                    }
+                                }
+                                TrendOrderAction::LogShadowCounterfactual { .. }
+                                | TrendOrderAction::None => {}
                             }
                         }
                     }
                 }
+            }
+        }
+
+        if open_pos.is_none() && resting_entry.is_none() {
+            if let Some(ref feat) = live_feat_opt {
+                let macro_veto = check_macro_calendar_veto(bar.timestamp_ms);
+                let cb_veto = cluster_cb.evaluate_equity_drawdown(
+                    bar.timestamp_ms,
+                    sim_cfg.account_equity_usdc + cumulative_pnl_usd,
+                    DEFAULT_MAX_DAILY_CLUSTER_DD_FRAC,
+                );
 
                 // 3B. ENGINE A: Evaluate 5m O-U Arming & 1m Multi-Bar Reversal Confirmation
                 let consolidation_vol_ok = feat.z_15.abs() < 2.2 && feat.z_60.abs() < 2.5;
@@ -4033,6 +4191,99 @@ mod tests {
                 assert!((tp2_opposite_bound - 79800.0).abs() < 1e-6);
             }
             other => panic!("Expected PostJudasSwingTrapReversal Short, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_backtest_engine_b_policy_c_session_squeeze_and_retest() {
+        use chrono::{TimeZone, Utc};
+        // Anchor evaluation start (bar 720) at 14:00 UTC on Wednesday Nov 11, 2026 (US institutional window)
+        let eval_start = Utc
+            .with_ymd_and_hms(2026, 11, 11, 14, 0, 0)
+            .unwrap()
+            .timestamp_millis() as u64;
+        let base_ts = eval_start - 720 * 60_000;
+
+        let mut bars = Vec::with_capacity(820);
+        // 1. 720 warmup bars: tight coiled oscillation in [$73,000 - $73,200] (creates tight squeeze <= 0.90)
+        for i in 0..720 {
+            let osc = if (i / 15) % 2 == 0 { 40.0 } else { -40.0 };
+            let px = 73_100.0 + osc + ((i % 5) as f64 - 2.0) * 8.0;
+            bars.push(HistoricalMarketBarRecord {
+                symbol: "BTC".to_string(),
+                timestamp_ms: base_ts + (i as u64) * 60_000,
+                open: px - 5.0,
+                high: px + 45.0,
+                low: px - 45.0,
+                close: px,
+                volume: 50.0,
+                best_bid: px - 1.0,
+                best_ask: px + 1.0,
+                obi_instant: 0.05,
+                obi_1s: 0.05,
+                obi_5s: 0.05,
+                funding_1h: 0.0000125,
+                open_interest: 100_000.0,
+                mark_px: px,
+                oracle_px: px,
+            });
+        }
+
+        // 2. Bars 720..765 (14:00 - 14:45 UTC): sustained upward expansion to push HMM P_T >= 0.80 -> ControllerMode::Trend,
+        //    with high volume impulse >= 1.65x and strong positive OBI >= +0.22 on 5m closes, followed by shallow retest & runner!
+        for j in 0..80 {
+            let px = if j < 30 {
+                // Steady upward breakout through $73,200 -> $73,650 (pushes P_T high & breaks Donchian)
+                73_150.0 + (j as f64) * 16.0
+            } else if j < 36 {
+                // Shallow retest back to ~$73,250 so Stage 2 Alo Retest fills
+                73_610.0 - ((j - 29) as f64) * 62.0
+            } else {
+                // Post-retest trend runner up to $74,300
+                73_240.0 + ((j - 35) as f64) * 24.0
+            };
+            let vol = if j < 35 { 130.0 } else { 80.0 };
+            let obi = if j < 36 { 0.35 } else { 0.25 };
+            bars.push(HistoricalMarketBarRecord {
+                symbol: "BTC".to_string(),
+                timestamp_ms: eval_start + (j as u64) * 60_000,
+                open: px - 8.0,
+                high: px + 18.0,
+                low: px - 15.0,
+                close: px,
+                volume: vol,
+                best_bid: px - 1.0,
+                best_ask: px + 1.0,
+                obi_instant: obi,
+                obi_1s: obi,
+                obi_5s: obi,
+                funding_1h: 0.0000125,
+                open_interest: 100_500.0,
+                mark_px: px,
+                oracle_px: px,
+            });
+        }
+
+        let cfg = SimulatedExchangeConfig {
+            sz_decimals: 5,
+            notional_usdc: 196.15,
+            account_equity_usdc: 560.44,
+            ..Default::default()
+        };
+        let res = run_engine_a_backtest("BTC", &bars, &cfg);
+        assert!(res.bars_evaluated == 80);
+        // Verify any Engine B trades sized under Policy C strictly adhere to the $55.00 loss-parity cap
+        for t in res
+            .trades
+            .iter()
+            .filter(|t| t.entry_policy == "ENGINE_B_TREND")
+        {
+            let ntl = t.qty * t.entry_px;
+            assert!(
+                ntl <= 55.01,
+                "Policy C Engine B trade notional ${:.2} exceeded $55.00 hard cap!",
+                ntl
+            );
         }
     }
 }

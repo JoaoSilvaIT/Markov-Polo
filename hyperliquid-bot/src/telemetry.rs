@@ -70,6 +70,8 @@ pub struct LiveTelemetry {
     pub ret_15m_bps: f64,
     #[serde(default)]
     pub ret_30m_bps: f64,
+    #[serde(default)]
+    pub ret_60m_bps: f64,
 }
 
 pub fn save_telemetry(symbol: &str, telemetry: &LiveTelemetry) {

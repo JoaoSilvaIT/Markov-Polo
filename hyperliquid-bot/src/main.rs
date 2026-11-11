@@ -1,4 +1,4 @@
-use chrono::Timelike;
+use chrono::{Datelike, Timelike};
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::H160;
 use hyperliquid_rust_sdk::{BaseUrl, ExchangeClient, InfoClient, Message, Subscription};
@@ -33,9 +33,9 @@ use crate::hmm::{compute_hmm_posteriors, train_hmm_offline, GaussianHMM};
 use crate::hyperliquid::{
     calculate_dynamic_notional, calculate_risk_scaled_notional, cancel_order,
     compute_drawdown_risk_multiplier, effective_tick_size, exceeds_micro_account_step_risk,
-    fetch_book_ticker, fetch_sz_decimals_map, get_account_value, get_user_position,
-    optimal_engine_b_tp_atr_multiple, place_disaster_stop_trigger_order, place_post_only_order,
-    quantize_price,
+    fetch_book_ticker, fetch_open_orders_for_coin, fetch_sz_decimals_map, get_account_value,
+    get_user_position, optimal_engine_b_tp_atr_multiple, place_disaster_stop_trigger_order,
+    place_post_only_order, quantize_price,
 };
 use crate::order::{emergency_flatten, place_ou_maker_entry};
 use crate::ou_process::{
@@ -48,10 +48,11 @@ use crate::state::{
     StateMap,
 };
 use crate::trend::{
-    append_candidate_log, calculate_atr, calculate_donchian, check_trend_alignment,
-    evaluate_pre_breakout_budget, load_shadow_trade, record_shadow_entry, record_shadow_exit,
-    save_shadow_trade, CandleBar, ChandelierExitState, EngineBCandidateLog, L2ObiTracker,
-    MarketCrowdingTracker, TrendAlignment,
+    append_candidate_log, calculate_atr, calculate_donchian, calculate_ker_n,
+    calculate_min_squeeze_ratio_90m, calculate_rel_vol_15m, check_trend_alignment,
+    load_shadow_trade, record_shadow_entry, record_shadow_exit, save_shadow_trade,
+    BreakoutTelemetry, CandleBar, ChandelierExitState, EngineBCandidateLog, EngineBTrendManager,
+    L2ObiTracker, MarketCrowdingTracker, TrendAlignment, TrendEngineConfig, TrendOrderAction,
 };
 
 async fn backfill_missing_1m_candles(
@@ -60,6 +61,8 @@ async fn backfill_missing_1m_candles(
     start_ms: u64,
     end_ms: u64,
     rolling_closes: &mut Vec<f64>,
+    rolling_5m_bars: &mut Vec<CandleBar>,
+    current_5m_bar: &mut Option<CandleBar>,
     rolling_15m_bars: &mut Vec<CandleBar>,
     current_15m_bar: &mut Option<CandleBar>,
 ) -> Result<usize, String> {
@@ -129,6 +132,39 @@ async fn backfill_missing_1m_candles(
             rolling_closes.remove(0);
         }
 
+        let candle_bucket_5m = (c.time_open / (5 * 60 * 1000)) * (5 * 60 * 1000);
+        if let Some(ref mut cur_5m) = current_5m_bar {
+            if cur_5m.time_open == candle_bucket_5m {
+                cur_5m.high = cur_5m.high.max(high_f);
+                cur_5m.low = cur_5m.low.min(low_f);
+                cur_5m.close = close_f;
+                cur_5m.volume += vol_f;
+            } else {
+                let closed = cur_5m.clone();
+                rolling_5m_bars.push(closed);
+                if rolling_5m_bars.len() > 300 {
+                    rolling_5m_bars.remove(0);
+                }
+                *cur_5m = CandleBar {
+                    time_open: candle_bucket_5m,
+                    open: open_f,
+                    high: high_f,
+                    low: low_f,
+                    close: close_f,
+                    volume: vol_f,
+                };
+            }
+        } else {
+            *current_5m_bar = Some(CandleBar {
+                time_open: candle_bucket_5m,
+                open: open_f,
+                high: high_f,
+                low: low_f,
+                close: close_f,
+                volume: vol_f,
+            });
+        }
+
         let candle_bucket_15m = (c.time_open / (15 * 60 * 1000)) * (15 * 60 * 1000);
         if let Some(ref mut cur_15m) = current_15m_bar {
             if cur_15m.time_open == candle_bucket_15m {
@@ -166,9 +202,18 @@ async fn backfill_missing_1m_candles(
     Ok(backfilled_count)
 }
 
+#[inline]
+fn effective_equity_fraction_for_config(config: &Config) -> f64 {
+    if config.trading_symbol.starts_with("xyz:") {
+        config.equity_fraction.min(0.32)
+    } else {
+        config.equity_fraction
+    }
+}
+
 /// Dynamically resolves the trade bank notional (in USDC).
 /// If sizing_mode is "dynamic", queries Hyperliquid for live account equity, caches it,
-/// and allocates `equity_fraction` of the total balance (e.g. 1/4 = 0.25, 1/3 = 0.33),
+/// and allocates `equity_fraction` of the total balance (0.35 Crypto, 0.32 HIP-3),
 /// clamped to Hyperliquid's minimum ($11.0) and the maximum safety cap.
 /// If live fetch fails or mode is "fixed", gracefully falls back to cached equity or `config.position_size_usdc`.
 async fn resolve_trade_bank(
@@ -180,6 +225,7 @@ async fn resolve_trade_bank(
     if config.sizing_mode == "fixed" {
         return config.position_size_usdc;
     }
+    let eff_eq_frac = effective_equity_fraction_for_config(config);
 
     if let Ok(account_val) = get_account_value(info, address).await {
         if account_val > 0.0 {
@@ -187,7 +233,7 @@ async fn resolve_trade_bank(
             *w = account_val;
             return calculate_dynamic_notional(
                 account_val,
-                config.equity_fraction,
+                eff_eq_frac,
                 11.0,
                 config.max_position_size_usdc,
                 config.position_size_usdc,
@@ -199,7 +245,7 @@ async fn resolve_trade_bank(
     if *r > 0.0 {
         return calculate_dynamic_notional(
             *r,
-            config.equity_fraction,
+            eff_eq_frac,
             11.0,
             config.max_position_size_usdc,
             config.position_size_usdc,
@@ -783,6 +829,9 @@ async fn main() {
     );
     let now_ms = chrono::Utc::now().timestamp_millis() as u64;
     let window_start_ms = now_ms.saturating_sub(960 * 60 * 1000);
+    let cur_bucket_5m = (now_ms / (5 * 60 * 1000)) * (5 * 60 * 1000);
+    let mut rolling_5m_bars: Vec<CandleBar> = Vec::with_capacity(300);
+    let mut initial_5m_bar: Option<CandleBar> = None;
     let cur_bucket_15m = (now_ms / (15 * 60 * 1000)) * (15 * 60 * 1000);
     let mut initial_15m_bar: Option<CandleBar> = None;
     let mut initial_last_1m_open: u64 = 0;
@@ -818,6 +867,71 @@ async fn main() {
                     let vol_f = c.vlm.parse::<f64>().unwrap_or(0.0);
                     rolling_closes.push(close_f);
 
+                    let b_5m = (c.time_open / (5 * 60 * 1000)) * (5 * 60 * 1000);
+                    if b_5m < cur_bucket_5m {
+                        if let Some(ref mut prev_5m) = initial_5m_bar {
+                            if prev_5m.time_open == b_5m {
+                                prev_5m.high = prev_5m.high.max(high_f);
+                                prev_5m.low = prev_5m.low.min(low_f);
+                                prev_5m.close = close_f;
+                                prev_5m.volume += vol_f;
+                            } else {
+                                rolling_5m_bars.push(prev_5m.clone());
+                                if rolling_5m_bars.len() > 300 {
+                                    rolling_5m_bars.remove(0);
+                                }
+                                *prev_5m = CandleBar {
+                                    time_open: b_5m,
+                                    open: open_f,
+                                    high: high_f,
+                                    low: low_f,
+                                    close: close_f,
+                                    volume: vol_f,
+                                };
+                            }
+                        } else {
+                            initial_5m_bar = Some(CandleBar {
+                                time_open: b_5m,
+                                open: open_f,
+                                high: high_f,
+                                low: low_f,
+                                close: close_f,
+                                volume: vol_f,
+                            });
+                        }
+                    } else if let Some(prev_5m) = initial_5m_bar.take() {
+                        if prev_5m.time_open < cur_bucket_5m {
+                            rolling_5m_bars.push(prev_5m);
+                            if rolling_5m_bars.len() > 300 {
+                                rolling_5m_bars.remove(0);
+                            }
+                            initial_5m_bar = Some(CandleBar {
+                                time_open: cur_bucket_5m,
+                                open: open_f,
+                                high: high_f,
+                                low: low_f,
+                                close: close_f,
+                                volume: vol_f,
+                            });
+                        } else {
+                            let mut cur = prev_5m;
+                            cur.high = cur.high.max(high_f);
+                            cur.low = cur.low.min(low_f);
+                            cur.close = close_f;
+                            cur.volume += vol_f;
+                            initial_5m_bar = Some(cur);
+                        }
+                    } else {
+                        initial_5m_bar = Some(CandleBar {
+                            time_open: cur_bucket_5m,
+                            open: open_f,
+                            high: high_f,
+                            low: low_f,
+                            close: close_f,
+                            volume: vol_f,
+                        });
+                    }
+
                     if c.time_open >= cur_bucket_15m {
                         if let Some(ref mut b15) = initial_15m_bar {
                             b15.high = b15.high.max(high_f);
@@ -837,9 +951,19 @@ async fn main() {
                     }
                 }
             }
+            if let Some(ref rem_5m) = initial_5m_bar {
+                if rem_5m.time_open < cur_bucket_5m {
+                    rolling_5m_bars.push(rem_5m.clone());
+                    if rolling_5m_bars.len() > 300 {
+                        rolling_5m_bars.remove(0);
+                    }
+                    initial_5m_bar = None;
+                }
+            }
             println!(
-                "✅ [INGESTION] Successfully loaded {} historical 1m bars for {}.",
+                "✅ [INGESTION] Successfully loaded {} historical 1m bars ({} closed 5m bars) for {}.",
                 rolling_closes.len(),
+                rolling_5m_bars.len(),
                 trading_symbol
             );
         }
@@ -940,7 +1064,7 @@ async fn main() {
     // 2. Query live open orders with fail-closed retries
     retry_count = 0;
     let open_orders_res = loop {
-        match info_client.open_orders(user_address).await {
+        match fetch_open_orders_for_coin(&info_client, user_address, &trading_symbol).await {
             Ok(orders) => break orders,
             Err(e) => {
                 retry_count += 1;
@@ -954,16 +1078,17 @@ async fn main() {
     let symbol_open_orders: Vec<_> = open_orders_res.into_iter().filter(|o| o.coin == trading_symbol).collect();
 
     // Query live account equity for dynamic sizing
+    let eff_eq_frac_startup = effective_equity_fraction_for_config(&config);
     let initial_equity = match get_account_value(&info_client, user_address).await {
         Ok(eq) => {
             println!(
                 "💰 [STARTUP ACCOUNT EQUITY] Equity: ${:.2} USDC | Mode: {} | Fraction: {:.1}% | Initial Trade Bank: ${:.2} USDC",
                 eq,
                 config.sizing_mode.to_uppercase(),
-                config.equity_fraction * 100.0,
+                eff_eq_frac_startup * 100.0,
                 calculate_dynamic_notional(
                     eq,
-                    config.equity_fraction,
+                    eff_eq_frac_startup,
                     11.0,
                     config.max_position_size_usdc,
                     config.position_size_usdc,
@@ -1467,24 +1592,12 @@ async fn main() {
 
                 if !pos.order_id.is_empty() && !pos.is_filled && needs_poll {
                     if let Ok(oid) = pos.order_id.parse::<u64>() {
-                        let open_orders = match tokio::time::timeout(
-                            Duration::from_secs(10),
-                            watcher_info.open_orders(user_address),
-                        )
-                        .await
-                        {
-                            Ok(Ok(o)) => o,
-                            Ok(Err(e)) => {
+                        let open_orders = match fetch_open_orders_for_coin(&watcher_info, user_address, &watcher_symbol).await {
+                            Ok(o) => o,
+                            Err(e) => {
                                 eprintln!(
                                     "⚠️ [FAST-SENTINEL] API failure querying open_orders for {}: {}. Retaining state (fail-closed).",
                                     watcher_symbol, e
-                                );
-                                continue;
-                            }
-                            Err(_) => {
-                                eprintln!(
-                                    "⚠️ [FAST-SENTINEL] Timeout querying open_orders for {}. Retaining state (fail-closed).",
-                                    watcher_symbol
                                 );
                                 continue;
                             }
@@ -1758,24 +1871,12 @@ async fn main() {
 
                     // Reconcile open orders and position before cleaning up state
                     let eps = 1e-5;
-                    let verify_orders = match tokio::time::timeout(
-                        Duration::from_secs(10),
-                        watcher_info.open_orders(user_address),
-                    )
-                    .await
-                    {
-                        Ok(Ok(orders)) => orders,
-                        Ok(Err(e)) => {
+                    let verify_orders = match fetch_open_orders_for_coin(&watcher_info, user_address, &watcher_symbol).await {
+                        Ok(orders) => orders,
+                        Err(e) => {
                             eprintln!(
                                 "⚠️ [FAST-SENTINEL] Failed to verify open_orders before cleanup for {}: {}. Retaining state.",
                                 watcher_symbol, e
-                            );
-                            continue;
-                        }
-                        Err(_) => {
-                            eprintln!(
-                                "⚠️ [FAST-SENTINEL] Timeout verifying open_orders before cleanup for {}. Retaining state.",
-                                watcher_symbol
                             );
                             continue;
                         }
@@ -1861,24 +1962,12 @@ async fn main() {
                 }
 
                 if is_tp_filled || is_flat {
-                    let final_orders = match tokio::time::timeout(
-                        Duration::from_secs(10),
-                        watcher_info.open_orders(user_address),
-                    )
-                    .await
-                    {
-                        Ok(Ok(orders)) => orders,
-                        Ok(Err(e)) => {
+                    let final_orders = match fetch_open_orders_for_coin(&watcher_info, user_address, &watcher_symbol).await {
+                        Ok(orders) => orders,
+                        Err(e) => {
                             eprintln!(
                                 "⚠️ [FAST-SENTINEL] Failed to query open_orders on TP close for {}: {}. Retaining state.",
                                 watcher_symbol, e
-                            );
-                            continue;
-                        }
-                        Err(_) => {
-                            eprintln!(
-                                "⚠️ [FAST-SENTINEL] Timeout querying open_orders on TP close for {}. Retaining state.",
-                                watcher_symbol
                             );
                             continue;
                         }
@@ -1988,25 +2077,38 @@ async fn main() {
     let trend_risk_fraction = config.trend_risk_fraction;
     let donchian_period = config.donchian_period;
     let chandelier_atr_mult = config.chandelier_atr_mult;
+    let eff_eq_frac_loop = effective_equity_fraction_for_config(&config);
+    let trend_cfg = TrendEngineConfig::for_symbol(
+        &trading_symbol,
+        eff_eq_frac_loop,
+        trend_risk_fraction,
+    );
+    let mut engine_b_mgr = EngineBTrendManager::new();
     let initial_trade_bank = calculate_dynamic_notional(
         initial_equity,
-        config.equity_fraction,
+        eff_eq_frac_loop,
         11.0,
         config.max_position_size_usdc,
         position_size_usdc,
     );
     println!(
-        "⚙️ [STARTUP CONFIG] Symbol: {} | Engine A: LIVE (Maker Post-Only) | Engine B (Trend): {} | Leverage: {}x | Sizing: {} (Bank: ${:.2}, Frac: {:.1}%, Mult: {:.2})",
+        "⚙️ [STARTUP CONFIG] Symbol: {} | Engine A: LIVE (Maker Post-Only, {:.0}% eq -> ${:.2}) | Engine B (Policy C): {} ({:?}, {:.2}x risk -> ${:.2} cap ${:.2}, Squeeze <= {:.2}, RelVol >= {:.2}x, Retest TTL {}s) | Leverage: {}x",
         trading_symbol,
-        trend_engine_mode.to_uppercase(),
-        config.hl_leverage,
-        config.sizing_mode.to_uppercase(),
+        eff_eq_frac_loop * 100.0,
         initial_trade_bank,
-        config.equity_fraction * 100.0,
-        trend_risk_fraction
+        trend_engine_mode.to_uppercase(),
+        trend_cfg.tier,
+        trend_cfg.trend_risk_fraction,
+        trend_cfg.compute_trend_notional_usdc(initial_equity),
+        trend_cfg.max_trend_notional_usdc,
+        trend_cfg.max_squeeze_ratio,
+        trend_cfg.min_rel_volume,
+        trend_cfg.retest_ttl_secs,
+        config.hl_leverage,
     );
     let cached_equity_loop = cached_account_equity.clone();
     let mut controller = load_controller_state(&trading_symbol);
+    let mut current_5m_bar: Option<CandleBar> = initial_5m_bar;
     let mut current_15m_bar: Option<CandleBar> = initial_15m_bar;
 
     // Initialize regime posteriors immediately from pre-filled 15m bars to eliminate startup blind-lag
@@ -2144,10 +2246,17 @@ async fn main() {
                                 let oi_val = perp_ctx.open_interest.parse::<f64>().unwrap_or(0.0);
                                 let mark_val = perp_ctx.shared.mark_px.parse::<f64>().unwrap_or(0.0);
                                 let oracle_val = perp_ctx.oracle_px.parse::<f64>().unwrap_or(0.0);
+                                let local_recv_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
                                 if f_rate.is_finite() {
                                     *funding_bg.write().await = f_rate;
                                 }
-                                crowding_bg.write().await.update(f_rate, oi_val, mark_val, oracle_val);
+                                crowding_bg.write().await.update_with_time(
+                                    f_rate,
+                                    oi_val,
+                                    mark_val,
+                                    oracle_val,
+                                    local_recv_ms,
+                                );
                             }
                         }
                     }
@@ -2320,6 +2429,8 @@ async fn main() {
                         last_processed_1m_open + 60_000,
                         completed_bar.time_open,
                         &mut rolling_closes,
+                        &mut rolling_5m_bars,
+                        &mut current_5m_bar,
                         &mut rolling_15m_bars,
                         &mut current_15m_bar,
                     ).await;
@@ -2364,6 +2475,69 @@ async fn main() {
 
                 let now_candle_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
                 cf_tracker.on_candle_bar(&trading_symbol, high_price, low_price, close_price, now_candle_ms);
+
+                let candle_bucket_5m = (completed_bar.time_open / (5 * 60 * 1000)) * (5 * 60 * 1000);
+                let is_last_1m_of_5m = completed_bar.time_open + 60_000 >= candle_bucket_5m + 5 * 60 * 1000;
+                let mut finalized_5m_bar: Option<CandleBar> = None;
+
+                if let Some(mut cur_5m) = current_5m_bar.take() {
+                    if cur_5m.time_open == candle_bucket_5m {
+                        cur_5m.high = cur_5m.high.max(high_price);
+                        cur_5m.low = cur_5m.low.min(low_price);
+                        cur_5m.close = close_price;
+                        cur_5m.volume += vol_val;
+                        if is_last_1m_of_5m {
+                            rolling_5m_bars.push(cur_5m.clone());
+                            if rolling_5m_bars.len() > 300 {
+                                rolling_5m_bars.remove(0);
+                            }
+                            finalized_5m_bar = Some(cur_5m);
+                        } else {
+                            current_5m_bar = Some(cur_5m);
+                        }
+                    } else {
+                        rolling_5m_bars.push(cur_5m.clone());
+                        if rolling_5m_bars.len() > 300 {
+                            rolling_5m_bars.remove(0);
+                        }
+                        finalized_5m_bar = Some(cur_5m);
+                        let new_5m = CandleBar {
+                            time_open: candle_bucket_5m,
+                            open: open_price,
+                            high: high_price,
+                            low: low_price,
+                            close: close_price,
+                            volume: vol_val,
+                        };
+                        if is_last_1m_of_5m {
+                            rolling_5m_bars.push(new_5m.clone());
+                            if rolling_5m_bars.len() > 300 {
+                                rolling_5m_bars.remove(0);
+                            }
+                            finalized_5m_bar = Some(new_5m);
+                        } else {
+                            current_5m_bar = Some(new_5m);
+                        }
+                    }
+                } else {
+                    let new_5m = CandleBar {
+                        time_open: candle_bucket_5m,
+                        open: open_price,
+                        high: high_price,
+                        low: low_price,
+                        close: close_price,
+                        volume: vol_val,
+                    };
+                    if is_last_1m_of_5m {
+                        rolling_5m_bars.push(new_5m.clone());
+                        if rolling_5m_bars.len() > 300 {
+                            rolling_5m_bars.remove(0);
+                        }
+                        finalized_5m_bar = Some(new_5m);
+                    } else {
+                        current_5m_bar = Some(new_5m);
+                    }
+                }
 
                 let candle_bucket_15m = (completed_bar.time_open / (15 * 60 * 1000)) * (15 * 60 * 1000);
                 let is_last_1m_of_15m = completed_bar.time_open + 60_000 >= candle_bucket_15m + 15 * 60 * 1000;
@@ -2901,6 +3075,11 @@ async fn main() {
                         } else {
                             0.0
                         },
+                        ret_60m_bps: if rolling_closes.len() >= 61 && rolling_closes[rolling_closes.len() - 61] > 0.0 {
+                            (close_price / rolling_closes[rolling_closes.len() - 61]).ln() * 1e4
+                        } else {
+                            0.0
+                        },
                     };
                     save_telemetry(&symbol_clone, &telemetry_data);
 
@@ -3015,267 +3194,405 @@ async fn main() {
                     }
 
                     // ------------------------------------------------------------------
-                    // ENGINE B ENTRY: Donchian Breakout + Continuous L2 EWMA OBI Hurdle
+                    // ENGINE B (POLICY C): Risk-Parity Sizing, Session Gating,
+                    // Coiled-Spring Squeeze Filter & Two-Stage Alo Maker Retest
                     // ------------------------------------------------------------------
-                    if controller.current_mode == ControllerMode::Trend {
-                        let active_shadow = load_shadow_trade(&symbol_clone);
-                        let has_active_trade = if trend_engine_mode == "live" {
-                            state_clone.lock().await.contains_key(&symbol_clone)
+                    let active_shadow = load_shadow_trade(&symbol_clone);
+                    let (state_has_symbol, state_is_filled, state_is_engine_b) = {
+                        let sl = state_clone.lock().await;
+                        if let Some(p) = sl.get(&symbol_clone) {
+                            (true, p.is_filled, p.engine_type == "EngineB")
                         } else {
-                            active_shadow.is_some()
-                        };
-                        if !has_active_trade {
+                            (false, false, false)
+                        }
+                    };
+                    if state_is_filled && state_is_engine_b {
+                        engine_b_mgr.on_order_filled();
+                    } else if engine_b_mgr.is_waiting_retest() && !state_has_symbol {
+                        engine_b_mgr.on_order_cancelled_or_rejected();
+                    }
+                    if controller.current_mode == ControllerMode::Neutral && engine_b_mgr.is_stage1_armed() {
+                        engine_b_mgr.disarm();
+                    }
+
+                    let has_active_non_retest_trade = if trend_engine_mode == "live" {
+                        state_has_symbol && (state_is_filled || !state_is_engine_b)
+                    } else {
+                        active_shadow.is_some()
+                    };
+
+                    if let Some(ref closed_5m) = finalized_5m_bar {
+                        if !has_active_non_retest_trade {
                             let engine_b_donchian_bars = if finalized_15m_bar.is_some() && rolling_15m_bars.len() > 1 {
                                 &rolling_15m_bars[..rolling_15m_bars.len() - 1]
                             } else {
                                 &rolling_15m_bars[..]
                             };
                             let donchian_opt = calculate_donchian(engine_b_donchian_bars, donchian_period);
-                            if let Some(ref donchian) = donchian_opt {
-                                let closes_15m: Vec<f64> = rolling_15m_bars.iter().map(|b| b.close).collect();
-                                let alignment = check_trend_alignment(&closes_15m);
-                                let has_donchian_breakout_1m = close_price > donchian.upper || close_price < donchian.lower;
-                                // Engine B Execution: Strictly requires a completed 15-minute bar close (`finalized_15m_bar.is_some()`)
-                                // above/below the 12-bar 15m Donchian channel with a strong 15m candle close in the outer 35% of the 15m bar range.
-                                let (is_15m_bull_close, is_15m_bear_close) = if let Some(ref c15) = finalized_15m_bar {
-                                    let rng = (c15.high - c15.low).max(1e-9);
-                                    (
-                                        c15.close > c15.open && (c15.close - c15.low) / rng >= 0.65,
-                                        c15.close < c15.open && (c15.high - c15.close) / rng >= 0.65,
-                                    )
-                                } else {
-                                    (false, false)
-                                };
-                                let is_long_breakout = is_15m_bull_close
-                                    && !candle_feed_degraded
-                                    && !is_candle_gap
-                                    && !is_upside_shock
-                                    && z_60 < 2.5
-                                    && z_15 < 3.0
-                                    && close_price > donchian.upper
-                                    && close_price >= open_price
-                                    && alignment == TrendAlignment::Bullish;
-                                let is_short_breakout = is_15m_bear_close
-                                    && !candle_feed_degraded
-                                    && !is_candle_gap
-                                    && !is_downside_shock
-                                    && z_60 > -2.5
-                                    && z_15 > -3.0
-                                    && close_price < donchian.lower
-                                    && close_price <= open_price
-                                    && alignment == TrendAlignment::Bearish;
 
-                                let macro_veto_b = check_macro_calendar_veto(now_ms_cb);
-                                if (is_long_breakout || is_short_breakout) && is_cluster_blocked {
-                                    println!("⏸️ [SHADOW-TREND VETO] Active cluster lease in place. Vetoing Engine B entry to prevent cross-engine conflict.");
-                                } else if (is_long_breakout || is_short_breakout) && is_cb_paused {
-                                    println!("🚨 [ENGINE B CIRCUIT BREAKER VETO] {} breakout vetoed: Symbol or Cluster Daily Drawdown Circuit Breaker active.", symbol_clone);
-                                } else if (is_long_breakout || is_short_breakout) && macro_veto_b.is_some() {
-                                    println!("🛡️ [MACRO CALENDAR SHIELD] {} Engine B breakout gated during scheduled release window: {}", symbol_clone, macro_veto_b.unwrap_or_default());
-                                } else if is_long_breakout || is_short_breakout {
-                                        let side = if is_long_breakout { Side::Long } else { Side::Short };
-                                        let atr_opt = calculate_atr(&rolling_15m_bars, 20);
+                            if controller.current_mode == ControllerMode::Neutral {
+                                funnel_counters.engine_b_mode_ineligible += 1;
+                                if let Some(ref donchian) = donchian_opt {
+                                    if closed_5m.close > donchian.upper || closed_5m.close < donchian.lower {
+                                        let b_side = if closed_5m.close > donchian.upper { "BUY" } else { "SELL" };
+                                        let primary_veto = if controller.shock_cooldown_bars > 0 {
+                                            "SHOCK_COOLDOWN_ACTIVE".to_string()
+                                        } else {
+                                            "MODE_NEUTRAL".to_string()
+                                        };
+                                        let atr_val = calculate_atr(&rolling_15m_bars, 20)
+                                            .unwrap_or(closed_5m.close * 0.01)
+                                            .max(closed_5m.close * 0.002);
+                                        let (cf_tp, cf_sl) = if b_side == "BUY" {
+                                            (closed_5m.close + 1.5 * atr_val, closed_5m.close - 0.40 * atr_val)
+                                        } else {
+                                            (closed_5m.close - 1.5 * atr_val, closed_5m.close + 0.40 * atr_val)
+                                        };
+                                        let now_ms_n = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                                        let live_eq_n = *cached_equity_loop.read().await;
+                                        let cf_trend_notional = trend_cfg.compute_trend_notional_usdc(live_eq_n);
+                                        let cf_opp = crate::counterfactual::ActiveOpportunity::new(
+                                            symbol_clone.clone(),
+                                            "EngineB_DonchianTrend".to_string(),
+                                            b_side.to_string(),
+                                            "NEUTRAL".to_string(),
+                                            now_ms_n,
+                                            1800,
+                                            crate::counterfactual::CounterfactualDecision {
+                                                accepted: false,
+                                                primary_veto: primary_veto.clone(),
+                                                all_vetos: vec![primary_veto],
+                                                threshold_sigma: 0.0,
+                                                signal_value: if b_side == "BUY" {
+                                                    closed_5m.close - donchian.upper
+                                                } else {
+                                                    donchian.lower - closed_5m.close
+                                                },
+                                                hmm_probabilities: crate::counterfactual::HmmProbs {
+                                                    consolidation: current_p_c,
+                                                    trend: current_p_t,
+                                                    shock: current_p_s,
+                                                },
+                                            },
+                                            crate::counterfactual::MarketAtDecision {
+                                                reference_price: closed_5m.close,
+                                                bid: closed_5m.close,
+                                                ask: closed_5m.close,
+                                                spread_bps: 1.0,
+                                                l2_age_ms: 0,
+                                                obi: l2_1s,
+                                                volatility_z15: z_15,
+                                                volatility_z60: Some(z_60),
+                                            },
+                                            crate::counterfactual::HypotheticalOrder {
+                                                order_type: "post_only_limit".to_string(),
+                                                limit_price: closed_5m.close,
+                                                size: cf_trend_notional / closed_5m.close.max(1e-9),
+                                                time_in_force: "ALO".to_string(),
+                                                assumed_cancel_rule: "retest_ttl".to_string(),
+                                                queue_ahead_estimate: None,
+                                            },
+                                            cf_tp,
+                                            cf_sl,
+                                        );
+                                        cf_tracker.register_opportunity(cf_opp);
+                                    }
+                                }
+                            } else if let Some(ref donchian) = donchian_opt {
+                                let is_mode_mean_reversion = controller.current_mode == ControllerMode::MeanReversion;
+                                if is_mode_mean_reversion {
+                                    funnel_counters.engine_b_mode_ineligible += 1;
+                                }
 
-                                        if let Some(current_atr) = atr_opt.filter(|&a| a > 0.0) {
-                                            let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-                                            let obi_lock = obi_tracker.read().await;
-                                            let (obi_favorable, obi_reason) = obi_lock.satisfies_entry_hurdle(&side, now_ms);
-                                            let obi_inst = obi_lock.instant_obi;
-                                            let obi_250ms = obi_lock.ewma_250ms_obi;
-                                            let obi_1s = obi_lock.ewma_1s_obi;
-                                            let obi_5s = obi_lock.ewma_5s_obi;
-                                            let qual_opt = obi_lock.compute_feed_quality();
-                                            let tau_regime = qual_opt.as_ref().map(|q| q.regime.clone()).unwrap_or_else(|| "Unknown".to_string());
-                                            let tau1_ms = qual_opt.as_ref().map(|q| q.tau_1_ms).unwrap_or(obi_lock.tau_1_ms);
-                                            let tau2_ms = qual_opt.as_ref().map(|q| q.tau_2_ms).unwrap_or(obi_lock.tau_2_ms);
-                                            let feed_quality = qual_opt.as_ref().map(|q| q.status.clone()).unwrap_or_else(|| "SIGNAL_GOOD".to_string());
-                                            drop(obi_lock);
+                                let atr_opt = calculate_atr(&rolling_15m_bars, 20);
+                                if let Some(current_atr) = atr_opt.filter(|&a| a > 0.0) {
+                                    let now_utc_b = chrono::Utc::now();
+                                    let now_ms_b = now_utc_b.timestamp_millis().max(0) as u64;
+                                    let timestamp_sec_b = (now_ms_b / 1000).max(1);
+                                    let weekday_utc_b = now_utc_b.weekday().num_days_from_sunday() as u8;
 
+                                    let (
+                                        obi_inst,
+                                        obi_250ms,
+                                        obi_1s,
+                                        obi_5s,
+                                        l2_usable_b,
+                                        tau_regime,
+                                        tau1_ms,
+                                        tau2_ms,
+                                        feed_quality,
+                                    ) = {
+                                        let obi_lock = obi_tracker.read().await;
+                                        let qual_opt = obi_lock.compute_feed_quality();
+                                        let fq = qual_opt
+                                            .as_ref()
+                                            .map(|q| q.status.clone())
+                                            .unwrap_or_else(|| "SIGNAL_GOOD".to_string());
+                                        let fresh = obi_lock.is_fresh_and_uncrossed(now_ms_b, 7500)
+                                            && obi_lock.updates_since_reconnect >= 3
+                                            && now_ms_b.saturating_sub(obi_lock.reconnect_time_ms) >= 15_000
+                                            && fq != "SIGNAL_UNUSABLE";
+                                        (
+                                            obi_lock.instant_obi,
+                                            obi_lock.ewma_250ms_obi,
+                                            obi_lock.ewma_1s_obi,
+                                            obi_lock.ewma_5s_obi,
+                                            fresh,
+                                            qual_opt
+                                                .as_ref()
+                                                .map(|q| q.regime.clone())
+                                                .unwrap_or_else(|| "Unknown".to_string()),
+                                            qual_opt
+                                                .as_ref()
+                                                .map(|q| q.tau_1_ms)
+                                                .unwrap_or(obi_lock.tau_1_ms),
+                                            qual_opt
+                                                .as_ref()
+                                                .map(|q| q.tau_2_ms)
+                                                .unwrap_or(obi_lock.tau_2_ms),
+                                            fq,
+                                        )
+                                    };
+                                    let eff_l2_obi = if l2_usable_b {
+                                        0.40 * obi_inst + 0.35 * obi_250ms + 0.25 * obi_1s
+                                    } else {
+                                        0.0
+                                    };
+
+                                    let min_squeeze_ratio_90m = calculate_min_squeeze_ratio_90m(&rolling_15m_bars);
+                                    let rel_vol_15m = calculate_rel_vol_15m(
+                                        engine_b_donchian_bars,
+                                        &rolling_5m_bars,
+                                        finalized_15m_bar.as_ref(),
+                                    );
+                                    let ker_15m = calculate_ker_n(&rolling_15m_bars, 6);
+                                    let oi_delta_15m_pct = crowding_tracker.read().await.oi_delta_15m_pct(now_ms_b);
+
+                                    let btc_ret_60m_abs = if symbol_clone.eq_ignore_ascii_case("BTC") {
+                                        if rolling_closes.len() >= 61 && rolling_closes[rolling_closes.len() - 61] > 0.0 {
+                                            (closed_5m.close / rolling_closes[rolling_closes.len() - 61]).ln().abs()
+                                        } else {
+                                            0.0
+                                        }
+                                    } else {
+                                        std::fs::read_to_string("hl_telemetry_BTC.json")
+                                            .ok()
+                                            .and_then(|c| serde_json::from_str::<LiveTelemetry>(&c).ok())
+                                            .filter(|t| now_ms_b.saturating_sub(t.timestamp_ms) <= 180_000)
+                                            .map(|t| (t.ret_60m_bps / 10_000.0).abs())
+                                            .unwrap_or(0.0)
+                                    };
+
+                                    let telemetry_b = BreakoutTelemetry {
+                                        bar_open: closed_5m.open,
+                                        bar_high: closed_5m.high,
+                                        bar_low: closed_5m.low,
+                                        bar_close: closed_5m.close,
+                                        donchian_high_12_15m: donchian.upper,
+                                        donchian_low_12_15m: donchian.lower,
+                                        atr_15m: current_atr,
+                                        min_squeeze_ratio_90m,
+                                        rel_vol_15m,
+                                        hurst_60m: live_feat.hurst_60m,
+                                        l2_obi: eff_l2_obi,
+                                        oi_delta_15m_pct,
+                                    };
+
+                                    let live_eq_pre = *cached_equity_loop.read().await;
+                                    let action = engine_b_mgr.on_5m_bar_close(
+                                        &trend_cfg,
+                                        &telemetry_b,
+                                        timestamp_sec_b,
+                                        weekday_utc_b,
+                                        live_eq_pre,
+                                        is_mode_mean_reversion,
+                                        ker_15m,
+                                        btc_ret_60m_abs,
+                                    );
+
+                                    match action {
+                                        TrendOrderAction::LogShadowCounterfactual {
+                                            dir,
+                                            virtual_entry_px,
+                                            reason,
+                                        } => {
+                                            let side = dir.to_side();
+                                            if reason == "STAGE1_OBI_RETEST_HURDLE_FAIL" {
+                                                funnel_counters.engine_b_obi_hurdle_veto += 1;
+                                            } else if !is_mode_mean_reversion {
+                                                funnel_counters.engine_b_alignment_veto += 1;
+                                            }
+                                            println!(
+                                                "🟣 [POLICY C SHADOW GATE] {} {:?} breakout routed to SHADOW ({}) | Px: ${:.2} | Squeeze: {:.2} (<= {:.2}) | RelVol: {:.2}x (>= {:.2}x) | Hurst: {:.2} | OBI: {:.2} | KER: {:.2}",
+                                                symbol_clone,
+                                                side,
+                                                reason,
+                                                virtual_entry_px,
+                                                min_squeeze_ratio_90m,
+                                                trend_cfg.max_squeeze_ratio,
+                                                rel_vol_15m,
+                                                trend_cfg.min_rel_volume,
+                                                live_feat.hurst_60m,
+                                                eff_l2_obi,
+                                                ker_15m
+                                            );
+                                            let d_sign = dir.sign();
+                                            let cf_tp = virtual_entry_px + d_sign * 1.50 * current_atr;
+                                            let cf_sl = virtual_entry_px - d_sign * 0.40 * current_atr;
+                                            let cf_trend_notional = trend_cfg.compute_trend_notional_usdc(live_eq_pre);
+                                            let cf_opp = crate::counterfactual::ActiveOpportunity::new(
+                                                symbol_clone.clone(),
+                                                "EngineB_DonchianTrend".to_string(),
+                                                if side == Side::Long { "BUY".to_string() } else { "SELL".to_string() },
+                                                format!("{:?}", controller.current_mode).to_uppercase(),
+                                                now_ms_b,
+                                                1800,
+                                                crate::counterfactual::CounterfactualDecision {
+                                                    accepted: false,
+                                                    primary_veto: reason.to_string(),
+                                                    all_vetos: vec![reason.to_string()],
+                                                    threshold_sigma: 0.0,
+                                                    signal_value: eff_l2_obi,
+                                                    hmm_probabilities: crate::counterfactual::HmmProbs {
+                                                        consolidation: current_p_c,
+                                                        trend: current_p_t,
+                                                        shock: current_p_s,
+                                                    },
+                                                },
+                                                crate::counterfactual::MarketAtDecision {
+                                                    reference_price: virtual_entry_px,
+                                                    bid: virtual_entry_px,
+                                                    ask: virtual_entry_px,
+                                                    spread_bps: 1.0,
+                                                    l2_age_ms: 0,
+                                                    obi: obi_1s,
+                                                    volatility_z15: z_15,
+                                                    volatility_z60: Some(z_60),
+                                                },
+                                                crate::counterfactual::HypotheticalOrder {
+                                                    order_type: "post_only_limit".to_string(),
+                                                    limit_price: virtual_entry_px,
+                                                    size: cf_trend_notional / virtual_entry_px.max(1e-9),
+                                                    time_in_force: "ALO".to_string(),
+                                                    assumed_cancel_rule: "retest_ttl".to_string(),
+                                                    queue_ahead_estimate: None,
+                                                },
+                                                cf_tp,
+                                                cf_sl,
+                                            );
+                                            cf_tracker.register_opportunity(cf_opp);
+
+                                            if reason == "STAGE1_OBI_RETEST_HURDLE_FAIL" {
+                                                let donchian_distance_bps = if side == Side::Long {
+                                                    ((closed_5m.close - donchian.upper) / donchian.upper.max(1e-9)) * 10_000.0
+                                                } else {
+                                                    ((donchian.lower - closed_5m.close) / donchian.lower.max(1e-9)) * 10_000.0
+                                                };
+                                                append_candidate_log(&EngineBCandidateLog {
+                                                    candidate_id: format!("{}-{}-{}", symbol_clone, now_ms_b, if side == Side::Long { "L" } else { "S" }),
+                                                    symbol: symbol_clone.clone(),
+                                                    decision_time_ms: now_ms_b,
+                                                    side: if side == Side::Long { "LONG".to_string() } else { "SHORT".to_string() },
+                                                    tau_regime,
+                                                    tau1_ms,
+                                                    tau2_ms,
+                                                    obi_instant: obi_inst,
+                                                    obi_tau1: obi_250ms,
+                                                    obi_tau2: obi_1s,
+                                                    obi_5s,
+                                                    p_trend: current_p_t,
+                                                    donchian_distance_bps,
+                                                    feed_quality,
+                                                    hurdle_passed: false,
+                                                    portfolio_selected: false,
+                                                });
+                                            }
+                                        }
+
+                                        TrendOrderAction::PostAloMakerRetestOrder {
+                                            dir,
+                                            limit_px,
+                                            stop_loss_px,
+                                            tp1_px: _,
+                                            notional_usdc,
+                                            ttl_secs,
+                                        } => {
+                                            let side = dir.to_side();
                                             let donchian_distance_bps = if side == Side::Long {
-                                                ((close_price - donchian.upper) / donchian.upper) * 10_000.0
+                                                ((closed_5m.close - donchian.upper) / donchian.upper.max(1e-9)) * 10_000.0
                                             } else {
-                                                ((donchian.lower - close_price) / donchian.lower) * 10_000.0
+                                                ((donchian.lower - closed_5m.close) / donchian.lower.max(1e-9)) * 10_000.0
                                             };
-
-                                            let candidate_id = format!("{}-{}-{}", symbol_clone, now_ms, if side == Side::Long { "L" } else { "S" });
+                                            let candidate_id = format!("{}-{}-{}", symbol_clone, now_ms_b, if side == Side::Long { "L" } else { "S" });
                                             let mut portfolio_selected = false;
 
+                                            let macro_veto_b = check_macro_calendar_veto(now_ms_cb);
                                             let btc_lead_veto = check_btc_lead_lag_veto(
                                                 &symbol_clone,
                                                 side == Side::Long,
                                                 true,
-                                                now_ms,
+                                                now_ms_b,
                                             );
-                                            if let Some(ref veto_msg) = btc_lead_veto {
-                                                println!(
-                                                    "⏸️ [ENGINE B BTC LEAD-LAG VETO] {} {:?} breakout vetoed: {}",
-                                                    symbol_clone, side, veto_msg
-                                                );
-                                            }
-
                                             let crowding_mult = crowding_tracker.read().await.directional_trend_multiplier(&side);
-                                            if crowding_mult < 0.45 {
-                                                println!(
-                                                    "⚠️ [ENGINE B CROWDING HAZARD VETO] {} {:?} breakout vetoed: extreme crowded funding/OI squeeze hazard (H_t = {:.2} < 0.45).",
-                                                    symbol_clone, side, crowding_mult
-                                                );
-                                            }
+                                            let adverse_shock = (side == Side::Long && (is_upside_shock || z_60 >= 2.5 || z_15 >= 3.0))
+                                                || (side == Side::Short && (is_downside_shock || z_60 <= -2.5 || z_15 <= -3.0));
 
-                                            let budget_verdict = evaluate_pre_breakout_budget(
-                                                &symbol_clone,
-                                                &rolling_15m_bars,
-                                                donchian,
-                                                current_atr,
-                                                close_price,
-                                                z_60,
-                                                &side,
+                                            let _ = resolve_trade_bank(&info_clone, user_address, &config, &cached_equity_loop).await;
+                                            let live_eq = *cached_equity_loop.read().await;
+                                            let hwm_eq = *high_water_mark_equity.read().await;
+                                            let dd_mult = compute_drawdown_risk_multiplier(live_eq, hwm_eq);
+                                            let policy_c_base = trend_cfg.compute_trend_notional_usdc(live_eq).min(notional_usdc.max(trend_cfg.max_trend_notional_usdc));
+                                            let final_notional = (policy_c_base * dd_mult * crowding_mult)
+                                                .clamp(trend_cfg.min_trade_notional_usdc, trend_cfg.max_trend_notional_usdc);
+
+                                            let step_risk_exceeded = exceeds_micro_account_step_risk(
+                                                live_eq,
+                                                final_notional,
+                                                limit_px,
+                                                stop_loss_px,
+                                                0.0175,
                                             );
-                                            let residual_budget_ok = budget_verdict.approved;
-                                            if !residual_budget_ok {
-                                                println!(
-                                                    "⏸️ [ENGINE B RESIDUAL BUDGET VETO] {} {:?} breakout exhausted (coiled: {}, DCW20: {:.2}x ATR, BBW20: {:.2}x, RMB: {:.2}x < {:.2}x, Overshoot: {:.2}x ATR, |Z60|: {:.2} vs {:.2}). Skipping late entry.",
-                                                    symbol_clone,
-                                                    side,
-                                                    budget_verdict.is_coiled,
-                                                    budget_verdict.dcw_20,
-                                                    budget_verdict.bbw_atr_20,
-                                                    budget_verdict.rmb_atr,
-                                                    budget_verdict.min_rmb_atr,
-                                                    budget_verdict.overshoot_atr,
-                                                    z_60.abs(),
-                                                    budget_verdict.max_z60
-                                                );
-                                            }
 
-                                            if obi_favorable && btc_lead_veto.is_none() && crowding_mult >= 0.45 && residual_budget_ok {
-                                                funnel_counters.engine_b_orders_placed += 1;
-                                                let trade_bank = resolve_trade_bank(&info_clone, user_address, &config, &cached_equity_loop).await;
-                                                let sl_dist_b = (chandelier_atr_mult * current_atr).min(close_price * 0.0100);
-                                                let initial_sl = if side == Side::Long {
-                                                    close_price - sl_dist_b
-                                                } else {
-                                                    close_price + sl_dist_b
-                                                };
-                                                let live_eq = *cached_equity_loop.read().await;
-                                                let hwm_eq = *high_water_mark_equity.read().await;
-                                                let dd_mult = compute_drawdown_risk_multiplier(live_eq, hwm_eq);
-                                                let eff_trend_risk = 0.0060 * trend_risk_fraction * dd_mult * crowding_mult;
-                                                let ou_cfg_b = crate::ou_process::asset_ou_config(&symbol_clone);
-                                                let max_b_notional = config
-                                                    .max_position_size_usdc
-                                                    .min(ou_cfg_b.volatility_adjusted_trend_notional_cap(
-                                                        live_eq,
-                                                        close_price,
-                                                        current_atr,
-                                                    ));
-                                                let trend_notional = if config.sizing_mode == "dynamic" && live_eq > 0.0 {
-                                                    calculate_risk_scaled_notional(
-                                                        live_eq,
-                                                        (trade_bank * trend_risk_fraction * crowding_mult).min(max_b_notional),
-                                                        eff_trend_risk,
-                                                        close_price,
-                                                        initial_sl,
-                                                        config.hl_leverage,
-                                                        crate::state::max_concurrent_cluster_positions(),
-                                                        11.0,
-                                                        max_b_notional,
-                                                    )
-                                                } else {
-                                                    (trade_bank * trend_risk_fraction * crowding_mult).max(11.0).min(max_b_notional)
-                                                };
-                                                let step_risk_exceeded = exceeds_micro_account_step_risk(
-                                                    live_eq,
-                                                    trend_notional,
-                                                    close_price,
-                                                    initial_sl,
-                                                    0.0175,
-                                                );
-                                                if step_risk_exceeded {
-                                                    println!(
-                                                        "⚠️ [ENGINE B STEP-FUNCTION RISK VETO] {} {:?} stop distance ({:.2} vs {:.2}) exceeds 1.75% equity risk cap at $11 min notional.",
-                                                        symbol_clone, side, close_price, initial_sl
-                                                    );
-                                                }
-                                                let shadow_size = trend_notional / close_price;
-
-                                                if !step_risk_exceeded && trend_engine_mode == "live" {
-                                                    let mut state_lock = state_clone.lock().await;
-                                                    if !state_lock.contains_key(&symbol_clone) && !is_cluster_blocked {
-                                                        match crate::order::place_trend_breakout_entry(
-                                                            &state_path_clone,
-                                                            &exchange_clone,
-                                                            &info_clone,
-                                                            &mut state_lock,
-                                                            &symbol_clone,
-                                                            side.clone(),
-                                                            close_price,
-                                                            initial_sl,
-                                                            current_atr,
-                                                            trend_notional,
-                                                            sz_decimals,
-                                                            discord_clone.clone(),
-                                                        ).await {
-                                                            Ok(res) => {
-                                                                println!("🚀 [ENGINE B LIVE ENTRY DISPATCHED] {} {:?}", symbol_clone, res);
-                                                                portfolio_selected = true;
-                                                            }
-                                                            Err(e) => {
-                                                                eprintln!("❌ [ENGINE B LIVE ERROR] Breakout entry failed for {}: {}", symbol_clone, e);
-                                                            }
-                                                        }
-                                                    }
-                                                } else {
-                                                    let shadow_trade = record_shadow_entry(
-                                                        &symbol_clone,
-                                                        side.clone(),
-                                                        close_price,
-                                                        shadow_size,
-                                                        current_atr,
-                                                        chandelier_atr_mult,
-                                                    );
-                                                    portfolio_selected = shadow_trade.is_portfolio_selected;
-                                                    let side_str = if side == Side::Long { "LONG" } else { "SHORT" };
-                                                    println!(
-                                                        "🟣 [SHADOW-TREND ENTRY] {} {} breakout entered at ${:.2} | Size: {:.4} (${:.2}) | Initial Stop: ${:.2} | Multiscale OBI (inst: {:.2}, 250ms: {:.2}, 1s: {:.2}, 5s: {:.2})",
-                                                        symbol_clone, side_str, close_price, shadow_size, trend_notional, shadow_trade.initial_stop, obi_inst, obi_250ms, obi_1s, obi_5s
-                                                    );
-                                                    crate::discord::send_alert(
-                                                        discord_clone.as_deref(),
-                                                        &format!(
-                                                            "🟣 **[PHASE 0 SHADOW-TREND ENTRY]** {} {}\n**Simulated Entry:** ${:.2}\n**Initial Stop:** ${:.2}\n**Size:** {:.4} (${:.2})\n**Multiscale EWMA OBI:** inst={:.2}, 250ms={:.2}, 1s={:.2}, 5s={:.2} | **ATR:** ${:.2}",
-                                                            symbol_clone, side_str, close_price, shadow_trade.initial_stop, shadow_size, trend_notional, obi_inst, obi_250ms, obi_1s, obi_5s, current_atr
-                                                        ),
-                                                    ).await;
-                                                }
+                                            let safety_veto: Option<&'static str> = if candle_feed_degraded || is_candle_gap {
+                                                Some("DATA_FEED_DEGRADED")
+                                            } else if is_cluster_blocked {
+                                                Some("CLUSTER_LEASE_BLOCKED")
+                                            } else if is_cb_paused {
+                                                Some("CIRCUIT_BREAKER_PAUSED")
+                                            } else if macro_veto_b.is_some() {
+                                                Some("MACRO_CALENDAR_SHIELD")
+                                            } else if adverse_shock {
+                                                Some("ADVERSE_SHOCK_VETO")
+                                            } else if btc_lead_veto.is_some() {
+                                                Some("BTC_LEAD_LAG_VETO")
+                                            } else if crowding_mult < 0.45 {
+                                                Some("CROWDING_HAZARD_VETO")
+                                            } else if step_risk_exceeded {
+                                                Some("STEP_RISK_VETO")
                                             } else {
-                                                funnel_counters.engine_b_obi_hurdle_veto += 1;
-                                                println!(
-                                                    "⚠️ [SHADOW-TREND VETO] Multiscale OBI hurdle failed: {} (inst: {:.3}, 250ms: {:.3}, 1s: {:.3}, 5s: {:.3}).",
-                                                    obi_reason, obi_inst, obi_250ms, obi_1s, obi_5s
-                                                );
+                                                None
+                                            };
 
-                                                let (cf_tp, cf_sl) = if side == Side::Long {
-                                                    (close_price + 3.0 * current_atr, close_price - 2.0 * current_atr)
-                                                } else {
-                                                    (close_price - 3.0 * current_atr, close_price + 2.0 * current_atr)
-                                                };
-                                                let cf_trend_notional = {
-                                                    let r = cached_equity_loop.read().await;
-                                                    calculate_dynamic_notional(*r, config.equity_fraction, 11.0, config.max_position_size_usdc, position_size_usdc) * trend_risk_fraction
-                                                };
+                                            if let Some(veto_code) = safety_veto {
+                                                engine_b_mgr.on_order_cancelled_or_rejected();
+                                                println!(
+                                                    "⏸️ [POLICY C SAFETY VETO] {} {:?} Stage 2 Alo Retest vetoed ({}) | Retest: ${:.2}, Stop: ${:.2}, Notional: ${:.2}",
+                                                    symbol_clone, side, veto_code, limit_px, stop_loss_px, final_notional
+                                                );
+                                                let d_sign = dir.sign();
                                                 let cf_opp = crate::counterfactual::ActiveOpportunity::new(
                                                     symbol_clone.clone(),
                                                     "EngineB_DonchianTrend".to_string(),
                                                     if side == Side::Long { "BUY".to_string() } else { "SELL".to_string() },
                                                     format!("{:?}", controller.current_mode).to_uppercase(),
-                                                    now_ms,
+                                                    now_ms_b,
                                                     1800,
                                                     crate::counterfactual::CounterfactualDecision {
                                                         accepted: false,
-                                                        primary_veto: "L2_OBI_HURDLE_FAIL".to_string(),
-                                                        all_vetos: vec!["L2_OBI_HURDLE_FAIL".to_string()],
+                                                        primary_veto: veto_code.to_string(),
+                                                        all_vetos: vec![veto_code.to_string()],
                                                         threshold_sigma: 0.0,
-                                                        signal_value: obi_inst,
+                                                        signal_value: eff_l2_obi,
                                                         hmm_probabilities: crate::counterfactual::HmmProbs {
                                                             consolidation: current_p_c,
                                                             trend: current_p_t,
@@ -3283,9 +3600,9 @@ async fn main() {
                                                         },
                                                     },
                                                     crate::counterfactual::MarketAtDecision {
-                                                        reference_price: close_price,
-                                                        bid: close_price,
-                                                        ask: close_price,
+                                                        reference_price: limit_px,
+                                                        bid: limit_px,
+                                                        ask: limit_px,
                                                         spread_bps: 1.0,
                                                         l2_age_ms: 0,
                                                         obi: obi_1s,
@@ -3293,23 +3610,92 @@ async fn main() {
                                                         volatility_z60: Some(z_60),
                                                     },
                                                     crate::counterfactual::HypotheticalOrder {
-                                                        order_type: "market".to_string(),
-                                                        limit_price: close_price,
-                                                        size: cf_trend_notional / close_price,
-                                                        time_in_force: "IOC".to_string(),
-                                                        assumed_cancel_rule: "immediate".to_string(),
+                                                        order_type: "post_only_limit".to_string(),
+                                                        limit_price: limit_px,
+                                                        size: final_notional / limit_px.max(1e-9),
+                                                        time_in_force: "ALO".to_string(),
+                                                        assumed_cancel_rule: "retest_ttl".to_string(),
                                                         queue_ahead_estimate: None,
                                                     },
-                                                    cf_tp,
-                                                    cf_sl,
+                                                    limit_px + d_sign * 1.50 * current_atr,
+                                                    stop_loss_px,
                                                 );
                                                 cf_tracker.register_opportunity(cf_opp);
+                                            } else if trend_engine_mode == "live" {
+                                                let mut state_lock = state_clone.lock().await;
+                                                if !state_lock.contains_key(&symbol_clone) && !is_cluster_blocked {
+                                                    let ttl_mins = (ttl_secs as f64) / 60.0;
+                                                    match crate::order::place_trend_breakout_entry(
+                                                        &state_path_clone,
+                                                        &exchange_clone,
+                                                        &info_clone,
+                                                        &mut state_lock,
+                                                        &symbol_clone,
+                                                        side.clone(),
+                                                        closed_5m.close,
+                                                        Some(limit_px),
+                                                        stop_loss_px,
+                                                        current_atr,
+                                                        final_notional,
+                                                        ttl_mins,
+                                                        sz_decimals,
+                                                        discord_clone.clone(),
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok(res) => {
+                                                            let is_dispatched = res.get("status").and_then(|s| s.as_str()) == Some("DISPATCHED");
+                                                            if is_dispatched {
+                                                                funnel_counters.engine_b_orders_placed += 1;
+                                                                portfolio_selected = true;
+                                                                println!(
+                                                                    "🚀 [POLICY C ENGINE B RETEST POSTED] {} {:?} | Limit: ${:.2} | Stop: ${:.2} | Notional: ${:.2} | TTL: {:.0}m | {:?}",
+                                                                    symbol_clone, side, limit_px, stop_loss_px, final_notional, ttl_mins, res
+                                                                );
+                                                            } else {
+                                                                funnel_counters.engine_b_orders_rejected += 1;
+                                                                engine_b_mgr.on_order_cancelled_or_rejected();
+                                                                println!(
+                                                                    "⏸️ [POLICY C ENGINE B ORDER SKIPPED] {} {:?}",
+                                                                    symbol_clone, res
+                                                                );
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            funnel_counters.engine_b_orders_rejected += 1;
+                                                            engine_b_mgr.on_order_cancelled_or_rejected();
+                                                            eprintln!(
+                                                                "❌ [ENGINE B LIVE ERROR] Policy C retest entry failed for {}: {}",
+                                                                symbol_clone, e
+                                                            );
+                                                        }
+                                                    }
+                                                } else {
+                                                    engine_b_mgr.on_order_cancelled_or_rejected();
+                                                }
+                                            } else {
+                                                let shadow_size = final_notional / limit_px.max(1e-9);
+                                                let shadow_trade = record_shadow_entry(
+                                                    &symbol_clone,
+                                                    side.clone(),
+                                                    limit_px,
+                                                    shadow_size,
+                                                    current_atr,
+                                                    chandelier_atr_mult,
+                                                );
+                                                portfolio_selected = shadow_trade.is_portfolio_selected;
+                                                engine_b_mgr.on_order_filled();
+                                                let side_str = if side == Side::Long { "LONG" } else { "SHORT" };
+                                                println!(
+                                                    "🟣 [POLICY C SHADOW-TREND ENTRY] {} {} Alo Retest @ ${:.2} | Size: {:.4} (${:.2}) | Stop: ${:.2} | Squeeze: {:.2} | RelVol: {:.2}x | OBI: {:.2}",
+                                                    symbol_clone, side_str, limit_px, shadow_size, final_notional, stop_loss_px, min_squeeze_ratio_90m, rel_vol_15m, eff_l2_obi
+                                                );
                                             }
 
-                                            let candidate_log = EngineBCandidateLog {
+                                            append_candidate_log(&EngineBCandidateLog {
                                                 candidate_id,
                                                 symbol: symbol_clone.clone(),
-                                                decision_time_ms: now_ms,
+                                                decision_time_ms: now_ms_b,
                                                 side: if side == Side::Long { "LONG".to_string() } else { "SHORT".to_string() },
                                                 tau_regime,
                                                 tau1_ms,
@@ -3321,87 +3707,50 @@ async fn main() {
                                                 p_trend: current_p_t,
                                                 donchian_distance_bps,
                                                 feed_quality,
-                                                hurdle_passed: obi_favorable,
+                                                hurdle_passed: true,
                                                 portfolio_selected,
-                                            };
-                                            append_candidate_log(&candidate_log);
-                                        } else {
-                                            println!("⚠️ [SHADOW-TREND VETO] Missing or non-positive 20-period ATR. Entry aborted.");
+                                            });
                                         }
-                                    } else if has_donchian_breakout_1m {
-                                        funnel_counters.engine_b_alignment_veto += 1;
-                                    } else {
-                                        funnel_counters.engine_b_no_breakout += 1;
+
+                                        TrendOrderAction::CancelRestingRetestOrder { reason } => {
+                                            println!(
+                                                "🛑 [POLICY C RETEST CANCEL] {} cancelling resting Stage 2 Alo retest order ({})",
+                                                symbol_clone, reason
+                                            );
+                                            let mut state_lock = state_clone.lock().await;
+                                            let should_cancel = state_lock
+                                                .get(&symbol_clone)
+                                                .map(|p| p.engine_type == "EngineB" && !p.is_filled)
+                                                .unwrap_or(false);
+                                            if should_cancel {
+                                                let _ = execute_emergency_flatten_with_retry(
+                                                    &state_path_clone,
+                                                    &exchange_clone,
+                                                    &info_clone,
+                                                    user_address,
+                                                    &mut state_lock,
+                                                    &symbol_clone,
+                                                    sz_decimals,
+                                                    discord_clone.clone(),
+                                                )
+                                                .await;
+                                            }
+                                        }
+
+                                        TrendOrderAction::None => {
+                                            if !engine_b_mgr.is_stage1_armed() && !engine_b_mgr.is_waiting_retest() {
+                                                funnel_counters.engine_b_no_breakout += 1;
+                                            } else if engine_b_mgr.is_stage1_armed() {
+                                                println!(
+                                                    "🎯 [POLICY C STAGE 1 ARMED] {} 5m breakout outside Donchian awaiting 2-bar persistence & OBI >= {:.2}",
+                                                    symbol_clone, trend_cfg.min_obi_retest
+                                                );
+                                            }
+                                        }
                                     }
-                            }
-                        }
-                    } else {
-                        funnel_counters.engine_b_mode_ineligible += 1;
-                        let prior_bars = if finalized_15m_bar.is_some() && rolling_15m_bars.len() > 1 {
-                            &rolling_15m_bars[..rolling_15m_bars.len() - 1]
-                        } else {
-                            &rolling_15m_bars[..]
-                        };
-                        if let Some(ref donchian) = calculate_donchian(prior_bars, donchian_period) {
-                            if close_price > donchian.upper || close_price < donchian.lower {
-                                let b_side = if close_price > donchian.upper { "BUY" } else { "SELL" };
-                                let primary_veto = if controller.shock_cooldown_bars > 0 {
-                                    "SHOCK_COOLDOWN_ACTIVE".to_string()
                                 } else {
-                                    format!("MODE_{:?}", controller.current_mode).to_uppercase()
-                                };
-                                let atr_val = calculate_atr(&rolling_15m_bars, 20).unwrap_or(close_price * 0.01).max(close_price * 0.002);
-                                let (cf_tp, cf_sl) = if b_side == "BUY" {
-                                    (close_price + 3.0 * atr_val, close_price - 2.0 * atr_val)
-                                } else {
-                                    (close_price - 3.0 * atr_val, close_price + 2.0 * atr_val)
-                                };
-                                let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-                                let cf_trend_notional = {
-                                    let r = cached_equity_loop.read().await;
-                                    calculate_dynamic_notional(*r, config.equity_fraction, 11.0, config.max_position_size_usdc, position_size_usdc) * trend_risk_fraction
-                                };
-                                let cf_opp = crate::counterfactual::ActiveOpportunity::new(
-                                    symbol_clone.clone(),
-                                    "EngineB_DonchianTrend".to_string(),
-                                    b_side.to_string(),
-                                    format!("{:?}", controller.current_mode).to_uppercase(),
-                                    now_ms,
-                                    1800,
-                                    crate::counterfactual::CounterfactualDecision {
-                                        accepted: false,
-                                        primary_veto: primary_veto.clone(),
-                                        all_vetos: vec![primary_veto],
-                                        threshold_sigma: 0.0,
-                                        signal_value: if b_side == "BUY" { close_price - donchian.upper } else { donchian.lower - close_price },
-                                        hmm_probabilities: crate::counterfactual::HmmProbs {
-                                            consolidation: current_p_c,
-                                            trend: current_p_t,
-                                            shock: current_p_s,
-                                        },
-                                    },
-                                    crate::counterfactual::MarketAtDecision {
-                                        reference_price: close_price,
-                                        bid: close_price,
-                                        ask: close_price,
-                                        spread_bps: 1.0,
-                                        l2_age_ms: 0,
-                                        obi: l2_1s,
-                                        volatility_z15: z_15,
-                                        volatility_z60: Some(z_60),
-                                    },
-                                    crate::counterfactual::HypotheticalOrder {
-                                        order_type: "market".to_string(),
-                                        limit_price: close_price,
-                                        size: cf_trend_notional / close_price,
-                                        time_in_force: "IOC".to_string(),
-                                        assumed_cancel_rule: "immediate".to_string(),
-                                        queue_ahead_estimate: None,
-                                    },
-                                    cf_tp,
-                                    cf_sl,
-                                );
-                                cf_tracker.register_opportunity(cf_opp);
+                                    println!("⚠️ [POLICY C VETO] Missing or non-positive 20-period ATR. Entry aborted.");
+                                }
                             }
                         }
                     }
@@ -3480,10 +3829,14 @@ async fn main() {
                                     )
                                     .await;
                                     continue;
-                                } else if pos.engine_type == "EngineB" && (controller.current_mode != ControllerMode::Trend || is_downside_shock) {
+                                } else if pos.engine_type == "EngineB"
+                                    && (controller.current_mode != ControllerMode::Trend
+                                        || (pos.side == "LONG" && is_downside_shock)
+                                        || (pos.side == "SHORT" && is_upside_shock))
+                                {
                                     println!(
-                                        "🛑 [RESTING ENTRY CANCELLED] Engine B invalidated (mode: {}, downside shock: {}). Cancelling resting maker order for {}.",
-                                        controller.current_mode, is_downside_shock, symbol_clone
+                                        "🛑 [RESTING ENTRY CANCELLED] Engine B invalidated (mode: {}, side: {}, down_shock: {}, up_shock: {}). Cancelling resting maker order for {}.",
+                                        controller.current_mode, pos.side, is_downside_shock, is_upside_shock, symbol_clone
                                     );
                                     let _ = execute_emergency_flatten_with_retry(
                                         &state_path_clone,
@@ -3496,6 +3849,7 @@ async fn main() {
                                         discord_clone.clone(),
                                     )
                                     .await;
+                                    engine_b_mgr.on_order_cancelled_or_rejected();
                                     continue;
                                 }
                             }
@@ -4081,7 +4435,15 @@ async fn main() {
                                 let mut cb_lock = cb_clone.lock().await;
                                 cb_lock.record_loss();
                                 save_circuit_breaker(&cb_path_clone, &cb_lock);
-                            } else if pos_engine_type == "EngineB" && is_downside_shock {
+                            } else if pos_engine_type == "EngineB"
+                                && state_lock
+                                    .get(&symbol_clone)
+                                    .map(|p| {
+                                        (p.side == "LONG" && is_downside_shock)
+                                            || (p.side == "SHORT" && is_upside_shock)
+                                    })
+                                    .unwrap_or(false)
+                            {
                                 println!(
                                     "🚨 [SHOCK VETO ON POSITION] Severe adverse shock on {} (Z15: {:.2}, Z60: {:.2}, Engine: {})! Flattening.",
                                     symbol_clone, z_15, z_60, pos_engine_type

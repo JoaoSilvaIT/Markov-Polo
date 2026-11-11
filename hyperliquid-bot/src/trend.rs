@@ -1,6 +1,7 @@
 use crate::state::{sync_parent_dir, FlockGuard, Side};
-use chrono::Utc;
+use chrono::{Datelike, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 
@@ -149,6 +150,7 @@ pub fn calculate_obi_score(bids: &[(f64, f64)], asks: &[(f64, f64)], depth: usiz
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct BreakoutBudgetVerdict {
     pub approved: bool,
     pub is_coiled: bool,
@@ -162,6 +164,7 @@ pub struct BreakoutBudgetVerdict {
 
 /// Evaluates causal Track 1 Pre-Breakout Compression ("Coil") and Residual Move Budget (`RMB_t`)
 /// calibrated from the 2024–2026 Hyperliquid L1 15-minute event study (`asset_thresholds.csv`).
+#[allow(dead_code)]
 pub fn evaluate_pre_breakout_budget(
     symbol: &str,
     bars_15m: &[CandleBar],
@@ -694,6 +697,7 @@ impl L2ObiTracker {
         mid + self.instant_obi * (spread / 2.0)
     }
 
+    #[allow(dead_code)]
     pub fn satisfies_entry_hurdle(&self, side: &Side, now_ms: u64) -> (bool, &'static str) {
         if !self.is_fresh_and_uncrossed(now_ms, 7500) {
             return (false, "L2 Book Stale or Crossed");
@@ -751,6 +755,8 @@ pub struct MarketCrowdingTracker {
     pub funding_z: f64,
     pub dlog_oi_z: f64,
     pub basis_z: f64,
+    /// Timestamped Open Interest history `(timestamp_ms, open_interest)` for exact 15m delta lookup
+    pub oi_history: VecDeque<(u64, f64)>,
 }
 
 impl MarketCrowdingTracker {
@@ -777,7 +783,19 @@ impl MarketCrowdingTracker {
         ((val - median) / scale).clamp(-5.0, 5.0)
     }
 
+    #[allow(dead_code)]
     pub fn update(&mut self, funding_1h: f64, open_interest: f64, mark_px: f64, oracle_px: f64) {
+        self.update_with_time(funding_1h, open_interest, mark_px, oracle_px, 0);
+    }
+
+    pub fn update_with_time(
+        &mut self,
+        funding_1h: f64,
+        open_interest: f64,
+        mark_px: f64,
+        oracle_px: f64,
+        timestamp_ms: u64,
+    ) {
         if !funding_1h.is_finite() || !open_interest.is_finite() || open_interest <= 0.0 {
             return;
         }
@@ -785,6 +803,18 @@ impl MarketCrowdingTracker {
         self.open_interest = open_interest;
         self.mark_px = mark_px;
         self.oracle_px = oracle_px;
+
+        if timestamp_ms > 0 {
+            self.oi_history.push_back((timestamp_ms, open_interest));
+            let cutoff_ms = timestamp_ms.saturating_sub(25 * 60 * 1000);
+            while let Some(&(ts, _)) = self.oi_history.front() {
+                if ts < cutoff_ms && self.oi_history.len() > 2 {
+                    self.oi_history.pop_front();
+                } else {
+                    break;
+                }
+            }
+        }
 
         self.funding_samples.push(funding_1h);
         if self.funding_samples.len() > 240 {
@@ -816,6 +846,36 @@ impl MarketCrowdingTracker {
         }
 
         self.funding_z = Self::robust_z(funding_1h, &self.funding_samples, 1e-5);
+    }
+
+    /// Returns the causal 15-minute percentage change in Open Interest (e.g. -0.20 means -0.20%).
+    /// Fails open (0.0) if Open Interest history has not yet spanned at least 10 minutes.
+    pub fn oi_delta_15m_pct(&self, now_ms: u64) -> f64 {
+        if self.open_interest <= 0.0
+            || !self.open_interest.is_finite()
+            || self.oi_history.is_empty()
+        {
+            return 0.0;
+        }
+        let target_ts = now_ms.saturating_sub(15 * 60 * 1000);
+        // Find sample closest to 15 minutes ago (require at least 10 minutes of history)
+        let mut best_sample: Option<(u64, f64)> = None;
+        for &(ts, oi) in &self.oi_history {
+            if ts <= target_ts {
+                best_sample = Some((ts, oi));
+            } else {
+                if best_sample.is_none() && now_ms.saturating_sub(ts) >= 10 * 60 * 1000 {
+                    best_sample = Some((ts, oi));
+                }
+                break;
+            }
+        }
+        match best_sample {
+            Some((_, prev_oi)) if prev_oi > 0.0 => {
+                ((self.open_interest - prev_oi) / prev_oi) * 100.0
+            }
+            _ => 0.0,
+        }
     }
 
     /// Computes the exogenous Crowding Hazard Multiplier H_t in [0.25, 1.0]:
@@ -1494,6 +1554,708 @@ pub fn record_shadow_exit(trade: &mut ShadowTrade, exit_price: f64, exit_reason:
     }
 
     net_pnl
+}
+
+// ============================================================================
+// POLICY C: ENGINE B LOSS-PARITY SIZING, SESSION GATING, COILED-SPRING
+// SQUEEZE FILTER & TWO-STAGE ALO MAKER RETEST STATE MACHINE
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TrendDirection {
+    Long,
+    Short,
+}
+
+impl TrendDirection {
+    #[inline(always)]
+    pub fn sign(self) -> f64 {
+        match self {
+            TrendDirection::Long => 1.0,
+            TrendDirection::Short => -1.0,
+        }
+    }
+
+    #[inline(always)]
+    pub fn to_side(self) -> Side {
+        match self {
+            TrendDirection::Long => Side::Long,
+            TrendDirection::Short => Side::Short,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TrendAssetTier {
+    CryptoMajor,
+    CryptoAlt,
+    Hip3UsEquity,
+    Hip3Commodity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionMode {
+    Live,
+    Shadow { reason: &'static str },
+}
+
+/// Configuration for Engine B Risk Budgeting, Session Gating, and Squeeze/Retest Filters (Policy C).
+#[derive(Debug, Clone, Copy)]
+pub struct TrendEngineConfig {
+    pub tier: TrendAssetTier,
+    pub equity_fraction_eng_a: f64,   // 0.35 Crypto, 0.32 HIP-3
+    pub trend_risk_fraction: f64,     // 0.28 Majors/Commodities, 0.25 Alts, 0.30 Equities
+    pub max_trend_notional_usdc: f64, // Hard cap: $55.00 Majors/Equities, $50.00 Alts, $52.00 Commodities
+    pub min_trade_notional_usdc: f64, // Hyperliquid floor guard: $12.00 USDC (> $10 MinTradeNtl)
+    pub live_start_min_utc: u16, // 795 (13:15 UTC) Crypto; 875 (14:35 UTC EST) Equities; 750 (12:30 UTC) Commodities
+    pub live_end_min_utc: u16, // 1230 (20:30 UTC) Crypto; 975 (16:15 UTC EST) Equities; 1170 (19:30 UTC) Commodities
+    pub use_us_dst_shift: bool, // Shift -60m during US EDT for Equities
+    pub offpeak_min_ker: Option<f64>,
+    pub offpeak_min_rel_vol: Option<f64>,
+    pub offpeak_min_btc_ret_60m: Option<f64>,
+    pub max_squeeze_ratio: f64,       // 0.88 - 0.92
+    pub min_rel_volume: f64,          // 1.65 - 1.80
+    pub min_hurst_60m: f64,           // 0.48 - 0.50
+    pub min_clv_conviction: f64,      // 0.45 - 0.50
+    pub min_obi_retest: f64,          // +0.22 to +0.28
+    pub retest_limit_offset_atr: f64, // 0.04 - 0.05
+    pub retest_stop_atr: f64,         // 0.32 - 0.35
+    pub retest_ttl_secs: u64,         // 600 to 900 seconds (10-15 mins)
+}
+
+impl TrendEngineConfig {
+    /// Returns the calibrated Policy C configuration for any symbol in the 15-bot cluster.
+    /// `env_equity_fraction` defaults to 0.35 and `env_trend_risk_fraction` defaults to 0.28.
+    pub fn for_symbol(
+        symbol: &str,
+        env_equity_fraction: f64,
+        env_trend_risk_fraction: f64,
+    ) -> Self {
+        let s = symbol.to_uppercase();
+        let env_eq = if env_equity_fraction.is_finite() && env_equity_fraction > 0.0 {
+            env_equity_fraction
+        } else {
+            0.35
+        };
+        let env_scale = if env_trend_risk_fraction.is_finite() && env_trend_risk_fraction > 0.0 {
+            (env_trend_risk_fraction / 0.28).clamp(0.25, 1.25)
+        } else {
+            1.0
+        };
+
+        match s.as_str() {
+            "BTC" | "ETH" | "SOL" => Self {
+                tier: TrendAssetTier::CryptoMajor,
+                equity_fraction_eng_a: env_eq,
+                trend_risk_fraction: (0.28 * env_scale).clamp(0.10, 0.35),
+                max_trend_notional_usdc: 55.0,
+                min_trade_notional_usdc: 12.0,
+                live_start_min_utc: 795, // 13:15 UTC
+                live_end_min_utc: 1230,  // 20:30 UTC
+                use_us_dst_shift: false,
+                offpeak_min_ker: Some(0.62),
+                offpeak_min_rel_vol: Some(2.80),
+                offpeak_min_btc_ret_60m: Some(0.0175),
+                max_squeeze_ratio: 0.90,
+                min_rel_volume: 1.65,
+                min_hurst_60m: 0.48,
+                min_clv_conviction: 0.45,
+                min_obi_retest: 0.22,
+                retest_limit_offset_atr: 0.05,
+                retest_stop_atr: 0.35,
+                retest_ttl_secs: 720, // 12 mins
+            },
+            "XYZ:NVDA" | "NVDA" | "XYZ:TSLA" | "TSLA" | "XYZ:XYZ100" | "XYZ100" | "XYZ:AAPL"
+            | "AAPL" => Self {
+                tier: TrendAssetTier::Hip3UsEquity,
+                equity_fraction_eng_a: env_eq.min(0.32),
+                trend_risk_fraction: (0.30 * env_scale).clamp(0.10, 0.35),
+                max_trend_notional_usdc: 55.0,
+                min_trade_notional_usdc: 12.0,
+                live_start_min_utc: 875, // 14:35 UTC EST (13:35 UTC EDT)
+                live_end_min_utc: 975,   // 16:15 UTC EST (15:15 UTC EDT)
+                use_us_dst_shift: true,
+                offpeak_min_ker: None,
+                offpeak_min_rel_vol: None,
+                offpeak_min_btc_ret_60m: None,
+                max_squeeze_ratio: 0.92,
+                min_rel_volume: 1.75,
+                min_hurst_60m: 0.48,
+                min_clv_conviction: 0.45,
+                min_obi_retest: 0.25,
+                retest_limit_offset_atr: 0.05,
+                retest_stop_atr: 0.35,
+                retest_ttl_secs: 720, // 12 mins
+            },
+            "XYZ:GOLD" | "GOLD" | "XYZ:SILVER" | "SILVER" => Self {
+                tier: TrendAssetTier::Hip3Commodity,
+                equity_fraction_eng_a: env_eq.min(0.32),
+                trend_risk_fraction: (0.28 * env_scale).clamp(0.10, 0.35),
+                max_trend_notional_usdc: 52.0,
+                min_trade_notional_usdc: 12.0,
+                live_start_min_utc: 750, // 12:30 UTC
+                live_end_min_utc: 1170,  // 19:30 UTC
+                use_us_dst_shift: false,
+                offpeak_min_ker: Some(0.65),
+                offpeak_min_rel_vol: Some(3.00),
+                offpeak_min_btc_ret_60m: None,
+                max_squeeze_ratio: 0.90,
+                min_rel_volume: 1.65,
+                min_hurst_60m: 0.48,
+                min_clv_conviction: 0.45,
+                min_obi_retest: 0.22,
+                retest_limit_offset_atr: 0.05,
+                retest_stop_atr: 0.32,
+                retest_ttl_secs: 900, // 15 mins
+            },
+            // Crypto Alts: AVAX, HYPE, NEAR, XRP, SUI, LINK, ZEC
+            _ => Self {
+                tier: TrendAssetTier::CryptoAlt,
+                equity_fraction_eng_a: env_eq,
+                trend_risk_fraction: (0.25 * env_scale).clamp(0.10, 0.32),
+                max_trend_notional_usdc: 50.0,
+                min_trade_notional_usdc: 12.0,
+                live_start_min_utc: 795, // 13:15 UTC
+                live_end_min_utc: 1230,  // 20:30 UTC
+                use_us_dst_shift: false,
+                offpeak_min_ker: None,
+                offpeak_min_rel_vol: None,
+                offpeak_min_btc_ret_60m: None,
+                max_squeeze_ratio: 0.88,
+                min_rel_volume: 1.80,
+                min_hurst_60m: 0.50,
+                min_clv_conviction: 0.50,
+                min_obi_retest: 0.28,
+                retest_limit_offset_atr: 0.04,
+                retest_stop_atr: 0.35,
+                retest_ttl_secs: 600, // 10 mins
+            },
+        }
+    }
+
+    /// Computes the loss-parity & fractional-Kelly capped Engine B notional in USDC.
+    #[inline]
+    pub fn compute_trend_notional_usdc(&self, account_equity_usdc: f64) -> f64 {
+        if !account_equity_usdc.is_finite() || account_equity_usdc <= 0.0 {
+            return self.min_trade_notional_usdc;
+        }
+        let eng_a_notional = account_equity_usdc * self.equity_fraction_eng_a;
+        let raw_trend_notional = eng_a_notional * self.trend_risk_fraction;
+        raw_trend_notional
+            .min(self.max_trend_notional_usdc)
+            .max(self.min_trade_notional_usdc)
+    }
+}
+
+/// Evaluates whether Engine B is permitted to execute `Live` or must route to `Shadow`
+/// (CounterfactualTracker) based on UTC session hours, US DST, RWA schedules, and Macro Shock Override criteria.
+pub struct SessionTrendGate;
+
+impl SessionTrendGate {
+    #[inline]
+    pub fn evaluate_session_mode(
+        cfg: &TrendEngineConfig,
+        timestamp_sec: u64,
+        weekday_utc: u8,
+        is_mode_mean_reversion: bool,
+        ker_15m: f64,
+        rel_vol_15m: f64,
+        btc_ret_60m_abs: f64,
+    ) -> ExecutionMode {
+        // 1. Respect Engine A MODE_MEANREVERSION exclusivity lock (Alpha-Protective)
+        if is_mode_mean_reversion {
+            return ExecutionMode::Shadow {
+                reason: "BLOCKED_BY_MODE_MEANREVERSION",
+            };
+        }
+
+        let min_of_day = ((timestamp_sec / 60) % 1440) as u16;
+
+        // 2. Weekend / CME Globex maintenance lockout for HIP-3 Equities and Commodities
+        match cfg.tier {
+            TrendAssetTier::Hip3UsEquity => {
+                if weekday_utc == 0 || weekday_utc == 6 {
+                    return ExecutionMode::Shadow {
+                        reason: "WEEKEND_RWA_LOCKOUT",
+                    };
+                }
+            }
+            TrendAssetTier::Hip3Commodity => {
+                let cme_closed = weekday_utc == 6
+                    || (weekday_utc == 0 && min_of_day < 1395)
+                    || (weekday_utc == 5 && min_of_day >= 1245)
+                    || (1315..=1390).contains(&min_of_day);
+                if cme_closed {
+                    return ExecutionMode::Shadow {
+                        reason: "WEEKEND_RWA_LOCKOUT",
+                    };
+                }
+            }
+            _ => {}
+        }
+
+        // Adjust primary window by -60m during US Daylight Saving Time (EDT) for US Equities
+        let dst_shift_mins: u16 = if cfg.use_us_dst_shift {
+            if let chrono::LocalResult::Single(dt) = Utc.timestamp_opt(timestamp_sec as i64, 0) {
+                if crate::ou_process::is_us_daylight_saving_date(dt.year(), dt.month(), dt.day()) {
+                    60
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        let start_min = cfg.live_start_min_utc.saturating_sub(dst_shift_mins);
+        let end_min = cfg.live_end_min_utc.saturating_sub(dst_shift_mins);
+        let in_primary_window = min_of_day >= start_min && min_of_day <= end_min;
+
+        if in_primary_window {
+            return ExecutionMode::Live;
+        }
+
+        // 3. Off-Peak Asian/European Chop Window:
+        // Force Shadow unless tier supports verified 3-sigma Macro Volatility Ignition override
+        if let (Some(min_ker), Some(min_rv)) = (cfg.offpeak_min_ker, cfg.offpeak_min_rel_vol) {
+            let btc_ok = match cfg.offpeak_min_btc_ret_60m {
+                Some(min_btc) => btc_ret_60m_abs >= min_btc,
+                None => true,
+            };
+            if ker_15m >= min_ker && rel_vol_15m >= min_rv && btc_ok {
+                return ExecutionMode::Live;
+            }
+        }
+
+        ExecutionMode::Shadow {
+            reason: "OFF_PEAK_ASIAN_CHOP_SHADOW_GATE",
+        }
+    }
+}
+
+/// Evaluates the Coiled-Spring Pre-Breakout Squeeze, Volume Impulse, and Microstructure Filter.
+pub struct BreakoutFilter;
+
+#[derive(Debug, Clone, Copy)]
+pub struct BreakoutTelemetry {
+    #[allow(dead_code)]
+    pub bar_open: f64,
+    pub bar_high: f64,
+    pub bar_low: f64,
+    pub bar_close: f64,
+    pub donchian_high_12_15m: f64,
+    pub donchian_low_12_15m: f64,
+    pub atr_15m: f64,
+    pub min_squeeze_ratio_90m: f64, // min_{k in 1..=6} (2.0 * sigma_{20,15m} / (1.5 * ATR_{20,15m}))
+    pub rel_vol_15m: f64,
+    pub hurst_60m: f64,
+    pub l2_obi: f64,
+    pub oi_delta_15m_pct: f64,
+}
+
+impl BreakoutFilter {
+    #[inline]
+    pub fn check_coiled_spring_gates(
+        cfg: &TrendEngineConfig,
+        t: &BreakoutTelemetry,
+        dir: TrendDirection,
+    ) -> Result<(), &'static str> {
+        if !t.atr_15m.is_finite()
+            || t.atr_15m <= 0.0
+            || !t.bar_close.is_finite()
+            || !t.bar_high.is_finite()
+            || !t.bar_low.is_finite()
+        {
+            return Err("REJECT_INVALID_TELEMETRY");
+        }
+        if !t.min_squeeze_ratio_90m.is_finite() || t.min_squeeze_ratio_90m > cfg.max_squeeze_ratio {
+            return Err("REJECT_NO_PRE_BREAKOUT_SQUEEZE");
+        }
+        if !t.rel_vol_15m.is_finite() || t.rel_vol_15m < cfg.min_rel_volume {
+            return Err("REJECT_LOW_VOLUME_DRIFT_BREAKOUT");
+        }
+        if !t.hurst_60m.is_finite() || t.hurst_60m < cfg.min_hurst_60m {
+            return Err("REJECT_LOW_HURST_MEAN_REVERTING_REGIME");
+        }
+        if !t.oi_delta_15m_pct.is_finite() || t.oi_delta_15m_pct < -0.15 {
+            return Err("REJECT_LIQUIDATION_FLUSH_COLLAPSING_OI");
+        }
+
+        let range = (t.bar_high - t.bar_low).max(1e-12);
+        let clv = ((2.0 * t.bar_close - t.bar_high - t.bar_low) / range).clamp(-1.0, 1.0);
+        let d = dir.sign();
+
+        if d * clv < cfg.min_clv_conviction {
+            return Err("REJECT_WEAK_CANDLE_CLOSE_CONVICTION");
+        }
+        let body_acceptance = match dir {
+            TrendDirection::Long => t.bar_close - t.donchian_high_12_15m,
+            TrendDirection::Short => t.donchian_low_12_15m - t.bar_close,
+        };
+        if body_acceptance < 0.08 * t.atr_15m {
+            return Err("REJECT_INSUFFICIENT_BOUNDARY_ACCEPTANCE");
+        }
+
+        Ok(())
+    }
+}
+
+/// Two-Stage Persistence + Passive `Alo` Maker Retest State Machine for Engine B.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RetestState {
+    Idle,
+    Stage1ConfirmingPersistence {
+        dir: TrendDirection,
+        broken_donchian_px: f64,
+        confirm_bars_5m: u8,
+        armed_at_sec: u64,
+    },
+    Stage2WaitingMakerRetest {
+        dir: TrendDirection,
+        broken_donchian_px: f64,
+        alo_limit_px: f64,
+        post_fill_stop_px: f64,
+        initial_tp1_px: f64,
+        posted_at_sec: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TrendOrderAction {
+    None,
+    LogShadowCounterfactual {
+        dir: TrendDirection,
+        virtual_entry_px: f64,
+        reason: &'static str,
+    },
+    PostAloMakerRetestOrder {
+        dir: TrendDirection,
+        limit_px: f64,
+        stop_loss_px: f64,
+        tp1_px: f64,
+        notional_usdc: f64,
+        ttl_secs: u64,
+    },
+    CancelRestingRetestOrder {
+        reason: &'static str,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct EngineBTrendManager {
+    pub state: RetestState,
+}
+
+impl Default for EngineBTrendManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EngineBTrendManager {
+    pub fn new() -> Self {
+        Self {
+            state: RetestState::Idle,
+        }
+    }
+
+    #[inline]
+    pub fn is_waiting_retest(&self) -> bool {
+        matches!(self.state, RetestState::Stage2WaitingMakerRetest { .. })
+    }
+
+    #[inline]
+    pub fn is_stage1_armed(&self) -> bool {
+        matches!(self.state, RetestState::Stage1ConfirmingPersistence { .. })
+    }
+
+    #[inline]
+    pub fn on_order_filled(&mut self) {
+        if matches!(self.state, RetestState::Stage2WaitingMakerRetest { .. }) {
+            self.state = RetestState::Idle;
+        }
+    }
+
+    #[inline]
+    pub fn on_order_cancelled_or_rejected(&mut self) {
+        if matches!(self.state, RetestState::Stage2WaitingMakerRetest { .. }) {
+            self.state = RetestState::Idle;
+        }
+    }
+
+    #[inline]
+    pub fn disarm(&mut self) {
+        self.state = RetestState::Idle;
+    }
+
+    /// Evaluates 5-minute close persistence and manages Stage 2 `Alo` Maker Retest orders.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_5m_bar_close(
+        &mut self,
+        cfg: &TrendEngineConfig,
+        t: &BreakoutTelemetry,
+        timestamp_sec: u64,
+        weekday_utc: u8,
+        account_equity_usdc: f64,
+        is_mode_mean_reversion: bool,
+        ker_15m: f64,
+        btc_ret_60m_abs: f64,
+    ) -> TrendOrderAction {
+        let candidate_dir = if t.bar_close > t.donchian_high_12_15m {
+            Some((TrendDirection::Long, t.donchian_high_12_15m))
+        } else if t.bar_close < t.donchian_low_12_15m {
+            Some((TrendDirection::Short, t.donchian_low_12_15m))
+        } else {
+            None
+        };
+
+        match self.state {
+            RetestState::Idle => {
+                let Some((dir, bound_px)) = candidate_dir else {
+                    return TrendOrderAction::None;
+                };
+
+                // 1. Check Session Gating first
+                let mode = SessionTrendGate::evaluate_session_mode(
+                    cfg,
+                    timestamp_sec,
+                    weekday_utc,
+                    is_mode_mean_reversion,
+                    ker_15m,
+                    t.rel_vol_15m,
+                    btc_ret_60m_abs,
+                );
+                if let ExecutionMode::Shadow { reason } = mode {
+                    return TrendOrderAction::LogShadowCounterfactual {
+                        dir,
+                        virtual_entry_px: t.bar_close,
+                        reason,
+                    };
+                }
+
+                // 2. Check Coiled-Spring Squeeze & Volume Impulse Filter
+                if let Err(reject_reason) = BreakoutFilter::check_coiled_spring_gates(cfg, t, dir) {
+                    return TrendOrderAction::LogShadowCounterfactual {
+                        dir,
+                        virtual_entry_px: t.bar_close,
+                        reason: reject_reason,
+                    };
+                }
+
+                // First 5m bar confirmed outside Donchian channel: Enter Stage 1
+                self.state = RetestState::Stage1ConfirmingPersistence {
+                    dir,
+                    broken_donchian_px: bound_px,
+                    confirm_bars_5m: 1,
+                    armed_at_sec: timestamp_sec,
+                };
+                TrendOrderAction::None
+            }
+
+            RetestState::Stage1ConfirmingPersistence {
+                dir,
+                broken_donchian_px,
+                confirm_bars_5m,
+                armed_at_sec,
+            } => {
+                // Re-verify session mode before promoting Stage 1 -> Stage 2
+                let mode = SessionTrendGate::evaluate_session_mode(
+                    cfg,
+                    timestamp_sec,
+                    weekday_utc,
+                    is_mode_mean_reversion,
+                    ker_15m,
+                    t.rel_vol_15m,
+                    btc_ret_60m_abs,
+                );
+                if let ExecutionMode::Shadow { reason } = mode {
+                    self.state = RetestState::Idle;
+                    return TrendOrderAction::LogShadowCounterfactual {
+                        dir,
+                        virtual_entry_px: t.bar_close,
+                        reason,
+                    };
+                }
+
+                let d = dir.sign();
+                let still_outside = d * (t.bar_close - broken_donchian_px) >= 0.05 * t.atr_15m;
+                if !still_outside || timestamp_sec.saturating_sub(armed_at_sec) > 600 {
+                    // Failed 2-bar persistence (Immediate fakeout snapback caught!)
+                    self.state = RetestState::Idle;
+                    return TrendOrderAction::LogShadowCounterfactual {
+                        dir,
+                        virtual_entry_px: t.bar_close,
+                        reason: "STAGE1_PERSISTENCE_SNAPBACK_AVOIDED",
+                    };
+                }
+
+                if confirm_bars_5m + 1 >= 2 {
+                    if d * t.l2_obi >= cfg.min_obi_retest {
+                        // 2 consecutive 5m bars confirmed + L2 OBI aligned: Post Stage 2 Alo Retest Order!
+                        let alo_limit_px =
+                            broken_donchian_px + d * cfg.retest_limit_offset_atr * t.atr_15m;
+                        let post_fill_stop_px =
+                            broken_donchian_px - d * cfg.retest_stop_atr * t.atr_15m;
+                        let initial_tp1_px = alo_limit_px + d * 1.50 * t.atr_15m;
+                        let notional_usdc = cfg.compute_trend_notional_usdc(account_equity_usdc);
+
+                        self.state = RetestState::Stage2WaitingMakerRetest {
+                            dir,
+                            broken_donchian_px,
+                            alo_limit_px,
+                            post_fill_stop_px,
+                            initial_tp1_px,
+                            posted_at_sec: timestamp_sec,
+                        };
+
+                        return TrendOrderAction::PostAloMakerRetestOrder {
+                            dir,
+                            limit_px: alo_limit_px,
+                            stop_loss_px: post_fill_stop_px,
+                            tp1_px: initial_tp1_px,
+                            notional_usdc,
+                            ttl_secs: cfg.retest_ttl_secs,
+                        };
+                    } else {
+                        self.state = RetestState::Idle;
+                        return TrendOrderAction::LogShadowCounterfactual {
+                            dir,
+                            virtual_entry_px: t.bar_close,
+                            reason: "STAGE1_OBI_RETEST_HURDLE_FAIL",
+                        };
+                    }
+                }
+
+                self.state = RetestState::Idle;
+                TrendOrderAction::None
+            }
+
+            RetestState::Stage2WaitingMakerRetest {
+                dir,
+                broken_donchian_px,
+                posted_at_sec,
+                ..
+            } => {
+                let d = dir.sign();
+                // Cancel resting Alo retest order if TTL expires, L2 OBI flips adverse, or price falls back inside channel
+                if timestamp_sec.saturating_sub(posted_at_sec) >= cfg.retest_ttl_secs {
+                    self.state = RetestState::Idle;
+                    return TrendOrderAction::CancelRestingRetestOrder {
+                        reason: "RETEST_TTL_EXPIRED",
+                    };
+                }
+                if d * t.l2_obi < 0.0 || d * (t.bar_close - broken_donchian_px) < -0.10 * t.atr_15m
+                {
+                    self.state = RetestState::Idle;
+                    return TrendOrderAction::CancelRestingRetestOrder {
+                        reason: "FAST_SENTINEL_OBI_OR_STRUCTURE_ABORT",
+                    };
+                }
+                TrendOrderAction::None
+            }
+        }
+    }
+}
+
+/// Computes the Policy C 90-minute rolling minimum Bollinger-to-Keltner squeeze ratio:
+/// `min_{k in 1..=6} (2.0 * sigma_{20, 15m}(t - k) / (1.5 * ATR_{20, 15m}(t - k)))`.
+/// Returns `1.0` (no squeeze) when fewer than 21 15m bars or valid ATRs are available.
+pub fn calculate_min_squeeze_ratio_90m(bars_15m: &[CandleBar]) -> f64 {
+    let n15 = bars_15m.len();
+    if n15 < 21 {
+        return 1.0;
+    }
+    let mut min_sq = f64::MAX;
+    for k in 1..=6 {
+        let end = n15.saturating_sub(k);
+        if end >= 20 {
+            let sub = &bars_15m[end - 20..end];
+            let mean_c = sub.iter().map(|b| b.close).sum::<f64>() / 20.0;
+            let var_c = sub.iter().map(|b| (b.close - mean_c).powi(2)).sum::<f64>() / 20.0;
+            let std_20 = var_c.sqrt();
+            let atr_opt = if end >= 21 {
+                calculate_atr(&bars_15m[..end], 20)
+            } else {
+                calculate_atr(sub, 19)
+            };
+            if let Some(atr_sub) = atr_opt.filter(|&a| a.is_finite() && a > 1e-9) {
+                let sq = (2.0 * std_20) / (1.5 * atr_sub);
+                if sq.is_finite() && sq < min_sq {
+                    min_sq = sq;
+                }
+            }
+        }
+    }
+    if min_sq < f64::MAX {
+        min_sq
+    } else {
+        1.0
+    }
+}
+
+/// Computes the causal 15-minute relative volume impulse `R_V = V_15m / EMA_20(V_15m)`.
+/// Uses `finalized_15m` when a 15m bar just closed, or the sum of the last 3 completed 5m bars
+/// on intermediate 5m closes so volume is always measured over a full 15-minute window.
+pub fn calculate_rel_vol_15m(
+    prior_15m_bars: &[CandleBar],
+    recent_5m_bars: &[CandleBar],
+    finalized_15m: Option<&CandleBar>,
+) -> f64 {
+    let v_curr = if let Some(c15) = finalized_15m {
+        c15.volume
+    } else if recent_5m_bars.len() >= 3 {
+        recent_5m_bars[recent_5m_bars.len() - 3..]
+            .iter()
+            .map(|b| b.volume)
+            .sum()
+    } else {
+        return 0.0;
+    };
+
+    if !v_curr.is_finite() || v_curr <= 0.0 || prior_15m_bars.is_empty() {
+        return 0.0;
+    }
+
+    let vols: Vec<f64> = prior_15m_bars
+        .iter()
+        .map(|b| b.volume)
+        .filter(|&v| v.is_finite() && v > 0.0)
+        .collect();
+    if vols.is_empty() {
+        return 0.0;
+    }
+
+    let ema_vol = if vols.len() >= 20 {
+        calculate_ema(&vols, 20).unwrap_or(0.0)
+    } else {
+        vols.iter().sum::<f64>() / (vols.len() as f64)
+    };
+
+    if ema_vol > 1e-9 {
+        v_curr / ema_vol
+    } else {
+        0.0
+    }
+}
+
+/// Computes Kaufman Efficiency Ratio over `period` bars (`KER in [0.0, 1.0]`).
+pub fn calculate_ker_n(bars: &[CandleBar], period: usize) -> f64 {
+    if period == 0 || bars.len() <= period {
+        return 0.0;
+    }
+    let slice = &bars[bars.len() - period - 1..];
+    let net_disp = (slice[period].close - slice[0].close).abs();
+    let mut path_sum = 0.0;
+    for i in 1..=period {
+        path_sum += (slice[i].close - slice[i - 1].close).abs();
+    }
+    if path_sum <= 1e-12 {
+        0.0
+    } else {
+        (net_disp / path_sum).clamp(0.0, 1.0)
+    }
 }
 
 #[cfg(test)]
@@ -2193,5 +2955,388 @@ mod tests {
             !verdict_exhausted.approved,
             "Exhausted cascade with DCW20=6.0x and Z60=-3.76 must be rejected"
         );
+    }
+
+    fn make_policy_c_telemetry(
+        close: f64,
+        donchian_high: f64,
+        donchian_low: f64,
+        atr: f64,
+    ) -> BreakoutTelemetry {
+        BreakoutTelemetry {
+            bar_open: close - 0.30 * atr,
+            bar_high: close + 0.05 * atr,
+            bar_low: close - 0.35 * atr,
+            bar_close: close,
+            donchian_high_12_15m: donchian_high,
+            donchian_low_12_15m: donchian_low,
+            atr_15m: atr,
+            min_squeeze_ratio_90m: 0.84,
+            rel_vol_15m: 1.95,
+            hurst_60m: 0.54,
+            l2_obi: 0.34,
+            oi_delta_15m_pct: 0.15,
+        }
+    }
+
+    #[test]
+    fn test_policy_c_loss_parity_notional_across_all_tiers() {
+        let eq = 560.44;
+
+        let btc = TrendEngineConfig::for_symbol("BTC", 0.35, 0.28);
+        assert_eq!(btc.tier, TrendAssetTier::CryptoMajor);
+        let btc_ntl = btc.compute_trend_notional_usdc(eq);
+        // 560.44 * 0.35 * 0.28 = $54.92312 (< $55 cap)
+        assert!((btc_ntl - 54.92312).abs() < 0.01);
+
+        let sui = TrendEngineConfig::for_symbol("SUI", 0.35, 0.28);
+        assert_eq!(sui.tier, TrendAssetTier::CryptoAlt);
+        let sui_ntl = sui.compute_trend_notional_usdc(eq);
+        // 560.44 * 0.35 * 0.25 = $49.0385 (< $50 cap)
+        assert!((sui_ntl - 49.0385).abs() < 0.01);
+
+        let nvda = TrendEngineConfig::for_symbol("xyz:NVDA", 0.35, 0.28);
+        assert_eq!(nvda.tier, TrendAssetTier::Hip3UsEquity);
+        let nvda_ntl = nvda.compute_trend_notional_usdc(eq);
+        // 560.44 * 0.32 * 0.30 = $53.80224 (< $55 cap)
+        assert!((nvda_ntl - 53.80224).abs() < 0.01);
+
+        let gold = TrendEngineConfig::for_symbol("xyz:GOLD", 0.35, 0.28);
+        assert_eq!(gold.tier, TrendAssetTier::Hip3Commodity);
+        let gold_ntl = gold.compute_trend_notional_usdc(eq);
+        // 560.44 * 0.32 * 0.28 = $50.215424 (< $52 cap)
+        assert!((gold_ntl - 50.215424).abs() < 0.01);
+
+        // Hard cap holds on large equity & floor guard holds on tiny equity
+        assert_eq!(btc.compute_trend_notional_usdc(5000.0), 55.0);
+        assert_eq!(sui.compute_trend_notional_usdc(5000.0), 50.0);
+        assert_eq!(btc.compute_trend_notional_usdc(50.0), 12.0);
+    }
+
+    #[test]
+    fn test_policy_c_session_gating_dst_and_macro_override() {
+        let btc_cfg = TrendEngineConfig::for_symbol("BTC", 0.35, 0.28);
+        let alt_cfg = TrendEngineConfig::for_symbol("XRP", 0.35, 0.28);
+        let nvda_cfg = TrendEngineConfig::for_symbol("xyz:NVDA", 0.35, 0.28);
+        let gold_cfg = TrendEngineConfig::for_symbol("xyz:GOLD", 0.35, 0.28);
+
+        // 01:15 UTC on Wednesday (Asian chop) -> Shadow for BTC & XRP
+        let ts_0115_est = chrono::Utc
+            .with_ymd_and_hms(2026, 11, 11, 1, 15, 0)
+            .unwrap()
+            .timestamp() as u64;
+        assert_eq!(
+            SessionTrendGate::evaluate_session_mode(
+                &btc_cfg,
+                ts_0115_est,
+                3,
+                false,
+                0.45,
+                1.2,
+                0.004
+            ),
+            ExecutionMode::Shadow {
+                reason: "OFF_PEAK_ASIAN_CHOP_SHADOW_GATE"
+            }
+        );
+
+        // Macro Shock Override at 01:15 UTC (KER >= 0.62, R_V >= 2.80, |BTC 1h| >= 1.75%)
+        assert_eq!(
+            SessionTrendGate::evaluate_session_mode(
+                &btc_cfg,
+                ts_0115_est,
+                3,
+                false,
+                0.65,
+                3.0,
+                0.020
+            ),
+            ExecutionMode::Live
+        );
+        // Alts remain strictly Shadow off-peak even on Macro Shock
+        assert_eq!(
+            SessionTrendGate::evaluate_session_mode(
+                &alt_cfg,
+                ts_0115_est,
+                3,
+                false,
+                0.65,
+                3.0,
+                0.020
+            ),
+            ExecutionMode::Shadow {
+                reason: "OFF_PEAK_ASIAN_CHOP_SHADOW_GATE"
+            }
+        );
+
+        // 14:45 UTC on Wednesday (US institutional window) -> Live, unless MODE_MEANREVERSION
+        let ts_1445_est = chrono::Utc
+            .with_ymd_and_hms(2026, 11, 11, 14, 45, 0)
+            .unwrap()
+            .timestamp() as u64;
+        assert_eq!(
+            SessionTrendGate::evaluate_session_mode(
+                &btc_cfg,
+                ts_1445_est,
+                3,
+                false,
+                0.30,
+                1.7,
+                0.005
+            ),
+            ExecutionMode::Live
+        );
+        assert_eq!(
+            SessionTrendGate::evaluate_session_mode(
+                &btc_cfg,
+                ts_1445_est,
+                3,
+                true,
+                0.80,
+                3.5,
+                0.03
+            ),
+            ExecutionMode::Shadow {
+                reason: "BLOCKED_BY_MODE_MEANREVERSION"
+            }
+        );
+
+        // US Equities DST awareness:
+        // Nov 11 (EST): 13:45 UTC is pre-open -> Shadow; 14:45 UTC is ORB -> Live
+        let ts_1345_est = chrono::Utc
+            .with_ymd_and_hms(2026, 11, 11, 13, 45, 0)
+            .unwrap()
+            .timestamp() as u64;
+        assert_eq!(
+            SessionTrendGate::evaluate_session_mode(
+                &nvda_cfg,
+                ts_1345_est,
+                3,
+                false,
+                0.5,
+                2.0,
+                0.0
+            ),
+            ExecutionMode::Shadow {
+                reason: "OFF_PEAK_ASIAN_CHOP_SHADOW_GATE"
+            }
+        );
+        assert_eq!(
+            SessionTrendGate::evaluate_session_mode(
+                &nvda_cfg,
+                ts_1445_est,
+                3,
+                false,
+                0.5,
+                2.0,
+                0.0
+            ),
+            ExecutionMode::Live
+        );
+
+        // July 15 (EDT): 13:45 UTC is ORB -> Live; 15:45 UTC is post-window -> Shadow
+        let ts_1345_edt = chrono::Utc
+            .with_ymd_and_hms(2026, 7, 15, 13, 45, 0)
+            .unwrap()
+            .timestamp() as u64;
+        let ts_1545_edt = chrono::Utc
+            .with_ymd_and_hms(2026, 7, 15, 15, 45, 0)
+            .unwrap()
+            .timestamp() as u64;
+        assert_eq!(
+            SessionTrendGate::evaluate_session_mode(
+                &nvda_cfg,
+                ts_1345_edt,
+                3,
+                false,
+                0.5,
+                2.0,
+                0.0
+            ),
+            ExecutionMode::Live
+        );
+        assert_eq!(
+            SessionTrendGate::evaluate_session_mode(
+                &nvda_cfg,
+                ts_1545_edt,
+                3,
+                false,
+                0.5,
+                2.0,
+                0.0
+            ),
+            ExecutionMode::Shadow {
+                reason: "OFF_PEAK_ASIAN_CHOP_SHADOW_GATE"
+            }
+        );
+
+        // Weekend RWA lockout for Equities & Commodities
+        assert_eq!(
+            SessionTrendGate::evaluate_session_mode(
+                &nvda_cfg,
+                ts_1445_est,
+                6,
+                false,
+                0.8,
+                4.0,
+                0.03
+            ),
+            ExecutionMode::Shadow {
+                reason: "WEEKEND_RWA_LOCKOUT"
+            }
+        );
+        assert_eq!(
+            SessionTrendGate::evaluate_session_mode(
+                &gold_cfg,
+                ts_1445_est,
+                6,
+                false,
+                0.8,
+                4.0,
+                0.03
+            ),
+            ExecutionMode::Shadow {
+                reason: "WEEKEND_RWA_LOCKOUT"
+            }
+        );
+    }
+
+    #[test]
+    fn test_policy_c_coiled_spring_gates_and_two_stage_alo_retest_lifecycle() {
+        let cfg = TrendEngineConfig::for_symbol("BTC", 0.35, 0.28);
+        let ts_us = chrono::Utc
+            .with_ymd_and_hms(2026, 11, 11, 14, 30, 0)
+            .unwrap()
+            .timestamp() as u64;
+
+        // 1. Reject missing squeeze
+        let mut tel_no_sq = make_policy_c_telemetry(73_500.0, 73_400.0, 73_000.0, 250.0);
+        tel_no_sq.min_squeeze_ratio_90m = 1.05;
+        assert_eq!(
+            BreakoutFilter::check_coiled_spring_gates(&cfg, &tel_no_sq, TrendDirection::Long),
+            Err("REJECT_NO_PRE_BREAKOUT_SQUEEZE")
+        );
+
+        // 2. Reject low volume drift
+        let mut tel_low_vol = make_policy_c_telemetry(73_500.0, 73_400.0, 73_000.0, 250.0);
+        tel_low_vol.rel_vol_15m = 1.05;
+        assert_eq!(
+            BreakoutFilter::check_coiled_spring_gates(&cfg, &tel_low_vol, TrendDirection::Long),
+            Err("REJECT_LOW_VOLUME_DRIFT_BREAKOUT")
+        );
+
+        // 3. Stage 1 -> Snapback fakeout caught
+        let mut mgr = EngineBTrendManager::new();
+        let tel_bar1 = make_policy_c_telemetry(73_450.0, 73_400.0, 73_000.0, 250.0);
+        let a1 = mgr.on_5m_bar_close(&cfg, &tel_bar1, ts_us, 3, 560.44, false, 0.45, 0.005);
+        assert_eq!(a1, TrendOrderAction::None);
+        assert!(mgr.is_stage1_armed());
+
+        let tel_snapback = make_policy_c_telemetry(73_380.0, 73_400.0, 73_000.0, 250.0);
+        let a_snap = mgr.on_5m_bar_close(
+            &cfg,
+            &tel_snapback,
+            ts_us + 300,
+            3,
+            560.44,
+            false,
+            0.45,
+            0.005,
+        );
+        assert!(matches!(
+            a_snap,
+            TrendOrderAction::LogShadowCounterfactual {
+                reason: "STAGE1_PERSISTENCE_SNAPBACK_AVOIDED",
+                ..
+            }
+        ));
+        assert_eq!(mgr.state, RetestState::Idle);
+
+        // 4. Full Stage 1 -> Stage 2 -> Structure Abort & TTL Expiry
+        let a1_ok = mgr.on_5m_bar_close(&cfg, &tel_bar1, ts_us, 3, 560.44, false, 0.45, 0.005);
+        assert_eq!(a1_ok, TrendOrderAction::None);
+        let tel_bar2 = make_policy_c_telemetry(73_480.0, 73_420.0, 73_000.0, 250.0);
+        let a2 = mgr.on_5m_bar_close(&cfg, &tel_bar2, ts_us + 300, 3, 560.44, false, 0.45, 0.005);
+        match a2 {
+            TrendOrderAction::PostAloMakerRetestOrder {
+                dir,
+                limit_px,
+                stop_loss_px,
+                notional_usdc,
+                ttl_secs,
+                ..
+            } => {
+                assert_eq!(dir, TrendDirection::Long);
+                // B = 73_400.0, ATR = 250.0 -> limit = 73_400 + 0.05*250 = 73_412.5, stop = 73_400 - 0.35*250 = 73_312.5
+                assert!((limit_px - 73_412.5).abs() < 1e-6);
+                assert!((stop_loss_px - 73_312.5).abs() < 1e-6);
+                assert!((notional_usdc - 54.92312).abs() < 0.05);
+                assert_eq!(ttl_secs, 720);
+            }
+            other => panic!("Expected PostAloMakerRetestOrder, got {:?}", other),
+        }
+        assert!(mgr.is_waiting_retest());
+
+        // TTL expiry cancels resting order
+        let a_ttl = mgr.on_5m_bar_close(
+            &cfg,
+            &tel_bar2,
+            ts_us + 300 + 720,
+            3,
+            560.44,
+            false,
+            0.45,
+            0.005,
+        );
+        assert_eq!(
+            a_ttl,
+            TrendOrderAction::CancelRestingRetestOrder {
+                reason: "RETEST_TTL_EXPIRED"
+            }
+        );
+        assert_eq!(mgr.state, RetestState::Idle);
+    }
+
+    #[test]
+    fn test_policy_c_squeeze_rel_vol_and_oi_delta_helpers() {
+        let mut bars_15m = Vec::with_capacity(30);
+        for i in 0..29 {
+            // Very tight closing range (std ~ 0.15) vs 1.0 ATR -> squeeze ratio ~ 0.20 <= 0.90
+            let c = 100.0 + if i % 2 == 0 { 0.15 } else { -0.15 };
+            bars_15m.push(CandleBar {
+                time_open: i as u64 * 900_000,
+                open: 100.0,
+                high: 100.5,
+                low: 99.5,
+                close: c,
+                volume: 1000.0,
+            });
+        }
+        let breakout_15m = CandleBar {
+            time_open: 29 * 900_000,
+            open: 100.0,
+            high: 102.0,
+            low: 99.9,
+            close: 101.8,
+            volume: 2200.0,
+        };
+        bars_15m.push(breakout_15m.clone());
+
+        let sq = calculate_min_squeeze_ratio_90m(&bars_15m);
+        assert!(sq <= 0.90, "Expected tight squeeze <= 0.90, got {}", sq);
+
+        let rv = calculate_rel_vol_15m(&bars_15m[..29], &[], Some(&breakout_15m));
+        assert!(
+            (rv - 2.20).abs() < 0.05,
+            "Expected rel_vol ~ 2.20, got {}",
+            rv
+        );
+
+        let mut tracker = MarketCrowdingTracker::default();
+        let t0 = 1_760_000_000_000u64;
+        tracker.update_with_time(0.00001, 10_000.0, 100.0, 100.0, t0);
+        tracker.update_with_time(0.00001, 9_950.0, 100.0, 100.0, t0 + 15 * 60 * 1000);
+        let oi_pct = tracker.oi_delta_15m_pct(t0 + 15 * 60 * 1000);
+        assert!((oi_pct - (-0.50)).abs() < 1e-6);
     }
 }
