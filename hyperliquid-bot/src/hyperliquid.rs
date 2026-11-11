@@ -720,6 +720,7 @@ pub async fn fetch_open_orders_for_coin(
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ClearinghouseDexEquitySummary {
     pub account_value: f64,
+    #[allow(dead_code)]
     pub total_raw_usd: f64,
     pub total_margin_used: f64,
     pub unrealized_pnl: f64,
