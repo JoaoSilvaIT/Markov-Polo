@@ -35,12 +35,14 @@ use crate::hyperliquid::{
     compute_drawdown_risk_multiplier, effective_tick_size, exceeds_micro_account_step_risk,
     fetch_book_ticker, fetch_open_orders_for_coin, fetch_sz_decimals_map, get_account_value,
     get_user_position, optimal_engine_b_tp_atr_multiple, place_disaster_stop_trigger_order,
-    place_post_only_order, quantize_price,
+    place_reduce_only_tp_order, quantize_price, round_to_decimals,
 };
 use crate::order::{emergency_flatten, place_ou_maker_entry};
 use crate::ou_process::{
-    calculate_directional_edge_bps, calculate_features_with_funding, check_macro_calendar_veto,
-    compute_fee_adjusted_kelly_scalar, evaluate_session_lifecycle_gate, AssetFeeSchedule,
+    asset_calibration, calculate_directional_edge_bps, calculate_features_with_funding,
+    check_macro_calendar_veto, compute_engine_a_disaster_stop_distance,
+    compute_fee_adjusted_kelly_scalar, engine_a_min_soft_inv_excursion_bps,
+    evaluate_session_lifecycle_gate, verify_maker_touch_absorption, AssetFeeSchedule, Direction,
     SessionLifecycleAction,
 };
 use crate::state::{
@@ -1231,6 +1233,8 @@ async fn main() {
                         disaster_stop_oid: None,
                         disaster_stop_ratcheted_to_be: false,
                         last_fill_check: 0,
+                        tranche1_tp_filled: false,
+                        last_peak_mins: 0.0,
                     },
                 );
             }
@@ -1310,6 +1314,8 @@ async fn main() {
                                 disaster_stop_oid: None,
                                 disaster_stop_ratcheted_to_be: false,
                                 last_fill_check: 0,
+                                tranche1_tp_filled: false,
+                                last_peak_mins: 0.0,
                             };
                             state_lock.insert(trading_symbol.clone(), reconstructed);
                             let _ = save_state(&state_file_path, &state_lock);
@@ -1393,12 +1399,14 @@ async fn main() {
     let watcher_obi = obi_tracker.clone();
     let live_funding_rate = Arc::new(RwLock::new(0.0_f64));
     let crowding_tracker = Arc::new(RwLock::new(MarketCrowdingTracker::default()));
+    let watcher_crowding = crowding_tracker.clone();
     let high_water_mark_equity = Arc::new(RwLock::new(initial_equity));
     let sentinel_notify = Arc::new(Notify::new());
     let watcher_notify = sentinel_notify.clone();
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(1500));
+        let mut stop_breach_streak: u8 = 0;
         loop {
             tokio::select! {
                 _ = interval.tick() => {},
@@ -1413,7 +1421,10 @@ async fn main() {
 
             let pos = match pos_opt {
                 Some(p) => p,
-                None => continue,
+                None => {
+                    stop_breach_streak = 0;
+                    continue;
+                }
             };
 
             // Cross-reference user position on live exchange (Fail-Closed)
@@ -1466,31 +1477,73 @@ async fn main() {
             }
 
             // -------------------------------------------------------------
-            // Defense Layer 1: Live Order Book Catastrophe Stop Loss (1.5s Sentinel)
+            // Defense Layer 1 (F-07 Hardened): Mark-Price OR 3-Tick Microprice Persistence Stop Loss
+            // Prevents 1-second L2 BBO flash vacuums from triggering Taker IOC dumps while markPx is calm.
             // -------------------------------------------------------------
-            if (pos.is_filled || pos_exists) && pos.stop_loss_price > 0.0 {
+            if pos_exists && pos.stop_loss_price > 0.0 {
                 let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-                let ws_quotes = {
+                let (ws_quotes, ws_micro_px) = {
                     let guard = watcher_obi.read().await;
                     if guard.is_fresh_and_uncrossed(now_ms, 2500) {
-                        Some((guard.best_bid, guard.best_ask))
+                        let micro = guard.compute_micro_price();
+                        (Some((guard.best_bid, guard.best_ask)), micro)
                     } else {
-                        None
+                        (None, 0.0)
                     }
                 };
                 let quotes_res = match ws_quotes {
                     Some(q) => Ok(q),
                     None => fetch_book_ticker(&watcher_info, &watcher_symbol).await,
                 };
-                if let Ok((best_bid, best_ask)) = quotes_res {
-                    let is_breached = if pos.side == "LONG" {
-                        best_bid > 0.0 && best_bid <= pos.stop_loss_price
-                    } else {
-                        best_ask > 0.0 && best_ask >= pos.stop_loss_price
-                    };
+                let (mark_px_now, mark_ts_now) = {
+                    let cg = watcher_crowding.read().await;
+                    (cg.mark_px, cg.last_mark_update_ms)
+                };
+                let mark_fresh = mark_px_now > 0.0 && now_ms.saturating_sub(mark_ts_now) <= 12_000;
 
-                    if is_breached {
-                        let breach_px = if pos.side == "LONG" { best_bid } else { best_ask };
+                if let Ok((best_bid, best_ask)) = quotes_res {
+                    let mid_now = 0.5 * (best_bid + best_ask);
+                    let spread_bps = if mid_now > 0.0 && best_ask > best_bid {
+                        ((best_ask - best_bid) / mid_now) * 10_000.0
+                    } else {
+                        999.0
+                    };
+                    let micro_px = if ws_micro_px > 0.0 { ws_micro_px } else { mid_now };
+
+                    let mark_breached = mark_fresh
+                        && if pos.side == "LONG" {
+                            mark_px_now <= pos.stop_loss_price
+                        } else {
+                            mark_px_now >= pos.stop_loss_price
+                        };
+                    let micro_breached = spread_bps < 25.0
+                        && micro_px > 0.0
+                        && if pos.side == "LONG" {
+                            micro_px <= pos.stop_loss_price
+                        } else {
+                            micro_px >= pos.stop_loss_price
+                        };
+
+                    if micro_breached {
+                        stop_breach_streak = stop_breach_streak.saturating_add(1);
+                    } else {
+                        stop_breach_streak = 0;
+                    }
+
+                    let req_ticks = if pos.engine_type == "EngineB" { 2 } else { 3 };
+                    let is_confirmed_breach =
+                        mark_breached || (micro_breached && stop_breach_streak >= req_ticks);
+
+                    if is_confirmed_breach {
+                        stop_breach_streak = 0;
+                        let breach_px = if mark_breached {
+                            mark_px_now
+                        } else if pos.side == "LONG" {
+                            best_bid
+                        } else {
+                            best_ask
+                        };
+                        let trigger_src = if mark_breached { "MarkPx" } else { "Microprice-3Tick" };
                         let is_profit_lock = if pos.side == "LONG" {
                             pos.entry_price > 0.0 && breach_px > pos.entry_price * 1.0005
                         } else {
@@ -1499,22 +1552,22 @@ async fn main() {
 
                         if is_profit_lock {
                             println!(
-                                "🟢 [FAST-SENTINEL PROFIT-LOCK TRAILING STOP] {} hit profit-locked stop at ${:.4} (Entry: ${:.4}, Current: ${:.4})! Harvesting profit...",
-                                watcher_symbol, pos.stop_loss_price, pos.entry_price, breach_px
+                                "🟢 [FAST-SENTINEL PROFIT-LOCK TRAILING STOP ({})] {} hit profit-locked stop at ${:.4} (Entry: ${:.4}, Current: ${:.4})! Harvesting profit...",
+                                trigger_src, watcher_symbol, pos.stop_loss_price, pos.entry_price, breach_px
                             );
                             let profit_msg = format!(
-                                "🟢 **PROFIT-LOCK TRAILING STOP HIT (FAST-SENTINEL):** {}\n**Side:** {}\n**Entry:** ${:.4}\n**Harvest Price:** ${:.4}\nClosing position in profit.",
-                                watcher_symbol, pos.side, pos.entry_price, breach_px
+                                "🟢 **PROFIT-LOCK TRAILING STOP HIT (FAST-SENTINEL {}):** {}\n**Side:** {}\n**Entry:** ${:.4}\n**Harvest Price:** ${:.4}\nClosing position in profit.",
+                                trigger_src, watcher_symbol, pos.side, pos.entry_price, breach_px
                             );
                             crate::discord::send_alert(watcher_discord.as_deref(), &profit_msg).await;
                         } else {
                             println!(
-                                "🛑 [FAST-SENTINEL 1.5s STOP LOSS] {} breached catastrophe stop at ${:.4} (Current: ${:.4})! Emergency flattening...",
-                                watcher_symbol, pos.stop_loss_price, breach_px
+                                "🛑 [FAST-SENTINEL 1.5s STOP LOSS ({})] {} breached catastrophe stop at ${:.4} (Current: ${:.4}, Spread: {:.1} bps)! Emergency flattening...",
+                                trigger_src, watcher_symbol, pos.stop_loss_price, breach_px, spread_bps
                             );
                             let stop_msg = format!(
-                                "🛑 **CATASTROPHE STOP LOSS HIT (1.5s FAST-SENTINEL):** {}\n**Side:** {}\n**Breach Price:** ${:.4}\n**Hard Stop:** ${:.4}\nEmergency flattening immediately.",
-                                watcher_symbol, pos.side, breach_px, pos.stop_loss_price
+                                "🛑 **CATASTROPHE STOP LOSS HIT (FAST-SENTINEL {}):** {}\n**Side:** {}\n**Breach Price:** ${:.4}\n**Hard Stop:** ${:.4}\nEmergency flattening immediately.",
+                                trigger_src, watcher_symbol, pos.side, breach_px, pos.stop_loss_price
                             );
                             crate::discord::send_alert(watcher_discord.as_deref(), &stop_msg).await;
                         }
@@ -1568,7 +1621,10 @@ async fn main() {
                     // Check if disaster stop ratchet should trigger (using live position size & fee-aware breakeven)
                     let mut dr = false;
                     let mut rp = None;
-                    if (p.is_filled || pos_exists) && p.max_progress >= 0.55 && !p.disaster_stop_ratcheted_to_be {
+                    if (p.is_filled || pos_exists)
+                        && (p.max_progress >= 0.55 || p.tranche1_tp_filled)
+                        && !p.disaster_stop_ratcheted_to_be
+                    {
                         if let Some(old_sl_oid) = p.disaster_stop_oid {
                             let is_long = p.side == "LONG";
                             let lock_bps = if p.max_progress >= 0.75 {
@@ -1800,7 +1856,47 @@ async fn main() {
 
                 if pos.is_filled && !pos_exists {
                     is_truly_dead = true;
-                    reported_status = "CLOSED_ON_EXCHANGE".to_string();
+                    reported_status = if pos.tranche1_tp_filled {
+                        "TRANCHE2_RUNNER_CLOSED_ON_EXCHANGE".to_string()
+                    } else {
+                        "CLOSED_ON_EXCHANGE".to_string()
+                    };
+                    if pos.tranche1_tp_filled && pos.entry_price > 0.0 && pos.amount > 0.0 {
+                        let exit_px = if pos.stop_loss_price > 0.0 {
+                            pos.stop_loss_price
+                        } else {
+                            pos.entry_price
+                        };
+                        let pnl_usd = if pos.side == "LONG" {
+                            (exit_px - pos.entry_price) * pos.amount
+                        } else {
+                            (pos.entry_price - exit_px) * pos.amount
+                        };
+                        let pnl_bps = if pos.side == "LONG" {
+                            ((exit_px - pos.entry_price) / pos.entry_price) * 10_000.0
+                        } else {
+                            ((pos.entry_price - exit_px) / pos.entry_price) * 10_000.0
+                        };
+                        crate::telemetry::append_real_trade_record(&crate::telemetry::RealTradeRecord {
+                            symbol: watcher_symbol.clone(),
+                            side: pos.side.clone(),
+                            engine: pos.engine_type.clone(),
+                            amount: pos.amount,
+                            entry_price: pos.entry_price,
+                            exit_price: exit_px,
+                            opened_at: pos.opened_at.clone(),
+                            closed_at: chrono::Utc::now().to_rfc3339(),
+                            pnl_usd,
+                            pnl_bps,
+                            exit_reason: "CHANDELIER_RUNNER_EXIT".to_string(),
+                            is_win: pnl_usd >= 0.0,
+                        });
+                        if pnl_usd >= 0.0 {
+                            let mut cb_lock = watcher_cb.lock().await;
+                            cb_lock.record_win();
+                            save_circuit_breaker(&watcher_cb_path, &cb_lock);
+                        }
+                    }
                 }
 
                 if is_filled && pos.engine_type == "EngineB" && !pos.is_filled {
@@ -1830,7 +1926,11 @@ async fn main() {
                     crate::discord::send_alert(watcher_discord.as_deref(), &msg).await;
                 }
 
-                if is_filled && pos_exists && pos.take_profit_price > 0.0 {
+                if is_filled
+                    && pos_exists
+                    && pos.take_profit_price > 0.0
+                    && !(pos.engine_type == "EngineB" && pos.tranche1_tp_filled)
+                {
                     if !pos.is_filled {
                         let mut state_lock = watcher_state.lock().await;
                         if let Some(p) = state_lock.get_mut(&watcher_symbol) {
@@ -1845,12 +1945,39 @@ async fn main() {
                     } else {
                         pos.take_profit_price
                     };
-                    let tp_price = quantize_price(raw_tp, watcher_sz_decimals);
                     let tp_is_buy = pos.side == "SHORT";
-                    let tp_amount = if current_szi.abs() > 0.0 { current_szi.abs() } else { pos.amount };
+                    let total_amt = if current_szi.abs() > 0.0 {
+                        current_szi.abs()
+                    } else {
+                        pos.amount
+                    };
+                    let total_notional = total_amt * pos.entry_price;
+
+                    // 2-Tranche Asymmetric Runner (F-08 Engine B & F-12 Engine A):
+                    // Split 50% / 50% whenever both legs strictly clear Hyperliquid's $10.00 MinTradeNtl ($10.50 floor).
+                    let t1_half = round_to_decimals(total_amt * 0.5, watcher_sz_decimals);
+                    let rem_half = round_to_decimals(total_amt - t1_half, watcher_sz_decimals);
+                    let use_two_tranche = !pos.tranche1_tp_filled
+                        && total_notional >= 28.0
+                        && t1_half > 0.0
+                        && rem_half > 0.0
+                        && t1_half * raw_tp >= 10.50
+                        && rem_half * raw_tp >= 10.50;
+
+                    let (tp_amount, tp_price, tranche_tag) = if use_two_tranche {
+                        if pos.engine_type == "EngineB" {
+                            (t1_half, quantize_price(raw_tp, watcher_sz_decimals), "T1-50%")
+                        } else {
+                            let t1_eng_a_px = pos.entry_price + 0.65 * (raw_tp - pos.entry_price);
+                            (t1_half, quantize_price(t1_eng_a_px, watcher_sz_decimals), "T1-50%")
+                        }
+                    } else {
+                        (total_amt, quantize_price(raw_tp, watcher_sz_decimals), "FULL")
+                    };
+
                     println!(
-                        "🟢 [FAST-SENTINEL] Position Active for {} (Side: {}, Size: {:.4} / ${:.2})! Placing Take Profit Limit order at ${:.2}",
-                        watcher_symbol, pos.side, tp_amount, tp_amount * pos.entry_price, tp_price
+                        "🟢 [FAST-SENTINEL] Position Active for {} (Side: {}, Total: {:.4} / ${:.2})! Placing {} Alo-Priority TP at ${:.2} (Qty: {:.4})",
+                        watcher_symbol, pos.side, total_amt, total_notional, tranche_tag, tp_price, tp_amount
                     );
 
                     if let Err(e) = crate::state::assert_current_lease(&watcher_symbol, &pos.lease_owner_uuid, pos.lease_fencing_token) {
@@ -1859,13 +1986,14 @@ async fn main() {
                     }
 
                     let tp_cloid = uuid::Uuid::new_v4();
-                    match place_post_only_order(
+                    match place_reduce_only_tp_order(
                         &watcher_exchange,
+                        &watcher_info,
                         &watcher_symbol,
                         tp_is_buy,
                         tp_price,
                         tp_amount,
-                        true, // reduce_only = true (routes as Gtc in hyperliquid.rs)
+                        watcher_sz_decimals,
                         Some(tp_cloid),
                     )
                     .await
@@ -1876,19 +2004,19 @@ async fn main() {
                                 if let Some(p) = state_lock.get_mut(&watcher_symbol) {
                                     p.tp_order_id = tp_oid.to_string();
                                     p.is_filled = true;
-                                    p.amount = tp_amount;
+                                    p.amount = total_amt;
                                     let _ = save_state(&watcher_state_path, &state_lock);
                                 }
                             }
                             let msg = format!(
-                                "🟢 **TAKE PROFIT PLACED (HYPERLIQUID):** {}\n**Side:** {} TP\n**Target:** ${:.2}\n**Size:** {:.5}",
-                                watcher_symbol, pos.side, tp_price, tp_amount
+                                "🟢 **TAKE PROFIT PLACED ({} ALO-PRIORITY):** {}\n**Side:** {} TP\n**Target:** ${:.2}\n**TP Size:** {:.5} (Total Pos: {:.5})",
+                                tranche_tag, watcher_symbol, pos.side, tp_price, tp_amount, total_amt
                             );
                             crate::discord::send_alert(watcher_discord.as_deref(), &msg).await;
 
-                            // Layer 2: Also place Exchange-Native Reduce-Only Disaster Stop-Market Trigger Order on Hyperliquid
-                            // (15 bps behind Fast-Sentinel soft stop so Mark-Price basis noise never front-runs Fast-Sentinel)
-                            if pos.stop_loss_price > 0.0 {
+                            // Layer 2: Place Exchange-Native Reduce-Only Disaster Stop-Market Trigger Order on Hyperliquid
+                            // for FULL position size (only if none resting yet)
+                            if pos.stop_loss_price > 0.0 && pos.disaster_stop_oid.is_none() {
                                 let raw_disaster_sl = if pos.side == "LONG" {
                                     pos.stop_loss_price * 0.9985
                                 } else {
@@ -1901,7 +2029,7 @@ async fn main() {
                                     &watcher_symbol,
                                     tp_is_buy,
                                     disaster_sl_px,
-                                    tp_amount,
+                                    total_amt,
                                     watcher_sz_decimals,
                                     Some(sl_cloid),
                                 )
@@ -1916,13 +2044,13 @@ async fn main() {
                                             }
                                         }
                                         println!(
-                                            "🛡️ [FAST-SENTINEL] Exchange-Native Disaster Stop-Market Trigger placed on Hyperliquid for {} at ${:.2} (oid: {})",
-                                            watcher_symbol, disaster_sl_px, sl_oid
+                                            "🛡️ [FAST-SENTINEL] Exchange-Native Disaster Stop-Market Trigger placed on Hyperliquid for {} at ${:.2} (oid: {}, sz: {:.4})",
+                                            watcher_symbol, disaster_sl_px, sl_oid, total_amt
                                         );
                                     }
                                     Err(e) => {
                                         eprintln!(
-                                            "⚠️ [FAST-SENTINEL] Could not place exchange-native disaster stop trigger for {}: {} (Fast-Sentinel 1.5s L2 stop remains active)",
+                                            "⚠️ [FAST-SENTINEL] Could not place exchange-native disaster stop trigger for {}: {} (Fast-Sentinel stop remains active)",
                                             watcher_symbol, e
                                         );
                                     }
@@ -1954,9 +2082,18 @@ async fn main() {
                         }
                     };
                     let entry_oid_num = pos.order_id.parse::<u64>().unwrap_or(0);
-                    let is_still_resting = verify_orders.iter().any(|o| o.oid == entry_oid_num);
+                    let mut symbol_orders_remain = false;
+                    if pos.is_filled && !pos_exists {
+                        for o in verify_orders.iter().filter(|o| o.coin == watcher_symbol) {
+                            if cancel_order(&watcher_exchange, &watcher_symbol, o.oid).await.is_err() {
+                                symbol_orders_remain = true;
+                            }
+                        }
+                    } else {
+                        symbol_orders_remain = verify_orders.iter().any(|o| o.oid == entry_oid_num);
+                    }
 
-                    if current_szi.abs() <= eps && !is_still_resting {
+                    if current_szi.abs() <= eps && !symbol_orders_remain {
                         let mut state_lock = watcher_state.lock().await;
                         // Defensive sequence step 1: CloseConfirmed
                         if let Some(p) = state_lock.get_mut(&watcher_symbol) {
@@ -2029,6 +2166,167 @@ async fn main() {
                     if let Some(p) = state_lock.get_mut(&watcher_symbol) {
                         p.tp_order_id.clear();
                         let _ = save_state(&watcher_state_path, &state_lock);
+                    }
+                    continue;
+                }
+
+                if is_tp_filled && !is_flat && !pos.tranche1_tp_filled {
+                    // Tranche 1 (50%) filled while Tranche 2 (50% runner) remains open on exchange!
+                    let rem_amt = current_szi.abs();
+                    let t1_amt = (pos.amount - rem_amt).max(0.0);
+                    let raw_tp_t1 = if pos.effective_tp > 0.0 {
+                        pos.effective_tp
+                    } else {
+                        pos.take_profit_price
+                    };
+                    let t1_exit_px = if pos.engine_type == "EngineB" {
+                        quantize_price(raw_tp_t1, watcher_sz_decimals)
+                    } else {
+                        quantize_price(
+                            pos.entry_price + 0.65 * (raw_tp_t1 - pos.entry_price),
+                            watcher_sz_decimals,
+                        )
+                    };
+                    if t1_amt > 0.0 && pos.entry_price > 0.0 && t1_exit_px > 0.0 {
+                        let t1_pnl_usd = if pos.side == "LONG" {
+                            (t1_exit_px - pos.entry_price) * t1_amt
+                        } else {
+                            (pos.entry_price - t1_exit_px) * t1_amt
+                        };
+                        let t1_pnl_bps = if pos.side == "LONG" {
+                            ((t1_exit_px - pos.entry_price) / pos.entry_price) * 10_000.0
+                        } else {
+                            ((pos.entry_price - t1_exit_px) / pos.entry_price) * 10_000.0
+                        };
+                        crate::telemetry::append_real_trade_record(&crate::telemetry::RealTradeRecord {
+                            symbol: watcher_symbol.clone(),
+                            side: pos.side.clone(),
+                            engine: pos.engine_type.clone(),
+                            amount: t1_amt,
+                            entry_price: pos.entry_price,
+                            exit_price: t1_exit_px,
+                            opened_at: pos.opened_at.clone(),
+                            closed_at: chrono::Utc::now().to_rfc3339(),
+                            pnl_usd: t1_pnl_usd,
+                            pnl_bps: t1_pnl_bps,
+                            exit_reason: "TRANCHE1_TAKE_PROFIT".to_string(),
+                            is_win: t1_pnl_usd >= 0.0,
+                        });
+                        if t1_pnl_usd >= 0.0 {
+                            let mut cb_lock = watcher_cb.lock().await;
+                            cb_lock.record_win();
+                            save_circuit_breaker(&watcher_cb_path, &cb_lock);
+                        }
+                    }
+                    let is_long_pos = pos.side == "LONG";
+                    let be_buf_frac = (watcher_fee_sched.maker_taker_rt_bps() + 3.0) * 1e-4;
+                    let be_px_raw = if is_long_pos {
+                        pos.entry_price * (1.0 + be_buf_frac)
+                    } else {
+                        pos.entry_price * (1.0 - be_buf_frac)
+                    };
+                    let be_px = quantize_price(be_px_raw, watcher_sz_decimals);
+                    let safe_be_vs_bbo = if is_long_pos {
+                        live_bid_ratchet <= 0.0 || be_px < live_bid_ratchet * 0.9995
+                    } else {
+                        live_ask_ratchet <= 0.0 || be_px > live_ask_ratchet * 1.0005
+                    };
+
+                    // 1. Update state and ratchet local protective stop monotonically to fee-covered breakeven
+                    {
+                        let mut state_lock = watcher_state.lock().await;
+                        if let Some(p) = state_lock.get_mut(&watcher_symbol) {
+                            p.tranche1_tp_filled = true;
+                            p.tp_order_id.clear();
+                            p.amount = rem_amt;
+                            if safe_be_vs_bbo {
+                                if is_long_pos {
+                                    p.stop_loss_price = p.stop_loss_price.max(be_px);
+                                    if p.engine_type == "EngineB" {
+                                        p.chandelier_stop = p.chandelier_stop.max(be_px);
+                                    }
+                                } else {
+                                    if p.stop_loss_price > 0.0 {
+                                        p.stop_loss_price = p.stop_loss_price.min(be_px);
+                                    } else {
+                                        p.stop_loss_price = be_px;
+                                    }
+                                    if p.engine_type == "EngineB" {
+                                        if p.chandelier_stop > 0.0 {
+                                            p.chandelier_stop = p.chandelier_stop.min(be_px);
+                                        } else {
+                                            p.chandelier_stop = be_px;
+                                        }
+                                    }
+                                }
+                            }
+                            let _ = save_state(&watcher_state_path, &state_lock);
+                        }
+                    }
+
+                    // 2. Replace Exchange-Native Disaster Stop with exact remaining size & breakeven trigger
+                    if safe_be_vs_bbo {
+                        if let Ok(new_sl_oid) = crate::hyperliquid::ratchet_disaster_stop_to_breakeven(
+                            &watcher_exchange,
+                            &watcher_symbol,
+                            !is_long_pos,
+                            rem_amt,
+                            be_px,
+                            watcher_sz_decimals,
+                            pos.disaster_stop_oid,
+                            Some(uuid::Uuid::new_v4()),
+                        )
+                        .await
+                        {
+                            let mut state_lock = watcher_state.lock().await;
+                            if let Some(p) = state_lock.get_mut(&watcher_symbol) {
+                                p.disaster_stop_oid = Some(new_sl_oid);
+                                p.disaster_stop_ratcheted_to_be = true;
+                                let _ = save_state(&watcher_state_path, &state_lock);
+                            }
+                        }
+                    }
+
+                    // 3. Engine A places Tranche 2 TP at equilibrium target_mu; Engine B lets Chandelier trail uncapped
+                    if pos.engine_type != "EngineB" {
+                        let t2_raw = if pos.effective_tp > 0.0 {
+                            pos.effective_tp
+                        } else {
+                            pos.take_profit_price
+                        };
+                        let t2_px = quantize_price(t2_raw, watcher_sz_decimals);
+                        if let Ok(t2_oid) = place_reduce_only_tp_order(
+                            &watcher_exchange,
+                            &watcher_info,
+                            &watcher_symbol,
+                            !is_long_pos,
+                            t2_px,
+                            rem_amt,
+                            watcher_sz_decimals,
+                            Some(uuid::Uuid::new_v4()),
+                        )
+                        .await
+                        {
+                            let mut state_lock = watcher_state.lock().await;
+                            if let Some(p) = state_lock.get_mut(&watcher_symbol) {
+                                p.tp_order_id = t2_oid.to_string();
+                                let _ = save_state(&watcher_state_path, &state_lock);
+                            }
+                        }
+                        println!(
+                            "🎯 [ENGINE A TRANCHE 1 FILLED (50%)] {} locked 50% early profit! Tranche 2 ({:.4}) resting at ${:.2} with BE stop @ ${:.2}.",
+                            watcher_symbol, rem_amt, t2_px, be_px
+                        );
+                    } else {
+                        println!(
+                            "🚀 [ENGINE B TRANCHE 1 FILLED (50% @ +1.5 ATR)] {} locked 50%! Remaining 50% runner ({:.4}) trailing via 2.0x ATR Chandelier with BE stop @ ${:.2}.",
+                            watcher_symbol, rem_amt, be_px
+                        );
+                        let msg_t1 = format!(
+                            "🚀 **ENGINE B TRANCHE 1 FILLED (50%):** {}\n**Remaining Runner:** {:.5} trailing via Chandelier Stop\n**Breakeven Stop:** ${:.2}",
+                            watcher_symbol, rem_amt, be_px
+                        );
+                        crate::discord::send_alert(watcher_discord.as_deref(), &msg_t1).await;
                     }
                     continue;
                 }
@@ -3302,6 +3600,54 @@ async fn main() {
                             };
                             let donchian_opt = calculate_donchian(engine_b_donchian_bars, donchian_period);
 
+                            // F-08 / U-03: 5m Synthetic-15m HMM Promotion Bridge
+                            // Eliminates 15-25m clock lockstep delay when a coiled-spring 5m Donchian breakout fires!
+                            if controller.current_mode != ControllerMode::Trend
+                                && rolling_5m_bars.len() >= 45
+                                && !candle_feed_degraded
+                                && !is_candle_gap
+                            {
+                                let has_5m_donchian_bo = donchian_opt
+                                    .as_ref()
+                                    .map(|d| closed_5m.close > d.upper || closed_5m.close < d.lower)
+                                    .unwrap_or(false);
+                                if has_5m_donchian_bo || engine_b_mgr.is_stage1_armed() {
+                                    let mut syn_15m_closes: Vec<f64> = Vec::with_capacity(100);
+                                    let mut idx_r = rolling_5m_bars.len();
+                                    while idx_r > 0 && syn_15m_closes.len() < 100 {
+                                        syn_15m_closes.push(rolling_5m_bars[idx_r - 1].close);
+                                        idx_r = idx_r.saturating_sub(3);
+                                    }
+                                    syn_15m_closes.reverse();
+                                    if syn_15m_closes.len() >= 15 {
+                                        let (syn_p_c, syn_p_t, syn_p_s) = {
+                                            let hmm_lock = hmm_model.read().await;
+                                            compute_hmm_posteriors(&*hmm_lock, &syn_15m_closes)
+                                                .unwrap_or((current_p_c, current_p_t, current_p_s))
+                                        };
+                                        let is_severe_shock_syn = is_downside_shock
+                                            || (is_upside_shock && (syn_p_t < 0.82 || syn_p_s >= 0.50));
+                                        let now_ms_syn = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                                        if controller.promote_synthetic_15m_to_trend(
+                                            syn_p_t,
+                                            true,
+                                            is_severe_shock_syn,
+                                            z_60,
+                                            now_ms_syn,
+                                        ) {
+                                            current_p_c = syn_p_c;
+                                            current_p_t = syn_p_t;
+                                            current_p_s = syn_p_s;
+                                            save_controller_state(&symbol_clone, &controller);
+                                            println!(
+                                                "⚡ [SYNTHETIC-15M HMM PROMOTION] {} promoted directly to TREND on 5m close (P_T: {:.1}%, P_C: {:.1}%, P_S: {:.1}%).",
+                                                symbol_clone, syn_p_t * 100.0, syn_p_c * 100.0, syn_p_s * 100.0
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
                             if controller.current_mode == ControllerMode::Neutral {
                                 funnel_counters.engine_b_mode_ineligible += 1;
                                 if let Some(ref donchian) = donchian_opt {
@@ -3897,16 +4243,17 @@ async fn main() {
 
                                     if let Some((tp_is_buy, tp_px, tp_amt)) = need_fallback_tp {
                                         println!(
-                                            "🟢 [1M-FAILSAFE TP] Position Active for {} (Size: {:.4})! Placing Take Profit Limit order at ${:.2}",
+                                            "🟢 [1M-FAILSAFE TP] Position Active for {} (Size: {:.4})! Placing Alo-Priority TP Limit order at ${:.2}",
                                             symbol_clone, tp_amt, tp_px
                                         );
-                                        if let Ok(tp_oid) = place_post_only_order(
+                                        if let Ok(tp_oid) = place_reduce_only_tp_order(
                                             &exchange_clone,
+                                            &info_clone,
                                             &symbol_clone,
                                             tp_is_buy,
                                             tp_px,
                                             tp_amt,
-                                            true,
+                                            sz_decimals,
                                             Some(uuid::Uuid::new_v4()),
                                         )
                                         .await
@@ -4072,35 +4419,47 @@ async fn main() {
                                             chandelier_stopped = true;
                                         }
 
-                                        // Also track normalized progress & 20% giveback ratchet + 45m stagnation harvest relative to Engine B Take-Profit target
+                                        // Also track normalized progress & 20% giveback ratchet (pre-Tranche 1) + conditional 75m stagnation stop
                                         let is_long = pos.side == "LONG";
+                                        let fav_move = if is_long {
+                                            close_price - pos.entry_price
+                                        } else {
+                                            pos.entry_price - close_price
+                                        };
+                                        let unrealized_atr = if current_atr > 0.0 {
+                                            fav_move / current_atr
+                                        } else {
+                                            0.0
+                                        };
                                         let d_0 = if is_long {
                                             pos.take_profit_price - pos.entry_price
                                         } else {
                                             pos.entry_price - pos.take_profit_price
                                         };
                                         if d_0 > 0.0 && pos.take_profit_price > 0.0 {
-                                            let q_t = if is_long {
-                                                (close_price - pos.entry_price) / d_0
-                                            } else {
-                                                (pos.entry_price - close_price) / d_0
-                                            };
+                                            let q_t = fav_move / d_0;
                                             if q_t > pos.max_progress {
                                                 pos.max_progress = q_t;
+                                                pos.last_peak_mins = elapsed_mins;
                                             }
-                                            let q_be = 0.15;
-                                            if pos.max_progress >= 0.75
-                                                && q_t <= f64::max(q_be, pos.max_progress - 0.20)
-                                            {
-                                                giveback_triggered = true;
-                                            } else if elapsed_mins >= 45.0
-                                                && pos.max_progress >= 0.30
-                                                && q_t <= (pos.max_progress - 0.15).max(0.08)
-                                            {
-                                                giveback_triggered = true;
+                                            if !pos.tranche1_tp_filled {
+                                                let q_be = 0.15;
+                                                if pos.max_progress >= 0.75
+                                                    && q_t <= f64::max(q_be, pos.max_progress - 0.20)
+                                                {
+                                                    giveback_triggered = true;
+                                                } else if elapsed_mins >= 45.0
+                                                    && pos.max_progress >= 0.30
+                                                    && q_t <= (pos.max_progress - 0.15).max(0.08)
+                                                {
+                                                    giveback_triggered = true;
+                                                }
                                             }
                                         }
-                                        max_allowed_mins = 75.0;
+                                        // Conditional Time-Stop (F-08): Disable 75m cap once Tranche 1 filled or runner >= 0.75 ATR with P_T >= 0.60
+                                        let runner_active = pos.tranche1_tp_filled
+                                            || (unrealized_atr >= 0.75 && current_p_t >= 0.60);
+                                        max_allowed_mins = if runner_active { 360.0 } else { 75.0 };
                                         if elapsed_mins >= max_allowed_mins {
                                             time_stop_triggered = true;
                                         }
@@ -4152,20 +4511,7 @@ async fn main() {
                                             } else {
                                                 ((close_price - pos.entry_price) / pos.entry_price.max(1e-9) * 1e4).max(0.0)
                                             };
-                                            let min_soft_inv_excursion_bps = match symbol_clone.to_uppercase().as_str() {
-                                                "XYZ:GOLD" | "GOLD" => 32.0,
-                                                "XYZ:XYZ100" | "XYZ100" => 35.0,
-                                                "XYZ:SILVER" | "SILVER" => 42.0,
-                                                "BTC" => 45.0,
-                                                "ETH" | "XYZ:NVDA" | "NVDA" => 48.0,
-                                                "XRP" | "LINK" | "XYZ:TSLA" | "TSLA" => 58.0,
-                                                "SOL" => 55.0,
-                                                "AVAX" => 60.0,
-                                                "ZEC" => 62.0,
-                                                "SUI" | "NEAR" => 65.0,
-                                                "HYPE" => 68.0,
-                                                _ => 50.0,
-                                            };
+                                            let min_soft_inv_excursion_bps = engine_a_min_soft_inv_excursion_bps(&symbol_clone);
                                             let (frozen_z_ou, eff_z_15) = if adverse_bps_from_entry >= min_soft_inv_excursion_bps {
                                                 (raw_frozen_z_ou, z_15)
                                             } else {
@@ -4256,6 +4602,7 @@ async fn main() {
                                             if q_t > pos.max_progress {
                                                 pos.max_progress = q_t;
                                                 pos.max_favorable_price = close_price;
+                                                pos.last_peak_mins = elapsed_mins;
                                             }
 
                                             // Arm Profit Protection once trade covers >= min(75% of target, 1.8 * min_net_edge_bps)
@@ -4267,6 +4614,46 @@ async fn main() {
                                                 && q_t <= f64::max(q_be, pos.max_progress - 0.20)
                                             {
                                                 giveback_triggered = true;
+                                            }
+
+                                            // F-12 Stall-Hazard Passive Maker Ratchet:
+                                            // Harvest stalled mean-reversions passively via Alo TP without capping expanding winners
+                                            if !should_reprice
+                                                && !pos.tranche1_tp_filled
+                                                && pos.max_progress >= 0.45
+                                                && pos.max_progress < 0.75
+                                                && !pos.tp_order_id.is_empty()
+                                            {
+                                                let cal_a = asset_calibration(&symbol_clone);
+                                                let tau_stall = (elapsed_mins - pos.last_peak_mins).max(0.0);
+                                                let d_dir = if is_long { 1.0 } else { -1.0 };
+                                                if tau_stall >= (cal_a.stall_trigger_mins as f64) * 2.0
+                                                    && d_dir * l2_1s < 0.10
+                                                {
+                                                    let min_harvest_frac = (fee_sched.maker_maker_rt_bps() + 4.0) * 1e-4;
+                                                    let stall_raw_tp = if is_long {
+                                                        let mfe_78 = pos.entry_price + 0.78 * (pos.max_favorable_price - pos.entry_price);
+                                                        mfe_78.max(pos.entry_price * (1.0 + min_harvest_frac))
+                                                    } else {
+                                                        let mfe_78 = pos.entry_price - 0.78 * (pos.entry_price - pos.max_favorable_price);
+                                                        mfe_78.min(pos.entry_price * (1.0 - min_harvest_frac))
+                                                    };
+                                                    let stall_tp_q = quantize_price(stall_raw_tp, sz_decimals);
+                                                    let valid_stall_reprice = if is_long {
+                                                        stall_tp_q < pos.effective_tp && stall_tp_q > close_price + entry_tick
+                                                    } else {
+                                                        stall_tp_q > pos.effective_tp && stall_tp_q + entry_tick < close_price
+                                                    };
+                                                    if valid_stall_reprice {
+                                                        should_reprice = true;
+                                                        new_reprice_target = stall_tp_q;
+                                                        reprice_qty = pos.amount;
+                                                        reprice_is_buy = !is_long;
+                                                        old_tp_order_id = pos.tp_order_id.clone();
+                                                        pos.effective_tp = stall_tp_q;
+                                                        pos.last_reprice_time = chrono::Utc::now().timestamp_millis();
+                                                    }
+                                                }
                                             }
 
                                             if session_blocks_new_entries && !should_reprice && pos.entry_price > 0.0 {
@@ -4395,13 +4782,14 @@ async fn main() {
                                     }
                                 }
                                 let reprice_cloid = uuid::Uuid::new_v4();
-                                match place_post_only_order(
+                                match place_reduce_only_tp_order(
                                     &exchange_clone,
+                                    &info_clone,
                                     &symbol_clone,
                                     reprice_is_buy,
                                     rounded_target,
                                     reprice_qty,
-                                    true, // reduce_only = true
+                                    sz_decimals,
                                     Some(reprice_cloid),
                                 )
                                 .await
@@ -4898,6 +5286,30 @@ async fn main() {
                                                 cur_min_utc >= 56 && current_funding_1h < -0.00025
                                             };
 
+                                            let cal_entry = asset_calibration(&symbol_clone);
+                                            let tick_entry = effective_tick_size(close_price, sz_decimals);
+                                            let atr_1m_est = (live_feat.sigma_1m_prev * close_price).max(tick_entry);
+                                            let bar_touched_beyond_limit = if is_long_arm {
+                                                low_price < limit_price - tick_entry
+                                            } else {
+                                                high_price > limit_price + tick_entry
+                                            };
+                                            let touch_absorbed = if bar_touched_beyond_limit {
+                                                verify_maker_touch_absorption(
+                                                    Direction::from_side(&side_enum),
+                                                    limit_price,
+                                                    high_price,
+                                                    low_price,
+                                                    close_price,
+                                                    atr_1m_est,
+                                                    l2_1s,
+                                                    &cal_entry,
+                                                )
+                                            } else {
+                                                let d_sign = if is_long_arm { 1.0 } else { -1.0 };
+                                                d_sign * l2_1s >= -0.28
+                                            };
+
                                             if let Some(veto_reason) = btc_lead_veto {
                                                 println!(
                                                     "🛡️ [BTC IMPULSE VETO] {} {} reversal bounce disarmed due to adverse BTC impulse: {}.",
@@ -4905,6 +5317,11 @@ async fn main() {
                                                 );
                                                 armed_state.is_armed = false;
                                                 save_armed_signal(&arm_path_clone, &armed_state);
+                                            } else if !touch_absorbed {
+                                                println!(
+                                                    "⏸️ [TOUCH ABSORPTION GATE] {} {} adverse OBI/rebound collapse (L2 1s OBI: {:.2}). Waiting for book replenishment.",
+                                                    symbol_clone, arm_side, l2_1s
+                                                );
                                             } else if top_of_hour_adverse_funding {
                                                 println!(
                                                     "⏳ [FUNDING BOUNDARY GATE] {} {} entry deferred at minute :{:02} UTC due to adverse hourly funding ({:.2} bps/hr). Holding armed until :00.",
@@ -4932,10 +5349,11 @@ async fn main() {
                                                     let live_eq = *cached_equity_loop.read().await;
                                                     let hwm_eq = *high_water_mark_equity.read().await;
                                                     let dd_mult = compute_drawdown_risk_multiplier(live_eq, hwm_eq);
-                                                    let hard_stop_frac = ou_cfg.hard_disaster_stop_bps * 1e-4;
-                                                    let tp_dist = (frozen_target - limit_price).abs();
-                                                    let calibrated_sl = (1.5 * tp_dist).max(0.0035 * limit_price);
-                                                    let est_sl_dist = calibrated_sl.min(limit_price * hard_stop_frac);
+                                                    let est_sl_dist = compute_engine_a_disaster_stop_distance(
+                                                        &symbol_clone,
+                                                        limit_price,
+                                                        frozen_target,
+                                                    );
                                                     let est_sl_px = if is_long_arm {
                                                         limit_price - est_sl_dist
                                                     } else {

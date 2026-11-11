@@ -4393,6 +4393,39 @@ impl DualClearinghouseSlotArbiter {
 // SECTION: DYNAMIC HIP-3 FEE SCHEDULE & DST-AWARE SESSION LIFECYCLE GATE
 // =========================================================================
 
+/// Returns the minimum adverse excursion from entry (in bps) required before
+/// `TwoTierInvalidationManager` permits a 5m soft structural invalidation flatten.
+#[inline]
+pub fn engine_a_min_soft_inv_excursion_bps(symbol: &str) -> f64 {
+    match symbol.to_uppercase().as_str() {
+        "XYZ:GOLD" | "GOLD" => 32.0,
+        "XYZ:XYZ100" | "XYZ100" => 35.0,
+        "XYZ:SILVER" | "SILVER" => 42.0,
+        "BTC" => 45.0,
+        "ETH" | "XYZ:NVDA" | "NVDA" => 48.0,
+        "XRP" | "LINK" | "XYZ:TSLA" | "TSLA" => 58.0,
+        "SOL" => 55.0,
+        "AVAX" => 60.0,
+        "ZEC" => 62.0,
+        "SUI" | "NEAR" => 65.0,
+        "HYPE" => 68.0,
+        _ => 50.0,
+    }
+}
+
+/// Computes the Engine A Exchange-Native / Fast-Sentinel catastrophic disaster stop distance
+/// strictly outside `TwoTierInvalidationManager` (`>= max(2.5 * tp_dist, min_soft_inv + 35 bps, 85 bps)`),
+/// preventing 1.5s L2 noise from prematurely front-running 5m statistical invalidation.
+#[inline]
+pub fn compute_engine_a_disaster_stop_distance(symbol: &str, entry_px: f64, tp_px: f64) -> f64 {
+    let ou_cfg = asset_ou_config(symbol);
+    let min_soft_inv_bps = engine_a_min_soft_inv_excursion_bps(symbol);
+    let min_disaster_bps = (min_soft_inv_bps + 35.0).max(85.0);
+    let edge_dist = (entry_px - tp_px).abs();
+    let calibrated_sl = (2.5 * edge_dist).max(entry_px * (min_disaster_bps * 1e-4));
+    calibrated_sl.min(entry_px * (ou_cfg.hard_disaster_stop_bps * 1e-4))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AssetFeeSchedule {
     pub maker_bps: f64,
@@ -5520,6 +5553,15 @@ mod tests {
         assert_eq!(
             evaluate_session_lifecycle_gate("BTC", ts_est_flat),
             SessionLifecycleAction::AllowNormalTrading
+        );
+
+        // 3. F-07 Engine A Disaster Stop decoupling (> min_soft_inv_bps + 35 bps, >= 85 bps)
+        let btc_sl_dist = compute_engine_a_disaster_stop_distance("BTC", 70_000.0, 70_175.0); // 25 bps TP
+        let btc_sl_bps = (btc_sl_dist / 70_000.0) * 1e4;
+        assert!(
+            btc_sl_bps >= 85.0 - 1e-6,
+            "BTC disaster stop must be >= 85 bps so 5m invalidation (45 bps) runs first; got {:.1}",
+            btc_sl_bps
         );
     }
 }

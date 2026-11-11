@@ -96,7 +96,8 @@ impl RegimeController {
         } else {
             // Already in active cooldown from ongoing shock - preserve wall-clock countdown!
             self.peak_shock_z = self.peak_shock_z.max(current_shock_z);
-            let rem_mins = ((self.cooldown_until_ms.saturating_sub(now_ms)) as f64 / 60_000.0).ceil() as u64;
+            let rem_mins =
+                ((self.cooldown_until_ms.saturating_sub(now_ms)) as f64 / 60_000.0).ceil() as u64;
             self.last_reason = format!(
                 "Ongoing Shock Cooldown Active (|Z15|={:.2}, |Z60|={:.2}) -> Remaining: ~{}m (Clock preserved)",
                 z_15, z_60, rem_mins
@@ -218,7 +219,8 @@ impl RegimeController {
                 if self.shock_cooldown_bars > 0 {
                     self.shock_cooldown_bars -= 1;
                 }
-                let rem_mins = ((self.cooldown_until_ms.saturating_sub(now_ms)) as f64 / 60_000.0).ceil() as u64;
+                let rem_mins = ((self.cooldown_until_ms.saturating_sub(now_ms)) as f64 / 60_000.0)
+                    .ceil() as u64;
                 self.last_reason = format!(
                     "Ongoing Shock Cooldown Active (|Z15|={:.2}, |Z60|={:.2}) -> Remaining: ~{}m (Clock preserved)",
                     z_15, z_60, rem_mins
@@ -314,9 +316,11 @@ impl RegimeController {
                 //     * Strong trend (P_T >= 0.85) -> 2 bars dwell!
                 //     * Moderate trend (P_T >= 0.75) -> 3 bars dwell!
                 let valid_trend_trigger = if has_breakout {
-                    (p_trend >= 0.80 && self.trend_streak >= 1) || (p_trend >= 0.75 && self.trend_streak >= 2)
+                    (p_trend >= 0.80 && self.trend_streak >= 1)
+                        || (p_trend >= 0.75 && self.trend_streak >= 2)
                 } else {
-                    (p_trend >= 0.85 && self.trend_streak >= 2) || (p_trend >= 0.75 && self.trend_streak >= 3)
+                    (p_trend >= 0.85 && self.trend_streak >= 2)
+                        || (p_trend >= 0.75 && self.trend_streak >= 3)
                 };
 
                 if valid_trend_trigger {
@@ -341,7 +345,10 @@ impl RegimeController {
                 // - High confidence consolidation (P_C >= 0.78, calm vol |Z15| < 1.8, |Z60| < 2.2) -> 1 bar dwell!
                 // - Strong consolidation (P_C >= 0.70) -> 2 bars dwell!
                 // - Moderate consolidation (P_C >= 0.65) -> 3 bars dwell!
-                else if ((p_consolidation >= 0.78 && z_15.abs() < 1.8 && z_60.abs() < 2.2 && self.consolidation_streak >= 1)
+                else if ((p_consolidation >= 0.78
+                    && z_15.abs() < 1.8
+                    && z_60.abs() < 2.2
+                    && self.consolidation_streak >= 1)
                     || (p_consolidation >= 0.70 && self.consolidation_streak >= 2)
                     || (p_consolidation >= 0.65 && self.consolidation_streak >= 3))
                     && is_ou_stationary
@@ -358,18 +365,30 @@ impl RegimeController {
                     self.epoch += 1;
                 } else {
                     let required_t_dwell = if has_breakout {
-                        if p_trend >= 0.80 { 1 } else { 2 }
+                        if p_trend >= 0.80 {
+                            1
+                        } else {
+                            2
+                        }
                     } else {
-                        if p_trend >= 0.85 { 2 } else { 3 }
+                        if p_trend >= 0.85 {
+                            2
+                        } else {
+                            3
+                        }
                     };
-                    let required_c_dwell = if p_consolidation >= 0.78 && z_15.abs() < 1.8 && z_60.abs() < 2.2 {
-                        1
-                    } else if p_consolidation >= 0.70 {
-                        2
-                    } else {
-                        3
-                    };
-                    if p_consolidation >= 0.65 && self.consolidation_streak >= required_c_dwell && (!is_ou_stationary || !is_half_life_valid) {
+                    let required_c_dwell =
+                        if p_consolidation >= 0.78 && z_15.abs() < 1.8 && z_60.abs() < 2.2 {
+                            1
+                        } else if p_consolidation >= 0.70 {
+                            2
+                        } else {
+                            3
+                        };
+                    if p_consolidation >= 0.65
+                        && self.consolidation_streak >= required_c_dwell
+                        && (!is_ou_stationary || !is_half_life_valid)
+                    {
                         self.last_reason = format!(
                             "Consolidation dwell met ({}/{}), awaiting stationary O-U half-life (15m-120m)",
                             self.consolidation_streak, required_c_dwell
@@ -427,7 +446,10 @@ impl RegimeController {
                     self.last_transition_time = Utc::now().to_rfc3339();
                     self.epoch += 1;
 
-                    let valid_trend_breakout = has_breakout && p_trend >= 0.80 && self.trend_streak >= 1 && !is_severe_shock;
+                    let valid_trend_breakout = has_breakout
+                        && p_trend >= 0.80
+                        && self.trend_streak >= 1
+                        && !is_severe_shock;
                     if valid_trend_breakout {
                         self.current_mode = ControllerMode::Trend;
                         self.last_reason = format!(
@@ -455,9 +477,46 @@ impl RegimeController {
             self.current_mode = ControllerMode::Neutral;
             self.trend_streak = 0;
             self.last_transition_time = Utc::now().to_rfc3339();
-            self.last_reason = "Trend position closed via Chandelier Stop -> Returning to Neutral buffer".to_string();
+            self.last_reason =
+                "Trend position closed via Chandelier Stop -> Returning to Neutral buffer"
+                    .to_string();
             self.epoch += 1;
         }
+    }
+
+    /// Promotes `RegimeController` to `ControllerMode::Trend` on a 5-minute boundary using a
+    /// synthetic trailing 15-minute HMM posterior evaluation when a coiled-spring Donchian breakout
+    /// completes Stage 1 persistence, eliminating 15-25 minute 15m-clock lockstep latency.
+    pub fn promote_synthetic_15m_to_trend(
+        &mut self,
+        p_trend: f64,
+        has_breakout: bool,
+        is_severe_shock: bool,
+        z_60: f64,
+        now_ms: u64,
+    ) -> bool {
+        let wall_clock_cd_active = self.cooldown_until_ms > 0 && now_ms < self.cooldown_until_ms;
+        if self.current_mode == ControllerMode::Trend
+            || is_severe_shock
+            || self.shock_cooldown_bars > 0
+            || wall_clock_cd_active
+            || z_60 <= -2.5
+            || !has_breakout
+            || p_trend < 0.75
+        {
+            return false;
+        }
+        self.current_mode = ControllerMode::Trend;
+        self.trend_streak = self.trend_streak.max(1);
+        self.consolidation_streak = 0;
+        self.breakout_seen_in_streak = true;
+        self.last_transition_time = Utc::now().to_rfc3339();
+        self.last_reason = format!(
+            "Synthetic-15m 5m-Bridge Trend Promotion (P_T={:.1}% >= 75.0%)",
+            p_trend * 100.0
+        );
+        self.epoch += 1;
+        true
     }
 
     /// Returns gate funnel inspection status for diagnostic telemetry
@@ -474,9 +533,17 @@ impl RegimeController {
     ) -> (String, String) {
         let has_breakout = has_donchian_breakout || self.breakout_seen_in_streak;
         let required_t_dwell = if has_breakout {
-            if p_trend >= 0.80 { 1 } else { 2 }
+            if p_trend >= 0.80 {
+                1
+            } else {
+                2
+            }
         } else {
-            if p_trend >= 0.85 { 2 } else { 3 }
+            if p_trend >= 0.85 {
+                2
+            } else {
+                3
+            }
         };
         let required_c_dwell = if p_consolidation >= 0.78 && z_15.abs() < 1.8 && z_60.abs() < 2.2 {
             1
@@ -493,7 +560,10 @@ impl RegimeController {
             } else {
                 0
             };
-            format!("BLOCKED(Cooldown {}b, ~{}m)", self.shock_cooldown_bars, rem_mins)
+            format!(
+                "BLOCKED(Cooldown {}b, ~{}m)",
+                self.shock_cooldown_bars, rem_mins
+            )
         } else if z_15.abs() >= 2.2 || z_60.abs() >= 2.5 {
             format!("BLOCKED(Vol Z15={:.2}, Z60={:.2})", z_15, z_60)
         } else if p_consolidation < 0.65 {
@@ -514,7 +584,10 @@ impl RegimeController {
             } else {
                 0
             };
-            format!("BLOCKED(Cooldown {}b, ~{}m)", self.shock_cooldown_bars, rem_mins)
+            format!(
+                "BLOCKED(Cooldown {}b, ~{}m)",
+                self.shock_cooldown_bars, rem_mins
+            )
         } else if z_60 <= -2.5 {
             format!("BLOCKED(Z60={:.2}<=-2.5)", z_60)
         } else if p_trend < 0.75 {
@@ -584,7 +657,17 @@ mod tests {
         let mut controller = RegimeController::default();
 
         // Strong trend (P_T >= 0.90) with Donchian breakout triggers in 1 bar
-        let mode = controller.evaluate_15m_bar(BASE_TIME_MS, 0.05, 0.92, 1.0, 0.5, true, false, false, false);
+        let mode = controller.evaluate_15m_bar(
+            BASE_TIME_MS,
+            0.05,
+            0.92,
+            1.0,
+            0.5,
+            true,
+            false,
+            false,
+            false,
+        );
         assert_eq!(mode, ControllerMode::Trend);
         assert_eq!(controller.trend_streak, 1);
         assert!(controller.last_reason.contains("Trend confirmed"));
@@ -595,12 +678,32 @@ mod tests {
         let mut controller = RegimeController::default();
 
         // Bar 1: Moderate trend (P_T = 0.77) with breakout -> 1/2 dwell required
-        let mode1 = controller.evaluate_15m_bar(BASE_TIME_MS, 0.10, 0.77, 1.0, 0.5, true, false, false, false);
+        let mode1 = controller.evaluate_15m_bar(
+            BASE_TIME_MS,
+            0.10,
+            0.77,
+            1.0,
+            0.5,
+            true,
+            false,
+            false,
+            false,
+        );
         assert_eq!(mode1, ControllerMode::Neutral);
         assert_eq!(controller.trend_streak, 1);
 
         // Bar 2: Moderate trend continuation (P_T = 0.78) -> Confirmed on bar 2!
-        let mode2 = controller.evaluate_15m_bar(BASE_TIME_MS + 900_000, 0.10, 0.78, 1.2, 0.6, true, false, false, false);
+        let mode2 = controller.evaluate_15m_bar(
+            BASE_TIME_MS + 900_000,
+            0.10,
+            0.78,
+            1.2,
+            0.6,
+            true,
+            false,
+            false,
+            false,
+        );
         assert_eq!(mode2, ControllerMode::Trend);
         assert_eq!(controller.trend_streak, 2);
     }
@@ -610,13 +713,33 @@ mod tests {
         let mut controller = RegimeController::default();
 
         // Bar 1: P_T = 0.78 WITH initial breakout
-        let mode1 = controller.evaluate_15m_bar(BASE_TIME_MS, 0.10, 0.78, 1.0, 0.5, true, false, false, false);
+        let mode1 = controller.evaluate_15m_bar(
+            BASE_TIME_MS,
+            0.10,
+            0.78,
+            1.0,
+            0.5,
+            true,
+            false,
+            false,
+            false,
+        );
         assert_eq!(mode1, ControllerMode::Neutral);
         assert_eq!(controller.trend_streak, 1);
         assert!(controller.breakout_seen_in_streak);
 
         // Bar 2: P_T = 0.78 WITHOUT new breakout (continuation) -> Triggers on bar 2!
-        let mode2 = controller.evaluate_15m_bar(BASE_TIME_MS + 900_000, 0.10, 0.78, 1.2, 0.6, false, false, false, false);
+        let mode2 = controller.evaluate_15m_bar(
+            BASE_TIME_MS + 900_000,
+            0.10,
+            0.78,
+            1.2,
+            0.6,
+            false,
+            false,
+            false,
+            false,
+        );
         assert_eq!(mode2, ControllerMode::Trend);
         assert_eq!(controller.trend_streak, 2);
     }
@@ -626,13 +749,33 @@ mod tests {
         let mut controller = RegimeController::default();
 
         // Bar 1: P_T = 0.95 without 15m breakout (streak 1 -> awaits 2)
-        let mode1 = controller.evaluate_15m_bar(BASE_TIME_MS, 0.05, 0.95, 1.0, 0.5, false, false, false, false);
+        let mode1 = controller.evaluate_15m_bar(
+            BASE_TIME_MS,
+            0.05,
+            0.95,
+            1.0,
+            0.5,
+            false,
+            false,
+            false,
+            false,
+        );
         assert_eq!(mode1, ControllerMode::Neutral);
         assert_eq!(controller.trend_streak, 1);
         assert!(!controller.breakout_seen_in_streak);
 
         // Bar 2: P_T = 0.95 without 15m breakout -> triggers on bar 2 via momentum expansion!
-        let mode2 = controller.evaluate_15m_bar(BASE_TIME_MS + 900_000, 0.05, 0.95, 1.0, 0.5, false, false, false, false);
+        let mode2 = controller.evaluate_15m_bar(
+            BASE_TIME_MS + 900_000,
+            0.05,
+            0.95,
+            1.0,
+            0.5,
+            false,
+            false,
+            false,
+            false,
+        );
         assert_eq!(mode2, ControllerMode::Trend);
         assert_eq!(controller.trend_streak, 2);
         assert!(controller.last_reason.contains("momentum expansion"));
@@ -643,17 +786,47 @@ mod tests {
         let mut controller = RegimeController::default();
 
         // Bar 1: P_T = 0.78 without 15m breakout -> Neutral (1/3)
-        let mode1 = controller.evaluate_15m_bar(BASE_TIME_MS, 0.10, 0.78, 1.0, 0.5, false, false, false, false);
+        let mode1 = controller.evaluate_15m_bar(
+            BASE_TIME_MS,
+            0.10,
+            0.78,
+            1.0,
+            0.5,
+            false,
+            false,
+            false,
+            false,
+        );
         assert_eq!(mode1, ControllerMode::Neutral);
         assert_eq!(controller.trend_streak, 1);
 
         // Bar 2: P_T = 0.78 without 15m breakout -> Neutral (2/3)
-        let mode2 = controller.evaluate_15m_bar(BASE_TIME_MS + 900_000, 0.10, 0.78, 1.0, 0.5, false, false, false, false);
+        let mode2 = controller.evaluate_15m_bar(
+            BASE_TIME_MS + 900_000,
+            0.10,
+            0.78,
+            1.0,
+            0.5,
+            false,
+            false,
+            false,
+            false,
+        );
         assert_eq!(mode2, ControllerMode::Neutral);
         assert_eq!(controller.trend_streak, 2);
 
         // Bar 3: P_T = 0.78 without 15m breakout -> Confirmed on bar 3 (3/3)!
-        let mode3 = controller.evaluate_15m_bar(BASE_TIME_MS + 1_800_000, 0.10, 0.78, 1.0, 0.5, false, false, false, false);
+        let mode3 = controller.evaluate_15m_bar(
+            BASE_TIME_MS + 1_800_000,
+            0.10,
+            0.78,
+            1.0,
+            0.5,
+            false,
+            false,
+            false,
+            false,
+        );
         assert_eq!(mode3, ControllerMode::Trend);
         assert_eq!(controller.trend_streak, 3);
         assert!(controller.last_reason.contains("momentum expansion"));
@@ -664,12 +837,42 @@ mod tests {
         let mut controller = RegimeController::default();
 
         // 2 bars of strong trend
-        controller.evaluate_15m_bar(BASE_TIME_MS, 0.05, 0.95, 1.0, 0.5, true, false, false, false);
-        controller.evaluate_15m_bar(BASE_TIME_MS + 900_000, 0.05, 0.95, 1.0, 0.5, true, false, false, false);
+        controller.evaluate_15m_bar(
+            BASE_TIME_MS,
+            0.05,
+            0.95,
+            1.0,
+            0.5,
+            true,
+            false,
+            false,
+            false,
+        );
+        controller.evaluate_15m_bar(
+            BASE_TIME_MS + 900_000,
+            0.05,
+            0.95,
+            1.0,
+            0.5,
+            true,
+            false,
+            false,
+            false,
+        );
         assert_eq!(controller.trend_streak, 2);
 
         // Bar 3: HMM detects severe regime shock (P_Shock = 1.0, P_T = 0, P_C = 0)
-        let mode = controller.evaluate_15m_bar(BASE_TIME_MS + 1_800_000, 0.0, 0.0, 1.0, 0.5, false, false, false, false);
+        let mode = controller.evaluate_15m_bar(
+            BASE_TIME_MS + 1_800_000,
+            0.0,
+            0.0,
+            1.0,
+            0.5,
+            false,
+            false,
+            false,
+            false,
+        );
         assert_eq!(mode, ControllerMode::Neutral);
         assert_eq!(controller.trend_streak, 0); // Must be zero, NOT decremented!
     }
@@ -679,17 +882,57 @@ mod tests {
         let mut controller = RegimeController::default();
 
         // 2 bars of moderate trend without breakout (P_T = 0.78 -> staying in Neutral)
-        controller.evaluate_15m_bar(BASE_TIME_MS, 0.10, 0.78, 1.0, 0.5, false, false, false, false);
-        controller.evaluate_15m_bar(BASE_TIME_MS + 900_000, 0.10, 0.78, 1.0, 0.5, false, false, false, false);
+        controller.evaluate_15m_bar(
+            BASE_TIME_MS,
+            0.10,
+            0.78,
+            1.0,
+            0.5,
+            false,
+            false,
+            false,
+            false,
+        );
+        controller.evaluate_15m_bar(
+            BASE_TIME_MS + 900_000,
+            0.10,
+            0.78,
+            1.0,
+            0.5,
+            false,
+            false,
+            false,
+            false,
+        );
         assert_eq!(controller.trend_streak, 2);
 
         // Bar 3 enters deadband (P_T = 0.60, P_C = 0.20): leaky decay decrements to 1 (NOT zero!)
-        let mode = controller.evaluate_15m_bar(BASE_TIME_MS + 1_800_000, 0.20, 0.60, 0.5, 0.2, false, false, false, false);
+        let mode = controller.evaluate_15m_bar(
+            BASE_TIME_MS + 1_800_000,
+            0.20,
+            0.60,
+            0.5,
+            0.2,
+            false,
+            false,
+            false,
+            false,
+        );
         assert_eq!(mode, ControllerMode::Neutral);
         assert_eq!(controller.trend_streak, 1); // Leaky decay saved 1 streak!
 
         // Bar 4 enters deadband again: decays to 0
-        controller.evaluate_15m_bar(BASE_TIME_MS + 2_700_000, 0.20, 0.60, 0.5, 0.2, false, false, false, false);
+        controller.evaluate_15m_bar(
+            BASE_TIME_MS + 2_700_000,
+            0.20,
+            0.60,
+            0.5,
+            0.2,
+            false,
+            false,
+            false,
+            false,
+        );
         assert_eq!(controller.trend_streak, 0);
     }
 
@@ -698,12 +941,32 @@ mod tests {
         let mut controller = RegimeController::default();
 
         // Bar 1: Strong consolidation P_C = 0.74 (between 0.70 and 0.78)
-        let mode1 = controller.evaluate_15m_bar(BASE_TIME_MS, 0.74, 0.12, 0.2, 0.1, false, true, true, false);
+        let mode1 = controller.evaluate_15m_bar(
+            BASE_TIME_MS,
+            0.74,
+            0.12,
+            0.2,
+            0.1,
+            false,
+            true,
+            true,
+            false,
+        );
         assert_eq!(mode1, ControllerMode::Neutral);
         assert_eq!(controller.consolidation_streak, 1);
 
         // Bar 2: Strong consolidation P_C = 0.74 -> Confirms on bar 2!
-        let mode2 = controller.evaluate_15m_bar(BASE_TIME_MS + 900_000, 0.74, 0.10, 0.1, 0.0, false, true, true, false);
+        let mode2 = controller.evaluate_15m_bar(
+            BASE_TIME_MS + 900_000,
+            0.74,
+            0.10,
+            0.1,
+            0.0,
+            false,
+            true,
+            true,
+            false,
+        );
         assert_eq!(mode2, ControllerMode::MeanReversion);
         assert_eq!(controller.consolidation_streak, 2);
     }
@@ -718,12 +981,32 @@ mod tests {
         assert_eq!(controller.consolidation_streak, 1);
 
         // Bar 2: Moderate consolidation P_C = 0.67
-        controller.evaluate_15m_bar(BASE_TIME_MS + 900_000, 0.67, 0.15, 0.1, 0.1, false, true, true, false);
+        controller.evaluate_15m_bar(
+            BASE_TIME_MS + 900_000,
+            0.67,
+            0.15,
+            0.1,
+            0.1,
+            false,
+            true,
+            true,
+            false,
+        );
         assert_eq!(controller.current_mode, ControllerMode::Neutral);
         assert_eq!(controller.consolidation_streak, 2);
 
         // Bar 3: Moderate consolidation P_C = 0.67 -> Confirms on bar 3!
-        controller.evaluate_15m_bar(BASE_TIME_MS + 1_800_000, 0.67, 0.15, 0.0, 0.1, false, true, true, false);
+        controller.evaluate_15m_bar(
+            BASE_TIME_MS + 1_800_000,
+            0.67,
+            0.15,
+            0.0,
+            0.1,
+            false,
+            true,
+            true,
+            false,
+        );
         assert_eq!(controller.current_mode, ControllerMode::MeanReversion);
         assert_eq!(controller.consolidation_streak, 3);
     }
@@ -733,7 +1016,17 @@ mod tests {
         let mut controller = RegimeController::default();
 
         // High confidence consolidation P_C = 0.82 with calm volatility (|Z15| = 0.2, |Z60| = 0.1) triggers on bar 1!
-        let mode = controller.evaluate_15m_bar(BASE_TIME_MS, 0.82, 0.10, 0.2, 0.1, false, true, true, false);
+        let mode = controller.evaluate_15m_bar(
+            BASE_TIME_MS,
+            0.82,
+            0.10,
+            0.2,
+            0.1,
+            false,
+            true,
+            true,
+            false,
+        );
         assert_eq!(mode, ControllerMode::MeanReversion);
         assert_eq!(controller.consolidation_streak, 1);
         assert!(controller.last_reason.contains("Consolidation confirmed"));
@@ -744,11 +1037,31 @@ mod tests {
         let mut controller = RegimeController::default();
         // Transition into MeanReversion
         controller.evaluate_15m_bar(BASE_TIME_MS, 0.74, 0.15, 0.2, 0.1, false, true, true, false);
-        controller.evaluate_15m_bar(BASE_TIME_MS + 900_000, 0.74, 0.15, 0.2, 0.1, false, true, true, false);
+        controller.evaluate_15m_bar(
+            BASE_TIME_MS + 900_000,
+            0.74,
+            0.15,
+            0.2,
+            0.1,
+            false,
+            true,
+            true,
+            false,
+        );
         assert_eq!(controller.current_mode, ControllerMode::MeanReversion);
 
         // Flash crash shock occurs (|Z_15| = -3.5, is_severe_shock = true)
-        let mode = controller.evaluate_15m_bar(BASE_TIME_MS + 1_800_000, 0.70, 0.20, -3.5, -2.0, false, true, true, true);
+        let mode = controller.evaluate_15m_bar(
+            BASE_TIME_MS + 1_800_000,
+            0.70,
+            0.20,
+            -3.5,
+            -2.0,
+            false,
+            true,
+            true,
+            true,
+        );
         assert_eq!(mode, ControllerMode::Neutral);
         assert!(controller.last_reason.contains("Severe Volatility Shock"));
     }
@@ -760,7 +1073,17 @@ mod tests {
 
         // Single bar with P_T = 0.95, Z_15 = +3.4, breakout, and is_severe_shock = true
         // Severe shock MUST route to Neutral (100% Cash Buffer), NOT Trend!
-        let mode = controller.evaluate_15m_bar(BASE_TIME_MS, 0.05, 0.95, 3.4, 1.5, true, false, false, true);
+        let mode = controller.evaluate_15m_bar(
+            BASE_TIME_MS,
+            0.05,
+            0.95,
+            3.4,
+            1.5,
+            true,
+            false,
+            false,
+            true,
+        );
         assert_eq!(mode, ControllerMode::Neutral);
         assert!(controller.last_reason.contains("Severe Volatility Shock"));
     }
@@ -783,18 +1106,39 @@ mod tests {
         let shock_time = BASE_TIME_MS;
 
         // Severe shock hits
-        let mode = controller.evaluate_15m_bar(shock_time, 0.05, 0.95, 3.4, 1.5, true, false, false, true);
+        let mode =
+            controller.evaluate_15m_bar(shock_time, 0.05, 0.95, 3.4, 1.5, true, false, false, true);
         assert_eq!(mode, ControllerMode::Neutral);
         assert_eq!(controller.shock_cooldown_bars, 1);
         assert_eq!(controller.cooldown_until_ms, shock_time + 15 * 60 * 1000);
 
         // Bar 1 of cooldown (15 minutes later): bar decrements to 0 and wall-clock reached
-        let mode1 = controller.evaluate_15m_bar(shock_time + 15 * 60 * 1000, 0.05, 0.95, 1.0, 0.5, true, false, false, false);
+        let mode1 = controller.evaluate_15m_bar(
+            shock_time + 15 * 60 * 1000,
+            0.05,
+            0.95,
+            1.0,
+            0.5,
+            true,
+            false,
+            false,
+            false,
+        );
         assert_eq!(mode1, ControllerMode::Neutral);
         assert_eq!(controller.shock_cooldown_bars, 0);
 
         // Bar 2 (30 minutes later): Cooldown is completely finished. Strong trend confirms on bar 1!
-        let mode2 = controller.evaluate_15m_bar(shock_time + 30 * 60 * 1000, 0.05, 0.95, 1.0, 0.5, true, false, false, false);
+        let mode2 = controller.evaluate_15m_bar(
+            shock_time + 30 * 60 * 1000,
+            0.05,
+            0.95,
+            1.0,
+            0.5,
+            true,
+            false,
+            false,
+            false,
+        );
         assert_eq!(mode2, ControllerMode::Trend);
         assert_eq!(controller.trend_streak, 1);
     }
@@ -809,11 +1153,23 @@ mod tests {
         assert_eq!(controller.shock_cooldown_bars, 1);
 
         // Suppose a bar evaluates rapidly (e.g. at 5 minutes)
-        let mode_early = controller.evaluate_15m_bar(shock_time + 5 * 60 * 1000, 0.05, 0.95, 1.0, 0.5, true, false, false, false);
+        let mode_early = controller.evaluate_15m_bar(
+            shock_time + 5 * 60 * 1000,
+            0.05,
+            0.95,
+            1.0,
+            0.5,
+            true,
+            false,
+            false,
+            false,
+        );
         // Bars have reached 0, BUT wall clock cooldown still has 10m left!
         assert_eq!(mode_early, ControllerMode::Neutral);
         assert_eq!(controller.shock_cooldown_bars, 0);
-        assert!(controller.last_reason.contains("remaining) -> Forced Neutral"));
+        assert!(controller
+            .last_reason
+            .contains("remaining) -> Forced Neutral"));
     }
 
     #[test]
@@ -828,7 +1184,17 @@ mod tests {
         assert!(controller.last_reason.contains("Immediate Shock Downgrade"));
 
         // Next evaluation within cooldown must be forced Neutral
-        let mode = controller.evaluate_15m_bar(BASE_TIME_MS + 10 * 60 * 1000, 0.05, 0.95, 1.0, 0.5, true, false, false, false);
+        let mode = controller.evaluate_15m_bar(
+            BASE_TIME_MS + 10 * 60 * 1000,
+            0.05,
+            0.95,
+            1.0,
+            0.5,
+            true,
+            false,
+            false,
+            false,
+        );
         assert_eq!(mode, ControllerMode::Neutral);
     }
 
@@ -857,8 +1223,13 @@ mod tests {
         // 1m bar 12: A catastrophic escalation hits (Z = 5.0 >= peak 3.2 + 1.5)
         // Clock restarts!
         controller.force_shock_cooldown(5.0, 1.5, shock_start + 720_000);
-        assert_eq!(controller.cooldown_until_ms, shock_start + 720_000 + 15 * 60 * 1000);
-        assert!(controller.last_reason.contains("Secondary Shock Escalation"));
+        assert_eq!(
+            controller.cooldown_until_ms,
+            shock_start + 720_000 + 15 * 60 * 1000
+        );
+        assert!(controller
+            .last_reason
+            .contains("Secondary Shock Escalation"));
     }
 
     #[test]
@@ -867,13 +1238,35 @@ mod tests {
 
         // Establish MeanReversion mode
         controller.evaluate_15m_bar(BASE_TIME_MS, 0.82, 0.10, 0.2, 0.1, false, true, true, false);
-        controller.evaluate_15m_bar(BASE_TIME_MS + 900_000, 0.84, 0.10, 0.1, 0.0, false, true, true, false);
+        controller.evaluate_15m_bar(
+            BASE_TIME_MS + 900_000,
+            0.84,
+            0.10,
+            0.1,
+            0.0,
+            false,
+            true,
+            true,
+            false,
+        );
         assert_eq!(controller.current_mode, ControllerMode::MeanReversion);
 
         // Next bar has |Z_15| = 2.3 (>= 2.2 threshold) -> Immediately drops to Neutral
-        let mode = controller.evaluate_15m_bar(BASE_TIME_MS + 1_800_000, 0.82, 0.10, 2.3, 0.5, false, true, true, false);
+        let mode = controller.evaluate_15m_bar(
+            BASE_TIME_MS + 1_800_000,
+            0.82,
+            0.10,
+            2.3,
+            0.5,
+            false,
+            true,
+            true,
+            false,
+        );
         assert_eq!(mode, ControllerMode::Neutral);
-        assert!(controller.last_reason.contains("Consolidation invalidated (Z15="));
+        assert!(controller
+            .last_reason
+            .contains("Consolidation invalidated (Z15="));
     }
 
     #[test]
@@ -894,20 +1287,46 @@ mod tests {
         let bar_ts = 1712000000_000u64;
 
         // First evaluation succeeds
-        let res1 = controller.evaluate_15m_bar_idempotent(bar_ts, bar_ts, 0.80, 0.15, 0.2, 0.1, false, true, true, false);
+        let res1 = controller.evaluate_15m_bar_idempotent(
+            bar_ts, bar_ts, 0.80, 0.15, 0.2, 0.1, false, true, true, false,
+        );
         assert!(res1.is_some());
         assert_eq!(controller.last_evaluated_close_ms, bar_ts);
 
         // Duplicate evaluation with same timestamp is dropped
-        let res2 = controller.evaluate_15m_bar_idempotent(bar_ts, bar_ts, 0.80, 0.15, 0.2, 0.1, false, true, true, false);
+        let res2 = controller.evaluate_15m_bar_idempotent(
+            bar_ts, bar_ts, 0.80, 0.15, 0.2, 0.1, false, true, true, false,
+        );
         assert!(res2.is_none());
 
         // Stale evaluation with earlier timestamp is dropped
-        let res3 = controller.evaluate_15m_bar_idempotent(bar_ts - 900_000, bar_ts, 0.80, 0.15, 0.2, 0.1, false, true, true, false);
+        let res3 = controller.evaluate_15m_bar_idempotent(
+            bar_ts - 900_000,
+            bar_ts,
+            0.80,
+            0.15,
+            0.2,
+            0.1,
+            false,
+            true,
+            true,
+            false,
+        );
         assert!(res3.is_none());
 
         // Next bar (later timestamp) succeeds
-        let res4 = controller.evaluate_15m_bar_idempotent(bar_ts + 900_000, bar_ts + 900_000, 0.80, 0.15, 0.2, 0.1, false, true, true, false);
+        let res4 = controller.evaluate_15m_bar_idempotent(
+            bar_ts + 900_000,
+            bar_ts + 900_000,
+            0.80,
+            0.15,
+            0.2,
+            0.1,
+            false,
+            true,
+            true,
+            false,
+        );
         assert!(res4.is_some());
         assert_eq!(controller.last_evaluated_close_ms, bar_ts + 900_000);
     }
@@ -918,27 +1337,45 @@ mod tests {
         let shock_time = BASE_TIME_MS;
 
         // 1. Initial shock hits
-        let mode1 = controller.evaluate_15m_bar(shock_time, 0.05, 0.95, 3.4, 1.5, true, false, false, true);
+        let mode1 =
+            controller.evaluate_15m_bar(shock_time, 0.05, 0.95, 3.4, 1.5, true, false, false, true);
         assert_eq!(mode1, ControllerMode::Neutral);
         assert_eq!(controller.shock_cooldown_bars, 1);
 
         // 2. Secondary shock escalation hits during cooldown (Z = -5.0 >= peak 3.4 + 1.5)! Clock must restart to full 1 bar and 15m
-        let mode3 = controller.evaluate_15m_bar(shock_time + 10 * 60 * 1000, 0.05, 0.95, -5.0, -2.0, true, false, false, true);
+        let mode3 = controller.evaluate_15m_bar(
+            shock_time + 10 * 60 * 1000,
+            0.05,
+            0.95,
+            -5.0,
+            -2.0,
+            true,
+            false,
+            false,
+            true,
+        );
         assert_eq!(mode3, ControllerMode::Neutral);
         assert_eq!(controller.shock_cooldown_bars, 1);
-        assert_eq!(controller.cooldown_until_ms, shock_time + 10 * 60 * 1000 + 15 * 60 * 1000);
-        assert!(controller.last_reason.contains("Secondary Severe Shock in Cooldown"));
+        assert_eq!(
+            controller.cooldown_until_ms,
+            shock_time + 10 * 60 * 1000 + 15 * 60 * 1000
+        );
+        assert!(controller
+            .last_reason
+            .contains("Secondary Severe Shock in Cooldown"));
     }
 
     #[test]
     fn test_inspect_gates_telemetry() {
         let mut controller = RegimeController::default();
-        let (gate_a, gate_b) = controller.inspect_gates(0.85, 0.10, 0.5, 1.0, false, true, true, BASE_TIME_MS);
+        let (gate_a, gate_b) =
+            controller.inspect_gates(0.85, 0.10, 0.5, 1.0, false, true, true, BASE_TIME_MS);
         assert_eq!(gate_a, "DWELL(0/1)");
         assert_eq!(gate_b, "BLOCKED(P_T=10.0% < 75%)");
 
         controller.force_shock_cooldown(3.5, 1.0, BASE_TIME_MS);
-        let (gate_a_shock, gate_b_shock) = controller.inspect_gates(0.85, 0.10, 0.5, 1.0, false, true, true, BASE_TIME_MS);
+        let (gate_a_shock, gate_b_shock) =
+            controller.inspect_gates(0.85, 0.10, 0.5, 1.0, false, true, true, BASE_TIME_MS);
         assert!(gate_a_shock.contains("BLOCKED(Cooldown 1b"));
         assert!(gate_b_shock.contains("BLOCKED(Cooldown 1b"));
     }
@@ -965,7 +1402,17 @@ mod tests {
 
         // Momentum breakout bar: P_T = 0.92, Donchian breakout = true, Z15 = +2.8 (momentum), Z60 = 1.0, not severe shock
         // Must NOT be blocked by Z15 = 2.8!
-        let mode = controller.evaluate_15m_bar(BASE_TIME_MS, 0.05, 0.92, 2.8, 1.0, true, false, false, false);
+        let mode = controller.evaluate_15m_bar(
+            BASE_TIME_MS,
+            0.05,
+            0.92,
+            2.8,
+            1.0,
+            true,
+            false,
+            false,
+            false,
+        );
         assert_eq!(mode, ControllerMode::Trend);
         assert_eq!(controller.trend_streak, 1);
         assert!(controller.last_reason.contains("Trend confirmed"));
@@ -977,14 +1424,34 @@ mod tests {
         let shock_start = BASE_TIME_MS;
 
         // Severe shock hits at t=0
-        controller.evaluate_15m_bar(shock_start, 0.05, 0.90, -3.5, -2.0, false, false, false, true);
+        controller.evaluate_15m_bar(
+            shock_start,
+            0.05,
+            0.90,
+            -3.5,
+            -2.0,
+            false,
+            false,
+            false,
+            true,
+        );
         assert_eq!(controller.current_mode, ControllerMode::Neutral);
         assert_eq!(controller.cooldown_until_ms, shock_start + 15 * 60 * 1000);
         assert_eq!(controller.shock_cooldown_bars, 1);
 
         // At t = 10m: ongoing shock (Z15: -3.2, Z60: -2.0)
         // Must PRESERVE original cooldown_until_ms (still ending at shock_start + 15m)
-        controller.evaluate_15m_bar(shock_start + 10 * 60 * 1000, 0.05, 0.90, -3.2, -2.0, false, false, false, true);
+        controller.evaluate_15m_bar(
+            shock_start + 10 * 60 * 1000,
+            0.05,
+            0.90,
+            -3.2,
+            -2.0,
+            false,
+            false,
+            false,
+            true,
+        );
         assert_eq!(controller.cooldown_until_ms, shock_start + 15 * 60 * 1000);
         assert_eq!(controller.shock_cooldown_bars, 0);
         assert!(controller.last_reason.contains("Clock preserved"));
@@ -999,13 +1466,24 @@ mod tests {
 
         // Strong upward bull rally: P_T = 0.92, Donchian breakout = true, Z15 = +3.0, Z60 = +3.5 (sustained rally)
         // Must NOT be blocked by positive Z60!
-        let mode = controller.evaluate_15m_bar(BASE_TIME_MS, 0.05, 0.92, 3.0, 3.5, true, false, false, false);
+        let mode = controller.evaluate_15m_bar(
+            BASE_TIME_MS,
+            0.05,
+            0.92,
+            3.0,
+            3.5,
+            true,
+            false,
+            false,
+            false,
+        );
         assert_eq!(mode, ControllerMode::Trend);
         assert_eq!(controller.trend_streak, 1);
         assert!(controller.last_reason.contains("Trend confirmed"));
 
         // Gates inspection: Engine B must be ELIGIBLE (not BLOCKED by Z60 >= 2.5)
-        let (gate_a, gate_b) = controller.inspect_gates(0.05, 0.92, 3.0, 3.5, true, false, false, BASE_TIME_MS);
+        let (gate_a, gate_b) =
+            controller.inspect_gates(0.05, 0.92, 3.0, 3.5, true, false, false, BASE_TIME_MS);
         assert!(gate_a.contains("BLOCKED(Vol")); // Engine A properly protected!
         assert_eq!(gate_b, "ELIGIBLE"); // Engine B is ready!
     }
@@ -1018,8 +1496,71 @@ mod tests {
         assert_eq!(controller.current_mode, ControllerMode::MeanReversion);
 
         // Next 15m bar closes with P_T = 1.00 and Donchian breakout = true (like ETH at $2431.20)
-        let mode = controller.evaluate_15m_bar(BASE_TIME_MS + 900_000, 0.0, 1.0, 0.20, 0.46, true, true, true, false);
-        assert_eq!(mode, ControllerMode::Trend, "Confirmed 15m Donchian breakout with P_T >= 80% must promote directly to Trend");
+        let mode = controller.evaluate_15m_bar(
+            BASE_TIME_MS + 900_000,
+            0.0,
+            1.0,
+            0.20,
+            0.46,
+            true,
+            true,
+            true,
+            false,
+        );
+        assert_eq!(
+            mode,
+            ControllerMode::Trend,
+            "Confirmed 15m Donchian breakout with P_T >= 80% must promote directly to Trend"
+        );
         assert_eq!(controller.trend_streak, 1);
+    }
+
+    #[test]
+    fn test_synthetic_15m_5m_bridge_trend_promotion() {
+        let mut controller = RegimeController::default();
+        assert_eq!(controller.current_mode, ControllerMode::Neutral);
+
+        // Rejected if P_T < 0.75, no breakout, severe shock, or Z60 <= -2.5
+        assert!(!controller.promote_synthetic_15m_to_trend(0.74, true, false, 0.5, BASE_TIME_MS));
+        assert!(!controller.promote_synthetic_15m_to_trend(0.85, false, false, 0.5, BASE_TIME_MS));
+        assert!(!controller.promote_synthetic_15m_to_trend(0.85, true, true, 0.5, BASE_TIME_MS));
+        assert!(!controller.promote_synthetic_15m_to_trend(0.85, true, false, -2.6, BASE_TIME_MS));
+
+        // Rejected during shock cooldown
+        controller.force_shock_cooldown(3.2, 0.5, BASE_TIME_MS);
+        assert!(!controller.promote_synthetic_15m_to_trend(
+            0.85,
+            true,
+            false,
+            0.5,
+            BASE_TIME_MS + 60_000
+        ));
+
+        // 15m bar ticks after 15m cooldown expiry, clearing shock_cooldown_bars
+        controller.evaluate_15m_bar(
+            BASE_TIME_MS + 15 * 60 * 1000,
+            0.10,
+            0.70,
+            1.0,
+            0.5,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(controller.shock_cooldown_bars, 0);
+
+        // Succeeds cleanly once cooldown expires
+        let promoted = controller.promote_synthetic_15m_to_trend(
+            0.78,
+            true,
+            false,
+            0.5,
+            BASE_TIME_MS + 20 * 60 * 1000,
+        );
+        assert!(promoted);
+        assert_eq!(controller.current_mode, ControllerMode::Trend);
+        assert_eq!(controller.trend_streak, 1);
+        assert!(controller.last_reason.contains("Synthetic-15m 5m-Bridge"));
     }
 }

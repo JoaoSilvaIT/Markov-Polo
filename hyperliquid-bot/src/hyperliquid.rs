@@ -233,7 +233,7 @@ pub fn effective_tick_size(price: f64, sz_decimals: u32) -> f64 {
     10f64.powi(-eff_decimals)
 }
 
-/// Places a Post-Only (Alo) Limit Order
+/// Places a Post-Only (Alo) or GTC Limit Order
 pub async fn place_post_only_order(
     exchange: &ExchangeClient,
     coin: &str,
@@ -243,14 +243,29 @@ pub async fn place_post_only_order(
     reduce_only: bool,
     cloid: Option<uuid::Uuid>,
 ) -> Result<u64, String> {
-    // Hyperliquid rule: Reduce-only closing orders (like Take Profit) cannot use "Alo" (Post-Only);
-    // they must use "Gtc" (Good-Til-Cancelled). Entries use "Alo" for maker rebates and anti-taker protection.
-    let tif = if reduce_only {
-        "Gtc".to_string()
-    } else {
-        "Alo".to_string()
-    };
+    place_limit_order_with_tif(
+        exchange,
+        coin,
+        is_buy,
+        price,
+        size,
+        reduce_only,
+        if reduce_only { "Gtc" } else { "Alo" },
+        cloid,
+    )
+    .await
+}
 
+async fn place_limit_order_with_tif(
+    exchange: &ExchangeClient,
+    coin: &str,
+    is_buy: bool,
+    price: f64,
+    size: f64,
+    reduce_only: bool,
+    tif: &str,
+    cloid: Option<uuid::Uuid>,
+) -> Result<u64, String> {
     let order_req = ClientOrderRequest {
         asset: coin.to_string(),
         is_buy,
@@ -259,7 +274,7 @@ pub async fn place_post_only_order(
         sz: size,
         cloid,
         order_type: ClientOrder::Limit(ClientLimit {
-            tif,
+            tif: tif.to_string(),
         }),
     };
 
@@ -289,6 +304,115 @@ pub async fn place_post_only_order(
         }
         ExchangeResponseStatus::Err(e) => Err(format!("Exchange error: {}", e)),
     }
+}
+
+/// Computes the passive `Alo` limit price for a Reduce-Only Take-Profit order given live BBO.
+/// Keeps `target_px` untouched when it already sits strictly passive of the BBO; otherwise clamps
+/// 1 tick inside a wide spread (or onto the passive BBO edge on 1-tick spreads) so it collects Maker rebates.
+pub fn compute_passive_reduce_only_alo_price(
+    is_buy: bool,
+    target_px: f64,
+    top_bid: f64,
+    top_ask: f64,
+    sz_decimals: u32,
+) -> f64 {
+    let clean_target = quantize_price(target_px, sz_decimals);
+    if top_bid <= 0.0 || top_ask <= top_bid {
+        return clean_target;
+    }
+    let tick = effective_tick_size(top_bid, sz_decimals);
+    let spread = top_ask - top_bid;
+    let passive_raw = if is_buy {
+        let max_passive_bid = if spread >= 2.0 * tick - 1e-9 && top_ask - tick > top_bid {
+            top_ask - tick
+        } else {
+            top_bid
+        };
+        clean_target.min(max_passive_bid)
+    } else {
+        let min_passive_ask = if spread >= 2.0 * tick - 1e-9 && top_bid + tick < top_ask {
+            top_bid + tick
+        } else {
+            top_ask
+        };
+        clean_target.max(min_passive_ask)
+    };
+    quantize_price(passive_raw, sz_decimals)
+}
+
+/// Submits a Reduce-Only Take-Profit order prioritizing `tif: "Alo"` (Post-Only Maker, 1.44 bps / 0.288 bps)
+/// clamped safely to the passive side of the live BBO so it never pays Taker fees on entry.
+/// Falls back to `tif: "Gtc"` after 2 `Alo` rejections so a live position is never left without a resting TP.
+pub async fn place_reduce_only_tp_order(
+    exchange: &ExchangeClient,
+    info: &InfoClient,
+    coin: &str,
+    is_buy: bool,
+    target_px: f64,
+    size: f64,
+    sz_decimals: u32,
+    cloid: Option<uuid::Uuid>,
+) -> Result<u64, String> {
+    let clean_target = quantize_price(target_px, sz_decimals);
+    let mut last_err = String::new();
+
+    for attempt in 0..2 {
+        let alo_px = if let Ok((top_bid, top_ask)) = fetch_book_ticker(info, coin).await {
+            compute_passive_reduce_only_alo_price(is_buy, target_px, top_bid, top_ask, sz_decimals)
+        } else {
+            clean_target
+        };
+        let attempt_cloid = if attempt == 0 {
+            cloid
+        } else {
+            Some(uuid::Uuid::new_v4())
+        };
+
+        match place_limit_order_with_tif(
+            exchange,
+            coin,
+            is_buy,
+            alo_px,
+            size,
+            true,
+            "Alo",
+            attempt_cloid,
+        )
+        .await
+        {
+            Ok(oid) => return Ok(oid),
+            Err(e) => {
+                if attempt == 0
+                    && (e.contains("Post only")
+                        || e.contains("immediately matched")
+                        || e.contains("would match"))
+                {
+                    last_err = e;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+                last_err = e;
+                break;
+            }
+        }
+    }
+
+    // Fallback to GTC only if Alo was rejected because market already crossed target
+    eprintln!(
+        "ℹ️ [REDUCE-ONLY TP FALLBACK] {} Alo TP rejected ({}); falling back to Gtc at ${:.4}.",
+        coin, last_err, clean_target
+    );
+    place_limit_order_with_tif(
+        exchange,
+        coin,
+        is_buy,
+        clean_target,
+        size,
+        true,
+        "Gtc",
+        Some(uuid::Uuid::new_v4()),
+    )
+    .await
 }
 
 /// Places an Exchange-Native Reduce-Only Disaster Stop-Market Trigger Order (`tpsl: "sl"`, `is_market: true`)
@@ -357,8 +481,7 @@ pub async fn place_disaster_stop_trigger_order(
 /// Research-validated: BTC=1.0, ETH=1.5, SOL=2.0, AVAX=2.5
 pub fn optimal_engine_b_tp_atr_multiple(symbol: &str) -> f64 {
     match symbol.to_uppercase().as_str() {
-        "BTC" => 1.0,
-        "ETH" | "XYZ:NVDA" | "XYZ:TSLA" | "XYZ:XYZ100" | "XYZ:GOLD" | "XYZ:SILVER" => 1.5,
+        "BTC" | "ETH" | "XYZ:NVDA" | "XYZ:TSLA" | "XYZ:XYZ100" | "XYZ:GOLD" | "XYZ:SILVER" => 1.5,
         "XRP" | "LINK" | "ZEC" => 1.8,
         "SOL" | "HYPE" => 2.0,
         "AVAX" | "SUI" | "NEAR" => 2.5,
@@ -1038,6 +1161,25 @@ pub mod tests {
             ClearinghouseDexEquitySummary::default(),
         );
         assert!((eq_native_only - 560.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_passive_reduce_only_alo_price_and_btc_tp_multiple() {
+        // Sell TP (closing Long): wide spread -> target kept if passive; clamped to bid+tick if crossed
+        let p_normal = compute_passive_reduce_only_alo_price(false, 100.50, 100.00, 100.04, 3);
+        assert!((p_normal - 100.50).abs() < 1e-6);
+
+        let p_crossed_wide = compute_passive_reduce_only_alo_price(false, 100.50, 100.60, 100.64, 3);
+        assert!(p_crossed_wide > 100.60 && p_crossed_wide < 100.64);
+
+        let p_crossed_tight = compute_passive_reduce_only_alo_price(false, 100.50, 100.60, 100.61, 3);
+        assert!((p_crossed_tight - 100.61).abs() < 1e-6);
+
+        // Buy TP (closing Short): clamped to ask-tick if crossed
+        let p_buy_crossed = compute_passive_reduce_only_alo_price(true, 99.50, 99.30, 99.34, 3);
+        assert!(p_buy_crossed > 99.30 && p_buy_crossed < 99.34);
+
+        assert!((optimal_engine_b_tp_atr_multiple("BTC") - 1.5).abs() < 1e-9);
     }
 }
 

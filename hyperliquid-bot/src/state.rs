@@ -14,13 +14,38 @@ pub struct FlockGuard {
     _file: std::fs::File,
 }
 
+/// Resolves lockfile paths onto host-local tmpfs (`HL_CLUSTER_LOCK_DIR`, e.g. `/var/run/hl_cluster_lock`)
+/// when configured so kernel `flock(2)` never relies on NFS/SMB lease emulation, while falling back
+/// cleanly to `.` in local tests.
+pub fn resolve_lock_guard_path(path: &str) -> std::path::PathBuf {
+    if !path.contains('/') {
+        if let Ok(lock_dir) = std::env::var("HL_CLUSTER_LOCK_DIR") {
+            let trimmed = lock_dir.trim();
+            if !trimmed.is_empty() && std::path::Path::new(trimmed).is_dir() {
+                return std::path::Path::new(trimmed).join(path);
+            }
+        }
+    }
+    std::path::PathBuf::from(path)
+}
+
 impl FlockGuard {
     pub fn acquire(path: &str) -> std::io::Result<Self> {
-        let file = OpenOptions::new()
+        let resolved = resolve_lock_guard_path(path);
+        let file = match OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .open(path)?;
+            .open(&resolved)
+        {
+            Ok(f) => f,
+            Err(_) if resolved != std::path::Path::new(path) => OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(path)?,
+            Err(e) => return Err(e),
+        };
         let fd = file.as_raw_fd();
         let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
         if ret != 0 {
@@ -122,6 +147,10 @@ pub struct PositionState {
     pub disaster_stop_ratcheted_to_be: bool,
     #[serde(default)]
     pub last_fill_check: u64,
+    #[serde(default)]
+    pub tranche1_tp_filled: bool,
+    #[serde(default)]
+    pub last_peak_mins: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1619,6 +1648,8 @@ mod tests {
             disaster_stop_oid: None,
             disaster_stop_ratcheted_to_be: false,
             last_fill_check: 0,
+            tranche1_tp_filled: false,
+            last_peak_mins: 0.0,
         };
         assert!(!empty_pos.is_occupied());
 

@@ -757,6 +757,8 @@ pub struct MarketCrowdingTracker {
     pub basis_z: f64,
     /// Timestamped Open Interest history `(timestamp_ms, open_interest)` for exact 15m delta lookup
     pub oi_history: VecDeque<(u64, f64)>,
+    /// Timestamp (local ms) when `mark_px` was last refreshed from ActiveAssetCtx
+    pub last_mark_update_ms: u64,
 }
 
 impl MarketCrowdingTracker {
@@ -803,6 +805,9 @@ impl MarketCrowdingTracker {
         self.open_interest = open_interest;
         self.mark_px = mark_px;
         self.oracle_px = oracle_px;
+        if timestamp_ms > 0 && mark_px > 0.0 {
+            self.last_mark_update_ms = timestamp_ms;
+        }
 
         if timestamp_ms > 0 {
             self.oi_history.push_back((timestamp_ms, open_interest));
@@ -2094,10 +2099,20 @@ impl EngineBTrendManager {
                 if confirm_bars_5m + 1 >= 2 {
                     if d * t.l2_obi >= cfg.min_obi_retest {
                         // 2 consecutive 5m bars confirmed + L2 OBI aligned: Post Stage 2 Alo Retest Order!
-                        let alo_limit_px =
-                            broken_donchian_px + d * cfg.retest_limit_offset_atr * t.atr_15m;
-                        let post_fill_stop_px =
-                            broken_donchian_px - d * cfg.retest_stop_atr * t.atr_15m;
+                        // When confirmation close has expanded > 0.35 * ATR beyond broken_donchian_px,
+                        // anchor dynamically to a shallow 35% flag pullback so Stage 2 fills real runners.
+                        let extension = d * (t.bar_close - broken_donchian_px);
+                        let dynamic_offset = if extension > 0.35 * t.atr_15m {
+                            (0.35 * extension).min(extension - 0.10 * t.atr_15m)
+                        } else {
+                            cfg.retest_limit_offset_atr * t.atr_15m
+                        };
+                        let eff_offset =
+                            dynamic_offset.max(cfg.retest_limit_offset_atr * t.atr_15m);
+                        let alo_limit_px = broken_donchian_px + d * eff_offset;
+                        let total_stop_dist =
+                            (cfg.retest_limit_offset_atr + cfg.retest_stop_atr) * t.atr_15m;
+                        let post_fill_stop_px = alo_limit_px - d * total_stop_dist;
                         let initial_tp1_px = alo_limit_px + d * 1.50 * t.atr_15m;
                         let notional_usdc = cfg.compute_trend_notional_usdc(account_equity_usdc);
 
@@ -3335,8 +3350,58 @@ mod tests {
         let mut tracker = MarketCrowdingTracker::default();
         let t0 = 1_760_000_000_000u64;
         tracker.update_with_time(0.00001, 10_000.0, 100.0, 100.0, t0);
+        assert_eq!(tracker.last_mark_update_ms, t0);
         tracker.update_with_time(0.00001, 9_950.0, 100.0, 100.0, t0 + 15 * 60 * 1000);
         let oi_pct = tracker.oi_delta_15m_pct(t0 + 15 * 60 * 1000);
         assert!((oi_pct - (-0.50)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_dynamic_flag_pullback_anchor_for_extended_breakouts() {
+        let cfg = TrendEngineConfig::for_symbol("BTC", 0.35, 0.28);
+        let mut mgr = EngineBTrendManager::new();
+        let t0 = chrono::Utc
+            .with_ymd_and_hms(2026, 11, 11, 14, 30, 0)
+            .unwrap()
+            .timestamp() as u64; // Wednesday 14:30 UTC (primary window)
+
+        // Stage 1: break above 100.0 with ATR = 2.0
+        let bar1 = BreakoutTelemetry {
+            bar_open: 99.8,
+            bar_high: 100.5,
+            bar_low: 99.7,
+            bar_close: 100.4,
+            donchian_high_12_15m: 100.0,
+            donchian_low_12_15m: 96.0,
+            atr_15m: 2.0,
+            min_squeeze_ratio_90m: 0.65,
+            rel_vol_15m: 2.2,
+            hurst_60m: 0.56,
+            l2_obi: 0.35,
+            oi_delta_15m_pct: 0.25,
+        };
+        assert_eq!(
+            mgr.on_5m_bar_close(&cfg, &bar1, t0, 3, 560.0, false, 0.50, 0.005),
+            TrendOrderAction::None
+        );
+
+        // Stage 2: Strong continuation bar extends +1.6 ATR (103.2 vs 100.0 Donchian, extension = 3.2 > 0.70)
+        let mut bar2 = bar1;
+        bar2.bar_close = 103.2;
+        let act = mgr.on_5m_bar_close(&cfg, &bar2, t0 + 300, 3, 560.0, false, 0.55, 0.005);
+        match act {
+            TrendOrderAction::PostAloMakerRetestOrder {
+                limit_px,
+                stop_loss_px,
+                ..
+            } => {
+                // Anchors dynamically at 100.0 + 0.35 * 3.2 = 101.12 (vs stale 100.08)
+                assert!(limit_px > 101.0 && limit_px < 103.0, "got {}", limit_px);
+                let stop_width = limit_px - stop_loss_px;
+                let expected_width = (cfg.retest_limit_offset_atr + cfg.retest_stop_atr) * 2.0;
+                assert!((stop_width - expected_width).abs() < 1e-6);
+            }
+            other => panic!("Expected PostAloMakerRetestOrder, got {:?}", other),
+        }
     }
 }

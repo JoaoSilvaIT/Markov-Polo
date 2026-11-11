@@ -126,13 +126,13 @@ pub async fn place_ou_maker_entry(
         ));
     }
 
-    // Tier 2 Hard Disaster Stop per Section 4 of `O-U Mean Reversion Audit.md` (line 152):
-    // BTC: 150 bps (1.50%), ETH: 175 bps (1.75%), SOL: 200 bps (2.00%), AVAX: 220 bps (2.20%)
-    let ou_cfg = crate::ou_process::asset_ou_config(symbol);
-    let hard_stop_frac = ou_cfg.hard_disaster_stop_bps * 1e-4;
-    let edge_dist = (post_only_price - target_tp_quantized).abs();
-    let calibrated_sl = (1.5 * edge_dist).max(post_only_price * 0.0035);
-    let sl_dist = calibrated_sl.min(post_only_price * hard_stop_frac);
+    // Tier 2 Hard Disaster Stop (F-07 decoupled): >= max(2.5 * tp_dist, min_soft_inv + 35 bps, 85 bps)
+    // so Fast-Sentinel never prematurely front-runs 5m TwoTierInvalidationManager.
+    let sl_dist = crate::ou_process::compute_engine_a_disaster_stop_distance(
+        symbol,
+        post_only_price,
+        target_tp_quantized,
+    );
     let raw_sl = if is_buy {
         post_only_price - sl_dist
     } else {
@@ -249,9 +249,11 @@ pub async fn place_ou_maker_entry(
         }
     };
 
-    let final_edge_dist = (current_price - target_tp_quantized).abs();
-    let calibrated_final_sl = (1.5 * final_edge_dist).max(current_price * 0.0035);
-    let final_sl_dist = calibrated_final_sl.min(current_price * hard_stop_frac);
+    let final_sl_dist = crate::ou_process::compute_engine_a_disaster_stop_distance(
+        symbol,
+        current_price,
+        target_tp_quantized,
+    );
     let stop_loss_price = quantize_price(
         if is_buy {
             current_price - final_sl_dist
@@ -297,6 +299,8 @@ pub async fn place_ou_maker_entry(
         disaster_stop_oid: None,
         disaster_stop_ratcheted_to_be: false,
         last_fill_check: 0,
+        tranche1_tp_filled: false,
+        last_peak_mins: 0.0,
     };
 
     state.insert(symbol.to_string(), new_state.clone());
@@ -593,6 +597,8 @@ pub async fn place_trend_breakout_entry(
         disaster_stop_oid: None,
         disaster_stop_ratcheted_to_be: false,
         last_fill_check: 0,
+        tranche1_tp_filled: false,
+        last_peak_mins: 0.0,
     };
 
     state.insert(symbol.to_string(), new_state.clone());

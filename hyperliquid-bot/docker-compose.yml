@@ -10,6 +10,7 @@ x-bot-env: &bot-env
   HL_EQUITY_FRACTION: ${HL_EQUITY_FRACTION:-0.35}
   HL_TREND_RISK_FRACTION: ${HL_TREND_RISK_FRACTION:-0.28}
   HL_MAX_POSITION_SIZE_USDC: ${HL_MAX_POSITION_SIZE_USDC:-500.0}
+  HL_CLUSTER_LOCK_DIR: /var/run/hl_cluster_lock
 
 x-bot-common: &bot-common
   image: hyperliquid-bot:latest
@@ -42,6 +43,7 @@ x-bot-common: &bot-common
       hard: 65535
   volumes:
     - ./hl_bot_data:/app
+    - /dev/shm/hl_bot_lock:/var/run/hl_cluster_lock
   logging:
     driver: "json-file"
     options:
@@ -157,7 +159,6 @@ services:
   hl_dashboard:
     image: python:3.11-alpine
     container_name: hl_dashboard
-    profiles: ["dashboard", "all"]
     init: true
     restart: unless-stopped
     read_only: true
