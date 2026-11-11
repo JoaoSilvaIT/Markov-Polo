@@ -46,7 +46,8 @@ use crate::ou_process::{
     SessionLifecycleAction,
 };
 use crate::state::{
-    check_cluster_circuit_breaker, has_active_cluster_position, load_armed_signal,
+    check_cluster_circuit_breaker, has_active_cluster_position,
+    has_active_cluster_position_for_side, load_armed_signal,
     load_circuit_breaker, load_state, save_armed_signal, save_circuit_breaker, save_state, Side,
     StateMap,
 };
@@ -1318,7 +1319,7 @@ async fn main() {
                 (lease.owner_uuid, lease.fencing_token)
             } else {
                 let uuid = format!("{}_{}", trading_symbol, chrono::Utc::now().timestamp_micros());
-                let (_, tok) = crate::state::try_acquire_cluster_lease_for_engine_with_uuid(&trading_symbol, "EngineA", &uuid, 3600);
+                let (_, tok) = crate::state::try_acquire_cluster_lease_with_side(&trading_symbol, "EngineA", side_str, &uuid, 3600);
                 (uuid, tok)
             };
 
@@ -4155,9 +4156,15 @@ async fn main() {
                                                 0.0175,
                                             );
 
+                                            let side_label_b = if side == Side::Long { "LONG" } else { "SHORT" };
+                                            let side_cluster_blocked_b = has_active_cluster_position_for_side(
+                                                &symbol_clone,
+                                                Some(side_label_b),
+                                            )
+                                            .is_some();
                                             let safety_veto: Option<&'static str> = if candle_feed_degraded || is_candle_gap {
                                                 Some("DATA_FEED_DEGRADED")
-                                            } else if is_cluster_blocked {
+                                            } else if is_cluster_blocked || side_cluster_blocked_b {
                                                 Some("CLUSTER_LEASE_BLOCKED")
                                             } else if is_cb_paused {
                                                 Some("CIRCUIT_BREAKER_PAUSED")
@@ -5507,10 +5514,22 @@ async fn main() {
                                                 d_sign * l2_1s >= -0.28
                                             };
 
+                                            let side_cluster_blocked_a = has_active_cluster_position_for_side(
+                                                &symbol_clone,
+                                                Some(&arm_side),
+                                            );
                                             if let Some(veto_reason) = btc_lead_veto {
                                                 println!(
                                                     "🛡️ [BTC IMPULSE VETO] {} {} reversal bounce disarmed due to adverse BTC impulse: {}.",
                                                     symbol_clone, arm_side, veto_reason
+                                                );
+                                                armed_state.is_armed = false;
+                                                save_armed_signal(&arm_path_clone, &armed_state);
+                                            } else if let Some(ref corr_blk) = side_cluster_blocked_a {
+                                                funnel_counters.portfolio_lock_congested += 1;
+                                                println!(
+                                                    "⏸️ [DIRECTIONAL CLUSTER GATE] {} {} blocked by active correlated slot ({}). Disarming.",
+                                                    symbol_clone, arm_side, corr_blk
                                                 );
                                                 armed_state.is_armed = false;
                                                 save_armed_signal(&arm_path_clone, &armed_state);

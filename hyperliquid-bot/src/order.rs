@@ -5,7 +5,7 @@ use crate::hyperliquid::{
 };
 use crate::state::{
     assert_current_lease, clear_order_intent, release_cluster_lease_authenticated, save_order_intent_atomic,
-    save_state, try_acquire_cluster_lease_for_engine_with_uuid, OrderIntent, OrderIntentStatus,
+    save_state, try_acquire_cluster_lease_with_side, OrderIntent, OrderIntentStatus,
     PositionLifecycle, PositionState, Side, StateMap,
 };
 use chrono::Utc;
@@ -43,9 +43,14 @@ pub async fn place_ou_maker_entry(
     let lease_uuid = format!("{}_{}", symbol, Utc::now().timestamp_micros());
 
     // Atomically acquire the portfolio cluster lease (1 hour renewed continuously while holding)
-    let (acquired, fencing_token) = try_acquire_cluster_lease_for_engine_with_uuid(
+    let side_upper = match side {
+        Side::Long => "LONG",
+        Side::Short => "SHORT",
+    };
+    let (acquired, fencing_token) = try_acquire_cluster_lease_with_side(
         symbol,
         "EngineA",
+        side_upper,
         &lease_uuid,
         3600,
     );
@@ -359,9 +364,14 @@ pub async fn place_trend_breakout_entry(
     let lease_uuid = format!("{}_{}", symbol, Utc::now().timestamp_micros());
 
     // Atomically acquire the portfolio cluster lease for EngineB
-    let (acquired, fencing_token) = try_acquire_cluster_lease_for_engine_with_uuid(
+    let side_upper = match side {
+        Side::Long => "LONG",
+        Side::Short => "SHORT",
+    };
+    let (acquired, fencing_token) = try_acquire_cluster_lease_with_side(
         symbol,
         "EngineB",
+        side_upper,
         &lease_uuid,
         3600,
     );

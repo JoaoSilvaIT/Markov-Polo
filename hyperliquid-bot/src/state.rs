@@ -700,6 +700,8 @@ pub struct ClusterLease {
     pub expires_at: String,
     #[serde(default)]
     pub fencing_token: u64,
+    #[serde(default)]
+    pub side: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -833,6 +835,41 @@ pub fn try_acquire_cluster_lease_for_engine_with_uuid(
     owner_uuid: &str,
     duration_secs: i64,
 ) -> (bool, u64) {
+    try_acquire_cluster_lease_with_side_internal(
+        symbol,
+        engine_owner,
+        None,
+        owner_uuid,
+        duration_secs,
+        chrono::Utc::now().timestamp_millis(),
+    )
+}
+
+pub fn try_acquire_cluster_lease_with_side(
+    symbol: &str,
+    engine_owner: &str,
+    side: &str,
+    owner_uuid: &str,
+    duration_secs: i64,
+) -> (bool, u64) {
+    try_acquire_cluster_lease_with_side_internal(
+        symbol,
+        engine_owner,
+        Some(side),
+        owner_uuid,
+        duration_secs,
+        chrono::Utc::now().timestamp_millis(),
+    )
+}
+
+fn try_acquire_cluster_lease_with_side_internal(
+    symbol: &str,
+    engine_owner: &str,
+    candidate_side: Option<&str>,
+    owner_uuid: &str,
+    duration_secs: i64,
+    now_ms: i64,
+) -> (bool, u64) {
     let _guard = match FlockGuard::acquire(CLUSTER_LOCK_GUARD_FILE) {
         Ok(g) => g,
         Err(_) => return (false, 0),
@@ -855,6 +892,9 @@ pub fn try_acquire_cluster_lease_for_engine_with_uuid(
             if !existing_lease.owner_uuid.is_empty() && existing_lease.owner_uuid == owner_uuid {
                 existing_lease.engine_owner = engine_owner.to_string();
                 existing_lease.expires_at = expires.to_rfc3339();
+                if let Some(s) = candidate_side {
+                    existing_lease.side = Some(s.to_uppercase());
+                }
                 let token = existing_lease.fencing_token;
                 leases.insert(symbol.to_string(), existing_lease);
                 if write_leases_atomic(&leases).is_ok() {
@@ -894,40 +934,60 @@ pub fn try_acquire_cluster_lease_for_engine_with_uuid(
         }
     });
 
-    // 3. Count total active positions / leases across OTHER symbols
-    let mut other_active_symbols = std::collections::HashSet::new();
+    // 3. Collect active positions / leases & directions across OTHER symbols
+    let mut other_active_sides: HashMap<String, Option<String>> = HashMap::new();
     for other_lease in leases.values() {
         if other_lease.owner != symbol {
-            other_active_symbols.insert(other_lease.owner.clone());
+            other_active_sides.insert(other_lease.owner.clone(), other_lease.side.clone());
         }
     }
     for other_sym in configured_portfolio_symbols() {
-        if other_sym != symbol && !other_active_symbols.contains(&other_sym) {
+        if other_sym != symbol {
             let state_file = format!("hl_hmm_state_{}.json", other_sym);
             if let Ok(state) = load_state(&state_file) {
                 if let Some(pos) = state.get(&other_sym) {
                     if pos.is_occupied() {
-                        other_active_symbols.insert(other_sym);
+                        other_active_sides
+                            .entry(other_sym)
+                            .and_modify(|s| {
+                                if s.is_none() && !pos.side.is_empty() {
+                                    *s = Some(pos.side.to_uppercase());
+                                }
+                            })
+                            .or_insert_with(|| {
+                                if pos.side.is_empty() {
+                                    None
+                                } else {
+                                    Some(pos.side.to_uppercase())
+                                }
+                            });
                     }
                 }
             }
         }
     }
 
-    if other_active_symbols.len() >= max_allowed {
+    if other_active_sides.len() >= max_allowed {
         eprintln!(
             "⏸️ [CLUSTER CONGESTION] Symbol {} blocked. Active portfolio symbols: {:?} (max allowed: {}).",
-            symbol, other_active_symbols, max_allowed
+            symbol,
+            other_active_sides.keys().collect::<Vec<_>>(),
+            max_allowed
         );
         let _ = write_leases_atomic(&leases);
         return (false, 0);
     }
 
     if max_allowed > 1 {
-        if let Some(corr_reason) = is_cluster_slot_correlated_veto(symbol, &other_active_symbols) {
+        if let Some(corr_reason) = is_cluster_slot_correlated_veto_with_context(
+            symbol,
+            candidate_side,
+            &other_active_sides,
+            now_ms,
+        ) {
             eprintln!(
-                "⏸️ [CLUSTER CORRELATION VETO] Symbol {} blocked by correlated active slot: {}.",
-                symbol, corr_reason
+                "⏸️ [CLUSTER CORRELATION VETO] Symbol {} ({:?}) blocked by correlated active slot: {}.",
+                symbol, candidate_side, corr_reason
             );
             let _ = write_leases_atomic(&leases);
             return (false, 0);
@@ -950,6 +1010,7 @@ pub fn try_acquire_cluster_lease_for_engine_with_uuid(
         acquired_at: now.to_rfc3339(),
         expires_at: expires.to_rfc3339(),
         fencing_token: new_token,
+        side: candidate_side.map(|s| s.to_uppercase()),
     };
 
     leases.insert(symbol.to_string(), new_lease);
@@ -1137,22 +1198,57 @@ pub fn asset_downside_semibeta(symbol: &str) -> f64 {
     }
 }
 
-/// Evaluates the Downside Semibeta & Sector Cluster Orthogonality Lease constraint:
-/// Prevents two non-Major altcoins in the same structural cluster (e.g., SOL + SUI in AltL1)
-/// or two high-beta assets whose combined downside semibeta exceeds 2.65 from occupying
-/// both portfolio slots simultaneously.
-pub fn is_cluster_slot_correlated_veto(
+#[inline]
+pub fn is_hip3_symbol(symbol: &str) -> bool {
+    symbol.trim().to_lowercase().starts_with("xyz:")
+}
+
+/// Returns `true` during US Equities RTH (`09:30 - 16:00 ET`, DST-aware) on weekdays when HIP-3 RWA
+/// markets are actively trading and Slot 2 is reserved for orthogonal RWA positions (`DualClearinghouseSlotArbiter`).
+pub fn is_us_rth_window(now_ms: i64) -> bool {
+    use chrono::{Datelike, Timelike};
+    let Some(dt) = chrono::DateTime::from_timestamp_millis(now_ms) else {
+        return false;
+    };
+    let wd = dt.weekday().num_days_from_sunday();
+    if wd == 0 || wd == 6 {
+        return false;
+    }
+    let is_dst = crate::ou_process::is_us_daylight_saving_date(dt.year(), dt.month(), dt.day());
+    let (rth_open, rth_close) = if is_dst { (810, 1200) } else { (870, 1260) };
+    let min_of_day = dt.hour() * 60 + dt.minute();
+    min_of_day >= rth_open && min_of_day < rth_close
+}
+
+/// Evaluates the Downside Semibeta, Sector Cluster, and `DualClearinghouseSlotArbiter` orthogonality rules:
+/// 1. Prevents two non-Major assets in the same structural cluster (`AltL1`, `UsEquity`, `PreciousMetals`).
+/// 2. Caps combined downside semibeta at `2.65`.
+/// 3. During US RTH (`09:30-16:00 ET`) when HIP-3 RWA assets are configured, strictly reserves Slot 2 for
+///    an orthogonal HIP-3 asset (`max 1 NativeMain crypto`).
+/// 4. 24/7: Never allows two `NativeMain` crypto positions in the SAME direction (`LONG+LONG` or `SHORT+SHORT`),
+///    eliminating doubled directional BTC-beta risk across correlated cryptos.
+pub fn is_cluster_slot_correlated_veto_with_context(
     candidate_symbol: &str,
-    active_other_symbols: &std::collections::HashSet<String>,
+    candidate_side: Option<&str>,
+    active_other_sides: &HashMap<String, Option<String>>,
+    now_ms: i64,
 ) -> Option<String> {
-    if active_other_symbols.is_empty() {
+    if active_other_sides.is_empty() {
         return None;
     }
     let cand_cluster = asset_cluster(candidate_symbol);
     let cand_beta = asset_downside_semibeta(candidate_symbol);
-    for other in active_other_symbols {
+    let cand_is_hip3 = is_hip3_symbol(candidate_symbol);
+    let hip3_universe_active = configured_portfolio_symbols()
+        .iter()
+        .any(|s| is_hip3_symbol(s));
+    let rth_active = is_us_rth_window(now_ms);
+
+    for (other, other_side_opt) in active_other_sides {
         let other_cluster = asset_cluster(other);
         let other_beta = asset_downside_semibeta(other);
+        let other_is_hip3 = is_hip3_symbol(other);
+
         if cand_cluster != AssetCluster::Major && cand_cluster == other_cluster {
             return Some(format!("{}(SameCluster:{:?})", other, cand_cluster));
         }
@@ -1163,8 +1259,40 @@ pub fn is_cluster_slot_correlated_veto(
                 cand_beta + other_beta
             ));
         }
+        if !cand_is_hip3 && !other_is_hip3 {
+            if hip3_universe_active && rth_active {
+                return Some(format!("{}(DualDexRthSlot1Occupied)", other));
+            }
+            if let (Some(c_side), Some(o_side)) = (candidate_side, other_side_opt.as_deref()) {
+                if !c_side.is_empty() && c_side.eq_ignore_ascii_case(o_side) {
+                    return Some(format!(
+                        "{}(SameDirectionCrypto:{})",
+                        other,
+                        c_side.to_uppercase()
+                    ));
+                }
+            }
+        }
     }
     None
+}
+
+/// Backward-compatible wrapper without side/timestamp context.
+#[allow(dead_code)]
+pub fn is_cluster_slot_correlated_veto(
+    candidate_symbol: &str,
+    active_other_symbols: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let sides_map: HashMap<String, Option<String>> = active_other_symbols
+        .iter()
+        .map(|s| (s.clone(), None))
+        .collect();
+    is_cluster_slot_correlated_veto_with_context(
+        candidate_symbol,
+        None,
+        &sides_map,
+        chrono::Utc::now().timestamp_millis(),
+    )
 }
 
 /// Computes the Marchenko-Pastur Systemic Absorption Ratio (AR_t = \lambda_1 / M)
@@ -1258,28 +1386,40 @@ pub fn configured_portfolio_symbols() -> Vec<String> {
     ]
 }
 
-/// Checks if any other symbol in the portfolio cluster currently has an active open position or active atomic lease
+/// Checks if any other symbol in the portfolio cluster currently blocks `current_symbol`
+/// (optionally checking directional correlation for `proposed_side`).
 pub fn has_active_cluster_position(current_symbol: &str) -> Option<String> {
+    has_active_cluster_position_for_side(current_symbol, None)
+}
+
+pub fn has_active_cluster_position_for_side(
+    current_symbol: &str,
+    proposed_side: Option<&str>,
+) -> Option<String> {
     let now = chrono::Utc::now();
     let max_allowed = max_concurrent_cluster_positions();
-    let mut other_active_symbols = std::collections::HashSet::new();
+    let mut other_active_sides: HashMap<String, Option<String>> = HashMap::new();
 
     // 1. Check atomic lease locks
     let leases = load_cluster_leases();
     for (owner_sym, lease) in &leases {
         if owner_sym != current_symbol {
             let owner_state_file = format!("hl_hmm_state_{}.json", owner_sym);
-            let owner_has_pos = load_state(&owner_state_file)
+            let owner_pos = load_state(&owner_state_file)
                 .ok()
                 .and_then(|s| s.get(owner_sym).cloned())
-                .map(|p| p.is_occupied())
-                .unwrap_or(false);
+                .filter(|p| p.is_occupied());
 
-            if owner_has_pos {
-                other_active_symbols.insert(owner_sym.clone());
+            if let Some(p) = owner_pos {
+                let eff_side = if !p.side.is_empty() {
+                    Some(p.side.to_uppercase())
+                } else {
+                    lease.side.clone()
+                };
+                other_active_sides.insert(owner_sym.clone(), eff_side);
             } else if let Ok(exp_dt) = chrono::DateTime::parse_from_rfc3339(&lease.expires_at) {
                 if now < exp_dt.with_timezone(&chrono::Utc) {
-                    other_active_symbols.insert(owner_sym.clone());
+                    other_active_sides.insert(owner_sym.clone(), lease.side.clone());
                 }
             }
         }
@@ -1288,14 +1428,19 @@ pub fn has_active_cluster_position(current_symbol: &str) -> Option<String> {
     // 2. Check position state files across all portfolio symbols
     let all_symbols = configured_portfolio_symbols();
     for sym in &all_symbols {
-        if sym == current_symbol || other_active_symbols.contains(sym) {
+        if sym == current_symbol || other_active_sides.contains_key(sym) {
             continue;
         }
         let state_file = format!("hl_hmm_state_{}.json", sym);
         if let Ok(state) = load_state(&state_file) {
             if let Some(pos) = state.get(sym) {
                 if pos.is_occupied() {
-                    other_active_symbols.insert(sym.clone());
+                    let s = if pos.side.is_empty() {
+                        None
+                    } else {
+                        Some(pos.side.to_uppercase())
+                    };
+                    other_active_sides.insert(sym.clone(), s);
                 }
             }
         }
@@ -1309,11 +1454,16 @@ pub fn has_active_cluster_position(current_symbol: &str) -> Option<String> {
                 let symbol_part = file_name
                     .trim_start_matches("hl_hmm_state_")
                     .trim_end_matches(".json");
-                if symbol_part != current_symbol && !other_active_symbols.contains(symbol_part) {
+                if symbol_part != current_symbol && !other_active_sides.contains_key(symbol_part) {
                     if let Ok(state) = load_state(&file_name) {
                         if let Some(pos) = state.get(symbol_part) {
                             if pos.is_occupied() {
-                                other_active_symbols.insert(symbol_part.to_string());
+                                let s = if pos.side.is_empty() {
+                                    None
+                                } else {
+                                    Some(pos.side.to_uppercase())
+                                };
+                                other_active_sides.insert(symbol_part.to_string(), s);
                             }
                         }
                     }
@@ -1322,12 +1472,17 @@ pub fn has_active_cluster_position(current_symbol: &str) -> Option<String> {
         }
     }
 
-    if other_active_symbols.len() >= max_allowed {
-        let mut sorted: Vec<String> = other_active_symbols.into_iter().collect();
+    if other_active_sides.len() >= max_allowed {
+        let mut sorted: Vec<String> = other_active_sides.into_keys().collect();
         sorted.sort();
         Some(sorted.join(","))
     } else if max_allowed > 1 {
-        is_cluster_slot_correlated_veto(current_symbol, &other_active_symbols)
+        is_cluster_slot_correlated_veto_with_context(
+            current_symbol,
+            proposed_side,
+            &other_active_sides,
+            now.timestamp_millis(),
+        )
     } else {
         None
     }
@@ -1475,6 +1630,7 @@ mod tests {
     fn test_cluster_lease_concurrency_limit_2() {
         let _guard = TEST_MUTEX.lock().unwrap();
         std::env::set_var("HL_MAX_CONCURRENT_POSITIONS", "2");
+        std::env::set_var("HL_PORTFOLIO_SYMBOLS", "BTC,ETH,SOL");
         let _ = fs::remove_file(CLUSTER_LOCK_FILE);
         let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
         let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
@@ -1489,6 +1645,7 @@ mod tests {
         let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
         let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
         std::env::remove_var("HL_MAX_CONCURRENT_POSITIONS");
+        std::env::remove_var("HL_PORTFOLIO_SYMBOLS");
     }
 
     #[test]
@@ -1768,8 +1925,9 @@ mod tests {
         let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
         let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
 
-        // Temporarily configure 2 concurrent positions
+        // Temporarily configure 2 concurrent positions in legacy 3-crypto mode
         std::env::set_var("HL_MAX_CONCURRENT_POSITIONS", "2");
+        std::env::set_var("HL_PORTFOLIO_SYMBOLS", "BTC,ETH,SOL");
 
         // First position: BTC acquires lease
         let (acq_btc, tok_btc) =
@@ -1830,6 +1988,7 @@ mod tests {
         ));
 
         std::env::remove_var("HL_MAX_CONCURRENT_POSITIONS");
+        std::env::remove_var("HL_PORTFOLIO_SYMBOLS");
         let _ = fs::remove_file(CLUSTER_LOCK_FILE);
         let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
         let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
@@ -1899,6 +2058,7 @@ mod tests {
         let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
         let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
         std::env::set_var("HL_MAX_CONCURRENT_POSITIONS", "2");
+        std::env::set_var("HL_PORTFOLIO_SYMBOLS", "SOL,SUI,XRP");
 
         // 1. SOL (AltL1, beta=1.35) acquires Slot 1
         let (acq_sol, tok_sol) =
@@ -1944,6 +2104,7 @@ mod tests {
         );
 
         std::env::remove_var("HL_MAX_CONCURRENT_POSITIONS");
+        std::env::remove_var("HL_PORTFOLIO_SYMBOLS");
         let _ = fs::remove_file(CLUSTER_LOCK_FILE);
         let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
         let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
