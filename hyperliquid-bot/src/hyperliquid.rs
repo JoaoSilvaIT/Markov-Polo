@@ -721,6 +721,7 @@ pub async fn fetch_open_orders_for_coin(
 pub struct ClearinghouseDexEquitySummary {
     pub account_value: f64,
     pub total_raw_usd: f64,
+    pub total_margin_used: f64,
     pub unrealized_pnl: f64,
 }
 
@@ -778,6 +779,11 @@ async fn fetch_clearinghouse_dex_summary(
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.0);
+    let total_margin_used = ms
+        .and_then(|m| m.get("totalMarginUsed"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
     let unrealized_pnl = data
         .get("assetPositions")
         .and_then(|v| v.as_array())
@@ -796,12 +802,14 @@ async fn fetch_clearinghouse_dex_summary(
     Ok(ClearinghouseDexEquitySummary {
         account_value,
         total_raw_usd,
+        total_margin_used,
         unrealized_pnl,
     })
 }
 
 /// Pure mark-to-market equity reconciliation across Spot USDC, Native DEX (`dex=""`), and HIP-3 (`dex="xyz"`),
-/// preventing both double-counting under Unified Margin and phantom drawdowns when collateral sweeps into `dex="xyz"`.
+/// preventing both double-counting under Unified Margin (especially on Short perps where `totalRawUsd`
+/// inflates by `short_notional`) and phantom drawdowns when collateral sweeps into `dex="xyz"`.
 pub fn reconcile_unified_account_equity(
     spot_usdc_total: f64,
     spot_usdc_hold: f64,
@@ -812,24 +820,39 @@ pub fn reconcile_unified_account_equity(
         return (native.account_value + xyz.account_value).max(0.0);
     }
 
-    let base_equity = if native.account_value > spot_usdc_total + 1.0 {
-        native.account_value
-    } else if native.total_raw_usd > 0.0
-        && spot_usdc_hold < native.total_raw_usd * 0.5
-        && native.account_value < spot_usdc_total * 0.85
+    let (native_contrib, rem_hold) = if native.account_value > spot_usdc_total + 1.0
+        && spot_usdc_hold < native.total_margin_used * 0.85
     {
-        spot_usdc_total + native.account_value
+        // Standard non-unified perp account where collateral lives in native clearinghouse
+        return (native.account_value
+            + if xyz.total_margin_used > 0.01 {
+                xyz.account_value
+            } else {
+                xyz.unrealized_pnl
+            })
+        .max(0.0);
+    } else if native.total_margin_used <= 0.01 && native.account_value <= 0.01 {
+        (native.unrealized_pnl, spot_usdc_hold)
+    } else if spot_usdc_hold >= native.total_margin_used * 0.85 - 0.01 {
+        // Unified Margin: native margin is already inside `spot_usdc_total` (`spot_usdc_hold`)
+        (
+            native.unrealized_pnl,
+            (spot_usdc_hold - native.total_margin_used).max(0.0),
+        )
     } else {
-        (spot_usdc_total + native.unrealized_pnl).max(native.account_value)
+        // Native collateral was swept out of Spot USDC
+        (native.account_value, spot_usdc_hold)
     };
 
-    let xyz_contribution = if xyz.total_raw_usd > 0.0 && spot_usdc_hold < xyz.total_raw_usd * 0.5 {
-        xyz.account_value
-    } else {
+    let xyz_contrib = if xyz.total_margin_used <= 0.01 && xyz.account_value <= 0.01 {
         xyz.unrealized_pnl
+    } else if rem_hold >= xyz.total_margin_used * 0.85 - 0.01 {
+        xyz.unrealized_pnl
+    } else {
+        xyz.account_value
     };
 
-    (base_equity + xyz_contribution).max(0.0)
+    (spot_usdc_total + native_contrib + xyz_contrib).max(0.0)
 }
 
 /// Queries user's total mark-to-market account equity in USDC across Spot USDC, Native Perps (`dex=""`),
@@ -853,6 +876,11 @@ pub async fn get_account_value(
             .total_raw_usd
             .parse::<f64>()
             .unwrap_or(0.0);
+        let margin_used = st
+            .margin_summary
+            .total_margin_used
+            .parse::<f64>()
+            .unwrap_or(0.0);
         let upnl: f64 = st
             .asset_positions
             .iter()
@@ -861,6 +889,7 @@ pub async fn get_account_value(
         Ok::<ClearinghouseDexEquitySummary, String>(ClearinghouseDexEquitySummary {
             account_value: acct_val,
             total_raw_usd: raw_usd,
+            total_margin_used: margin_used,
             unrealized_pnl: upnl,
         })
     };
@@ -1131,6 +1160,7 @@ pub mod tests {
             ClearinghouseDexEquitySummary {
                 account_value: 60.79,
                 total_raw_usd: 59.69,
+                total_margin_used: 59.69,
                 unrealized_pnl: 1.10,
             },
         );
@@ -1144,6 +1174,7 @@ pub mod tests {
             ClearinghouseDexEquitySummary {
                 account_value: 60.79,
                 total_raw_usd: 59.69,
+                total_margin_used: 59.69,
                 unrealized_pnl: 1.10,
             },
         );
@@ -1156,11 +1187,31 @@ pub mod tests {
             ClearinghouseDexEquitySummary {
                 account_value: 560.0,
                 total_raw_usd: 560.0,
+                total_margin_used: 0.0,
                 unrealized_pnl: 0.0,
             },
             ClearinghouseDexEquitySummary::default(),
         );
         assert!((eq_native_only - 560.0).abs() < 1e-6);
+
+        // 5. Live Mainnet regression check: Native SHORT on Unified Account (`totalRawUsd` = margin + short notional)
+        // Must NOT double-count native.account_value ($42.03) on top of Spot USDC ($558.72)!
+        let eq_short_unified = reconcile_unified_account_equity(
+            558.716439,
+            41.932173,
+            ClearinghouseDexEquitySummary {
+                account_value: 42.031453,
+                total_raw_usd: 167.827973,
+                total_margin_used: 41.932173,
+                unrealized_pnl: 0.09928,
+            },
+            ClearinghouseDexEquitySummary::default(),
+        );
+        assert!(
+            (eq_short_unified - 558.815719).abs() < 1e-4,
+            "Unified Short equity must equal spot_total + uPnL (~558.82), got {}",
+            eq_short_unified
+        );
     }
 
     #[test]

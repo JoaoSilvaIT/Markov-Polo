@@ -103,12 +103,12 @@ def get_cached_hl_exchange_data(wallet_addr):
     try:
         ch = fetch_hl_info({"type": "clearinghouseState", "user": wallet_addr})
         nat_acct = 0.0
-        nat_raw = 0.0
+        nat_margin = 0.0
         nat_upnl = 0.0
         if isinstance(ch, dict):
             margin = ch.get("marginSummary") or ch.get("crossMarginSummary") or {}
             nat_acct = float(margin.get("accountValue", 0.0) or 0.0)
-            nat_raw = float(margin.get("totalRawUsd", 0.0) or 0.0)
+            nat_margin = float(margin.get("totalMarginUsed", 0.0) or 0.0)
             for ap in ch.get("assetPositions") or []:
                 nat_upnl += float(
                     (ap.get("position") or {}).get("unrealizedPnl", 0.0) or 0.0
@@ -118,7 +118,7 @@ def get_cached_hl_exchange_data(wallet_addr):
                 _HL_CACHE["withdrawable"] = withdrawable
 
         xyz_acct = 0.0
-        xyz_raw = 0.0
+        xyz_margin = 0.0
         xyz_upnl = 0.0
         try:
             xyz_ch = fetch_hl_info(
@@ -131,7 +131,7 @@ def get_cached_hl_exchange_data(wallet_addr):
                     or {}
                 )
                 xyz_acct = float(xm.get("accountValue", 0.0) or 0.0)
-                xyz_raw = float(xm.get("totalRawUsd", 0.0) or 0.0)
+                xyz_margin = float(xm.get("totalMarginUsed", 0.0) or 0.0)
                 for ap in xyz_ch.get("assetPositions") or []:
                     xyz_upnl += float(
                         (ap.get("position") or {}).get("unrealizedPnl", 0.0) or 0.0
@@ -151,21 +151,27 @@ def get_cached_hl_exchange_data(wallet_addr):
         # Mirror reconcile_unified_account_equity() from src/hyperliquid.rs
         if spot_total <= 1.0 and (nat_acct > 1.0 or xyz_acct > 1.0):
             total_eq = max(0.0, nat_acct + xyz_acct)
-        else:
-            if nat_acct > spot_total + 1.0:
-                base_eq = nat_acct
-            elif (
-                nat_raw > 0.0
-                and spot_hold < nat_raw * 0.5
-                and nat_acct < spot_total * 0.85
-            ):
-                base_eq = spot_total + nat_acct
-            else:
-                base_eq = max(spot_total + nat_upnl, nat_acct)
-            xyz_contrib = (
-                xyz_acct if (xyz_raw > 0.0 and spot_hold < xyz_raw * 0.5) else xyz_upnl
+        elif nat_acct > spot_total + 1.0 and spot_hold < nat_margin * 0.85:
+            total_eq = max(
+                0.0, nat_acct + (xyz_acct if xyz_margin > 0.01 else xyz_upnl)
             )
-            total_eq = max(0.0, base_eq + xyz_contrib)
+        else:
+            if nat_margin <= 0.01 and nat_acct <= 0.01:
+                nat_contrib = nat_upnl
+                rem_hold = spot_hold
+            elif spot_hold >= nat_margin * 0.85 - 0.01:
+                nat_contrib = nat_upnl
+                rem_hold = max(0.0, spot_hold - nat_margin)
+            else:
+                nat_contrib = nat_acct
+                rem_hold = spot_hold
+            if xyz_margin <= 0.01 and xyz_acct <= 0.01:
+                xyz_contrib = xyz_upnl
+            elif rem_hold >= xyz_margin * 0.85 - 0.01:
+                xyz_contrib = xyz_upnl
+            else:
+                xyz_contrib = xyz_acct
+            total_eq = max(0.0, spot_total + nat_contrib + xyz_contrib)
 
         if total_eq > 0.0:
             _HL_CACHE["account_equity"] = round(total_eq, 4)
