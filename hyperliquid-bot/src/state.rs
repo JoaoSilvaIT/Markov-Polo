@@ -1064,16 +1064,24 @@ pub enum AssetCluster {
     AltL1,
     DeFiInfra,
     Momentum,
+    HyperliquidEco,
+    PrivacyCrypto,
+    UsEquity,
+    PreciousMetals,
 }
 
-/// Assigns each Hyperliquid perpetual to one of the 4 orthogonal structural clusters
-/// per `Hyperliquid Quant System Scaling Research.txt`.
+/// Assigns each Hyperliquid perpetual across the 15-bot universe to an orthogonal structural cluster.
 pub fn asset_cluster(symbol: &str) -> AssetCluster {
     match symbol.to_uppercase().as_str() {
         "BTC" | "ETH" => AssetCluster::Major,
-        "SOL" | "AVAX" | "SUI" | "NEAR" | "HYPE" => AssetCluster::AltL1,
+        "SOL" | "AVAX" | "SUI" | "NEAR" => AssetCluster::AltL1,
+        "HYPE" => AssetCluster::HyperliquidEco,
+        "ZEC" => AssetCluster::PrivacyCrypto,
         "LINK" | "AAVE" | "UNI" | "ENA" => AssetCluster::DeFiInfra,
         "XRP" | "DOGE" | "WLD" => AssetCluster::Momentum,
+        "XYZ:NVDA" | "NVDA" | "XYZ:TSLA" | "TSLA" | "XYZ:XYZ100" | "XYZ100" | "XYZ:AAPL"
+        | "AAPL" => AssetCluster::UsEquity,
+        "XYZ:GOLD" | "GOLD" | "XYZ:SILVER" | "SILVER" => AssetCluster::PreciousMetals,
         _ => AssetCluster::AltL1,
     }
 }
@@ -1081,12 +1089,18 @@ pub fn asset_cluster(symbol: &str) -> AssetCluster {
 /// Empirical 180-minute downside semibeta (\beta_i^-) conditioned on negative 1m BTC log returns.
 pub fn asset_downside_semibeta(symbol: &str) -> f64 {
     match symbol.to_uppercase().as_str() {
+        "XYZ:GOLD" | "GOLD" => 0.20,
+        "XYZ:SILVER" | "SILVER" => 0.35,
+        "XYZ:XYZ100" | "XYZ100" => 0.45,
+        "XYZ:NVDA" | "NVDA" => 0.65,
+        "XYZ:TSLA" | "TSLA" => 0.75,
         "BTC" => 1.00,
-        "XRP" => 1.00,
-        "HYPE" => 1.15,
+        "XRP" => 1.15,
+        "ZEC" => 1.15,
         "ETH" => 1.20,
-        "LINK" => 1.30,
+        "LINK" => 1.25,
         "SOL" => 1.35,
+        "HYPE" => 1.35,
         "AVAX" => 1.35,
         "SUI" => 1.40,
         "NEAR" => 1.65,
@@ -1181,15 +1195,16 @@ pub fn compute_marchenko_pastur_absorption_ratio(return_streams: &[Vec<f64>]) ->
     (lambda_1 / (m as f64)).clamp(0.0, 1.0)
 }
 
-/// Returns configured universe of symbols participating in portfolio cluster
+/// Returns configured universe of symbols participating in portfolio cluster (preserving lowercase `xyz:` prefix)
 pub fn configured_portfolio_symbols() -> Vec<String> {
     if let Ok(val) =
         std::env::var("HL_PORTFOLIO_SYMBOLS").or_else(|_| std::env::var("PORTFOLIO_SYMBOLS"))
     {
         let syms: Vec<String> = val
             .split(',')
-            .map(|s| s.trim().to_uppercase())
+            .map(|s| s.trim())
             .filter(|s| !s.is_empty())
+            .map(crate::config::normalize_trading_symbol)
             .collect();
         if !syms.is_empty() {
             return syms;
@@ -1896,6 +1911,51 @@ mod tests {
             "Synchronized streams must yield AR_t ~ 1.0 (got {})",
             ar_synced
         );
+
+        std::env::remove_var("HL_MAX_CONCURRENT_POSITIONS");
+        let _ = fs::remove_file(CLUSTER_LOCK_FILE);
+        let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
+        let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
+    }
+
+    #[test]
+    fn test_15_asset_hip3_cluster_orthogonality_and_case_preservation() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let _ = fs::remove_file(CLUSTER_LOCK_FILE);
+        let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
+        let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
+        std::env::set_var("HL_MAX_CONCURRENT_POSITIONS", "2");
+        std::env::set_var("HL_PORTFOLIO_SYMBOLS", "BTC,xyz:nvda,XYZ:GOLD");
+
+        let syms = configured_portfolio_symbols();
+        assert_eq!(syms, vec!["BTC", "xyz:NVDA", "xyz:GOLD"]);
+        std::env::remove_var("HL_PORTFOLIO_SYMBOLS");
+
+        // 1. xyz:NVDA (UsEquity, beta=0.65) acquires Slot 1
+        let (acq_nvda, tok_nvda) =
+            try_acquire_cluster_lease_for_engine_with_uuid("xyz:NVDA", "EngineA", "uuid_nvda", 60);
+        assert!(acq_nvda);
+
+        // 2. xyz:TSLA (UsEquity) MUST be rejected by SameCluster orthogonality
+        let (acq_tsla, _) =
+            try_acquire_cluster_lease_for_engine_with_uuid("xyz:TSLA", "EngineA", "uuid_tsla", 60);
+        assert!(!acq_tsla, "Same UsEquity cluster must be vetoed");
+
+        // 3. xyz:GOLD (PreciousMetals, beta=0.20, sum=0.85 <= 2.65) MUST succeed alongside xyz:NVDA!
+        let (acq_gold, tok_gold) =
+            try_acquire_cluster_lease_for_engine_with_uuid("xyz:GOLD", "EngineA", "uuid_gold", 60);
+        assert!(acq_gold, "Orthogonal xyz:GOLD must coexist with xyz:NVDA");
+
+        assert!(release_cluster_lease_authenticated(
+            "xyz:NVDA",
+            Some("uuid_nvda"),
+            Some(tok_nvda)
+        ));
+        assert!(release_cluster_lease_authenticated(
+            "xyz:GOLD",
+            Some("uuid_gold"),
+            Some(tok_gold)
+        ));
 
         std::env::remove_var("HL_MAX_CONCURRENT_POSITIONS");
         let _ = fs::remove_file(CLUSTER_LOCK_FILE);

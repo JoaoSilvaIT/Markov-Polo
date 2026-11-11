@@ -9,9 +9,10 @@ pub const COUNTERFACTUAL_JOURNAL: &str = "hl_counterfactual_trades.jsonl";
 /// Minimum tick size for strict trade-through verification
 pub fn get_tick_size(symbol: &str) -> f64 {
     match symbol.to_uppercase().as_str() {
-        "BTC" => 1.0,
-        "ETH" => 0.10,
-        "SOL" => 0.01,
+        "BTC" | "XYZ:XYZ100" | "XYZ100" => 1.0,
+        "ETH" | "XYZ:GOLD" | "GOLD" => 0.10,
+        "SOL" | "ZEC" | "XYZ:NVDA" | "NVDA" | "XYZ:TSLA" | "TSLA" => 0.01,
+        "XYZ:SILVER" | "SILVER" => 0.005,
         "AVAX" | "HYPE" | "LINK" => 0.001,
         "NEAR" | "XRP" => 0.0001,
         "SUI" => 0.00001,

@@ -1,5 +1,6 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::f64;
+use std::sync::{OnceLock, RwLock};
 
 use crate::state::Side;
 
@@ -93,11 +94,15 @@ impl AssetOuConfig {
             return eq_cap;
         }
         let atr_bps = (current_atr_15m / close_price) * 1e4;
-        let ref_atr_bps = match self.symbol {
-            "BTC" => 35.0,
+        let ref_atr_bps = match self.symbol.to_uppercase().as_str() {
+            "XYZ:GOLD" => 22.0,
+            "XYZ:XYZ100" => 25.0,
+            "BTC" | "XYZ:SILVER" => 35.0,
+            "XYZ:NVDA" => 40.0,
             "ETH" => 45.0,
+            "XYZ:TSLA" => 50.0,
             "XRP" => 55.0,
-            "SOL" | "LINK" => 65.0,
+            "SOL" | "LINK" | "ZEC" => 65.0,
             "HYPE" => 70.0,
             "AVAX" | "SUI" => 75.0,
             "NEAR" => 85.0,
@@ -276,51 +281,88 @@ pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
             symbol: "xyz:NVDA",
             lookback_5m_bars: 120,
             min_half_life_m: 8.0,
-            max_half_life_m: 60.0,
+            max_half_life_m: 75.0,
             min_sigma_eq_bps: 20.0,
-            base_entry_sigma: 1.55,
+            base_entry_sigma: 1.58,
             min_entry_sigma: 1.40,
-            max_entry_sigma: 1.85,
+            max_entry_sigma: 1.88,
             rebound_gamma: 0.35,
             max_join_consumption_ratio: 0.25,
             max_retest_consumption_ratio: 0.50,
-            min_net_edge_bps: 18.0,
+            min_net_edge_bps: 19.0,
             target_notional_cap_usdc: 65.0,
             soft_z_ou_threshold: 2.50,
             soft_z15_shock_threshold: 2.80,
             hard_disaster_stop_bps: 140.0,
         },
-        "XYZ:GOLD" | "GOLD" => AssetOuConfig {
-            symbol: "xyz:GOLD",
-            lookback_5m_bars: 144,
-            min_half_life_m: 15.0,
-            max_half_life_m: 90.0,
-            min_sigma_eq_bps: 15.0,
+        "XYZ:XYZ100" | "XYZ100" => AssetOuConfig {
+            symbol: "xyz:XYZ100",
+            lookback_5m_bars: 120,
+            min_half_life_m: 8.0,
+            max_half_life_m: 75.0,
+            min_sigma_eq_bps: 16.0,
             base_entry_sigma: 1.52,
             min_entry_sigma: 1.38,
-            max_entry_sigma: 1.80,
+            max_entry_sigma: 1.82,
             rebound_gamma: 0.35,
             max_join_consumption_ratio: 0.25,
             max_retest_consumption_ratio: 0.50,
-            min_net_edge_bps: 15.0,
+            min_net_edge_bps: 16.0,
+            target_notional_cap_usdc: 72.0,
+            soft_z_ou_threshold: 2.45,
+            soft_z15_shock_threshold: 2.75,
+            hard_disaster_stop_bps: 115.0,
+        },
+        "XYZ:GOLD" | "GOLD" => AssetOuConfig {
+            symbol: "xyz:GOLD",
+            lookback_5m_bars: 144,
+            min_half_life_m: 8.0,
+            max_half_life_m: 60.0,
+            min_sigma_eq_bps: 15.0,
+            base_entry_sigma: 1.65,
+            min_entry_sigma: 1.45,
+            max_entry_sigma: 1.95,
+            rebound_gamma: 0.35,
+            max_join_consumption_ratio: 0.25,
+            max_retest_consumption_ratio: 0.50,
+            // Non-growth HIP-3 GOLD pays 5.76 bps MM / 12.12 bps MT RT: require >= 25 bps gross edge
+            min_net_edge_bps: 25.0,
             target_notional_cap_usdc: 75.0,
             soft_z_ou_threshold: 2.40,
             soft_z15_shock_threshold: 2.70,
             hard_disaster_stop_bps: 120.0,
         },
+        "XYZ:SILVER" | "SILVER" => AssetOuConfig {
+            symbol: "xyz:SILVER",
+            lookback_5m_bars: 120,
+            min_half_life_m: 8.0,
+            max_half_life_m: 60.0,
+            min_sigma_eq_bps: 20.0,
+            base_entry_sigma: 1.62,
+            min_entry_sigma: 1.42,
+            max_entry_sigma: 1.92,
+            rebound_gamma: 0.34,
+            max_join_consumption_ratio: 0.24,
+            max_retest_consumption_ratio: 0.48,
+            min_net_edge_bps: 20.0,
+            target_notional_cap_usdc: 64.0,
+            soft_z_ou_threshold: 2.55,
+            soft_z15_shock_threshold: 2.85,
+            hard_disaster_stop_bps: 145.0,
+        },
         "XYZ:TSLA" | "TSLA" => AssetOuConfig {
             symbol: "xyz:TSLA",
             lookback_5m_bars: 120,
             min_half_life_m: 8.0,
-            max_half_life_m: 60.0,
+            max_half_life_m: 75.0,
             min_sigma_eq_bps: 22.0,
-            base_entry_sigma: 1.62,
+            base_entry_sigma: 1.65,
             min_entry_sigma: 1.42,
-            max_entry_sigma: 1.90,
+            max_entry_sigma: 1.95,
             rebound_gamma: 0.32,
             max_join_consumption_ratio: 0.22,
             max_retest_consumption_ratio: 0.48,
-            min_net_edge_bps: 20.0,
+            min_net_edge_bps: 22.0,
             target_notional_cap_usdc: 60.0,
             soft_z_ou_threshold: 2.60,
             soft_z15_shock_threshold: 2.90,
@@ -330,11 +372,11 @@ pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
             symbol: "ZEC",
             lookback_5m_bars: 120,
             min_half_life_m: 8.0,
-            max_half_life_m: 75.0,
+            max_half_life_m: 90.0,
             min_sigma_eq_bps: 26.0,
-            base_entry_sigma: 1.60,
-            min_entry_sigma: 1.42,
-            max_entry_sigma: 1.90,
+            base_entry_sigma: 1.68,
+            min_entry_sigma: 1.45,
+            max_entry_sigma: 1.98,
             rebound_gamma: 0.34,
             max_join_consumption_ratio: 0.22,
             max_retest_consumption_ratio: 0.48,
@@ -2317,10 +2359,15 @@ pub fn calculate_features_with_funding_at(
 
     let total_drift_pct = slope_log * n_drift;
     let max_economic_drift = match symbol.to_uppercase().as_str() {
+        "XYZ:GOLD" | "GOLD" => 0.014,
+        "XYZ:XYZ100" | "XYZ100" => 0.018,
         "BTC" => 0.020,
+        "XYZ:SILVER" | "SILVER" => 0.023,
         "ETH" => 0.025,
+        "XYZ:NVDA" | "NVDA" => 0.030,
         "XRP" | "LINK" => 0.035,
-        "SOL" | "HYPE" => 0.040,
+        "XYZ:TSLA" | "TSLA" => 0.038,
+        "SOL" | "HYPE" | "ZEC" => 0.040,
         "AVAX" | "SUI" => 0.050,
         "NEAR" => 0.055,
         _ => 0.025,
@@ -2350,9 +2397,14 @@ pub fn calculate_features_with_funding_at(
     }
 
     let (hurdle_15, hurdle_60) = match symbol.to_uppercase().as_str() {
+        "XYZ:GOLD" | "GOLD" => (0.0045, 0.0085),
+        "XYZ:XYZ100" | "XYZ100" => (0.0055, 0.0110),
+        "XYZ:SILVER" | "SILVER" => (0.0075, 0.0145),
         "BTC" => (0.0075, 0.0150),
+        "XYZ:NVDA" | "NVDA" => (0.0095, 0.0185),
         "ETH" => (0.0100, 0.0200),
-        "XRP" | "LINK" => (0.0140, 0.0280),
+        "XYZ:TSLA" | "TSLA" => (0.0120, 0.0230),
+        "XRP" | "LINK" | "ZEC" => (0.0140, 0.0280),
         "SOL" | "HYPE" => (0.0150, 0.0300),
         "AVAX" | "SUI" => (0.0200, 0.0400),
         "NEAR" => (0.0220, 0.0440),
@@ -2791,7 +2843,7 @@ pub fn asset_calibration(symbol: &str) -> AssetCalibration {
             symbol: "xyz:GOLD",
             sz_decimals: 4,
             ou_horizon_mins: 15,
-            min_gross_entry_bps: 15.0,
+            min_gross_entry_bps: 25.0,
             sigma_min: 1.52,
             sigma_max: 2.15,
             beta_overshoot: 0.50,
@@ -2814,6 +2866,62 @@ pub fn asset_calibration(symbol: &str) -> AssetCalibration {
             funding_z24h_min: 2.10,
             oi_cascade_pct: 0.8,
             orb_min_range_bps: 30.0,
+        },
+        "XYZ:SILVER" | "SILVER" => AssetCalibration {
+            symbol: "xyz:SILVER",
+            sz_decimals: 2,
+            ou_horizon_mins: 10,
+            min_gross_entry_bps: 18.0,
+            sigma_min: 1.56,
+            sigma_max: 2.25,
+            beta_overshoot: 0.54,
+            w2_min: 0.35,
+            w2_max: 0.65,
+            stall_trigger_mins: 3,
+            cusum_delta_1m: 0.35,
+            cusum_b_1m_star: 3.90,
+            sprt_min_loss_gate_bps: -18.0,
+            touch_rebound_min: 0.34,
+            squeeze_ratio_max: 0.90,
+            sprt_delta: 0.82,
+            sprt_b_upper: 3.10,
+            z_disaster_offset: 1.85,
+            k_dir: 1.65,
+            u_veto: -2.10,
+            tau_obi_eng_a: 0.28,
+            tau_obi_eng_b: 0.24,
+            funding_trigger_bps: 3.0,
+            funding_z24h_min: 2.15,
+            oi_cascade_pct: 0.9,
+            orb_min_range_bps: 38.0,
+        },
+        "XYZ:XYZ100" | "XYZ100" => AssetCalibration {
+            symbol: "xyz:XYZ100",
+            sz_decimals: 4,
+            ou_horizon_mins: 10,
+            min_gross_entry_bps: 16.0,
+            sigma_min: 1.52,
+            sigma_max: 2.15,
+            beta_overshoot: 0.52,
+            w2_min: 0.35,
+            w2_max: 0.65,
+            stall_trigger_mins: 4,
+            cusum_delta_1m: 0.36,
+            cusum_b_1m_star: 4.05,
+            sprt_min_loss_gate_bps: -16.0,
+            touch_rebound_min: 0.32,
+            squeeze_ratio_max: 0.92,
+            sprt_delta: 0.84,
+            sprt_b_upper: 3.15,
+            z_disaster_offset: 1.75,
+            k_dir: 1.60,
+            u_veto: -2.20,
+            tau_obi_eng_a: 0.26,
+            tau_obi_eng_b: 0.22,
+            funding_trigger_bps: 2.5,
+            funding_z24h_min: 2.15,
+            oi_cascade_pct: 0.8,
+            orb_min_range_bps: 32.0,
         },
         "XYZ:TSLA" | "TSLA" => AssetCalibration {
             symbol: "xyz:TSLA",
@@ -3941,9 +4049,15 @@ impl HIP3PerpConfig {
             ClearinghouseDex::NativeMain => 1.0,
             ClearinghouseDex::Hip3Xyz => {
                 if self.growth_mode_enabled {
-                    0.15 * (1.0 + self.deployer_fee_scale)
-                } else {
+                    if self.deployer_fee_scale <= 1.0 {
+                        0.10 * (1.0 + self.deployer_fee_scale)
+                    } else {
+                        0.20 * self.deployer_fee_scale
+                    }
+                } else if self.deployer_fee_scale <= 1.0 {
                     1.0 + self.deployer_fee_scale
+                } else {
+                    2.0 * self.deployer_fee_scale
                 }
             }
         };
@@ -4107,7 +4221,7 @@ pub fn hip3_asset_config(symbol: &str) -> Option<HIP3PerpConfig> {
             sz_decimals: 2,
             isolated_only: true,
             target_leverage: 3,
-            growth_mode_enabled: false,
+            growth_mode_enabled: true, // Verified enabled on Mainnet (lastFeeScaleChangeTime: 2025-12-27)
             deployer_fee_scale: 1.0,
             schedule: TradingSessionSchedule::CmeGlobex24x5 {
                 daily_maint_start_min_utc: 1315,
@@ -4273,6 +4387,186 @@ impl DualClearinghouseSlotArbiter {
 
         best_candidate
     }
+}
+
+// =========================================================================
+// SECTION: DYNAMIC HIP-3 FEE SCHEDULE & DST-AWARE SESSION LIFECYCLE GATE
+// =========================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AssetFeeSchedule {
+    pub maker_bps: f64,
+    pub taker_bps: f64,
+    pub stop_slippage_bps: f64,
+}
+
+static LIVE_FEE_SCHEDULE_REGISTRY: OnceLock<RwLock<HashMap<String, AssetFeeSchedule>>> =
+    OnceLock::new();
+
+fn live_fee_registry() -> &'static RwLock<HashMap<String, AssetFeeSchedule>> {
+    LIVE_FEE_SCHEDULE_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Registers a live fee schedule discovered from Hyperliquid `metaAndAssetCtxs`.
+pub fn update_live_fee_schedule(symbol: &str, schedule: AssetFeeSchedule) {
+    if let Ok(mut w) = live_fee_registry().write() {
+        w.insert(symbol.to_uppercase(), schedule);
+    }
+}
+
+impl AssetFeeSchedule {
+    /// Computes exact Hyperliquid HIP-3 VIP0 (with 4% referral discount) fees from live metadata.
+    pub fn from_hip3_meta(growth_mode_enabled: bool, deployer_fee_scale: f64) -> Self {
+        let base_maker_bps = 1.44; // 1.5 bps * 0.96 referral discount
+        let base_taker_bps = 4.32; // 4.5 bps * 0.96 referral discount
+        let scale = if deployer_fee_scale.is_finite() && deployer_fee_scale >= 0.0 {
+            deployer_fee_scale
+        } else {
+            1.0
+        };
+        let mult = if growth_mode_enabled {
+            if scale <= 1.0 {
+                0.10 * (1.0 + scale)
+            } else {
+                0.20 * scale
+            }
+        } else if scale <= 1.0 {
+            1.0 + scale
+        } else {
+            2.0 * scale
+        };
+        Self {
+            maker_bps: base_maker_bps * mult,
+            taker_bps: base_taker_bps * mult,
+            stop_slippage_bps: if growth_mode_enabled { 0.50 } else { 0.60 },
+        }
+    }
+
+    /// Returns the live-discovered fee schedule if registered at startup, or the verified
+    /// Mainnet fallback for `symbol`.
+    pub fn for_symbol(symbol: &str) -> Self {
+        let upper = symbol.to_uppercase();
+        if let Ok(r) = live_fee_registry().read() {
+            if let Some(live) = r.get(&upper) {
+                return *live;
+            }
+        }
+        Self::static_fallback_for_symbol(&upper)
+    }
+
+    pub fn static_fallback_for_symbol(symbol_upper: &str) -> Self {
+        match symbol_upper {
+            // Non-growth HIP-3 GOLD: scaleIfHip3 = 2.0, growthModeScale = 1.0
+            "XYZ:GOLD" | "GOLD" => Self {
+                maker_bps: 2.88,
+                taker_bps: 8.64,
+                stop_slippage_bps: 0.60,
+            },
+            // Growth-Mode HIP-3 Equities, Index & SILVER: scaleIfHip3 = 2.0, growthModeScale = 0.1
+            "XYZ:NVDA" | "NVDA" | "XYZ:TSLA" | "TSLA" | "XYZ:XYZ100" | "XYZ100" | "XYZ:SILVER"
+            | "SILVER" | "XYZ:AAPL" | "AAPL" => Self {
+                maker_bps: 0.288,
+                taker_bps: 0.864,
+                stop_slippage_bps: 0.50,
+            },
+            // Native Validator Perps (VIP0 + 4% Referral Discount)
+            _ => Self {
+                maker_bps: 1.44,
+                taker_bps: 4.32,
+                stop_slippage_bps: 0.50,
+            },
+        }
+    }
+
+    #[inline]
+    pub fn maker_maker_rt_bps(&self) -> f64 {
+        2.0 * self.maker_bps
+    }
+
+    #[inline]
+    pub fn maker_taker_rt_bps(&self) -> f64 {
+        self.maker_bps + self.taker_bps + self.stop_slippage_bps
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionLifecycleAction {
+    AllowNormalTrading,
+    BlockNewEntriesAndRatchetTp(&'static str),
+    ForceFlat(&'static str),
+}
+
+/// Evaluates DST-aware RWA session lifecycle rules for Engine A / active position management:
+/// - US Equities (`xyz:NVDA`, `xyz:TSLA`, `xyz:XYZ100`): 09:35-15:40 ET normal entries,
+///   15:40-15:57 ET entry freeze + TP breakeven ratchet, >=15:57 ET or outside RTH/weekend ForceFlat.
+/// - CME Metals (`xyz:GOLD`, `xyz:SILVER`): 17:00-18:00 ET daily maintenance & weekend lockout.
+/// - Native Crypto: 24/7 AllowNormalTrading.
+pub fn evaluate_session_lifecycle_gate(
+    symbol: &str,
+    utc_timestamp_ms: i64,
+) -> SessionLifecycleAction {
+    use chrono::{Datelike, TimeZone, Utc};
+    let s_upper = symbol.to_uppercase();
+    let is_us_equity = matches!(
+        s_upper.as_str(),
+        "XYZ:NVDA" | "NVDA" | "XYZ:TSLA" | "TSLA" | "XYZ:XYZ100" | "XYZ100" | "XYZ:AAPL" | "AAPL"
+    );
+    let is_cme_metal = matches!(
+        s_upper.as_str(),
+        "XYZ:GOLD" | "GOLD" | "XYZ:SILVER" | "SILVER"
+    );
+
+    if !is_us_equity && !is_cme_metal {
+        return SessionLifecycleAction::AllowNormalTrading;
+    }
+
+    let dt = match Utc.timestamp_millis_opt(utc_timestamp_ms).single() {
+        Some(d) => d,
+        None => return SessionLifecycleAction::AllowNormalTrading,
+    };
+    let is_us_dst = is_us_daylight_saving_date(dt.year(), dt.month(), dt.day());
+    let total_day_mins = ((utc_timestamp_ms.max(0) as u64 / 60_000) % 1440) as u32;
+    let day_of_week = dt.weekday().num_days_from_sunday(); // 0=Sun, 6=Sat
+
+    if is_us_equity {
+        if day_of_week == 0 || day_of_week == 6 {
+            return SessionLifecycleAction::ForceFlat("US_EQUITY_WEEKEND");
+        }
+        // US RTH: 09:30 - 16:00 ET -> EDT: 810..1200 UTC mins, EST: 870..1260 UTC mins
+        let (rth_open, rth_close) = if is_us_dst { (810, 1200) } else { (870, 1260) };
+        if total_day_mins < rth_open || total_day_mins >= rth_close - 3 {
+            return SessionLifecycleAction::ForceFlat("US_EQUITY_RTH_CLOSE");
+        }
+        if total_day_mins < rth_open + 5 {
+            return SessionLifecycleAction::BlockNewEntriesAndRatchetTp(
+                "US_EQUITY_OPEN_AUCTION_5M",
+            );
+        }
+        if total_day_mins >= rth_close - 20 {
+            return SessionLifecycleAction::BlockNewEntriesAndRatchetTp("US_EQUITY_PRE_CLOSE_20M");
+        }
+    } else if is_cme_metal {
+        // CME Globex daily maintenance: 17:00 - 18:00 ET -> EDT: 1260..1320, EST: 1320..1380
+        let (maint_start, maint_end) = if is_us_dst {
+            (1260, 1320)
+        } else {
+            (1320, 1380)
+        };
+        if day_of_week == 6
+            || (day_of_week == 5 && total_day_mins >= maint_start - 5)
+            || (day_of_week == 0 && total_day_mins < maint_end + 5)
+        {
+            return SessionLifecycleAction::ForceFlat("CME_WEEKEND_CLOSED");
+        }
+        if total_day_mins >= maint_start - 5 && total_day_mins < maint_end + 5 {
+            return SessionLifecycleAction::ForceFlat("CME_DAILY_MAINTENANCE");
+        }
+        if total_day_mins >= maint_start - 20 && total_day_mins < maint_start - 5 {
+            return SessionLifecycleAction::BlockNewEntriesAndRatchetTp("CME_PRE_MAINT_20M");
+        }
+    }
+
+    SessionLifecycleAction::AllowNormalTrading
 }
 
 #[cfg(test)]
@@ -5140,6 +5434,92 @@ mod tests {
         assert_eq!(
             chosen_slot2_full.unwrap().cfg.dex,
             ClearinghouseDex::NativeMain
+        );
+    }
+
+    #[test]
+    fn test_asset_fee_schedule_and_dst_session_lifecycle_gate() {
+        // 1. Verified Hyperliquid Mainnet Fee Schedule
+        let gold_fee = AssetFeeSchedule::static_fallback_for_symbol("XYZ:GOLD");
+        assert!((gold_fee.maker_maker_rt_bps() - 5.76).abs() < 1e-6);
+        assert!((gold_fee.maker_taker_rt_bps() - 12.12).abs() < 1e-6);
+
+        let silver_fee = AssetFeeSchedule::from_hip3_meta(true, 1.0);
+        assert!((silver_fee.maker_maker_rt_bps() - 0.576).abs() < 1e-6);
+        assert!((silver_fee.maker_taker_rt_bps() - 1.652).abs() < 1e-6);
+
+        let btc_fee = AssetFeeSchedule::static_fallback_for_symbol("BTC");
+        assert!((btc_fee.maker_maker_rt_bps() - 2.88).abs() < 1e-6);
+        assert!((btc_fee.maker_taker_rt_bps() - 6.26).abs() < 1e-6);
+
+        // 2. DST-Aware US Equity Session Lifecycle Gate:
+        use chrono::{TimeZone, Utc};
+        // EST (Nov 11, 2026): RTH 14:30 - 21:00 UTC
+        let ts_est_open_auction = Utc
+            .with_ymd_and_hms(2026, 11, 11, 14, 32, 0)
+            .unwrap()
+            .timestamp_millis();
+        let ts_est_active = Utc
+            .with_ymd_and_hms(2026, 11, 11, 15, 30, 0)
+            .unwrap()
+            .timestamp_millis();
+        let ts_est_preclose = Utc
+            .with_ymd_and_hms(2026, 11, 11, 20, 45, 0)
+            .unwrap()
+            .timestamp_millis();
+        let ts_est_flat = Utc
+            .with_ymd_and_hms(2026, 11, 11, 20, 58, 0)
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            evaluate_session_lifecycle_gate("xyz:NVDA", ts_est_open_auction),
+            SessionLifecycleAction::BlockNewEntriesAndRatchetTp("US_EQUITY_OPEN_AUCTION_5M")
+        );
+        assert_eq!(
+            evaluate_session_lifecycle_gate("xyz:NVDA", ts_est_active),
+            SessionLifecycleAction::AllowNormalTrading
+        );
+        assert_eq!(
+            evaluate_session_lifecycle_gate("xyz:NVDA", ts_est_preclose),
+            SessionLifecycleAction::BlockNewEntriesAndRatchetTp("US_EQUITY_PRE_CLOSE_20M")
+        );
+        assert_eq!(
+            evaluate_session_lifecycle_gate("xyz:NVDA", ts_est_flat),
+            SessionLifecycleAction::ForceFlat("US_EQUITY_RTH_CLOSE")
+        );
+
+        // EDT (July 15, 2026): RTH 13:30 - 20:00 UTC
+        let ts_edt_active = Utc
+            .with_ymd_and_hms(2026, 7, 15, 13, 45, 0)
+            .unwrap()
+            .timestamp_millis();
+        let ts_edt_flat = Utc
+            .with_ymd_and_hms(2026, 7, 15, 19, 58, 0)
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            evaluate_session_lifecycle_gate("xyz:TSLA", ts_edt_active),
+            SessionLifecycleAction::AllowNormalTrading
+        );
+        assert_eq!(
+            evaluate_session_lifecycle_gate("xyz:TSLA", ts_edt_flat),
+            SessionLifecycleAction::ForceFlat("US_EQUITY_RTH_CLOSE")
+        );
+
+        // CME Metal maintenance: 17:00-18:00 ET (EST = 22:00-23:00 UTC)
+        let ts_cme_maint = Utc
+            .with_ymd_and_hms(2026, 11, 11, 22, 10, 0)
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            evaluate_session_lifecycle_gate("xyz:GOLD", ts_cme_maint),
+            SessionLifecycleAction::ForceFlat("CME_DAILY_MAINTENANCE")
+        );
+
+        // Native Crypto always AllowNormalTrading
+        assert_eq!(
+            evaluate_session_lifecycle_gate("BTC", ts_est_flat),
+            SessionLifecycleAction::AllowNormalTrading
         );
     }
 }

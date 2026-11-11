@@ -54,49 +54,123 @@ pub async fn fetch_sz_decimals_map(info: &InfoClient) -> HashMap<String, u32> {
     map
 }
 
-/// Dynamically fetches and registers HIP-3 builder perpetuals (e.g. dex="xyz") into `coin_to_asset` and `sz_decimals_map`
+/// Computes the canonical HyperCore integer asset ID for a HIP-3 builder-deployed perpetual:
+/// `asset_id = 100_000 + (perp_dex_index * 10_000) + index_in_meta`
+/// (e.g. on Hyperliquid Mainnet where `perpDexs[0] == null` and `perpDexs[1] == "xyz"`,
+/// `xyz:XYZ100` (idx 0) = 110000, `xyz:TSLA` (idx 1) = 110001, `xyz:NVDA` (idx 2) = 110002).
+#[inline]
+pub fn compute_hip3_asset_id(perp_dex_index: u32, index_in_meta: u32) -> u32 {
+    assert!(
+        perp_dex_index >= 1,
+        "HIP-3 builder DEX index must be >= 1 (index 0 is reserved for native validator perps)"
+    );
+    100_000 + (perp_dex_index * 10_000) + index_in_meta
+}
+
+/// Dynamically fetches and registers HIP-3 builder perpetuals (e.g. dex="xyz") into `coin_to_asset`,
+/// `sz_decimals_map`, and the live `AssetFeeSchedule` registry.
 pub async fn register_hip3_dex_assets(
     coin_to_asset: &mut HashMap<String, u32>,
     sz_map: &mut HashMap<String, u32>,
     dex_name: &str,
-    dex_index: u32,
+    fallback_dex_index: u32,
 ) {
-    // 1. Static fallbacks for top HIP-3 assets (dex="xyz", index 0)
-    coin_to_asset.insert("xyz:XYZ100".to_string(), 100000);
-    coin_to_asset.insert("xyz:TSLA".to_string(), 100001);
-    coin_to_asset.insert("xyz:NVDA".to_string(), 100002);
-    coin_to_asset.insert("xyz:GOLD".to_string(), 100003);
-    coin_to_asset.insert("xyz:SILVER".to_string(), 100026);
+    let eff_fallback_idx = fallback_dex_index.max(1);
 
-    sz_map.insert("xyz:XYZ100".to_string(), 4);
-    sz_map.insert("xyz:TSLA".to_string(), 3);
-    sz_map.insert("xyz:NVDA".to_string(), 3);
-    sz_map.insert("xyz:GOLD".to_string(), 4);
-    sz_map.insert("xyz:SILVER".to_string(), 2);
+    // 1. Static verified Mainnet fallbacks for top HIP-3 assets (dex="xyz", perp_dex_index = 1 -> 110000+)
+    if dex_name.eq_ignore_ascii_case("xyz") {
+        coin_to_asset.insert("xyz:XYZ100".to_string(), compute_hip3_asset_id(eff_fallback_idx, 0));
+        coin_to_asset.insert("xyz:TSLA".to_string(), compute_hip3_asset_id(eff_fallback_idx, 1));
+        coin_to_asset.insert("xyz:NVDA".to_string(), compute_hip3_asset_id(eff_fallback_idx, 2));
+        coin_to_asset.insert("xyz:GOLD".to_string(), compute_hip3_asset_id(eff_fallback_idx, 3));
+        coin_to_asset.insert("xyz:SILVER".to_string(), compute_hip3_asset_id(eff_fallback_idx, 26));
 
-    // 2. Dynamic live query from Hyperliquid info API
-    let client = reqwest::Client::new();
+        sz_map.insert("xyz:XYZ100".to_string(), 4);
+        sz_map.insert("xyz:TSLA".to_string(), 3);
+        sz_map.insert("xyz:NVDA".to_string(), 3);
+        sz_map.insert("xyz:GOLD".to_string(), 4);
+        sz_map.insert("xyz:SILVER".to_string(), 2);
+    }
+
+    // 2. Dynamically resolve `perp_dex_index` from Hyperliquid `perpDexs` endpoint
+    let client = reqwest::Client::builder()
+        .timeout(HL_REST_TIMEOUT)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let mut resolved_dex_index = eff_fallback_idx;
+    let dex_payload = serde_json::json!({ "type": "perpDexs" });
+    if let Ok(Ok(resp)) = tokio::time::timeout(
+        Duration::from_secs(6),
+        client
+            .post("https://api.hyperliquid.xyz/info")
+            .json(&dex_payload)
+            .send(),
+    )
+    .await
+    {
+        if let Ok(dex_list) = resp.json::<Vec<serde_json::Value>>().await {
+            for (i, entry) in dex_list.iter().enumerate() {
+                if let Some(name) = entry.get("name").and_then(|v| v.as_str()) {
+                    if name.eq_ignore_ascii_case(dex_name) && i >= 1 {
+                        resolved_dex_index = i as u32;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Dynamically query `metaAndAssetCtxs` for `dex_name` to map exact asset IDs, szDecimals, and fee scales
     let payload = serde_json::json!({
         "type": "metaAndAssetCtxs",
         "dex": dex_name
     });
 
-    if let Ok(resp) = client
-        .post("https://api.hyperliquid.xyz/info")
-        .json(&payload)
-        .send()
-        .await
+    if let Ok(Ok(resp)) = tokio::time::timeout(
+        Duration::from_secs(8),
+        client
+            .post("https://api.hyperliquid.xyz/info")
+            .json(&payload)
+            .send(),
+    )
+    .await
     {
         if let Ok(data) = resp.json::<serde_json::Value>().await {
-            if let Some(universe) = data.get(0).and_then(|v| v.get("universe")).and_then(|u| u.as_array()) {
-                let base_offset = 100_000 + (dex_index * 10_000);
+            if let Some(universe) = data
+                .get(0)
+                .and_then(|v| v.get("universe"))
+                .and_then(|u| u.as_array())
+            {
                 for (idx, u) in universe.iter().enumerate() {
                     if let Some(name) = u.get("name").and_then(|n| n.as_str()) {
-                        let asset_id = base_offset + (idx as u32);
+                        let asset_id = compute_hip3_asset_id(resolved_dex_index, idx as u32);
                         coin_to_asset.insert(name.to_string(), asset_id);
                         if let Some(sz_dec) = u.get("szDecimals").and_then(|s| s.as_u64()) {
                             sz_map.insert(name.to_string(), sz_dec as u32);
                         }
+                        let growth_mode = u
+                            .get("growthMode")
+                            .map(|g| {
+                                g.as_str()
+                                    .map(|s| s.eq_ignore_ascii_case("enabled"))
+                                    .or_else(|| g.as_bool())
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                        let deployer_fee_scale = u
+                            .get("deployerFeeScale")
+                            .and_then(|f| {
+                                f.as_str()
+                                    .and_then(|s| s.parse::<f64>().ok())
+                                    .or_else(|| f.as_f64())
+                            })
+                            .unwrap_or(1.0);
+                        let fee_sched = crate::ou_process::AssetFeeSchedule::from_hip3_meta(
+                            growth_mode,
+                            deployer_fee_scale,
+                        );
+                        crate::ou_process::update_live_fee_schedule(name, fee_sched);
                     }
                 }
             }
@@ -292,55 +366,52 @@ pub fn optimal_engine_b_tp_atr_multiple(symbol: &str) -> f64 {
     }
 }
 
-/// One-time ratchet of Exchange-Native Disaster Stop-Market to breakeven (+fee buffer).
-/// Called when intrabar MFE reaches ≥75% of distance to TP (per research: lines 148, 206, 515).
+/// Atomic Replace-Then-Cancel ratchet of Exchange-Native Disaster Stop-Market to breakeven (+fee buffer).
+/// Places the new fixed-size (`position_sz > 0`) Reduce-Only Stop-Market order FIRST, confirms it is
+/// resting on HyperCore, and ONLY THEN cancels `old_sl_oid` so the position is never unguarded.
 pub async fn ratchet_disaster_stop_to_breakeven(
     exchange: &ExchangeClient,
     coin: &str,
     is_buy_to_close: bool,
+    position_sz: f64,
     trigger_px: f64,
     sz_decimals: u32,
+    old_sl_oid: Option<u64>,
     cloid: Option<uuid::Uuid>,
 ) -> Result<u64, String> {
-    let clean_trigger = quantize_price(trigger_px, sz_decimals);
-    let order_req = ClientOrderRequest {
-        asset: coin.to_string(),
-        is_buy: is_buy_to_close,
-        reduce_only: true,
-        limit_px: clean_trigger, // worst-price = trigger for market stop
-        sz: 0.0, // size 0 = modify existing trigger order
+    let clean_sz = round_to_decimals(position_sz, sz_decimals);
+    if !clean_sz.is_finite() || clean_sz <= 0.0 {
+        return Err(format!(
+            "Cannot ratchet disaster stop for {} with non-positive size {}",
+            coin, position_sz
+        ));
+    }
+
+    // Step 1: Place new sized Reduce-Only trigger SL order (with 5% protective limit collar)
+    let new_sl_oid = place_disaster_stop_trigger_order(
+        exchange,
+        coin,
+        is_buy_to_close,
+        trigger_px,
+        clean_sz,
+        sz_decimals,
         cloid,
-        order_type: ClientOrder::Trigger(ClientTrigger {
-            is_market: true,
-            trigger_px: clean_trigger,
-            tpsl: "sl".to_string(),
-        }),
-    };
+    )
+    .await?;
 
-    let res = tokio::time::timeout(HL_REST_TIMEOUT, exchange.order(order_req, None))
-        .await
-        .map_err(|_| format!("Disaster stop ratchet timed out after 10s for {}", coin))?
-        .map_err(|e| format!("Disaster stop ratchet failed: {}", e))?;
-
-    match res {
-        ExchangeResponseStatus::Ok(resp) => {
-            if let Some(data) = resp.data {
-                if let Some(first) = data.statuses.first() {
-                    match first {
-                        ExchangeDataStatus::Resting(resting) => Ok(resting.oid),
-                        ExchangeDataStatus::Filled(filled) => Ok(filled.oid),
-                        ExchangeDataStatus::Error(msg) => Err(format!("Exchange rejected disaster stop ratchet: {}", msg)),
-                        other => Err(format!("Unexpected ratchet status: {:?}", other)),
-                    }
-                } else {
-                    Err("Empty ratchet response statuses".to_string())
-                }
-            } else {
-                Err("Missing ratchet response data".to_string())
+    // Step 2: Only after confirming `new_sl_oid` is accepted, cancel `old_sl_oid`
+    if let Some(old_oid) = old_sl_oid {
+        if old_oid != new_sl_oid {
+            if let Err(e) = cancel_order(exchange, coin, old_oid).await {
+                eprintln!(
+                    "⚠️ [DISASTER STOP RATCHET] Non-fatal: failed to cancel old SL oid {} for {} after placing new oid {}: {}",
+                    old_oid, coin, new_sl_oid, e
+                );
             }
         }
-        ExchangeResponseStatus::Err(e) => Err(format!("Exchange ratchet error: {}", e)),
     }
+
+    Ok(new_sl_oid)
 }
 
 /// Cancels an active order by oid
@@ -523,39 +594,174 @@ pub async fn fetch_open_orders_for_coin(
     }
 }
 
-/// Queries user's total account equity value in USDC across clearinghouse perps and spot balances
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClearinghouseDexEquitySummary {
+    pub account_value: f64,
+    pub total_raw_usd: f64,
+    pub unrealized_pnl: f64,
+}
+
+/// Fetches clearinghouse account summary for a specific DEX (`""` or `"xyz"`).
+async fn fetch_clearinghouse_dex_summary(
+    address: H160,
+    dex_name: &str,
+) -> Result<ClearinghouseDexEquitySummary, String> {
+    let client = reqwest::Client::builder()
+        .timeout(HL_REST_TIMEOUT)
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+    let payload = if dex_name.is_empty() {
+        serde_json::json!({
+            "type": "clearinghouseState",
+            "user": format!("{:?}", address)
+        })
+    } else {
+        serde_json::json!({
+            "type": "clearinghouseState",
+            "user": format!("{:?}", address),
+            "dex": dex_name
+        })
+    };
+
+    let resp = tokio::time::timeout(
+        HL_REST_TIMEOUT,
+        client.post("https://api.hyperliquid.xyz/info").json(&payload).send(),
+    )
+    .await
+    .map_err(|_| format!("Timed out querying clearinghouseState(dex='{}')", dex_name))?
+    .map_err(|e| format!("Failed querying clearinghouseState(dex='{}'): {}", dex_name, e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!(
+            "HTTP {} querying clearinghouseState(dex='{}')",
+            resp.status(),
+            dex_name
+        ));
+    }
+
+    let data = resp
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("Invalid clearinghouseState JSON (dex='{}'): {}", dex_name, e))?;
+
+    let ms = data.get("marginSummary");
+    let account_value = ms
+        .and_then(|m| m.get("accountValue"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let total_raw_usd = ms
+        .and_then(|m| m.get("totalRawUsd"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let unrealized_pnl = data
+        .get("assetPositions")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|ap| {
+                    ap.get("position")
+                        .and_then(|p| p.get("unrealizedPnl"))
+                        .and_then(|u| u.as_str())
+                        .and_then(|s| s.parse::<f64>().ok())
+                })
+                .sum()
+        })
+        .unwrap_or(0.0);
+
+    Ok(ClearinghouseDexEquitySummary {
+        account_value,
+        total_raw_usd,
+        unrealized_pnl,
+    })
+}
+
+/// Pure mark-to-market equity reconciliation across Spot USDC, Native DEX (`dex=""`), and HIP-3 (`dex="xyz"`),
+/// preventing both double-counting under Unified Margin and phantom drawdowns when collateral sweeps into `dex="xyz"`.
+pub fn reconcile_unified_account_equity(
+    spot_usdc_total: f64,
+    spot_usdc_hold: f64,
+    native: ClearinghouseDexEquitySummary,
+    xyz: ClearinghouseDexEquitySummary,
+) -> f64 {
+    if spot_usdc_total <= 1.0 && (native.account_value > 1.0 || xyz.account_value > 1.0) {
+        return (native.account_value + xyz.account_value).max(0.0);
+    }
+
+    let base_equity = if native.account_value > spot_usdc_total + 1.0 {
+        native.account_value
+    } else if native.total_raw_usd > 0.0
+        && spot_usdc_hold < native.total_raw_usd * 0.5
+        && native.account_value < spot_usdc_total * 0.85
+    {
+        spot_usdc_total + native.account_value
+    } else {
+        (spot_usdc_total + native.unrealized_pnl).max(native.account_value)
+    };
+
+    let xyz_contribution = if xyz.total_raw_usd > 0.0 && spot_usdc_hold < xyz.total_raw_usd * 0.5 {
+        xyz.account_value
+    } else {
+        xyz.unrealized_pnl
+    };
+
+    (base_equity + xyz_contribution).max(0.0)
+}
+
+/// Queries user's total mark-to-market account equity in USDC across Spot USDC, Native Perps (`dex=""`),
+/// and HIP-3 (`dex="xyz"`). Fails closed if any balance/clearinghouse RPC query errors.
 pub async fn get_account_value(
     info: &InfoClient,
     address: H160,
 ) -> Result<f64, String> {
-    // 1. Clearinghouse perp account value is mandatory (fail-closed if perp state RPC fails)
-    let state = tokio::time::timeout(HL_REST_TIMEOUT, info.user_state(address))
-        .await
-        .map_err(|_| "Timed out querying user_state for account_value".to_string())?
-        .map_err(|e| format!("Failed to query user_state: {}", e))?;
-    let perp_val = state
-        .margin_summary
-        .account_value
-        .parse::<f64>()
-        .map_err(|e| format!("Invalid margin_summary.account_value: {}", e))?;
+    let native_fut = async {
+        let st = tokio::time::timeout(HL_REST_TIMEOUT, info.user_state(address))
+            .await
+            .map_err(|_| "Timed out querying user_state for account_value".to_string())?
+            .map_err(|e| format!("Failed to query user_state: {}", e))?;
+        let acct_val = st
+            .margin_summary
+            .account_value
+            .parse::<f64>()
+            .map_err(|e| format!("Invalid margin_summary.account_value: {}", e))?;
+        let raw_usd = st
+            .margin_summary
+            .total_raw_usd
+            .parse::<f64>()
+            .unwrap_or(0.0);
+        let upnl: f64 = st
+            .asset_positions
+            .iter()
+            .filter_map(|ap| ap.position.unrealized_pnl.parse::<f64>().ok())
+            .sum();
+        Ok::<ClearinghouseDexEquitySummary, String>(ClearinghouseDexEquitySummary {
+            account_value: acct_val,
+            total_raw_usd: raw_usd,
+            unrealized_pnl: upnl,
+        })
+    };
 
-    // 2. Query unencumbered spot token balances (total - hold) for Unified Account setups
-    let mut free_spot_usdc = 0.0;
-    if let Ok(Ok(token_balances)) =
-        tokio::time::timeout(HL_REST_TIMEOUT, info.user_token_balances(address)).await
-    {
-        for b in token_balances.balances {
+    let spot_fut = async {
+        let tb = tokio::time::timeout(HL_REST_TIMEOUT, info.user_token_balances(address))
+            .await
+            .map_err(|_| "Timed out querying user_token_balances".to_string())?
+            .map_err(|e| format!("Failed to query user_token_balances: {}", e))?;
+        let mut total = 0.0;
+        let mut hold = 0.0;
+        for b in tb.balances {
             if b.coin == "USDC" {
-                let total = b.total.parse::<f64>().unwrap_or(0.0);
-                // In Hyperliquid unified accounts, cross-margin perp position requirements
-                // are reflected in b.hold. We use b.total so active trade margin does not falsely
-                // deflate total account equity and trip drawdown circuit breakers.
-                free_spot_usdc += total.max(0.0);
+                total += b.total.parse::<f64>().unwrap_or(0.0).max(0.0);
+                hold += b.hold.parse::<f64>().unwrap_or(0.0).max(0.0);
             }
         }
-    }
+        Ok::<(f64, f64), String>((total, hold))
+    };
 
-    Ok((perp_val + free_spot_usdc).max(0.0))
+    let xyz_fut = fetch_clearinghouse_dex_summary(address, "xyz");
+
+    let (native_sum, (spot_total, spot_hold), xyz_sum) = tokio::try_join!(native_fut, spot_fut, xyz_fut)?;
+    Ok(reconcile_unified_account_equity(spot_total, spot_hold, native_sum, xyz_sum))
 }
 
 /// Calculates dynamic order notional based on account equity, equity fraction, and safety boundaries.
@@ -771,16 +977,67 @@ pub mod tests {
     async fn test_register_hip3_dex_assets_mapping() {
         let mut coin_to_asset = HashMap::new();
         let mut sz_map = HashMap::new();
-        register_hip3_dex_assets(&mut coin_to_asset, &mut sz_map, "xyz", 0).await;
+        register_hip3_dex_assets(&mut coin_to_asset, &mut sz_map, "xyz", 1).await;
 
-        assert_eq!(*coin_to_asset.get("xyz:NVDA").expect("NVDA asset id"), 100002);
-        assert_eq!(*coin_to_asset.get("xyz:GOLD").expect("GOLD asset id"), 100003);
-        assert_eq!(*coin_to_asset.get("xyz:XYZ100").expect("XYZ100 asset id"), 100000);
-        assert_eq!(*coin_to_asset.get("xyz:TSLA").expect("TSLA asset id"), 100001);
-        assert_eq!(*coin_to_asset.get("xyz:SILVER").expect("SILVER asset id"), 100026);
+        assert_eq!(*coin_to_asset.get("xyz:XYZ100").expect("XYZ100 asset id"), 110000);
+        assert_eq!(*coin_to_asset.get("xyz:TSLA").expect("TSLA asset id"), 110001);
+        assert_eq!(*coin_to_asset.get("xyz:NVDA").expect("NVDA asset id"), 110002);
+        assert_eq!(*coin_to_asset.get("xyz:GOLD").expect("GOLD asset id"), 110003);
+        assert_eq!(*coin_to_asset.get("xyz:SILVER").expect("SILVER asset id"), 110026);
 
         assert_eq!(*sz_map.get("xyz:NVDA").expect("NVDA decimals"), 3);
         assert_eq!(*sz_map.get("xyz:GOLD").expect("GOLD decimals"), 4);
+    }
+
+    #[test]
+    fn test_reconcile_unified_account_equity_prevents_phantom_xyz_drawdown() {
+        // 1. Live flat Unified Account: Spot USDC = $559.59, hold = 0
+        let eq_flat = reconcile_unified_account_equity(
+            559.59,
+            0.0,
+            ClearinghouseDexEquitySummary::default(),
+            ClearinghouseDexEquitySummary::default(),
+        );
+        assert!((eq_flat - 559.59).abs() < 1e-6);
+
+        // 2. HIP-3 strictIsolated position opened: $59.69 swept out of Spot USDC into xyz rawUsd + $1.10 uPnL
+        let eq_xyz_swept = reconcile_unified_account_equity(
+            499.90,
+            0.0,
+            ClearinghouseDexEquitySummary::default(),
+            ClearinghouseDexEquitySummary {
+                account_value: 60.79,
+                total_raw_usd: 59.69,
+                unrealized_pnl: 1.10,
+            },
+        );
+        assert!((eq_xyz_swept - 560.69).abs() < 1e-6);
+
+        // 3. HIP-3 collateral still held inside Spot USDC total+hold, with $1.10 uPnL in xyz
+        let eq_xyz_held = reconcile_unified_account_equity(
+            559.59,
+            59.69,
+            ClearinghouseDexEquitySummary::default(),
+            ClearinghouseDexEquitySummary {
+                account_value: 60.79,
+                total_raw_usd: 59.69,
+                unrealized_pnl: 1.10,
+            },
+        );
+        assert!((eq_xyz_held - 560.69).abs() < 1e-6);
+
+        // 4. Pure Native Perp account (Spot = 0, Native = $560)
+        let eq_native_only = reconcile_unified_account_equity(
+            0.0,
+            0.0,
+            ClearinghouseDexEquitySummary {
+                account_value: 560.0,
+                total_raw_usd: 560.0,
+                unrealized_pnl: 0.0,
+            },
+            ClearinghouseDexEquitySummary::default(),
+        );
+        assert!((eq_native_only - 560.0).abs() < 1e-6);
     }
 }
 

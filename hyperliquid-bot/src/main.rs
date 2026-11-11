@@ -40,7 +40,8 @@ use crate::hyperliquid::{
 use crate::order::{emergency_flatten, place_ou_maker_entry};
 use crate::ou_process::{
     calculate_directional_edge_bps, calculate_features_with_funding, check_macro_calendar_veto,
-    compute_fee_adjusted_kelly_scalar,
+    compute_fee_adjusted_kelly_scalar, evaluate_session_lifecycle_gate, AssetFeeSchedule,
+    SessionLifecycleAction,
 };
 use crate::state::{
     check_cluster_circuit_breaker, has_active_cluster_position, load_armed_signal,
@@ -706,7 +707,8 @@ async fn main() {
 
     // Fetch size decimals lookup and dynamically register HIP-3 Builder DEX assets (xyz:NVDA, xyz:GOLD, etc.)
     let mut sz_map = fetch_sz_decimals_map(&info_client).await;
-    crate::hyperliquid::register_hip3_dex_assets(&mut exchange_raw.coin_to_asset, &mut sz_map, "xyz", 0).await;
+    crate::hyperliquid::register_hip3_dex_assets(&mut exchange_raw.coin_to_asset, &mut sz_map, "xyz", 1).await;
+    let resolved_asset_id = exchange_raw.coin_to_asset.get(&config.trading_symbol).copied();
     let exchange = Arc::new(exchange_raw);
     let sz_decimals_map = Arc::new(RwLock::new(sz_map));
     let trading_symbol = config.trading_symbol.clone();
@@ -714,10 +716,17 @@ async fn main() {
         let lock = sz_decimals_map.read().await;
         *lock.get(&trading_symbol).unwrap_or(&2)
     };
+    let startup_fee_sched = AssetFeeSchedule::for_symbol(&trading_symbol);
 
     println!(
-        "📊 [MARKET INFO] Symbol: {} | Size Decimals: {}",
-        trading_symbol, trading_sz_decimals
+        "📊 [MARKET INFO] Symbol: {} | Asset ID: {:?} | Size Decimals: {} | Fees (Maker/Taker/MM-RT/MT-RT bps): {:.3}/{:.3}/{:.3}/{:.3}",
+        trading_symbol,
+        resolved_asset_id,
+        trading_sz_decimals,
+        startup_fee_sched.maker_bps,
+        startup_fee_sched.taker_bps,
+        startup_fee_sched.maker_maker_rt_bps(),
+        startup_fee_sched.maker_taker_rt_bps(),
     );
 
     // Explicitly configure exchange leverage & margin mode (Cross vs Isolated)
@@ -1425,6 +1434,38 @@ async fn main() {
             };
 
             // -------------------------------------------------------------
+            // Defense Layer 0: DST-Aware Session Flat-at-Close Guard (HIP-3 RWA)
+            // -------------------------------------------------------------
+            if let SessionLifecycleAction::ForceFlat(flat_reason) =
+                evaluate_session_lifecycle_gate(&watcher_symbol, chrono::Utc::now().timestamp_millis())
+            {
+                if pos.is_filled || pos_exists || !pos.order_id.is_empty() {
+                    println!(
+                        "🔔 [FAST-SENTINEL FLAT-AT-CLOSE] {} triggering scheduled session close flatten ({}).",
+                        watcher_symbol, flat_reason
+                    );
+                    let flat_msg = format!(
+                        "🔔 **SCHEDULED SESSION FLAT-AT-CLOSE (HL):** {} ({}) closed ahead of market close/maintenance ({}).",
+                        watcher_symbol, pos.side, flat_reason
+                    );
+                    crate::discord::send_alert(watcher_discord.as_deref(), &flat_msg).await;
+                    let mut state_lock = watcher_state.lock().await;
+                    let _ = execute_emergency_flatten_with_retry(
+                        &watcher_state_path,
+                        &watcher_exchange,
+                        &watcher_info,
+                        user_address,
+                        &mut state_lock,
+                        &watcher_symbol,
+                        watcher_sz_decimals,
+                        watcher_discord.clone(),
+                    )
+                    .await;
+                    continue;
+                }
+            }
+
+            // -------------------------------------------------------------
             // Defense Layer 1: Live Order Book Catastrophe Stop Loss (1.5s Sentinel)
             // -------------------------------------------------------------
             if (pos.is_filled || pos_exists) && pos.stop_loss_price > 0.0 {
@@ -1506,8 +1547,13 @@ async fn main() {
             }
 
             // -------------------------------------------------------------
-            // Event-Driven REST Polling (429 mitigation) + Disaster Stop Ratchet
+            // Event-Driven REST Polling (429 mitigation) + Atomic Replace-Then-Cancel Disaster Stop Ratchet
             // -------------------------------------------------------------
+            let watcher_fee_sched = AssetFeeSchedule::for_symbol(&watcher_symbol);
+            let (live_bid_ratchet, live_ask_ratchet) = {
+                let guard = watcher_obi.read().await;
+                (guard.best_bid, guard.best_ask)
+            };
             let (_needs_poll, do_ratchet, ratchet_params) = {
                 let mut state_lock = watcher_state.lock().await;
                 if let Some(p) = state_lock.get_mut(&watcher_symbol) {
@@ -1519,25 +1565,38 @@ async fn main() {
                         || p.disaster_stop_oid.is_some()
                         || p.last_fill_check < chrono::Utc::now().timestamp_millis() as u64 - 30_000;
 
-                    // Check if disaster stop ratchet should trigger
+                    // Check if disaster stop ratchet should trigger (using live position size & fee-aware breakeven)
                     let mut dr = false;
                     let mut rp = None;
-                    if p.max_progress >= 0.55 && !p.disaster_stop_ratcheted_to_be {
-                        if let Some(oid) = p.disaster_stop_oid {
+                    if (p.is_filled || pos_exists) && p.max_progress >= 0.55 && !p.disaster_stop_ratcheted_to_be {
+                        if let Some(old_sl_oid) = p.disaster_stop_oid {
                             let is_long = p.side == "LONG";
-                            let lock_frac = if p.max_progress >= 0.75 {
-                                0.00115
+                            let lock_bps = if p.max_progress >= 0.75 {
+                                (watcher_fee_sched.maker_taker_rt_bps() + 2.5).max(8.0)
                             } else {
-                                0.00075
+                                (watcher_fee_sched.maker_maker_rt_bps() + 2.0).max(5.5)
                             };
+                            let lock_frac = lock_bps * 1e-4;
                             let be_trigger = if is_long {
                                 p.entry_price * (1.0 + lock_frac)
                             } else {
                                 p.entry_price * (1.0 - lock_frac)
                             };
-                            dr = true;
-                            rp = Some((oid, !is_long, be_trigger));
-                            p.disaster_stop_ratcheted_to_be = true; // Mark immediately to avoid duplicate
+                            // Verify trigger sits strictly on the protective side of live BBO so it never fires immediately
+                            let safe_vs_bbo = if is_long {
+                                live_bid_ratchet <= 0.0 || be_trigger < live_bid_ratchet * 0.9995
+                            } else {
+                                live_ask_ratchet <= 0.0 || be_trigger > live_ask_ratchet * 1.0005
+                            };
+                            let pos_sz = if current_szi.abs() > 1e-5 {
+                                current_szi.abs()
+                            } else {
+                                p.amount
+                            };
+                            if safe_vs_bbo && pos_sz > 0.0 {
+                                dr = true;
+                                rp = Some((old_sl_oid, !is_long, pos_sz, be_trigger));
+                            }
                         }
                     }
                     (np, dr, rp)
@@ -1546,26 +1605,39 @@ async fn main() {
                 }
             };
 
-            // Execute disaster stop ratchet outside lock
+            // Execute atomic Replace-Then-Cancel disaster stop ratchet outside lock
             if do_ratchet {
-                if let Some((_oid, is_buy_to_close, be_trigger)) = ratchet_params {
-                    if let Err(e) = crate::hyperliquid::ratchet_disaster_stop_to_breakeven(
+                if let Some((old_sl_oid, is_buy_to_close, pos_sz, be_trigger)) = ratchet_params {
+                    match crate::hyperliquid::ratchet_disaster_stop_to_breakeven(
                         &watcher_exchange,
                         &watcher_symbol,
                         is_buy_to_close,
+                        pos_sz,
                         be_trigger,
                         watcher_sz_decimals,
-                        None,
+                        Some(old_sl_oid),
+                        Some(uuid::Uuid::new_v4()),
                     ).await {
-                        eprintln!(
-                            "⚠️ [DISASTER STOP RATCHET] Failed to ratchet {} disaster stop to BE @ ${:.2}: {}",
-                            watcher_symbol, be_trigger, e
-                        );
-                    } else {
-                        println!(
-                            "🛡️ [DISASTER STOP RATCHET] {} disaster stop moved to breakeven @ ${:.2} (MFE ≥ 75%)",
-                            watcher_symbol, be_trigger
-                        );
+                        Ok(new_sl_oid) => {
+                            {
+                                let mut state_lock = watcher_state.lock().await;
+                                if let Some(p) = state_lock.get_mut(&watcher_symbol) {
+                                    p.disaster_stop_oid = Some(new_sl_oid);
+                                    p.disaster_stop_ratcheted_to_be = true;
+                                    let _ = save_state(&watcher_state_path, &state_lock);
+                                }
+                            }
+                            println!(
+                                "🛡️ [DISASTER STOP RATCHET] {} disaster stop replaced atomically to breakeven @ ${:.2} (old oid: {} -> new oid: {})",
+                                watcher_symbol, be_trigger, old_sl_oid, new_sl_oid
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "⚠️ [DISASTER STOP RATCHET] Failed to ratchet {} disaster stop to BE @ ${:.2} (retaining old oid {}): {}",
+                                watcher_symbol, be_trigger, old_sl_oid, e
+                            );
+                        }
                     }
                 }
             }
@@ -3755,11 +3827,50 @@ async fn main() {
                         }
                     }
 
+                    let fee_sched = AssetFeeSchedule::for_symbol(&symbol_clone);
+                    let session_gate = evaluate_session_lifecycle_gate(&symbol_clone, now_ms_cb as i64);
+                    let mut session_blocks_new_entries = false;
+                    match session_gate {
+                        SessionLifecycleAction::AllowNormalTrading => {}
+                        SessionLifecycleAction::BlockNewEntriesAndRatchetTp(_) => {
+                            session_blocks_new_entries = true;
+                        }
+                        SessionLifecycleAction::ForceFlat(flat_reason) => {
+                            session_blocks_new_entries = true;
+                            engine_b_mgr.disarm();
+                            let mut armed_state_flat = load_armed_signal(&arm_path_clone);
+                            if armed_state_flat.is_armed {
+                                armed_state_flat.is_armed = false;
+                                save_armed_signal(&arm_path_clone, &armed_state_flat);
+                            }
+                            let mut sl_flat = state_clone.lock().await;
+                            if sl_flat.contains_key(&symbol_clone) {
+                                println!(
+                                    "🔔 [1M SESSION FLAT-AT-CLOSE] {} triggering scheduled close/maintenance flatten ({}).",
+                                    symbol_clone, flat_reason
+                                );
+                                let _ = execute_emergency_flatten_with_retry(
+                                    &state_path_clone,
+                                    &exchange_clone,
+                                    &info_clone,
+                                    user_address,
+                                    &mut sl_flat,
+                                    &symbol_clone,
+                                    sz_decimals,
+                                    discord_clone.clone(),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+
                     let mut state_lock = state_clone.lock().await;
                     let has_position = state_lock.contains_key(&symbol_clone);
 
                     let consolidation_vol_ok = z_15.abs() < 2.2 && z_60.abs() < 2.5;
-                    let mr_invalidated = !consolidation_vol_ok || controller.current_mode != ControllerMode::MeanReversion;
+                    let mr_invalidated = !consolidation_vol_ok
+                        || controller.current_mode != ControllerMode::MeanReversion
+                        || session_blocks_new_entries;
 
                     if has_position {
                         // Failsafe Exchange Reconciliation: if local state still shows `!pos.is_filled`,
@@ -4041,13 +4152,18 @@ async fn main() {
                                             } else {
                                                 ((close_price - pos.entry_price) / pos.entry_price.max(1e-9) * 1e4).max(0.0)
                                             };
-                                            let min_soft_inv_excursion_bps = match symbol_clone.as_str() {
+                                            let min_soft_inv_excursion_bps = match symbol_clone.to_uppercase().as_str() {
+                                                "XYZ:GOLD" | "GOLD" => 32.0,
+                                                "XYZ:XYZ100" | "XYZ100" => 35.0,
+                                                "XYZ:SILVER" | "SILVER" => 42.0,
                                                 "BTC" => 45.0,
-                                                "ETH" => 50.0,
-                                                "XRP" | "LINK" => 58.0,
-                                                "SOL" | "HYPE" => 60.0,
-                                                "AVAX" | "SUI" => 62.0,
-                                                "NEAR" => 68.0,
+                                                "ETH" | "XYZ:NVDA" | "NVDA" => 48.0,
+                                                "XRP" | "LINK" | "XYZ:TSLA" | "TSLA" => 58.0,
+                                                "SOL" => 55.0,
+                                                "AVAX" => 60.0,
+                                                "ZEC" => 62.0,
+                                                "SUI" | "NEAR" => 65.0,
+                                                "HYPE" => 68.0,
                                                 _ => 50.0,
                                             };
                                             let (frozen_z_ou, eff_z_15) = if adverse_bps_from_entry >= min_soft_inv_excursion_bps {
@@ -4083,7 +4199,7 @@ async fn main() {
                                                 frozen_z_ou,
                                                 eff_z_15,
                                                 kalman_drift_against_pos,
-                                                1.5,
+                                                fee_sched.maker_bps,
                                                 entry_tick,
                                             );
                                             pos.consecutive_ou_breach_5m_bars = inv_mgr.consecutive_ou_breach_bars;
@@ -4151,6 +4267,29 @@ async fn main() {
                                                 && q_t <= f64::max(q_be, pos.max_progress - 0.20)
                                             {
                                                 giveback_triggered = true;
+                                            }
+
+                                            if session_blocks_new_entries && !should_reprice && pos.entry_price > 0.0 {
+                                                let min_harvest_margin = (fee_sched.maker_maker_rt_bps() + 2.0) * 1e-4;
+                                                let pre_close_tp = if is_long {
+                                                    quantize_price(pos.entry_price * (1.0 + min_harvest_margin), sz_decimals)
+                                                } else {
+                                                    quantize_price(pos.entry_price * (1.0 - min_harvest_margin), sz_decimals)
+                                                };
+                                                let valid_pre_close = if is_long {
+                                                    pre_close_tp < pos.effective_tp && pre_close_tp > close_price + entry_tick
+                                                } else {
+                                                    pre_close_tp > pos.effective_tp && pre_close_tp + entry_tick < close_price
+                                                };
+                                                if valid_pre_close {
+                                                    should_reprice = true;
+                                                    new_reprice_target = pre_close_tp;
+                                                    reprice_qty = pos.amount;
+                                                    reprice_is_buy = !is_long;
+                                                    old_tp_order_id = pos.tp_order_id.clone();
+                                                    pos.effective_tp = pre_close_tp;
+                                                    pos.last_reprice_time = chrono::Utc::now().timestamp_millis();
+                                                }
                                             }
 
                                             // -------------------------------------------------------------
@@ -4503,20 +4642,26 @@ async fn main() {
                             // while never disarming an already-armed signal on a normal bottom/top wick unless
                             // a genuine shock (`is_downside_shock`/`is_upside_shock`) or Kalman LLT waterfall fires.
                             let (max_drift_60, max_drift_120, max_slow_drift_180, max_slow_drift_240) =
-                                match symbol_clone.as_str() {
+                                match symbol_clone.to_uppercase().as_str() {
+                                    "XYZ:GOLD" | "GOLD" => (0.0022, 0.0018, 0.0018, 0.0022),
+                                    "XYZ:XYZ100" | "XYZ100" => (0.0028, 0.0022, 0.0022, 0.0026),
                                     "BTC" => (0.0035, 0.0025, 0.0025, 0.0030),
-                                    "ETH" => (0.0045, 0.0030, 0.0030, 0.0035),
-                                    "XRP" | "LINK" => (0.0050, 0.0042, 0.0042, 0.0050),
-                                    "SOL" | "HYPE" => (0.0052, 0.0045, 0.0045, 0.0055),
+                                    "XYZ:SILVER" | "SILVER" => (0.0040, 0.0030, 0.0030, 0.0035),
+                                    "ETH" | "XYZ:NVDA" | "NVDA" => (0.0045, 0.0030, 0.0030, 0.0035),
+                                    "XRP" | "LINK" | "XYZ:TSLA" | "TSLA" => (0.0050, 0.0042, 0.0042, 0.0050),
+                                    "SOL" | "HYPE" | "ZEC" => (0.0052, 0.0045, 0.0045, 0.0055),
                                     "AVAX" | "SUI" => (0.0065, 0.0050, 0.0060, 0.0075),
                                     "NEAR" => (0.0055, 0.0045, 0.0060, 0.0075),
                                     _ => (0.0045, 0.0030, 0.0030, 0.0035),
                                 };
-                            let (max_short_drift_60, max_short_drift_120, max_short_drift_240) = match symbol_clone.as_str() {
+                            let (max_short_drift_60, max_short_drift_120, max_short_drift_240) = match symbol_clone.to_uppercase().as_str() {
+                                "XYZ:GOLD" | "GOLD" => (0.0060, 0.0055, 0.0050),
+                                "XYZ:XYZ100" | "XYZ100" => (0.0070, 0.0065, 0.0058),
                                 "BTC" => (0.0085, 0.0075, 0.0065),
-                                "ETH" => (0.0095, 0.0100, 0.0080),
-                                "XRP" | "LINK" => (0.0110, 0.0125, 0.0095),
-                                "SOL" | "HYPE" => (0.0120, 0.0135, 0.0100),
+                                "XYZ:SILVER" | "SILVER" => (0.0090, 0.0090, 0.0075),
+                                "ETH" | "XYZ:NVDA" | "NVDA" => (0.0095, 0.0100, 0.0080),
+                                "XRP" | "LINK" | "XYZ:TSLA" | "TSLA" => (0.0110, 0.0125, 0.0095),
+                                "SOL" | "HYPE" | "ZEC" => (0.0120, 0.0135, 0.0100),
                                 "AVAX" | "SUI" => (0.0135, 0.0160, 0.0140),
                                 "NEAR" => (0.0140, 0.0160, 0.0140),
                                 _ => (0.0095, 0.0100, 0.0080),
@@ -4582,6 +4727,7 @@ async fn main() {
                             }
                             let is_eligible = !candle_feed_degraded
                                 && !is_candle_gap
+                                && !session_blocks_new_entries
                                 && is_consolidation
                                 && consolidation_vol_ok
                                 && is_valid_half_life
@@ -4600,10 +4746,15 @@ async fn main() {
                                 funnel_counters.engine_a_stationarity_ineligible += 1;
                             }
 
-                            if armed_state.is_armed && (!consolidation_vol_ok || controller.current_mode != ControllerMode::MeanReversion || macro_calendar_veto.is_some()) {
+                            if armed_state.is_armed
+                                && (!consolidation_vol_ok
+                                    || controller.current_mode != ControllerMode::MeanReversion
+                                    || macro_calendar_veto.is_some()
+                                    || session_blocks_new_entries)
+                            {
                                 println!(
-                                    "⏸️ [MEAN REVERSION VETO] Volatility breach, macro shield, or mode is {} (vol_ok: {}, macro_shield: {}, Z15: {:.2}, Z60: {:.2}). Clearing armed state for {}.",
-                                    controller.current_mode, consolidation_vol_ok, macro_calendar_veto.is_some(), z_15, z_60, symbol_clone
+                                    "⏸️ [MEAN REVERSION VETO] Volatility breach, macro shield, session freeze, or mode is {} (vol_ok: {}, macro_shield: {}, session_freeze: {}, Z15: {:.2}, Z60: {:.2}). Clearing armed state for {}.",
+                                    controller.current_mode, consolidation_vol_ok, macro_calendar_veto.is_some(), session_blocks_new_entries, z_15, z_60, symbol_clone
                                 );
                                 armed_state.is_armed = false;
                                 save_armed_signal(&arm_path_clone, &armed_state);
@@ -4684,7 +4835,12 @@ async fn main() {
                                     let max_arm_bars = (arm_timeout_mins.round() as usize).clamp(10, 15);
                                     let side_enum = if is_long_arm { Side::Long } else { Side::Short };
 
-                                    let eff_min_edge_bps = (ou_cfg.min_net_edge_bps * 0.78).max(18.0);
+                                    let eff_min_edge_bps = if fee_sched.maker_bps >= 2.5 {
+                                        // High-fee non-growth HIP-3 (xyz:GOLD): enforce full fee-adjusted edge hurdle
+                                        ou_cfg.min_net_edge_bps
+                                    } else {
+                                        (ou_cfg.min_net_edge_bps * 0.78).max(16.0)
+                                    };
                                     let placement_action = crate::ou_process::evaluate_armed_reversal_1m_step(
                                         &side_enum,
                                         armed_state.entry_threshold,
@@ -4697,7 +4853,7 @@ async fn main() {
                                         ou_cfg.max_join_consumption_ratio,
                                         ou_cfg.max_retest_consumption_ratio,
                                         eff_min_edge_bps,
-                                        1.44, // Hyperliquid VIP0 Maker fee with referral discount (bps)
+                                        fee_sched.maker_bps,
                                         expected_funding_drag_bps,
                                         high_price,
                                         low_price,
@@ -4761,7 +4917,7 @@ async fn main() {
                                                     frozen_target,
                                                     is_long_arm,
                                                 );
-                                                let net_edge_bps = raw_edge_bps - 2.88 - expected_funding_drag_bps;
+                                                let net_edge_bps = raw_edge_bps - fee_sched.maker_maker_rt_bps() - expected_funding_drag_bps;
 
                                                 if net_edge_bps < eff_min_edge_bps {
                                                     funnel_counters.engine_a_reversal_hurdle_veto += 1;
@@ -4799,7 +4955,7 @@ async fn main() {
                                                     let kelly_scalar = compute_fee_adjusted_kelly_scalar(
                                                         raw_edge_bps,
                                                         eff_min_edge_bps,
-                                                        1.44,
+                                                        fee_sched.maker_bps,
                                                         expected_funding_drag_bps,
                                                     ) * lambda_dir;
                                                     let risk_frac = 0.0075 * dd_mult * kelly_scalar;

@@ -184,10 +184,12 @@ pub fn load_funnel_counters(symbol: &str) -> FunnelAuditCounters {
         .unwrap_or_else(|| FunnelAuditCounters::new(symbol))
 }
 
-/// Returns the empirical Hyperliquid BTC-to-altcoin downside semibeta seed for causal impulse scaling.
+/// Returns the empirical Hyperliquid benchmark-to-asset downside semibeta seed for causal impulse scaling.
 pub fn empirical_btc_beta(symbol: &str, is_stress: bool) -> f64 {
     match (symbol.to_uppercase().as_str(), is_stress) {
-        ("BTC", _) => 1.00,
+        ("BTC", _) | ("XYZ:XYZ100", _) | ("XYZ:GOLD", _) => 1.00,
+        ("ZEC", false) => 0.85,
+        ("ZEC", true) => 1.05,
         ("XRP", false) => 1.05,
         ("XRP", true) => 1.25,
         ("HYPE", false) => 1.15,
@@ -196,12 +198,18 @@ pub fn empirical_btc_beta(symbol: &str, is_stress: bool) -> f64 {
         ("ETH", true) => 1.45,
         ("LINK", false) => 1.35,
         ("LINK", true) => 1.60,
+        ("XYZ:NVDA", false) => 1.45,
+        ("XYZ:NVDA", true) => 1.65,
+        ("XYZ:SILVER", false) => 1.55,
+        ("XYZ:SILVER", true) => 1.75,
         ("SOL", false) => 1.60,
         ("SOL", true) => 1.80,
         ("AVAX", false) => 1.60,
         ("AVAX", true) => 1.80,
         ("SUI", false) => 1.60,
         ("SUI", true) => 1.80,
+        ("XYZ:TSLA", false) => 1.65,
+        ("XYZ:TSLA", true) => 1.85,
         ("NEAR", false) => 1.75,
         ("NEAR", true) => 1.95,
         _ => 1.20,
@@ -232,6 +240,10 @@ pub fn evaluate_btc_impulse_veto(
     is_trend_engine: bool,
     btc: &BtcImpulseSnapshot,
 ) -> Option<String> {
+    if current_symbol.to_lowercase().starts_with("xyz:") {
+        // RWA Equities and Metals must NEVER be vetoed by crypto-specific BTC wicks
+        return None;
+    }
     if current_symbol.eq_ignore_ascii_case("BTC") {
         if is_trend_engine {
             return None;
@@ -335,37 +347,128 @@ pub fn evaluate_btc_impulse_veto(
     None
 }
 
-/// Evaluates cross-asset BTC lead-lag impulse spillover using the Beta-Scaled Multiscale Impulse Score I_{BTC->k}(t).
-/// Fails open (returns None) if BTC telemetry is missing/stale (>90s).
+/// Pure deterministic evaluation of asset-class systematic benchmark lead-lag impulse veto:
+/// - `xyz:NVDA`, `xyz:TSLA` -> benchmarked against `xyz:XYZ100`
+/// - `xyz:SILVER` -> benchmarked against `xyz:GOLD`
+/// - `BTC`, `xyz:XYZ100`, `xyz:GOLD` -> macro leaders (no cross-asset veto; BTC keeps self-impulse check)
+/// - Crypto Alts -> benchmarked against `BTC`
+pub fn evaluate_systematic_benchmark_impulse_veto(
+    benchmark_symbol: &str,
+    current_symbol: &str,
+    proposed_is_long: bool,
+    is_trend_engine: bool,
+    bench: &BtcImpulseSnapshot,
+) -> Option<String> {
+    if benchmark_symbol.eq_ignore_ascii_case("BTC") {
+        return evaluate_btc_impulse_veto(current_symbol, proposed_is_long, is_trend_engine, bench);
+    }
+
+    let is_stress =
+        bench.is_severe_shock || bench.z_15.abs() >= 2.5 || bench.ret_3m_bps.abs() >= 18.0;
+    let beta = empirical_btc_beta(current_symbol, is_stress);
+    let beta_ret_3m_bps = beta * bench.ret_3m_bps;
+    let beta_ret_5m_bps = beta * bench.ret_5m_bps;
+    let obi_composite = 0.50 * bench.obi_instant + 0.30 * bench.obi_1s + 0.20 * bench.obi_5s;
+    let fast_ret_bps = if bench.ret_3m_bps.abs() >= (0.85 * bench.ret_5m_bps).abs() {
+        bench.ret_3m_bps
+    } else {
+        0.85 * bench.ret_5m_bps
+    };
+    let z_fast = fast_ret_bps / 10.0;
+    let eff_z = if z_fast * bench.z_15 > 0.0 && z_fast.abs() > bench.z_15.abs() {
+        0.55 * bench.z_15 + 0.45 * z_fast
+    } else {
+        bench.z_15
+    };
+    let impulse_score = beta * (0.65 * eff_z + 0.35 * (2.5 * obi_composite));
+
+    if is_trend_engine {
+        if proposed_is_long
+            && (bench.z_15 <= -2.0 || impulse_score <= -2.2 || bench.ret_3m_bps <= -22.0)
+        {
+            return Some(format!(
+                "{} Lead-Lag Downside Impulse (I={:.2}, Z15={:.2}, 3m={:+.1}bps)",
+                benchmark_symbol, impulse_score, bench.z_15, bench.ret_3m_bps
+            ));
+        } else if !proposed_is_long
+            && (bench.z_15 >= 2.0 || impulse_score >= 2.2 || bench.ret_3m_bps >= 22.0)
+        {
+            return Some(format!(
+                "{} Lead-Lag Upside Impulse (I={:.2}, Z15={:.2}, 3m={:+.1}bps)",
+                benchmark_symbol, impulse_score, bench.z_15, bench.ret_3m_bps
+            ));
+        }
+    } else if proposed_is_long {
+        if impulse_score <= -1.35
+            || bench.z_15 <= -1.75
+            || beta_ret_3m_bps <= -24.0
+            || beta_ret_5m_bps <= -30.0
+            || (bench.is_severe_shock && bench.z_15 < -1.0)
+        {
+            return Some(format!(
+                "{} Lead-Lag Cascade Veto (I={:.2}, beta={:.2}, Z15={:.2}, 3m={:+.1}bps)",
+                benchmark_symbol, impulse_score, beta, bench.z_15, bench.ret_3m_bps
+            ));
+        }
+    } else if impulse_score >= 1.35
+        || bench.z_15 >= 1.75
+        || beta_ret_3m_bps >= 24.0
+        || beta_ret_5m_bps >= 30.0
+        || (bench.is_severe_shock && bench.z_15 > 1.0)
+    {
+        return Some(format!(
+            "{} Lead-Lag Squeeze Veto (I={:.2}, beta={:.2}, Z15={:.2}, 3m={:+.1}bps)",
+            benchmark_symbol, impulse_score, beta, bench.z_15, bench.ret_3m_bps
+        ));
+    }
+    None
+}
+
+/// Evaluates asset-class systematic lead-lag impulse spillover from the active benchmark telemetry file.
+/// Fails open (returns None) if benchmark telemetry is missing/stale (>90s).
 pub fn check_btc_lead_lag_veto(
     current_symbol: &str,
     proposed_is_long: bool,
     is_trend_engine: bool,
     now_ms: u64,
 ) -> Option<String> {
-    let btc_telem: LiveTelemetry = fs::read_to_string("hl_telemetry_BTC.json")
+    let benchmark_symbol = match current_symbol.to_uppercase().as_str() {
+        "XYZ:XYZ100" | "XYZ100" | "XYZ:GOLD" | "GOLD" => return None,
+        "XYZ:NVDA" | "NVDA" | "XYZ:TSLA" | "TSLA" | "XYZ:AAPL" | "AAPL" => "xyz:XYZ100",
+        "XYZ:SILVER" | "SILVER" => "xyz:GOLD",
+        _ => "BTC",
+    };
+
+    let telem_path = format!("hl_telemetry_{}.json", benchmark_symbol);
+    let bench_telem: LiveTelemetry = fs::read_to_string(telem_path)
         .ok()
         .and_then(|c| serde_json::from_str(&c).ok())?;
 
-    // Only enforce lead-lag filter if BTC telemetry snapshot is fresh within 90 seconds
-    if now_ms.saturating_sub(btc_telem.timestamp_ms) > 90_000 {
+    // Only enforce lead-lag filter if benchmark telemetry snapshot is fresh within 90 seconds
+    if now_ms.saturating_sub(bench_telem.timestamp_ms) > 90_000 {
         return None;
     }
 
     let snap = BtcImpulseSnapshot {
-        timestamp_ms: btc_telem.timestamp_ms,
-        ret_3m_bps: btc_telem.ret_3m_bps,
-        ret_5m_bps: btc_telem.ret_5m_bps,
-        ret_15m_bps: btc_telem.ret_15m_bps,
-        ret_30m_bps: btc_telem.ret_30m_bps,
-        z_15: btc_telem.z_15,
-        z_60: btc_telem.z_60,
-        is_severe_shock: btc_telem.is_severe_shock,
-        obi_instant: btc_telem.obi_instant,
-        obi_1s: btc_telem.obi_1s,
-        obi_5s: btc_telem.obi_5s,
+        timestamp_ms: bench_telem.timestamp_ms,
+        ret_3m_bps: bench_telem.ret_3m_bps,
+        ret_5m_bps: bench_telem.ret_5m_bps,
+        ret_15m_bps: bench_telem.ret_15m_bps,
+        ret_30m_bps: bench_telem.ret_30m_bps,
+        z_15: bench_telem.z_15,
+        z_60: bench_telem.z_60,
+        is_severe_shock: bench_telem.is_severe_shock,
+        obi_instant: bench_telem.obi_instant,
+        obi_1s: bench_telem.obi_1s,
+        obi_5s: bench_telem.obi_5s,
     };
-    evaluate_btc_impulse_veto(current_symbol, proposed_is_long, is_trend_engine, &snap)
+    evaluate_systematic_benchmark_impulse_veto(
+        benchmark_symbol,
+        current_symbol,
+        proposed_is_long,
+        is_trend_engine,
+        &snap,
+    )
 }
 
 /// Persistent ledger record for a completed real exchange trade on Hyperliquid L1.
@@ -547,5 +650,17 @@ mod tests {
         };
         let btc_short_veto = evaluate_btc_impulse_veto("BTC", false, false, &staircase_btc);
         assert!(btc_short_veto.is_some());
+
+        // 4. RWA Equities & Metals must NOT be vetoed by BTC wicks, and Equities route to xyz:XYZ100
+        assert!(evaluate_btc_impulse_veto("xyz:GOLD", true, false, &dump_btc).is_none());
+        assert!(evaluate_btc_impulse_veto("xyz:NVDA", true, false, &dump_btc).is_none());
+        let nvda_veto_by_xyz100 = evaluate_systematic_benchmark_impulse_veto(
+            "xyz:XYZ100",
+            "xyz:NVDA",
+            true,
+            false,
+            &dump_btc,
+        );
+        assert!(nvda_veto_by_xyz100.is_some());
     }
 }
