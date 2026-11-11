@@ -305,6 +305,12 @@
             <button onclick="selectCandleSymbol('XRP')" id="candle-btn-XRP" class="btn-period">XRP</button>
             <button onclick="selectCandleSymbol('SUI')" id="candle-btn-SUI" class="btn-period">SUI</button>
             <button onclick="selectCandleSymbol('LINK')" id="candle-btn-LINK" class="btn-period">LINK</button>
+            <button onclick="selectCandleSymbol('ZEC')" id="candle-btn-ZEC" class="btn-period">ZEC</button>
+            <button onclick="selectCandleSymbol('xyz:NVDA')" id="candle-btn-xyz_NVDA" class="btn-period">NVDA</button>
+            <button onclick="selectCandleSymbol('xyz:TSLA')" id="candle-btn-xyz_TSLA" class="btn-period">TSLA</button>
+            <button onclick="selectCandleSymbol('xyz:XYZ100')" id="candle-btn-xyz_XYZ100" class="btn-period">XYZ100</button>
+            <button onclick="selectCandleSymbol('xyz:GOLD')" id="candle-btn-xyz_GOLD" class="btn-period">GOLD</button>
+            <button onclick="selectCandleSymbol('xyz:SILVER')" id="candle-btn-xyz_SILVER" class="btn-period">SILVER</button>
           </div>
 
           <!-- Metric Toggle (Equity $ vs Net PnL $) in Progress Mode -->
@@ -331,12 +337,12 @@
       </div>
     </section>
 
-    <!-- ================= ROW 3: 9 ASSETS - LIVE SPECS & ENTRY TRIGGERS ================= -->
+    <!-- ================= ROW 3: 15 ASSETS - LIVE SPECS & ENTRY TRIGGERS ================= -->
     <section class="space-y-2">
       <div class="flex items-center justify-between px-1">
         <div class="flex items-center gap-2">
-          <h2 class="text-xs font-semibold uppercase tracking-wider text-terminal-muted">9-Asset Quantitative Specs & Trigger Matrix</h2>
-          <span class="text-[11px] font-mono text-terminal-dim">(BTC · ETH · SOL · AVAX · HYPE · NEAR · XRP · SUI · LINK)</span>
+          <h2 class="text-xs font-semibold uppercase tracking-wider text-terminal-muted">15-Asset Quantitative Specs & Trigger Matrix</h2>
+          <span class="text-[11px] font-mono text-terminal-dim">(Crypto 10 · US Equities 3 · Metals 2)</span>
         </div>
         <span class="text-[11px] font-mono text-terminal-dim">Multi-Engine: Engine A (5m O-U) · Engine B (15m Donchian) · Engine C/D</span>
       </div>
@@ -437,10 +443,19 @@
       return `${sign}${n.toFixed(1)} bps`;
     }
 
+    const TIER_ORDER = [
+      'BTC', 'ETH', 'SOL', 'AVAX', 'HYPE', 'NEAR', 'XRP', 'SUI', 'LINK', 'ZEC',
+      'xyz:NVDA', 'xyz:TSLA', 'xyz:XYZ100', 'xyz:GOLD', 'xyz:SILVER'
+    ];
+
+    function safeDomId(sym) {
+      return String(sym || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+    }
+
     function fmtPx(val, sym = 'BTC') {
       if (val === null || val === undefined || isNaN(val) || Number(val) <= 0) return '--';
       const n = Number(val);
-      const dec = sym === 'BTC' ? 1 : (sym === 'ETH' ? 2 : (sym === 'SOL' ? 3 : 4));
+      const dec = n >= 10000 ? 1 : (n >= 100 ? 2 : (n >= 10 ? 3 : 4));
       return `$${n.toFixed(dec)}`;
     }
 
@@ -503,8 +518,10 @@
 
     function selectCandleSymbol(sym) {
       candleSymbol = sym;
-      ['BTC', 'ETH', 'SOL', 'AVAX', 'HYPE', 'NEAR', 'XRP', 'SUI', 'LINK'].forEach(s => {
-        const btn = document.getElementById('candle-btn-' + s);
+      const present = latestData && latestData.assets ? Object.keys(latestData.assets) : [];
+      const allSyms = Array.from(new Set([...TIER_ORDER, ...present]));
+      allSyms.forEach(s => {
+        const btn = document.getElementById('candle-btn-' + safeDomId(s));
         if (btn) btn.className = s === sym ? 'btn-period active' : 'btn-period';
       });
       document.getElementById('chart-hero-summary').textContent = `${candleSymbol}-PERP 1m Live Candlesticks & Trigger Bands`;
@@ -648,7 +665,7 @@
       lastCandleFetchMs = nowMs;
 
       try {
-        const res = await fetch('/api/candles?symbol=' + candleSymbol);
+        const res = await fetch('/api/candles?symbol=' + encodeURIComponent(candleSymbol));
         if (!res.ok) return;
         const payload = await res.json();
         const candles = payload.candles || [];
@@ -816,12 +833,14 @@
       }
     }
 
-    // Render 9 Asset Cards
+    // Render Dynamic 15-Asset Cards
     function renderAssetCards(data) {
       const container = document.getElementById('assets-grid');
       if (!container) return;
 
-      const symbols = ['BTC', 'ETH', 'SOL', 'AVAX', 'HYPE', 'NEAR', 'XRP', 'SUI', 'LINK'];
+      const present = Object.keys(data.assets || {});
+      const symbols = TIER_ORDER.filter(s => present.length === 0 || present.includes(s));
+      present.forEach(s => { if (!symbols.includes(s)) symbols.push(s); });
       let html = '';
 
       symbols.forEach(sym => {
@@ -829,6 +848,8 @@
         const pos = (data.positions && data.positions[sym]) ? data.positions[sym] : null;
         const armed = (data.armed_signals && data.armed_signals[sym] && data.armed_signals[sym].is_armed) ? data.armed_signals[sym] : null;
         const ctrl = (data.controllers && data.controllers[sym]) ? data.controllers[sym] : {};
+        const shortSym = sym.includes(':') ? sym.split(':')[1] : sym;
+        const dexTag = sym.includes(':') ? sym.split(':')[0].toUpperCase() : 'PERP';
 
         const price = Number(d.price || 0);
         const mode = (d.mode || ctrl.current_mode || 'NEUTRAL').toUpperCase();
@@ -870,9 +891,9 @@
           <!-- Card Header -->
           <div class="flex items-center justify-between">
             <div class="flex items-center gap-2">
-              <span class="w-6 h-6 rounded bg-terminal-inset border border-terminal-border flex items-center justify-center font-bold text-xs text-terminal-accent">${sym[0]}</span>
+              <span class="w-6 h-6 rounded bg-terminal-inset border border-terminal-border flex items-center justify-center font-bold text-xs text-terminal-accent">${shortSym[0]}</span>
               <div>
-                <div class="font-bold text-[13px] text-white">${sym}-PERP</div>
+                <div class="font-bold text-[13px] text-white">${shortSym}-${dexTag}</div>
                 <div class="text-[10px] font-mono text-terminal-dim">t½: ${tHalf}m · Z15: ${z15} · Z60: ${z60}</div>
               </div>
             </div>

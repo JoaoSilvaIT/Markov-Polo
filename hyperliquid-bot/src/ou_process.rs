@@ -318,15 +318,15 @@ pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
             lookback_5m_bars: 144,
             min_half_life_m: 8.0,
             max_half_life_m: 60.0,
-            min_sigma_eq_bps: 15.0,
-            base_entry_sigma: 1.65,
-            min_entry_sigma: 1.45,
-            max_entry_sigma: 1.95,
+            min_sigma_eq_bps: 16.0,
+            base_entry_sigma: 2.05,
+            min_entry_sigma: 1.85,
+            max_entry_sigma: 2.35,
             rebound_gamma: 0.35,
             max_join_consumption_ratio: 0.25,
             max_retest_consumption_ratio: 0.50,
-            // Non-growth HIP-3 GOLD pays 5.76 bps MM / 12.12 bps MT RT: require >= 25 bps gross edge
-            min_net_edge_bps: 25.0,
+            // Non-growth HIP-3 GOLD pays 5.76 bps MM / 12.12 bps MT RT: reserve Engine A for extreme >=2.05σ tails
+            min_net_edge_bps: 26.0,
             target_notional_cap_usdc: 75.0,
             soft_z_ou_threshold: 2.40,
             soft_z15_shock_threshold: 2.70,
@@ -370,9 +370,9 @@ pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
         },
         "ZEC" => AssetOuConfig {
             symbol: "ZEC",
-            lookback_5m_bars: 120,
-            min_half_life_m: 8.0,
-            max_half_life_m: 90.0,
+            lookback_5m_bars: 96,
+            min_half_life_m: 10.0,
+            max_half_life_m: 135.0,
             min_sigma_eq_bps: 26.0,
             base_entry_sigma: 1.68,
             min_entry_sigma: 1.45,
@@ -1626,7 +1626,8 @@ pub fn estimate_ou_5m_kalman(
     }
 
     let n_5m = closes_5m.len();
-    let candidate_windows = [cfg.lookback_5m_bars.min(n_5m), 72usize.min(n_5m)];
+    let fallback_w = ((cfg.lookback_5m_bars * 2) / 3).clamp(64, 72);
+    let candidate_windows = [cfg.lookback_5m_bars.min(n_5m), fallback_w.min(n_5m)];
     let sigma_eq_floor_log = cfg.min_sigma_eq_bps * 1e-4;
     let dt = 5.0;
 
@@ -5563,5 +5564,15 @@ mod tests {
             "BTC disaster stop must be >= 85 bps so 5m invalidation (45 bps) runs first; got {:.1}",
             btc_sl_bps
         );
+
+        // 4. Post-Package2 calibration: ZEC step-trend window [96 bars, 10..135m] & GOLD tail-only (>=2.05σ)
+        let zec_ou = asset_ou_config("ZEC");
+        assert_eq!(zec_ou.lookback_5m_bars, 96);
+        assert!((zec_ou.min_half_life_m - 10.0).abs() < 1e-9);
+        assert!((zec_ou.max_half_life_m - 135.0).abs() < 1e-9);
+        let gold_ou = asset_ou_config("xyz:GOLD");
+        assert!(gold_ou.base_entry_sigma >= 2.05 - 1e-9);
+        assert!(gold_ou.min_net_edge_bps >= 26.0 - 1e-9);
+        assert!(gold_ou.min_sigma_eq_bps >= 16.0 - 1e-9);
     }
 }

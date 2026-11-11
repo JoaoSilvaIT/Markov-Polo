@@ -83,6 +83,14 @@ def fetch_hl_info(payload):
         return json.loads(resp.read().decode("utf-8"))
 
 
+def normalize_hl_symbol(raw):
+    s = str(raw or "").strip()
+    if ":" in s:
+        dex, coin = s.split(":", 1)
+        return f"{dex.lower()}:{coin.upper()}"
+    return s.upper()
+
+
 def get_cached_hl_exchange_data(wallet_addr):
     now_s = time.time()
     if not wallet_addr or len(wallet_addr) < 20:
@@ -94,23 +102,73 @@ def get_cached_hl_exchange_data(wallet_addr):
     _HL_CACHE["last_fetch_s"] = now_s
     try:
         ch = fetch_hl_info({"type": "clearinghouseState", "user": wallet_addr})
-        perp_val = 0.0
+        nat_acct = 0.0
+        nat_raw = 0.0
+        nat_upnl = 0.0
         if isinstance(ch, dict):
             margin = ch.get("marginSummary") or ch.get("crossMarginSummary") or {}
-            perp_val = float(margin.get("accountValue", 0.0) or 0.0)
+            nat_acct = float(margin.get("accountValue", 0.0) or 0.0)
+            nat_raw = float(margin.get("totalRawUsd", 0.0) or 0.0)
+            for ap in ch.get("assetPositions") or []:
+                nat_upnl += float(
+                    (ap.get("position") or {}).get("unrealizedPnl", 0.0) or 0.0
+                )
             withdrawable = float(ch.get("withdrawable", 0.0) or 0.0)
             if withdrawable > 0.0:
                 _HL_CACHE["withdrawable"] = withdrawable
-        spot_val = 0.0
+
+        xyz_acct = 0.0
+        xyz_raw = 0.0
+        xyz_upnl = 0.0
+        try:
+            xyz_ch = fetch_hl_info(
+                {"type": "clearinghouseState", "user": wallet_addr, "dex": "xyz"}
+            )
+            if isinstance(xyz_ch, dict):
+                xm = (
+                    xyz_ch.get("marginSummary")
+                    or xyz_ch.get("crossMarginSummary")
+                    or {}
+                )
+                xyz_acct = float(xm.get("accountValue", 0.0) or 0.0)
+                xyz_raw = float(xm.get("totalRawUsd", 0.0) or 0.0)
+                for ap in xyz_ch.get("assetPositions") or []:
+                    xyz_upnl += float(
+                        (ap.get("position") or {}).get("unrealizedPnl", 0.0) or 0.0
+                    )
+        except Exception:
+            pass
+
+        spot_total = 0.0
+        spot_hold = 0.0
         spot_ch = fetch_hl_info({"type": "spotClearinghouseState", "user": wallet_addr})
         if isinstance(spot_ch, dict):
             for b in spot_ch.get("balances", []):
                 if str(b.get("coin", "")).upper() == "USDC":
-                    total = float(b.get("total", 0.0) or 0.0)
-                    hold = float(b.get("hold", 0.0) or 0.0)
-                    spot_val += max(0.0, total - hold)
-        if perp_val + spot_val > 0.0:
-            _HL_CACHE["account_equity"] = round(perp_val + spot_val, 4)
+                    spot_total += float(b.get("total", 0.0) or 0.0)
+                    spot_hold += float(b.get("hold", 0.0) or 0.0)
+
+        # Mirror reconcile_unified_account_equity() from src/hyperliquid.rs
+        if spot_total <= 1.0 and (nat_acct > 1.0 or xyz_acct > 1.0):
+            total_eq = max(0.0, nat_acct + xyz_acct)
+        else:
+            if nat_acct > spot_total + 1.0:
+                base_eq = nat_acct
+            elif (
+                nat_raw > 0.0
+                and spot_hold < nat_raw * 0.5
+                and nat_acct < spot_total * 0.85
+            ):
+                base_eq = spot_total + nat_acct
+            else:
+                base_eq = max(spot_total + nat_upnl, nat_acct)
+            xyz_contrib = (
+                xyz_acct if (xyz_raw > 0.0 and spot_hold < xyz_raw * 0.5) else xyz_upnl
+            )
+            total_eq = max(0.0, base_eq + xyz_contrib)
+
+        if total_eq > 0.0:
+            _HL_CACHE["account_equity"] = round(total_eq, 4)
     except Exception:
         pass
 
@@ -166,7 +224,7 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
         grouped_closes = []
 
         for f in sorted_fills:
-            coin = str(f.get("coin", "")).upper()
+            coin = normalize_hl_symbol(f.get("coin", ""))
             direction = str(f.get("dir", ""))
             px = float(f.get("px", 0.0) or 0.0)
             sz = float(f.get("sz", 0.0) or 0.0)
@@ -911,6 +969,12 @@ def format_prometheus_metrics(data):
             "XRP",
             "SUI",
             "LINK",
+            "ZEC",
+            "xyz:NVDA",
+            "xyz:TSLA",
+            "xyz:XYZ100",
+            "xyz:GOLD",
+            "xyz:SILVER",
         ):
             continue
         lines.append(

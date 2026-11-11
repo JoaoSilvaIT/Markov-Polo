@@ -411,6 +411,9 @@ async fn main() {
                                     open_interest: 0.0,
                                     mark_px: cl,
                                     oracle_px: cl,
+                                    obi_ewma_tau1: None,
+                                    obi_ewma_tau2: None,
+                                    obi_1m_twap: None,
                                 };
                                 crate::backtest::append_historical_bar_record(&rec);
                             }
@@ -687,21 +690,21 @@ async fn main() {
     let config = Config::from_env();
     let startup_stagger_ms: u64 = match config.trading_symbol.as_str() {
         "BTC" => 0,
-        "ETH" => 400,
-        "SOL" => 800,
-        "AVAX" => 1200,
-        "HYPE" => 1600,
-        "NEAR" => 2000,
-        "XRP" => 2400,
-        "SUI" => 2800,
-        "LINK" => 3200,
-        "xyz:NVDA" => 3600,
-        "xyz:GOLD" => 4000,
-        "xyz:XYZ100" => 4400,
-        "xyz:TSLA" => 4800,
-        "xyz:SILVER" => 5200,
-        "ZEC" => 5600,
-        _ => 500,
+        "ETH" => 600,
+        "SOL" => 1200,
+        "AVAX" => 1800,
+        "HYPE" => 2400,
+        "NEAR" => 3000,
+        "XRP" => 3600,
+        "SUI" => 4200,
+        "LINK" => 4800,
+        "xyz:NVDA" => 5400,
+        "xyz:GOLD" => 6000,
+        "xyz:XYZ100" => 6600,
+        "xyz:TSLA" => 7200,
+        "xyz:SILVER" => 7800,
+        "ZEC" => 8400,
+        _ => 750,
     };
     if startup_stagger_ms > 0 {
         tokio::time::sleep(Duration::from_millis(startup_stagger_ms)).await;
@@ -880,15 +883,32 @@ async fn main() {
     let mut initial_15m_bar: Option<CandleBar> = None;
     let mut initial_last_1m_open: u64 = 0;
 
-    match info_client
-        .candles_snapshot(
-            trading_symbol.clone(),
-            "1m".to_string(),
-            window_start_ms,
-            now_ms,
-        )
-        .await
-    {
+    let mut res_1m_candles = Err("uninitialized".to_string());
+    for attempt in 0..3 {
+        match info_client
+            .candles_snapshot(
+                trading_symbol.clone(),
+                "1m".to_string(),
+                window_start_ms,
+                now_ms,
+            )
+            .await
+        {
+            Ok(c) => {
+                res_1m_candles = Ok(c);
+                break;
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                res_1m_candles = Err(err_str);
+                if attempt < 2 {
+                    tokio::time::sleep(Duration::from_millis(500 * (1 << attempt))).await;
+                }
+            }
+        }
+    }
+
+    match res_1m_candles {
         Ok(mut candles) => {
             candles.sort_by_key(|c| c.time_open);
             candles.dedup_by_key(|c| c.time_open);
@@ -1026,15 +1046,32 @@ async fn main() {
         trading_symbol
     );
     let window_15m_start_ms = now_ms.saturating_sub(100 * 15 * 60 * 1000);
-    match info_client
-        .candles_snapshot(
-            trading_symbol.clone(),
-            "15m".to_string(),
-            window_15m_start_ms,
-            now_ms,
-        )
-        .await
-    {
+    let mut res_15m_candles = Err("uninitialized".to_string());
+    for attempt in 0..3 {
+        match info_client
+            .candles_snapshot(
+                trading_symbol.clone(),
+                "15m".to_string(),
+                window_15m_start_ms,
+                now_ms,
+            )
+            .await
+        {
+            Ok(c) => {
+                res_15m_candles = Ok(c);
+                break;
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                res_15m_candles = Err(err_str);
+                if attempt < 2 {
+                    tokio::time::sleep(Duration::from_millis(500 * (1 << attempt))).await;
+                }
+            }
+        }
+    }
+
+    match res_15m_candles {
         Ok(mut candles) => {
             candles.sort_by_key(|c| c.time_open);
             candles.dedup_by_key(|c| c.time_open);
@@ -1121,9 +1158,30 @@ async fn main() {
     };
     let symbol_open_orders: Vec<_> = open_orders_res.into_iter().filter(|o| o.coin == trading_symbol).collect();
 
-    // Query live account equity for dynamic sizing
+    // Query live account equity for dynamic sizing (3-attempt retry on 429 / <= 1.0 blip)
     let eff_eq_frac_startup = effective_equity_fraction_for_config(&config);
-    let initial_equity = match get_account_value(&info_client, user_address).await {
+    let mut startup_eq_res = Err("uninitialized".to_string());
+    for attempt in 0..3 {
+        match get_account_value(&info_client, user_address).await {
+            Ok(eq) if eq > 1.0 => {
+                startup_eq_res = Ok(eq);
+                break;
+            }
+            Ok(eq) => {
+                startup_eq_res = Ok(eq);
+                if attempt < 2 {
+                    tokio::time::sleep(Duration::from_millis(if attempt == 0 { 400 } else { 900 })).await;
+                }
+            }
+            Err(e) => {
+                startup_eq_res = Err(e);
+                if attempt < 2 {
+                    tokio::time::sleep(Duration::from_millis(if attempt == 0 { 400 } else { 900 })).await;
+                }
+            }
+        }
+    }
+    let initial_equity = match startup_eq_res {
         Ok(eq) => {
             println!(
                 "💰 [STARTUP ACCOUNT EQUITY] Equity: ${:.2} USDC | Mode: {} | Fraction: {:.1}% | Initial Trade Bank: ${:.2} USDC",
@@ -3375,7 +3433,8 @@ async fn main() {
                                 };
                                 (trend_prox, sum)
                             } else if !is_valid_half_life {
-                                (mr_prox, format!("Vetoed: t_half={:.1}m outside 15m-120m band", half_life_m))
+                                let cfg_disp = crate::ou_process::asset_ou_config(&symbol_clone);
+                                (mr_prox, format!("Vetoed: t_half={:.1}m outside {:.0}m-{:.0}m band", half_life_m, cfg_disp.min_half_life_m, cfg_disp.max_half_life_m))
                             } else if controller.current_mode == ControllerMode::Neutral {
                                 (mr_prox, format!("Dwell Pacing: Streak C={}/2, T={}/2 bars", controller.consolidation_streak, controller.trend_streak))
                             } else if p_long >= p_short {
@@ -3398,10 +3457,11 @@ async fn main() {
                         }
                     };
 
-                    let (l2_instant, l2_1s, l2_5s, l2_fresh, l2_bid_snap, l2_ask_snap) = {
+                    let (l2_instant, l2_250ms, l2_1s, l2_5s, l2_fresh, l2_bid_snap, l2_ask_snap) = {
                         let guard = obi_tracker.read().await;
                         (
                             guard.instant_obi,
+                            guard.ewma_250ms_obi,
                             guard.ewma_1s_obi,
                             guard.ewma_5s_obi,
                             guard.is_fresh_and_uncrossed(chrono::Utc::now().timestamp_millis() as u64, 7500),
@@ -3512,6 +3572,9 @@ async fn main() {
                                 open_interest: oi_snap,
                                 mark_px: if mark_snap > 0.0 { mark_snap } else { close_price },
                                 oracle_px: if oracle_snap > 0.0 { oracle_snap } else { close_price },
+                                obi_ewma_tau1: Some(l2_250ms),
+                                obi_ewma_tau2: Some(l2_1s),
+                                obi_1m_twap: Some(l2_1s),
                             },
                         );
                     }
@@ -3762,12 +3825,21 @@ async fn main() {
                                     let timestamp_sec_b = (now_ms_b / 1000).max(1);
                                     let weekday_utc_b = now_utc_b.weekday().num_days_from_sunday() as u8;
 
+                                    let cand_dir_sign = if closed_5m.close > donchian.upper {
+                                        1.0
+                                    } else if closed_5m.close < donchian.lower {
+                                        -1.0
+                                    } else {
+                                        0.0
+                                    };
                                     let (
                                         obi_inst,
                                         obi_250ms,
                                         obi_1s,
                                         obi_5s,
-                                        l2_usable_b,
+                                        eff_l2_obi,
+                                        allow_clv_fallback,
+                                        l2_age_ms_b,
                                         tau_regime,
                                         tau1_ms,
                                         tau2_ms,
@@ -3779,16 +3851,16 @@ async fn main() {
                                             .as_ref()
                                             .map(|q| q.status.clone())
                                             .unwrap_or_else(|| "SIGNAL_GOOD".to_string());
-                                        let fresh = obi_lock.is_fresh_and_uncrossed(now_ms_b, 7500)
-                                            && obi_lock.updates_since_reconnect >= 3
-                                            && now_ms_b.saturating_sub(obi_lock.reconnect_time_ms) >= 15_000
-                                            && fq != "SIGNAL_UNUSABLE";
+                                        let (comp_obi, clv_fb, age_ms) =
+                                            obi_lock.evaluate_engine_b_obi(now_ms_b, cand_dir_sign);
                                         (
                                             obi_lock.instant_obi,
                                             obi_lock.ewma_250ms_obi,
                                             obi_lock.ewma_1s_obi,
                                             obi_lock.ewma_5s_obi,
-                                            fresh,
+                                            comp_obi,
+                                            clv_fb,
+                                            age_ms,
                                             qual_opt
                                                 .as_ref()
                                                 .map(|q| q.regime.clone())
@@ -3804,11 +3876,7 @@ async fn main() {
                                             fq,
                                         )
                                     };
-                                    let eff_l2_obi = if l2_usable_b {
-                                        0.40 * obi_inst + 0.35 * obi_250ms + 0.25 * obi_1s
-                                    } else {
-                                        0.0
-                                    };
+                                    let _ = l2_age_ms_b;
 
                                     let min_squeeze_ratio_90m = calculate_min_squeeze_ratio_90m(&rolling_15m_bars);
                                     let rel_vol_15m = calculate_rel_vol_15m(
@@ -3850,7 +3918,7 @@ async fn main() {
                                     };
 
                                     let live_eq_pre = *cached_equity_loop.read().await;
-                                    let action = engine_b_mgr.on_5m_bar_close(
+                                    let action = engine_b_mgr.on_5m_bar_close_with_l2_fallback(
                                         &trend_cfg,
                                         &telemetry_b,
                                         timestamp_sec_b,
@@ -3859,6 +3927,7 @@ async fn main() {
                                         is_mode_mean_reversion,
                                         ker_15m,
                                         btc_ret_60m_abs,
+                                        allow_clv_fallback,
                                     );
 
                                     match action {

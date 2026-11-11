@@ -469,7 +469,7 @@ impl L2ObiTracker {
             0.0
         };
 
-        if dt_ms > 0.0 && dt_ms <= 12000.0 {
+        if dt_ms > 0.0 && dt_ms <= 25_000.0 {
             let ln2 = std::f64::consts::LN_2;
 
             // Multiscale physical-time EWMA decay with dynamic tau_1 and tau_2:
@@ -487,8 +487,8 @@ impl L2ObiTracker {
 
             self.updates_since_reconnect = self.updates_since_reconnect.saturating_add(1);
         } else {
-            // Disconnect or stale interval (>12s): record gap and reinitialize
-            if dt_ms > 12000.0 {
+            // Disconnect or stale interval (>25s): record gap and reinitialize
+            if dt_ms > 25_000.0 {
                 self.gaps_over_3s = self.gaps_over_3s.saturating_add(1);
             }
             self.ewma_250ms_obi = obi_inst;
@@ -544,7 +544,7 @@ impl L2ObiTracker {
             0.0
         };
 
-        let status = if p95 > 12_000.0
+        let status = if p95 > 25_000.0
             || age_p99 > 3_000.0
             || mean_lag > 3_000.0
             || (self.gaps_over_3s > 0
@@ -677,6 +677,35 @@ pub fn append_candidate_log(log_entry: &EngineBCandidateLog) {
 }
 
 impl L2ObiTracker {
+    /// Evaluates Three-Tier L2 Freshness and post-sweep weighted composite OBI for Engine B (5m horizon):
+    /// - Tier 1 (`<= 15s`): Fresh -> `0.20 * obi_instant + 0.45 * tau1 + 0.35 * tau2`
+    /// - Tier 2 (`15s..45s`): Quiet / Soft-Stale Book -> exponentially decayed EWMA + CLV/RelVol fallback permission unless actively opposing (`d * raw < -0.08`)
+    /// - Tier 3 (`> 45s` or dead/crossed book): Fail-closed `(0.0, false, age_ms)`
+    /// Returns `(eff_l2_obi, allow_clv_fallback, l2_age_ms)`.
+    pub fn evaluate_engine_b_obi(&self, now_ms: u64, dir_sign: f64) -> (f64, bool, u64) {
+        if self.last_update_ms == 0
+            || now_ms < self.last_update_ms
+            || self.best_bid <= 0.0
+            || self.best_ask <= self.best_bid
+            || self.updates_since_reconnect == 0
+        {
+            return (0.0, false, u64::MAX);
+        }
+        let l2_age_ms = now_ms.saturating_sub(self.last_update_ms);
+        let raw_composite =
+            0.20 * self.instant_obi + 0.45 * self.ewma_250ms_obi + 0.35 * self.ewma_1s_obi;
+
+        if l2_age_ms <= 15_000 {
+            (raw_composite, false, l2_age_ms)
+        } else if l2_age_ms <= 45_000 {
+            let decay = (-((l2_age_ms as f64) - 15_000.0) / 30_000.0).exp();
+            let non_opposing = dir_sign * raw_composite >= -0.08;
+            (raw_composite * decay, non_opposing, l2_age_ms)
+        } else {
+            (0.0, false, l2_age_ms)
+        }
+    }
+
     pub fn is_fresh_and_uncrossed(&self, now_ms: u64, max_latency_ms: u64) -> bool {
         if self.last_update_ms == 0 || now_ms < self.last_update_ms {
             return false;
@@ -1997,6 +2026,8 @@ impl EngineBTrendManager {
 
     /// Evaluates 5-minute close persistence and manages Stage 2 `Alo` Maker Retest orders.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     pub fn on_5m_bar_close(
         &mut self,
         cfg: &TrendEngineConfig,
@@ -2007,6 +2038,32 @@ impl EngineBTrendManager {
         is_mode_mean_reversion: bool,
         ker_15m: f64,
         btc_ret_60m_abs: f64,
+    ) -> TrendOrderAction {
+        self.on_5m_bar_close_with_l2_fallback(
+            cfg,
+            t,
+            timestamp_sec,
+            weekday_utc,
+            account_equity_usdc,
+            is_mode_mean_reversion,
+            ker_15m,
+            btc_ret_60m_abs,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_5m_bar_close_with_l2_fallback(
+        &mut self,
+        cfg: &TrendEngineConfig,
+        t: &BreakoutTelemetry,
+        timestamp_sec: u64,
+        weekday_utc: u8,
+        account_equity_usdc: f64,
+        is_mode_mean_reversion: bool,
+        ker_15m: f64,
+        btc_ret_60m_abs: f64,
+        allow_clv_fallback: bool,
     ) -> TrendOrderAction {
         let candidate_dir = if t.bar_close > t.donchian_high_12_15m {
             Some((TrendDirection::Long, t.donchian_high_12_15m))
@@ -2097,7 +2154,25 @@ impl EngineBTrendManager {
                 }
 
                 if confirm_bars_5m + 1 >= 2 {
-                    if d * t.l2_obi >= cfg.min_obi_retest {
+                    let range_5m = (t.bar_high - t.bar_low).max(1e-12);
+                    let clv_5m =
+                        ((2.0 * t.bar_close - t.bar_high - t.bar_low) / range_5m).clamp(-1.0, 1.0);
+                    let body_atr = if t.atr_15m > 0.0 {
+                        d * (t.bar_close - t.bar_open) / t.atr_15m
+                    } else {
+                        0.0
+                    };
+                    let eff_obi_hurdle = if t.rel_vol_15m >= 2.10 && d * clv_5m >= 0.60 {
+                        (cfg.min_obi_retest * 0.50).max(0.10)
+                    } else {
+                        cfg.min_obi_retest
+                    };
+                    let clv_fallback_passed = allow_clv_fallback
+                        && d * t.l2_obi >= -0.08
+                        && d * clv_5m >= 0.55
+                        && t.rel_vol_15m >= 1.85
+                        && body_atr >= 0.12;
+                    if d * t.l2_obi >= eff_obi_hurdle || clv_fallback_passed {
                         // 2 consecutive 5m bars confirmed + L2 OBI aligned: Post Stage 2 Alo Retest Order!
                         // When confirmation close has expanded > 0.35 * ATR beyond broken_donchian_px,
                         // anchor dynamically to a shallow 35% flag pullback so Stage 2 fills real runners.
@@ -3403,5 +3478,66 @@ mod tests {
             }
             other => panic!("Expected PostAloMakerRetestOrder, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_engine_b_three_tier_l2_freshness_and_volume_clv_fallback() {
+        let mut tracker = L2ObiTracker::default();
+        let bids = vec![(100.0, 40.0)];
+        let asks = vec![(100.1, 15.0)];
+        let t0 = 1_000_000u64;
+        tracker.update(&bids, &asks, t0, t0);
+        tracker.update(&bids, &asks, t0 + 5_000, t0 + 5_000);
+
+        // Tier 1 (<=15s): fresh composite weighted 20/45/35, no fallback needed
+        let (obi_fresh, fb_fresh, age_fresh) = tracker.evaluate_engine_b_obi(t0 + 13_000, 1.0);
+        assert!(obi_fresh > 0.30);
+        assert!(!fb_fresh);
+        assert_eq!(age_fresh, 8_000);
+
+        // Tier 2 (15s..45s): quiet book retains decayed EWMA & permits CLV fallback when non-opposing
+        let (obi_quiet, fb_quiet, age_quiet) = tracker.evaluate_engine_b_obi(t0 + 30_000, 1.0);
+        assert!(obi_quiet > 0.0 && obi_quiet < obi_fresh);
+        assert!(fb_quiet);
+        assert_eq!(age_quiet, 25_000);
+
+        // Tier 3 (>45s): dead feed fails closed
+        let (obi_dead, fb_dead, _) = tracker.evaluate_engine_b_obi(t0 + 55_000, 1.0);
+        assert_eq!(obi_dead, 0.0);
+        assert!(!fb_dead);
+
+        // Volume-conditioned Stage 1 hurdle relaxation (RelVol >= 2.10, CLV >= 0.60, OBI = 0.13 >= 0.11)
+        let cfg = TrendEngineConfig::for_symbol("ETH", 0.35, 0.28);
+        let mut mgr = EngineBTrendManager::new();
+        let t_ts = chrono::Utc
+            .with_ymd_and_hms(2026, 11, 11, 14, 30, 0)
+            .unwrap()
+            .timestamp() as u64;
+        let bar1 = BreakoutTelemetry {
+            bar_open: 2000.0,
+            bar_high: 2012.0,
+            bar_low: 1999.0,
+            bar_close: 2010.0,
+            donchian_high_12_15m: 2005.0,
+            donchian_low_12_15m: 1980.0,
+            atr_15m: 10.0,
+            min_squeeze_ratio_90m: 0.65,
+            rel_vol_15m: 2.30,
+            hurst_60m: 0.56,
+            l2_obi: 0.13, // post-sweep depleted below 0.22, above 0.11 relaxed hurdle!
+            oi_delta_15m_pct: 0.20,
+        };
+        assert_eq!(
+            mgr.on_5m_bar_close(&cfg, &bar1, t_ts, 3, 560.0, false, 0.55, 0.005),
+            TrendOrderAction::None
+        );
+        let mut bar2 = bar1;
+        bar2.bar_close = 2011.0;
+        let act = mgr.on_5m_bar_close(&cfg, &bar2, t_ts + 300, 3, 560.0, false, 0.55, 0.005);
+        assert!(
+            matches!(act, TrendOrderAction::PostAloMakerRetestOrder { .. }),
+            "Volume-conditioned hurdle relaxation must accept post-sweep OBI 0.13; got {:?}",
+            act
+        );
     }
 }

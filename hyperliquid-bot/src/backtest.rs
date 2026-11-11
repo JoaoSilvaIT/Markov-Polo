@@ -58,6 +58,12 @@ pub struct HistoricalMarketBarRecord {
     pub open_interest: f64,
     pub mark_px: f64,
     pub oracle_px: f64,
+    #[serde(default)]
+    pub obi_ewma_tau1: Option<f64>,
+    #[serde(default)]
+    pub obi_ewma_tau2: Option<f64>,
+    #[serde(default)]
+    pub obi_1m_twap: Option<f64>,
 }
 
 /// Appends a completed 1-minute bar + L2/Funding/OI snapshot to `hl_history_{symbol}.jsonl`.
@@ -1992,10 +1998,37 @@ pub fn run_engine_a_backtest_with_btc(
                             );
                             let ker_15m = calculate_ker_n(&rolling_15m_bars, 6);
                             let min_sq_90m = calculate_min_squeeze_ratio_90m(&rolling_15m_bars);
-                            let eff_l2_obi = if has_native_l2 {
-                                0.40 * eff_obi_inst + 0.35 * eff_obi_1s + 0.25 * eff_obi_5s
-                            } else {
-                                eff_obi_inst
+                            let eff_l2_obi = match (bar.obi_ewma_tau1, bar.obi_ewma_tau2) {
+                                (Some(t1), Some(t2)) => {
+                                    (0.20 * eff_obi_inst + 0.45 * t1 + 0.35 * t2).clamp(-1.0, 1.0)
+                                }
+                                _ => {
+                                    // Legacy .jsonl replay proxy: CLV + RelVol + ATR-Normalized Body Impulse
+                                    let range_5m = (closed_5m.high - closed_5m.low).max(1e-12);
+                                    let clv_5m =
+                                        ((2.0 * closed_5m.close - closed_5m.high - closed_5m.low)
+                                            / range_5m)
+                                            .clamp(-1.0, 1.0);
+                                    let dp_5m = closed_5m.close - closed_5m.open;
+                                    let sgn_dp = if dp_5m > 0.0 {
+                                        1.0
+                                    } else if dp_5m < 0.0 {
+                                        -1.0
+                                    } else {
+                                        0.0
+                                    };
+                                    let body_comp = (dp_5m.abs() / (0.60 * current_atr)).min(1.0);
+                                    let rv_comp = ((rel_vol_15m - 0.85) / 1.10).tanh();
+                                    let proxy_obi = (0.55 * clv_5m * rv_comp
+                                        + 0.30 * sgn_dp * body_comp
+                                        + 0.15 * eff_obi_inst)
+                                        .clamp(-1.0, 1.0);
+                                    if engine_b_mgr.is_waiting_retest() && has_native_l2 {
+                                        0.20 * eff_obi_inst + 0.45 * eff_obi_1s + 0.35 * eff_obi_5s
+                                    } else {
+                                        proxy_obi
+                                    }
+                                }
                             };
                             let btc_ret_60m_abs = if symbol.eq_ignore_ascii_case("BTC") {
                                 if closes_history.len() >= 61
@@ -2040,7 +2073,7 @@ pub fn run_engine_a_backtest_with_btc(
                             let is_mode_mr =
                                 controller.current_mode == ControllerMode::MeanReversion;
                             let eq_now = sim_cfg.account_equity_usdc + cumulative_pnl_usd;
-                            match engine_b_mgr.on_5m_bar_close(
+                            match engine_b_mgr.on_5m_bar_close_with_l2_fallback(
                                 &trend_cfg,
                                 &tel,
                                 ts_sec,
@@ -2049,6 +2082,7 @@ pub fn run_engine_a_backtest_with_btc(
                                 is_mode_mr,
                                 ker_15m,
                                 btc_ret_60m_abs,
+                                bar.obi_ewma_tau1.is_none(),
                             ) {
                                 TrendOrderAction::PostAloMakerRetestOrder {
                                     dir,
@@ -3866,6 +3900,9 @@ mod tests {
                 open_interest: 50_000.0,
                 mark_px: px,
                 oracle_px: px,
+                obi_ewma_tau1: None,
+                obi_ewma_tau2: None,
+                obi_1m_twap: None,
             });
         }
 
@@ -3932,6 +3969,9 @@ mod tests {
                 open_interest: 50_000.0,
                 mark_px: px,
                 oracle_px: px,
+                obi_ewma_tau1: None,
+                obi_ewma_tau2: None,
+                obi_1m_twap: None,
             });
         }
 
@@ -4340,6 +4380,9 @@ mod tests {
                 open_interest: 100_000.0,
                 mark_px: px,
                 oracle_px: px,
+                obi_ewma_tau1: None,
+                obi_ewma_tau2: None,
+                obi_1m_twap: None,
             });
         }
 
@@ -4375,6 +4418,9 @@ mod tests {
                 open_interest: 100_500.0,
                 mark_px: px,
                 oracle_px: px,
+                obi_ewma_tau1: None,
+                obi_ewma_tau2: None,
+                obi_1m_twap: None,
             });
         }
 

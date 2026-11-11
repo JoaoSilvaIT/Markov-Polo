@@ -1481,6 +1481,9 @@ mod tests {
                 open_interest: 10_000.0,
                 mark_px: px,
                 oracle_px: px,
+                obi_ewma_tau1: None,
+                obi_ewma_tau2: None,
+                obi_1m_twap: None,
             });
         }
         let cfg = SimulatedExchangeConfig::default();
