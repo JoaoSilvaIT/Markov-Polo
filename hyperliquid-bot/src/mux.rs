@@ -336,6 +336,8 @@ async fn run_account_state_poller(address: H160, is_mainnet: bool) {
         .unwrap_or_default();
     let wallet_str = format!("{:?}", address);
     let mut err_streak = 0u32;
+    let mut write_err_streak = 0u32;
+    let mut logged_ready = false;
 
     loop {
         let (native_res, spot_res, xyz_res) = tokio::join!(
@@ -361,9 +363,25 @@ async fn run_account_state_poller(address: H160, is_mainnet: bool) {
                         reconciled_equity_usdc: eq,
                     };
                     if let Err(e) = write_shared_account_state_atomic(&state) {
-                        eprintln!("⚠️ [HL_MUX POLLER] Failed writing shared state: {}", e);
-                    } else if err_streak > 0 {
-                        println!("✅ [HL_MUX POLLER] Account state polling recovered (equity: ${:.2} USDC).", eq);
+                        write_err_streak = write_err_streak.saturating_add(1);
+                        if write_err_streak == 1 || write_err_streak % 20 == 0 {
+                            eprintln!(
+                                "⚠️ [HL_MUX POLLER] Failed writing shared state at {}: {} (streak {})",
+                                resolve_lock_guard_path(SHARED_ACCOUNT_STATE_FILE).display(),
+                                e,
+                                write_err_streak
+                            );
+                        }
+                    } else {
+                        if !logged_ready || err_streak > 0 || write_err_streak > 0 {
+                            println!(
+                                "✅ [HL_MUX POLLER] Shared account state active at {} (equity: ${:.2} USDC).",
+                                resolve_lock_guard_path(SHARED_ACCOUNT_STATE_FILE).display(),
+                                eq
+                            );
+                            logged_ready = true;
+                        }
+                        write_err_streak = 0;
                     }
                     err_streak = 0;
                 }
