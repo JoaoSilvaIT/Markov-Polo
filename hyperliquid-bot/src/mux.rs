@@ -597,25 +597,30 @@ pub async fn run_mux_server() {
         .map(|v| v.to_lowercase() != "false" && v != "0")
         .unwrap_or(true);
     let bind_addr = std::env::var("HL_MUX_BIND")
-        .unwrap_or_else(|_| DEFAULT_MUX_BIND_ADDR.to_string());
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_MUX_BIND_ADDR.to_string());
     let upstream_ws_url = if is_mainnet {
         "wss://api.hyperliquid.xyz/ws".to_string()
     } else {
         "wss://api.hyperliquid-testnet.xyz/ws".to_string()
     };
 
-    let wallet_addr: H160 = if let Ok(addr_str) = std::env::var("HL_WALLET_ADDRESS") {
-        H160::from_str(addr_str.trim())
-            .expect("Invalid HL_WALLET_ADDRESS for hl_mux")
-    } else if let Ok(pk) = std::env::var("HL_PRIVATE_KEY") {
-        let w: LocalWallet = pk
-            .trim()
-            .parse()
-            .expect("Invalid HL_PRIVATE_KEY for hl_mux");
-        w.address()
-    } else {
-        panic!("hl_mux requires HL_WALLET_ADDRESS or HL_PRIVATE_KEY");
-    };
+    let wallet_addr: H160 = std::env::var("HL_WALLET_ADDRESS")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .and_then(|s| H160::from_str(&s).ok())
+        .or_else(|| {
+            std::env::var("HL_PRIVATE_KEY")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .and_then(|pk| pk.parse::<LocalWallet>().ok())
+                .map(|w| w.address())
+        })
+        .expect("hl_mux requires valid HL_WALLET_ADDRESS or HL_PRIVATE_KEY");
 
     let symbols = configured_portfolio_symbols();
     let user_hex = format!("{:?}", wallet_addr);
