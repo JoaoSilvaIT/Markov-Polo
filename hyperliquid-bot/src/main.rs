@@ -302,6 +302,38 @@ pub async fn execute_emergency_flatten_with_retry(
     Err(last_err)
 }
 
+/// Computes the 2-tranche asymmetric TP plan `(tp_qty, tp_price, tranche_tag)` shared identically
+/// by `Fast-Sentinel` and adaptive/stall TP reprices so reprices never collapse an active 2-tranche split.
+pub fn compute_tp_order_plan(
+    engine_type: &str,
+    entry_price: f64,
+    raw_tp: f64,
+    total_amt: f64,
+    tranche1_tp_filled: bool,
+    sz_decimals: u32,
+) -> (f64, f64, &'static str) {
+    let total_notional = total_amt * entry_price;
+    let t1_half = round_to_decimals(total_amt * 0.5, sz_decimals);
+    let rem_half = round_to_decimals(total_amt - t1_half, sz_decimals);
+    let use_two_tranche = !tranche1_tp_filled
+        && total_notional >= 28.0
+        && t1_half > 0.0
+        && rem_half > 0.0
+        && t1_half * raw_tp >= 10.50
+        && rem_half * raw_tp >= 10.50;
+
+    if use_two_tranche {
+        if engine_type == "EngineB" {
+            (t1_half, quantize_price(raw_tp, sz_decimals), "T1-50%")
+        } else {
+            let t1_eng_a_px = entry_price + 0.65 * (raw_tp - entry_price);
+            (t1_half, quantize_price(t1_eng_a_px, sz_decimals), "T1-50%")
+        }
+    } else {
+        (total_amt, quantize_price(raw_tp, sz_decimals), "FULL")
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli_args: Vec<String> = std::env::args().collect();
@@ -2097,28 +2129,14 @@ async fn main() {
                         pos.amount
                     };
                     let total_notional = total_amt * pos.entry_price;
-
-                    // 2-Tranche Asymmetric Runner (F-08 Engine B & F-12 Engine A):
-                    // Split 50% / 50% whenever both legs strictly clear Hyperliquid's $10.00 MinTradeNtl ($10.50 floor).
-                    let t1_half = round_to_decimals(total_amt * 0.5, watcher_sz_decimals);
-                    let rem_half = round_to_decimals(total_amt - t1_half, watcher_sz_decimals);
-                    let use_two_tranche = !pos.tranche1_tp_filled
-                        && total_notional >= 28.0
-                        && t1_half > 0.0
-                        && rem_half > 0.0
-                        && t1_half * raw_tp >= 10.50
-                        && rem_half * raw_tp >= 10.50;
-
-                    let (tp_amount, tp_price, tranche_tag) = if use_two_tranche {
-                        if pos.engine_type == "EngineB" {
-                            (t1_half, quantize_price(raw_tp, watcher_sz_decimals), "T1-50%")
-                        } else {
-                            let t1_eng_a_px = pos.entry_price + 0.65 * (raw_tp - pos.entry_price);
-                            (t1_half, quantize_price(t1_eng_a_px, watcher_sz_decimals), "T1-50%")
-                        }
-                    } else {
-                        (total_amt, quantize_price(raw_tp, watcher_sz_decimals), "FULL")
-                    };
+                    let (tp_amount, tp_price, tranche_tag) = compute_tp_order_plan(
+                        &pos.engine_type,
+                        pos.entry_price,
+                        raw_tp,
+                        total_amt,
+                        pos.tranche1_tp_filled,
+                        watcher_sz_decimals,
+                    );
 
                     println!(
                         "🟢 [FAST-SENTINEL] Position Active for {} (Side: {}, Total: {:.4} / ${:.2})! Placing {} Alo-Priority TP at ${:.2} (Qty: {:.4})",
@@ -2313,6 +2331,16 @@ async fn main() {
                         let _ = save_state(&watcher_state_path, &state_lock);
                     }
                     continue;
+                }
+
+                // Sync late partial entry fill (e.g. final 4% filled right after initial TP placement)
+                let sz_step_eps = 0.5 * 10f64.powi(-(watcher_sz_decimals as i32));
+                if !is_tp_filled && !is_flat && current_szi.abs() > pos.amount + sz_step_eps {
+                    let mut state_lock = watcher_state.lock().await;
+                    if let Some(p) = state_lock.get_mut(&watcher_symbol) {
+                        p.amount = current_szi.abs();
+                        let _ = save_state(&watcher_state_path, &state_lock);
+                    }
                 }
 
                 if is_tp_filled && !is_flat && !pos.tranche1_tp_filled {
@@ -4384,42 +4412,15 @@ async fn main() {
                         if needs_fill_check {
                             if let Ok((live_szi, _)) = get_user_position(&info_clone, user_address, &symbol_clone).await {
                                 if live_szi.abs() > 1e-5 {
-                                    let mut need_fallback_tp = None;
                                     if let Some(p) = state_lock.get_mut(&symbol_clone) {
                                         p.is_filled = true;
                                         p.amount = live_szi.abs();
                                         p.opened_at = chrono::Utc::now().to_rfc3339();
-                                        if p.tp_order_id.is_empty() && p.take_profit_price > 0.0 {
-                                            let raw_tp = if p.effective_tp > 0.0 { p.effective_tp } else { p.take_profit_price };
-                                            need_fallback_tp = Some((p.side == "SHORT", quantize_price(raw_tp, sz_decimals), p.amount));
-                                        }
                                     }
                                     let _ = crate::state::save_state(&state_path_clone, &state_lock);
+                                    // Delegate TP + exchange-native disaster stop placement cleanly to Fast-Sentinel
+                                    // so 1m loop never races Fast-Sentinel or bypasses 2-tranche splitting.
                                     sentinel_notify.notify_one();
-
-                                    if let Some((tp_is_buy, tp_px, tp_amt)) = need_fallback_tp {
-                                        println!(
-                                            "🟢 [1M-FAILSAFE TP] Position Active for {} (Size: {:.4})! Placing Alo-Priority TP Limit order at ${:.2}",
-                                            symbol_clone, tp_amt, tp_px
-                                        );
-                                        if let Ok(tp_oid) = place_reduce_only_tp_order(
-                                            &exchange_clone,
-                                            &info_clone,
-                                            &symbol_clone,
-                                            tp_is_buy,
-                                            tp_px,
-                                            tp_amt,
-                                            sz_decimals,
-                                            Some(uuid::Uuid::new_v4()),
-                                        )
-                                        .await
-                                        {
-                                            if let Some(p) = state_lock.get_mut(&symbol_clone) {
-                                                p.tp_order_id = tp_oid.to_string();
-                                            }
-                                            let _ = crate::state::save_state(&state_path_clone, &state_lock);
-                                        }
-                                    }
                                 }
                             }
                         }
@@ -4920,52 +4921,92 @@ async fn main() {
 
                             // Handle Adaptive Reprice Execution on Hyperliquid
                             if should_reprice && new_reprice_target > 0.0 && reprice_qty > 0.0 {
-                                if let Some(pos) = state_lock.get(&symbol_clone) {
-                                    if let Err(e) = crate::state::assert_current_lease(&symbol_clone, &pos.lease_owner_uuid, pos.lease_fencing_token) {
-                                        eprintln!("❌ [ONE-WAY RATCHET REPRICE HL] Lease assertion failed for {}: {}", symbol_clone, e);
-                                        continue;
-                                    }
-                                }
-                                let rounded_target =
-                                    quantize_price(new_reprice_target, sz_decimals);
-                                println!(
-                                    "🔄 [ONE-WAY RATCHET REPRICE HL] {} live mean shifted. Repricing TP order to ${:.2}...",
-                                    symbol_clone, rounded_target
-                                );
-                                if !old_tp_order_id.is_empty() {
-                                    if let Ok(old_oid) = old_tp_order_id.parse::<u64>() {
-                                        let _ = cancel_order(&exchange_clone, &symbol_clone, old_oid).await;
-                                    }
-                                }
-                                let reprice_cloid = uuid::Uuid::new_v4();
-                                match place_reduce_only_tp_order(
-                                    &exchange_clone,
-                                    &info_clone,
-                                    &symbol_clone,
-                                    reprice_is_buy,
-                                    rounded_target,
-                                    reprice_qty,
-                                    sz_decimals,
-                                    Some(reprice_cloid),
-                                )
-                                .await
-                                {
-                                    Ok(new_oid) => {
-                                        if let Some(p) = state_lock.get_mut(&symbol_clone) {
-                                            p.tp_order_id = new_oid.to_string();
-                                            let _ = crate::state::save_state(&state_path_clone, &state_lock);
+                                let (pos_eng_r, pos_entry_r, pos_t1_r, mut eff_qty_r) = match state_lock.get(&symbol_clone) {
+                                    Some(pos) => {
+                                        if let Err(e) = crate::state::assert_current_lease(&symbol_clone, &pos.lease_owner_uuid, pos.lease_fencing_token) {
+                                            eprintln!("❌ [ONE-WAY RATCHET REPRICE HL] Lease assertion failed for {}: {}", symbol_clone, e);
+                                            continue;
                                         }
-                                        let reprice_msg = format!(
-                                            "🔄 **TP ADAPTIVELY REPRICED (HL):** {}\n**New Target:** ${:.2}\n**Live Mean Ratchet Active**",
-                                            symbol_clone, rounded_target
-                                        );
-                                        crate::discord::send_alert(discord_clone.as_deref(), &reprice_msg).await;
+                                        (pos.engine_type.clone(), pos.entry_price, pos.tranche1_tp_filled, pos.amount)
                                     }
-                                    Err(e) => {
-                                        eprintln!("❌ [REPRICE FAILED HL] Could not replace TP order for {}: {}", symbol_clone, e);
+                                    None => continue,
+                                };
+                                if let Ok((live_szi_r, _)) = get_user_position(&info_clone, user_address, &symbol_clone).await {
+                                    if live_szi_r.abs() > 1e-5 && !pos_t1_r {
+                                        eff_qty_r = live_szi_r.abs();
                                         if let Some(p) = state_lock.get_mut(&symbol_clone) {
-                                            p.tp_order_id.clear();
-                                            let _ = crate::state::save_state(&state_path_clone, &state_lock);
+                                            p.amount = eff_qty_r;
+                                        }
+                                    }
+                                }
+                                let rounded_target = quantize_price(new_reprice_target, sz_decimals);
+                                let (planned_qty, planned_px, planned_tag) = compute_tp_order_plan(
+                                    &pos_eng_r,
+                                    pos_entry_r,
+                                    rounded_target,
+                                    eff_qty_r,
+                                    pos_t1_r,
+                                    sz_decimals,
+                                );
+
+                                // Strictly cancel old TP before placing replacement so reduceOnly orders never split/accumulate
+                                let mut old_tp_cleared = old_tp_order_id.is_empty();
+                                if let Ok(old_oid) = old_tp_order_id.parse::<u64>() {
+                                    for attempt in 0..3 {
+                                        if cancel_order(&exchange_clone, &symbol_clone, old_oid).await.is_ok() {
+                                            old_tp_cleared = true;
+                                            break;
+                                        }
+                                        if attempt < 2 {
+                                            tokio::time::sleep(Duration::from_millis(300 * (attempt as u64 + 1))).await;
+                                        }
+                                    }
+                                    if !old_tp_cleared {
+                                        if let Ok(oo) = fetch_open_orders_for_coin(&info_clone, user_address, &symbol_clone).await {
+                                            old_tp_cleared = !oo.iter().any(|o| o.oid == old_oid);
+                                        }
+                                    }
+                                }
+                                if !old_tp_cleared {
+                                    eprintln!(
+                                        "⚠️ [ONE-WAY RATCHET REPRICE HL] Could not confirm cancellation of old TP {} for {}. Deferring reprice to avoid duplicate reduceOnly orders.",
+                                        old_tp_order_id, symbol_clone
+                                    );
+                                } else {
+                                    println!(
+                                        "🔄 [ONE-WAY RATCHET REPRICE HL] {} live mean shifted. Repricing {} TP order to ${:.4} (qty: {:.4})...",
+                                        symbol_clone, planned_tag, planned_px, planned_qty
+                                    );
+                                    let reprice_cloid = uuid::Uuid::new_v4();
+                                    match place_reduce_only_tp_order(
+                                        &exchange_clone,
+                                        &info_clone,
+                                        &symbol_clone,
+                                        reprice_is_buy,
+                                        planned_px,
+                                        planned_qty,
+                                        sz_decimals,
+                                        Some(reprice_cloid),
+                                    )
+                                    .await
+                                    {
+                                        Ok(new_oid) => {
+                                            if let Some(p) = state_lock.get_mut(&symbol_clone) {
+                                                p.tp_order_id = new_oid.to_string();
+                                                let _ = crate::state::save_state(&state_path_clone, &state_lock);
+                                            }
+                                            let reprice_msg = format!(
+                                                "🔄 **TP ADAPTIVELY REPRICED ({} HL):** {}\n**New Target:** ${:.4} (Qty: {:.4})\n**Live Mean Ratchet Active**",
+                                                planned_tag, symbol_clone, planned_px, planned_qty
+                                            );
+                                            crate::discord::send_alert(discord_clone.as_deref(), &reprice_msg).await;
+                                        }
+                                        Err(e) => {
+                                            eprintln!("❌ [REPRICE FAILED HL] Could not replace TP order for {}: {}", symbol_clone, e);
+                                            if let Some(p) = state_lock.get_mut(&symbol_clone) {
+                                                p.tp_order_id.clear();
+                                                let _ = crate::state::save_state(&state_path_clone, &state_lock);
+                                            }
                                         }
                                     }
                                 }
@@ -5810,5 +5851,36 @@ async fn main() {
 
         eprintln!("⚠️ [WEBSOCKET] Stream ended or dropped. Reconnecting in 3s...");
         tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_tp_order_plan;
+
+    #[test]
+    fn test_compute_tp_order_plan_preserves_two_tranche_splits() {
+        // Engine A Short AVAX: 14.6 AVAX @ $8.6032 ($125.61 >= $28) -> T1-50% = 7.3 @ 65% target
+        let (qty1, px1, tag1) = compute_tp_order_plan("EngineA", 8.6032, 8.5362, 14.6, false, 2);
+        assert_eq!(tag1, "T1-50%");
+        assert!((qty1 - 7.3).abs() < 1e-6);
+        assert!(px1 < 8.6032 && px1 > 8.5362, "got {}", px1);
+
+        // Engine A Tranche 2 after T1 filled -> FULL remaining 7.3 @ target_mu
+        let (qty2, px2, tag2) = compute_tp_order_plan("EngineA", 8.6032, 8.5469, 7.3, true, 2);
+        assert_eq!(tag2, "FULL");
+        assert!((qty2 - 7.3).abs() < 1e-6);
+        assert!((px2 - 8.5469).abs() < 1e-6);
+
+        // Engine B Long -> T1-50% directly at 1.5 ATR target
+        let (qty_b, px_b, tag_b) = compute_tp_order_plan("EngineB", 100.0, 102.5, 0.50, false, 2);
+        assert_eq!(tag_b, "T1-50%");
+        assert!((qty_b - 0.25).abs() < 1e-6);
+        assert!((px_b - 102.5).abs() < 1e-6);
+
+        // Sub-$28 order stays single-tranche FULL so both legs never violate $10 MinTradeNtl
+        let (qty_sm, _, tag_sm) = compute_tp_order_plan("EngineA", 10.0, 10.2, 2.0, false, 2);
+        assert_eq!(tag_sm, "FULL");
+        assert!((qty_sm - 2.0).abs() < 1e-6);
     }
 }
