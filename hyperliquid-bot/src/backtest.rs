@@ -22,11 +22,13 @@ use crate::hyperliquid::{effective_tick_size, optimal_engine_b_tp_atr_multiple, 
 use crate::ou_process::{
     asset_calibration, asset_ou_config, calculate_directional_edge_bps,
     calculate_features_with_funding_at, calculate_mad_sigma, check_macro_calendar_veto,
-    compute_fee_adjusted_kelly_scalar, evaluate_armed_reversal_1m_step,
-    evaluate_engine_c_hourly_squeeze, evaluate_engine_d_cascade_reversal,
+    compute_engine_a_disaster_stop_distance, compute_fee_adjusted_kelly_scalar,
+    evaluate_armed_reversal_1m_step, evaluate_engine_c_hourly_squeeze,
+    evaluate_engine_d_cascade_reversal, evaluate_session_lifecycle_gate,
     verify_maker_touch_absorption, AssetCalibration, AsymmetricExitManager, Direction, ExitSignal,
     HardenedAssetCalibration, HardenedExitDecision, MicroRegimeState, OneMinBarTick,
-    OrderPlacementAction, StallHazardExitManager, TwoTierInvalidationManager,
+    OrderPlacementAction, SessionLifecycleAction, StallHazardExitManager,
+    TwoTierInvalidationManager,
 };
 use crate::state::{ClusterCircuitBreaker, Side, DEFAULT_MAX_DAILY_CLUSTER_DD_FRAC};
 use crate::telemetry::{evaluate_btc_impulse_veto, BtcImpulseSnapshot};
@@ -527,20 +529,26 @@ pub fn run_engine_a_backtest_with_btc(
 
     let (max_drift_60, max_drift_120, max_slow_drift_180, max_slow_drift_240) =
         match symbol.to_uppercase().as_str() {
+            "XYZ:GOLD" | "GOLD" => (0.0022, 0.0018, 0.0018, 0.0022),
+            "XYZ:XYZ100" | "XYZ100" => (0.0028, 0.0022, 0.0022, 0.0026),
             "BTC" => (0.0035, 0.0025, 0.0025, 0.0030),
-            "ETH" => (0.0045, 0.0030, 0.0030, 0.0035),
-            "XRP" | "LINK" => (0.0050, 0.0042, 0.0042, 0.0050),
-            "SOL" | "HYPE" => (0.0052, 0.0045, 0.0045, 0.0055),
+            "XYZ:SILVER" | "SILVER" => (0.0040, 0.0030, 0.0030, 0.0035),
+            "ETH" | "XYZ:NVDA" | "NVDA" => (0.0045, 0.0030, 0.0030, 0.0035),
+            "XRP" | "LINK" | "XYZ:TSLA" | "TSLA" => (0.0050, 0.0042, 0.0042, 0.0050),
+            "SOL" | "HYPE" | "ZEC" => (0.0052, 0.0045, 0.0045, 0.0055),
             "AVAX" | "SUI" => (0.0065, 0.0050, 0.0060, 0.0075),
             "NEAR" => (0.0055, 0.0045, 0.0060, 0.0075),
             _ => (0.0045, 0.0030, 0.0030, 0.0035),
         };
     let (max_short_drift_60, max_short_drift_120, max_short_drift_240) =
         match symbol.to_uppercase().as_str() {
+            "XYZ:GOLD" | "GOLD" => (0.0060, 0.0055, 0.0050),
+            "XYZ:XYZ100" | "XYZ100" => (0.0070, 0.0065, 0.0058),
             "BTC" => (0.0085, 0.0075, 0.0065),
-            "ETH" => (0.0095, 0.0100, 0.0080),
-            "XRP" | "LINK" => (0.0110, 0.0125, 0.0095),
-            "SOL" | "HYPE" => (0.0120, 0.0135, 0.0100),
+            "XYZ:SILVER" | "SILVER" => (0.0090, 0.0090, 0.0075),
+            "ETH" | "XYZ:NVDA" | "NVDA" => (0.0095, 0.0100, 0.0080),
+            "XRP" | "LINK" | "XYZ:TSLA" | "TSLA" => (0.0110, 0.0125, 0.0095),
+            "SOL" | "HYPE" | "ZEC" => (0.0120, 0.0135, 0.0100),
             "AVAX" | "SUI" => (0.0135, 0.0160, 0.0140),
             "NEAR" => (0.0140, 0.0160, 0.0140),
             _ => (0.0095, 0.0100, 0.0080),
@@ -765,6 +773,14 @@ pub fn run_engine_a_backtest_with_btc(
             }
         }
 
+        let session_action = evaluate_session_lifecycle_gate(symbol, bar.timestamp_ms as i64);
+        let session_force_flat = matches!(session_action, SessionLifecycleAction::ForceFlat(_));
+        let session_blocks_entries =
+            !matches!(session_action, SessionLifecycleAction::AllowNormalTrading);
+        if session_force_flat {
+            is_armed = false;
+        }
+
         // ------------------------------------------------------------------
         // 1. MATCHING ENGINE: Process Resting Post-Only (Alo) Entry Order
         // ------------------------------------------------------------------
@@ -800,7 +816,12 @@ pub fn run_engine_a_backtest_with_btc(
                 Side::Short => bar.high >= entry_ord.limit_px + fill_pad,
             };
 
-            if macro_abort.is_some() {
+            if session_force_flat {
+                summary.orders_expired_unfilled += 1;
+                if entry_ord.is_engine_b {
+                    engine_b_mgr.on_order_cancelled_or_rejected();
+                }
+            } else if macro_abort.is_some() {
                 summary.macro_calendar_vetoes += 1;
                 summary.orders_expired_unfilled += 1;
                 if entry_ord.is_engine_b {
@@ -1107,16 +1128,52 @@ pub fn run_engine_a_backtest_with_btc(
                     "CHANDELIER_STOP"
                 };
 
-                if tp_hit && chandelier_hit {
-                    if check_tp_first {
-                        closed_outcome = Some((pos.tp_limit_px, true, "MAKER_TP"));
-                    } else {
-                        let slip = match pos.side {
-                            Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
-                            Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
+                let t1_filled_b = pos.asym_mgr.tranche1_filled;
+                if tp_hit && !t1_filled_b && (!chandelier_hit || check_tp_first) {
+                    if pos.initial_qty * pos.entry_px >= 28.0 {
+                        let t1_qty = 0.5 * pos.initial_qty;
+                        let t1_exit_px = pos.tp_limit_px;
+                        let t1_raw_pnl = match pos.side {
+                            Side::Long => t1_qty * (t1_exit_px - pos.entry_px),
+                            Side::Short => t1_qty * (pos.entry_px - t1_exit_px),
                         };
-                        closed_outcome = Some((pos.hard_stop_px * slip, false, stop_label));
-                        controller.notify_trend_stopped_out();
+                        let t1_fee = (t1_qty * t1_exit_px) * (sim_cfg.maker_fee_bps * 1e-4);
+                        pos.tranche1_realized_pnl_usd = t1_raw_pnl;
+                        pos.tranche1_exit_fee_usd = t1_fee;
+                        pos.qty = pos.initial_qty - t1_qty;
+                        pos.asym_mgr.tranche1_filled = true;
+                        let be_frac = (sim_cfg.maker_fee_bps + sim_cfg.taker_fee_bps + 3.0) * 1e-4;
+                        let be_px = quantize_price(
+                            match pos.side {
+                                Side::Long => pos.entry_px * (1.0 + be_frac),
+                                Side::Short => pos.entry_px * (1.0 - be_frac),
+                            },
+                            sim_cfg.sz_decimals,
+                        );
+                        match pos.side {
+                            Side::Long => {
+                                pos.hard_stop_px = pos.hard_stop_px.max(be_px);
+                                if let Some(ref mut chand) = pos.chandelier_opt {
+                                    chand.current_stop = chand.current_stop.max(be_px);
+                                }
+                            }
+                            Side::Short => {
+                                pos.hard_stop_px = if pos.hard_stop_px > 0.0 {
+                                    pos.hard_stop_px.min(be_px)
+                                } else {
+                                    be_px
+                                };
+                                if let Some(ref mut chand) = pos.chandelier_opt {
+                                    chand.current_stop = if chand.current_stop > 0.0 {
+                                        chand.current_stop.min(be_px)
+                                    } else {
+                                        be_px
+                                    };
+                                }
+                            }
+                        }
+                    } else {
+                        closed_outcome = Some((pos.tp_limit_px, true, "MAKER_TP"));
                     }
                 } else if chandelier_hit {
                     let slip = match pos.side {
@@ -1125,11 +1182,9 @@ pub fn run_engine_a_backtest_with_btc(
                     };
                     closed_outcome = Some((pos.hard_stop_px * slip, false, stop_label));
                     controller.notify_trend_stopped_out();
-                } else if tp_hit {
-                    closed_outcome = Some((pos.tp_limit_px, true, "MAKER_TP"));
                 }
 
-                if closed_outcome.is_none() {
+                if closed_outcome.is_none() && !pos.asym_mgr.tranche1_filled {
                     let d_0 = match pos.side {
                         Side::Long => pos.initial_tp_px - pos.entry_px,
                         Side::Short => pos.entry_px - pos.initial_tp_px,
@@ -1185,7 +1240,19 @@ pub fn run_engine_a_backtest_with_btc(
                         }
                     }
                 }
-                if closed_outcome.is_none() && elapsed_mins_1m >= 75.0 {
+                let fav_move_b = match pos.side {
+                    Side::Long => bar.close - pos.entry_px,
+                    Side::Short => pos.entry_px - bar.close,
+                };
+                let unreal_atr_b = if current_atr > 0.0 {
+                    fav_move_b / current_atr
+                } else {
+                    0.0
+                };
+                let runner_active_b =
+                    pos.asym_mgr.tranche1_filled || (unreal_atr_b >= 0.75 && current_p_t >= 0.60);
+                let max_b_mins = if runner_active_b { 360.0 } else { 75.0 };
+                if closed_outcome.is_none() && elapsed_mins_1m >= max_b_mins {
                     let slip = match pos.side {
                         Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
                         Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
@@ -1635,9 +1702,15 @@ pub fn run_engine_a_backtest_with_btc(
                     }
                 }
 
-                // Evaluate 1m Time-Decay Max Hold Stop
+                // Evaluate 1m Time-Decay Max Hold Stop or Scheduled Session Flat-at-Close
                 let max_hold_1m = (3.5 * pos.inv_mgr.half_life_minutes).clamp(90.0, 360.0);
-                if closed_outcome.is_none() && elapsed_mins_1m >= max_hold_1m {
+                if closed_outcome.is_none() && session_force_flat {
+                    let slip = match pos.side {
+                        Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
+                        Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
+                    };
+                    closed_outcome = Some((bar.close * slip, false, "SESSION_CLOSE_FLAT"));
+                } else if closed_outcome.is_none() && elapsed_mins_1m >= max_hold_1m {
                     let slip = match pos.side {
                         Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
                         Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
@@ -1832,7 +1905,7 @@ pub fn run_engine_a_backtest_with_btc(
         // ------------------------------------------------------------------
         // 3. DUAL-ENGINE EVALUATION: Engine B (15m Donchian Trend) & Engine A (5m O-U Mean Reversion)
         // ------------------------------------------------------------------
-        if open_pos.is_none() && !is_armed {
+        if open_pos.is_none() && !is_armed && !session_blocks_entries {
             if let Some(ref feat) = live_feat_opt {
                 let macro_veto = check_macro_calendar_veto(bar.timestamp_ms);
                 let cb_veto = cluster_cb.evaluate_equity_drawdown(
@@ -1847,23 +1920,64 @@ pub fn run_engine_a_backtest_with_btc(
 
                 // 3A. ENGINE B (Policy C): Session Gating, Squeeze Filter & Two-Stage Alo Retest
                 if resting_entry.is_none() || is_resting_b {
-                    if controller.current_mode == ControllerMode::Neutral {
-                        if engine_b_mgr.is_stage1_armed() {
-                            engine_b_mgr.disarm();
-                        }
-                        if is_resting_b {
-                            resting_entry = None;
-                            engine_b_mgr.on_order_cancelled_or_rejected();
-                        }
-                    } else if let Some(ref closed_5m) = finalized_5m_bar {
+                    if let Some(ref closed_5m) = finalized_5m_bar {
                         let prior_15m = if finalized_15m_bar.is_some() && rolling_15m_bars.len() > 1
                         {
                             &rolling_15m_bars[..rolling_15m_bars.len() - 1]
                         } else {
                             &rolling_15m_bars[..]
                         };
-                        if let (Some(ref donchian), Some(current_atr)) = (
-                            calculate_donchian(prior_15m, donchian_period),
+                        let donchian_b_opt = calculate_donchian(prior_15m, donchian_period);
+
+                        // F-08: 5m Synthetic-15m HMM Promotion Bridge
+                        if controller.current_mode != ControllerMode::Trend
+                            && rolling_5m_bars.len() >= 45
+                        {
+                            let has_5m_bo = donchian_b_opt
+                                .as_ref()
+                                .map(|d| closed_5m.close > d.upper || closed_5m.close < d.lower)
+                                .unwrap_or(false);
+                            if has_5m_bo || engine_b_mgr.is_stage1_armed() {
+                                let mut syn_15m_closes: Vec<f64> = Vec::with_capacity(100);
+                                let mut idx_r = rolling_5m_bars.len();
+                                while idx_r > 0 && syn_15m_closes.len() < 100 {
+                                    syn_15m_closes.push(rolling_5m_bars[idx_r - 1].close);
+                                    idx_r = idx_r.saturating_sub(3);
+                                }
+                                syn_15m_closes.reverse();
+                                if syn_15m_closes.len() >= 15 {
+                                    if let Some((syn_p_c, syn_p_t, syn_p_s)) =
+                                        compute_hmm_posteriors(&hmm_model, &syn_15m_closes)
+                                    {
+                                        let is_sev_syn = feat.is_downside_shock
+                                            || (feat.is_upside_shock
+                                                && (syn_p_t < 0.82 || syn_p_s >= 0.50));
+                                        if controller.promote_synthetic_15m_to_trend(
+                                            syn_p_t,
+                                            true,
+                                            is_sev_syn,
+                                            feat.z_60,
+                                            bar.timestamp_ms,
+                                        ) {
+                                            _current_p_c = syn_p_c;
+                                            current_p_t = syn_p_t;
+                                            current_p_s = syn_p_s;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if controller.current_mode == ControllerMode::Neutral {
+                            if engine_b_mgr.is_stage1_armed() {
+                                engine_b_mgr.disarm();
+                            }
+                            if is_resting_b {
+                                resting_entry = None;
+                                engine_b_mgr.on_order_cancelled_or_rejected();
+                            }
+                        } else if let (Some(ref donchian), Some(current_atr)) = (
+                            donchian_b_opt,
                             calculate_atr(&rolling_15m_bars, 20).filter(|&a| a > 0.0),
                         ) {
                             use chrono::Datelike;
@@ -2062,7 +2176,7 @@ pub fn run_engine_a_backtest_with_btc(
             }
         }
 
-        if open_pos.is_none() && resting_entry.is_none() {
+        if open_pos.is_none() && resting_entry.is_none() && !session_blocks_entries {
             if let Some(ref feat) = live_feat_opt {
                 let macro_veto = check_macro_calendar_veto(bar.timestamp_ms);
                 let cb_veto = cluster_cb.evaluate_equity_drawdown(
@@ -2275,11 +2389,11 @@ pub fn run_engine_a_backtest_with_btc(
                                                 ou_cfg.hard_disaster_stop_bps * 1e-4;
                                             let tp_dist = (tp1_px - limit_price).abs();
                                             let sl_dist = if has_native_l2 {
-                                                let calibrated_sl =
-                                                    (1.5 * tp_dist).max(0.0035 * limit_price);
-                                                calibrated_sl
-                                                    .min(limit_price * 0.0085)
-                                                    .min(limit_price * hard_stop_frac)
+                                                compute_engine_a_disaster_stop_distance(
+                                                    symbol,
+                                                    limit_price,
+                                                    tp1_px,
+                                                )
                                             } else {
                                                 let calibrated_sl =
                                                     (1.05 * tp_dist).max(0.0030 * limit_price);

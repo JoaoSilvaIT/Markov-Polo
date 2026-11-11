@@ -312,7 +312,10 @@ async fn main() {
         let info = InfoClient::new(None, Some(BaseUrl::Mainnet))
             .await
             .expect("Failed to create InfoClient for backtest");
-        let sz_map = fetch_sz_decimals_map(&info).await;
+        let mut sz_map = fetch_sz_decimals_map(&info).await;
+        let mut dummy_asset_map = std::collections::HashMap::new();
+        crate::hyperliquid::register_hip3_dex_assets(&mut dummy_asset_map, &mut sz_map, "xyz", 1)
+            .await;
         let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
         let start_ms = now_ms.saturating_sub(2400 * 60 * 1000); // 40 hours (2,400 x 1m bars)
 
@@ -332,7 +335,23 @@ async fn main() {
         let mut grand_fees_usd = 0.0;
         let mut grand_gross_usd = 0.0;
 
-        let all_symbols = ["BTC", "ETH", "SOL", "AVAX", "HYPE", "NEAR", "XRP", "SUI", "LINK"];
+        let all_symbols = [
+            "BTC",
+            "ETH",
+            "SOL",
+            "AVAX",
+            "HYPE",
+            "NEAR",
+            "XRP",
+            "SUI",
+            "LINK",
+            "ZEC",
+            "xyz:NVDA",
+            "xyz:GOLD",
+            "xyz:XYZ100",
+            "xyz:TSLA",
+            "xyz:SILVER",
+        ];
         let symbols_vec: Vec<&str> = if native_only {
             all_symbols
                 .iter()
@@ -370,7 +389,10 @@ async fn main() {
                             let cl = c.close.parse::<f64>().unwrap_or(0.0);
                             let v = c.vlm.parse::<f64>().unwrap_or(0.0);
                             if cl > 0.0 && h >= l && l > 0.0 {
-                                let sz_dec = *sz_map.get(sym).unwrap_or(&2);
+                                let sz_dec = sz_map
+                    .get(sym)
+                    .copied()
+                    .unwrap_or_else(|| asset_calibration(sym).sz_decimals);
                                 let tick = effective_tick_size(cl, sz_dec);
                                 let rec = crate::backtest::HistoricalMarketBarRecord {
                                     symbol: sym.to_string(),
@@ -417,7 +439,10 @@ async fn main() {
                 } else {
                     crate::backtest::load_historical_bars(sym)
                 };
-                let sz_dec = *sz_map.get(sym).unwrap_or(&2);
+                let sz_dec = sz_map
+                    .get(sym)
+                    .copied()
+                    .unwrap_or_else(|| asset_calibration(sym).sz_decimals);
                 println!(
                     "   ↳ [{}] Loaded {} bars from disk in {:.1}s",
                     sym,
@@ -444,10 +469,18 @@ async fn main() {
             .par_iter()
             .map(|&(sym, ref bars, sz_dec)| {
                 let t0 = std::time::Instant::now();
+                let fee_sched = AssetFeeSchedule::for_symbol(sym);
+                let eq_frac = if sym.to_lowercase().starts_with("xyz:") {
+                    0.32
+                } else {
+                    0.35
+                };
                 let sim_cfg = crate::backtest::SimulatedExchangeConfig {
+                    maker_fee_bps: fee_sched.maker_bps,
+                    taker_fee_bps: fee_sched.taker_bps,
                     sz_decimals: sz_dec,
-                    notional_usdc: 175.0,
-                    account_equity_usdc: 536.0,
+                    notional_usdc: 560.0 * eq_frac,
+                    account_equity_usdc: 560.0,
                     ..Default::default()
                 };
                 let res = crate::backtest::run_engine_a_backtest_with_btc(
