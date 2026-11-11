@@ -688,25 +688,27 @@ async fn main() {
     println!("🚀 [HYPERLIQUID PERP START] Fully Autonomous Deterministic O-U Architecture Initialized.");
 
     let config = Config::from_env();
+    let preloaded_state: StateMap = load_state(&config.state_file_path).unwrap_or_default();
+    let has_open_pos_on_disk = !preloaded_state.is_empty();
     let startup_stagger_ms: u64 = match config.trading_symbol.as_str() {
         "BTC" => 0,
-        "ETH" => 600,
-        "SOL" => 1200,
-        "AVAX" => 1800,
-        "HYPE" => 2400,
-        "NEAR" => 3000,
-        "XRP" => 3600,
-        "SUI" => 4200,
-        "LINK" => 4800,
-        "xyz:NVDA" => 5400,
-        "xyz:GOLD" => 6000,
-        "xyz:XYZ100" => 6600,
-        "xyz:TSLA" => 7200,
-        "xyz:SILVER" => 7800,
-        "ZEC" => 8400,
-        _ => 750,
+        "ETH" => 2000,
+        "SOL" => 4000,
+        "AVAX" => 6000,
+        "HYPE" => 8000,
+        "NEAR" => 10000,
+        "XRP" => 12000,
+        "SUI" => 14000,
+        "LINK" => 16000,
+        "xyz:NVDA" => 18000,
+        "xyz:GOLD" => 20000,
+        "xyz:XYZ100" => 22000,
+        "xyz:TSLA" => 24000,
+        "xyz:SILVER" => 26000,
+        "ZEC" => 28000,
+        _ => 1500,
     };
-    if startup_stagger_ms > 0 {
+    if !has_open_pos_on_disk && startup_stagger_ms > 0 {
         tokio::time::sleep(Duration::from_millis(startup_stagger_ms)).await;
     }
     let base_url = if config.hl_is_mainnet {
@@ -733,9 +735,29 @@ async fn main() {
         config.hl_is_mainnet
     );
 
-    let mut exchange_raw = ExchangeClient::new(None, wallet, Some(base_url.clone()), None, None)
-        .await
-        .expect("Failed to create ExchangeClient");
+    let mut exchange_opt = None;
+    let mut last_exch_err = String::new();
+    for attempt in 0..5 {
+        match ExchangeClient::new(None, wallet.clone(), Some(base_url.clone()), None, None).await {
+            Ok(client) => {
+                exchange_opt = Some(client);
+                break;
+            }
+            Err(e) => {
+                last_exch_err = format!("{:?}", e);
+                if attempt < 4 {
+                    let wait_ms = [2000u64, 4000, 6000, 10000][attempt];
+                    eprintln!(
+                        "⚠️ [STARTUP EXCHANGECLIENT RETRY {}/5] {} hit transient error ({}). Backing off {}ms...",
+                        attempt + 1, config.trading_symbol, last_exch_err, wait_ms
+                    );
+                    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                }
+            }
+        }
+    }
+    let mut exchange_raw = exchange_opt
+        .unwrap_or_else(|| panic!("Failed to create ExchangeClient after 5 attempts: {}", last_exch_err));
 
     let info_client = Arc::new(
         InfoClient::new(None, Some(base_url.clone()))
@@ -743,16 +765,25 @@ async fn main() {
             .expect("Failed to create InfoClient"),
     );
 
-    // Fetch size decimals lookup and dynamically register HIP-3 Builder DEX assets (xyz:NVDA, xyz:GOLD, etc.)
-    let mut sz_map = fetch_sz_decimals_map(&info_client).await;
-    crate::hyperliquid::register_hip3_dex_assets(&mut exchange_raw.coin_to_asset, &mut sz_map, "xyz", 1).await;
+    // Fetch size decimals lookup only for the symbol's clearinghouse to cut startup REST weight by >50%
+    let is_hip3_symbol = config.trading_symbol.to_lowercase().starts_with("xyz:");
+    let mut sz_map = if is_hip3_symbol {
+        std::collections::HashMap::new()
+    } else {
+        fetch_sz_decimals_map(&info_client).await
+    };
+    if is_hip3_symbol {
+        crate::hyperliquid::register_hip3_dex_assets(&mut exchange_raw.coin_to_asset, &mut sz_map, "xyz", 1).await;
+    }
     let resolved_asset_id = exchange_raw.coin_to_asset.get(&config.trading_symbol).copied();
     let exchange = Arc::new(exchange_raw);
     let sz_decimals_map = Arc::new(RwLock::new(sz_map));
     let trading_symbol = config.trading_symbol.clone();
     let trading_sz_decimals = {
         let lock = sz_decimals_map.read().await;
-        *lock.get(&trading_symbol).unwrap_or(&2)
+        lock.get(&trading_symbol)
+            .copied()
+            .unwrap_or_else(|| asset_calibration(&trading_symbol).sz_decimals)
     };
     let startup_fee_sched = AssetFeeSchedule::for_symbol(&trading_symbol);
 
@@ -767,11 +798,26 @@ async fn main() {
         startup_fee_sched.maker_taker_rt_bps(),
     );
 
-    // Explicitly configure exchange leverage & margin mode (Cross vs Isolated)
-    if let Err(e) = exchange
-        .update_leverage(config.hl_leverage, &trading_symbol, config.hl_is_cross, None)
-        .await
-    {
+    // Explicitly configure exchange leverage & margin mode (Cross vs Isolated, with 429 retry)
+    let mut lev_res = Err("uninitialized".to_string());
+    for attempt in 0..3 {
+        match exchange
+            .update_leverage(config.hl_leverage, &trading_symbol, config.hl_is_cross, None)
+            .await
+        {
+            Ok(_) => {
+                lev_res = Ok(());
+                break;
+            }
+            Err(e) => {
+                lev_res = Err(e.to_string());
+                if attempt < 2 {
+                    tokio::time::sleep(Duration::from_millis(1500 * (attempt as u64 + 1))).await;
+                }
+            }
+        }
+    }
+    if let Err(e) = lev_res {
         eprintln!(
             "⚠️ [LEVERAGE] Could not configure leverage to {}x for {}: {}",
             config.hl_leverage, trading_symbol, e
@@ -784,7 +830,7 @@ async fn main() {
     }
 
     // Position State
-    let state_map: StateMap = load_state(&config.state_file_path).unwrap_or_default();
+    let state_map: StateMap = preloaded_state;
     let active_state = Arc::new(Mutex::new(state_map));
     let state_file_path = config.state_file_path.clone();
 
@@ -815,6 +861,10 @@ async fn main() {
     let config_trainer_symbol = trading_symbol.clone();
 
     tokio::spawn(async move {
+        if std::path::Path::new(&config_trainer_path).exists() {
+            // Weights already loaded from disk; defer heavy 1000-bar 15m recalibration past the 15-bot startup window
+            tokio::time::sleep(Duration::from_millis(120_000 + startup_stagger_ms)).await;
+        }
         loop {
             println!("⚙️ [COLD-PATH] Initiating 24-hour HMM recalibration for {}...", config_trainer_symbol);
             let end_time = chrono::Utc::now().timestamp_millis() as u64;
@@ -1127,41 +1177,43 @@ async fn main() {
     // ------------------------------------------------------------------------
     println!("🔍 [STARTUP RECONCILIATION] Initiating deep exchange synchronization for {}...", trading_symbol);
 
-    // 1. Query live positions with fail-closed retries
+    // 1. Query live positions with fail-closed retries (429-resilient backoff)
     let mut retry_count = 0;
     let (startup_szi, startup_entry_px) = loop {
         match get_user_position(&info_client, user_address, &trading_symbol).await {
             Ok(pos) => break pos,
             Err(e) => {
                 retry_count += 1;
-                if retry_count >= 3 {
+                if retry_count >= 5 {
                     panic!("❌ [FATAL STARTUP] Could not query user position for {}: {}. Halting startup fail-closed.", trading_symbol, e);
                 }
-                tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                let wait_ms = [1500u64, 3000, 5000, 8000][retry_count - 1];
+                tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms)).await;
             }
         }
     };
 
-    // 2. Query live open orders with fail-closed retries
+    // 2. Query live open orders with fail-closed retries (429-resilient backoff)
     retry_count = 0;
     let open_orders_res = loop {
         match fetch_open_orders_for_coin(&info_client, user_address, &trading_symbol).await {
             Ok(orders) => break orders,
             Err(e) => {
                 retry_count += 1;
-                if retry_count >= 3 {
+                if retry_count >= 5 {
                     panic!("❌ [FATAL STARTUP] Could not query open orders for {}: {}. Halting startup fail-closed.", trading_symbol, e);
                 }
-                tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                let wait_ms = [1500u64, 3000, 5000, 8000][retry_count - 1];
+                tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms)).await;
             }
         }
     };
     let symbol_open_orders: Vec<_> = open_orders_res.into_iter().filter(|o| o.coin == trading_symbol).collect();
 
-    // Query live account equity for dynamic sizing (3-attempt retry on 429 / <= 1.0 blip)
+    // Query live account equity for dynamic sizing (5-attempt 429-resilient backoff)
     let eff_eq_frac_startup = effective_equity_fraction_for_config(&config);
     let mut startup_eq_res = Err("uninitialized".to_string());
-    for attempt in 0..3 {
+    for attempt in 0..5 {
         match get_account_value(&info_client, user_address).await {
             Ok(eq) if eq > 1.0 => {
                 startup_eq_res = Ok(eq);
@@ -1169,14 +1221,16 @@ async fn main() {
             }
             Ok(eq) => {
                 startup_eq_res = Ok(eq);
-                if attempt < 2 {
-                    tokio::time::sleep(Duration::from_millis(if attempt == 0 { 400 } else { 900 })).await;
+                if attempt < 4 {
+                    let wait_ms = [1500u64, 3000, 5000, 8000][attempt];
+                    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                 }
             }
             Err(e) => {
                 startup_eq_res = Err(e);
-                if attempt < 2 {
-                    tokio::time::sleep(Duration::from_millis(if attempt == 0 { 400 } else { 900 })).await;
+                if attempt < 4 {
+                    let wait_ms = [1500u64, 3000, 5000, 8000][attempt];
+                    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                 }
             }
         }
