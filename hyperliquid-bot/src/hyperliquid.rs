@@ -862,6 +862,10 @@ pub async fn get_account_value(
     info: &InfoClient,
     address: H160,
 ) -> Result<f64, String> {
+    let is_mainnet = !info.http_client.base_url.contains("testnet");
+    if let Some(cached_eq) = crate::mux::try_read_shared_equity(address, is_mainnet, 5_000) {
+        return Ok(cached_eq);
+    }
     let native_fut = async {
         let st = tokio::time::timeout(HL_REST_TIMEOUT, info.user_state(address))
             .await
