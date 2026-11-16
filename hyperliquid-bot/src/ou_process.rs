@@ -193,15 +193,15 @@ pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
             min_half_life_m: 15.0,
             max_half_life_m: 135.0,
             min_sigma_eq_bps: 34.0,
-            base_entry_sigma: 1.70,
-            min_entry_sigma: 1.50,
-            max_entry_sigma: 2.00,
+            base_entry_sigma: 1.95,
+            min_entry_sigma: 1.75,
+            max_entry_sigma: 2.30,
             rebound_gamma: 0.30,
             max_join_consumption_ratio: 0.22,
             max_retest_consumption_ratio: 0.45,
-            min_net_edge_bps: 32.0,
+            min_net_edge_bps: 36.0,
             target_notional_cap_usdc: 55.0,
-            soft_z_ou_threshold: 2.85,
+            soft_z_ou_threshold: 3.10,
             soft_z15_shock_threshold: 3.20,
             hard_disaster_stop_bps: 220.0,
         },
@@ -211,15 +211,15 @@ pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
             min_half_life_m: 15.0,
             max_half_life_m: 135.0,
             min_sigma_eq_bps: 38.0,
-            base_entry_sigma: 1.75,
-            min_entry_sigma: 1.55,
-            max_entry_sigma: 2.05,
+            base_entry_sigma: 2.00,
+            min_entry_sigma: 1.80,
+            max_entry_sigma: 2.35,
             rebound_gamma: 0.30,
             max_join_consumption_ratio: 0.22,
             max_retest_consumption_ratio: 0.45,
-            min_net_edge_bps: 35.0,
+            min_net_edge_bps: 39.0,
             target_notional_cap_usdc: 50.0,
-            soft_z_ou_threshold: 2.90,
+            soft_z_ou_threshold: 3.15,
             soft_z15_shock_threshold: 3.30,
             hard_disaster_stop_bps: 240.0,
         },
@@ -229,15 +229,15 @@ pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
             min_half_life_m: 15.0,
             max_half_life_m: 135.0,
             min_sigma_eq_bps: 30.0,
-            base_entry_sigma: 1.65,
-            min_entry_sigma: 1.45,
-            max_entry_sigma: 1.95,
+            base_entry_sigma: 1.95,
+            min_entry_sigma: 1.75,
+            max_entry_sigma: 2.28,
             rebound_gamma: 0.30,
             max_join_consumption_ratio: 0.22,
             max_retest_consumption_ratio: 0.45,
-            min_net_edge_bps: 28.0,
+            min_net_edge_bps: 32.0,
             target_notional_cap_usdc: 60.0,
-            soft_z_ou_threshold: 2.85,
+            soft_z_ou_threshold: 3.10,
             soft_z15_shock_threshold: 3.20,
             hard_disaster_stop_bps: 200.0,
         },
@@ -247,15 +247,15 @@ pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
             min_half_life_m: 15.0,
             max_half_life_m: 135.0,
             min_sigma_eq_bps: 35.0,
-            base_entry_sigma: 1.70,
-            min_entry_sigma: 1.50,
-            max_entry_sigma: 2.00,
+            base_entry_sigma: 1.95,
+            min_entry_sigma: 1.75,
+            max_entry_sigma: 2.30,
             rebound_gamma: 0.30,
             max_join_consumption_ratio: 0.22,
             max_retest_consumption_ratio: 0.45,
-            min_net_edge_bps: 32.0,
+            min_net_edge_bps: 36.0,
             target_notional_cap_usdc: 55.0,
-            soft_z_ou_threshold: 2.85,
+            soft_z_ou_threshold: 3.10,
             soft_z15_shock_threshold: 3.20,
             hard_disaster_stop_bps: 220.0,
         },
@@ -265,15 +265,15 @@ pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
             min_half_life_m: 15.0,
             max_half_life_m: 135.0,
             min_sigma_eq_bps: 32.0,
-            base_entry_sigma: 1.68,
-            min_entry_sigma: 1.48,
-            max_entry_sigma: 1.98,
+            base_entry_sigma: 1.95,
+            min_entry_sigma: 1.75,
+            max_entry_sigma: 2.28,
             rebound_gamma: 0.30,
             max_join_consumption_ratio: 0.22,
             max_retest_consumption_ratio: 0.45,
-            min_net_edge_bps: 30.0,
+            min_net_edge_bps: 34.0,
             target_notional_cap_usdc: 58.0,
-            soft_z_ou_threshold: 2.85,
+            soft_z_ou_threshold: 3.10,
             soft_z15_shock_threshold: 3.20,
             hard_disaster_stop_bps: 210.0,
         },
@@ -374,15 +374,15 @@ pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
             min_half_life_m: 10.0,
             max_half_life_m: 135.0,
             min_sigma_eq_bps: 26.0,
-            base_entry_sigma: 1.68,
-            min_entry_sigma: 1.45,
-            max_entry_sigma: 1.98,
+            base_entry_sigma: 1.92,
+            min_entry_sigma: 1.72,
+            max_entry_sigma: 2.25,
             rebound_gamma: 0.34,
             max_join_consumption_ratio: 0.22,
             max_retest_consumption_ratio: 0.48,
-            min_net_edge_bps: 24.0,
+            min_net_edge_bps: 28.0,
             target_notional_cap_usdc: 65.0,
-            soft_z_ou_threshold: 2.70,
+            soft_z_ou_threshold: 3.05,
             soft_z15_shock_threshold: 3.00,
             hard_disaster_stop_bps: 180.0,
         },
@@ -3723,6 +3723,7 @@ pub fn verify_maker_touch_absorption(
 pub struct StallHazardExitManager {
     pub dir: Direction,
     pub entry_px: f64,
+    pub entry_sigma_1m: f64,
     pub mfe_bps: f64,
     pub elapsed_mins: usize,
     pub last_peak_min: usize,
@@ -3757,12 +3758,23 @@ pub enum HardenedExitDecision {
 }
 
 impl StallHazardExitManager {
+    #[allow(dead_code)]
     pub fn new(dir: Direction, entry_px: f64, disaster_stop_bps: f64) -> Self {
+        Self::new_with_sigma(dir, entry_px, disaster_stop_bps, 0.0)
+    }
+
+    pub fn new_with_sigma(
+        dir: Direction,
+        entry_px: f64,
+        disaster_stop_bps: f64,
+        entry_sigma_1m: f64,
+    ) -> Self {
         let d = dir.sign();
         let hard_disaster_stop_px = entry_px * (1.0 - d * (disaster_stop_bps.max(42.0) * 1e-4));
         Self {
             dir,
             entry_px,
+            entry_sigma_1m: entry_sigma_1m.max(0.0),
             mfe_bps: 0.0,
             elapsed_mins: 0,
             last_peak_min: 0,
@@ -3841,7 +3853,32 @@ impl StallHazardExitManager {
             };
         }
 
-        // 5. Siegmund/Wald AR(1) + Kurtosis-Corrected 1m Page-CUSUM Update
+        // 5. Siegmund/Wald AR(1) + Kurtosis-Corrected Asymmetric 1m Page-CUSUM (Package 6)
+        //    - Variance Deflation Shield: anchors denominator <= 1.5 * entry_sigma_1m on shocks
+        //    - Asymmetric Huber: c_adverse = 4.50, c_favorable = 2.00
+        //    - Asymmetric Tail Bypass: single-bar z_adverse >= 4.2 vs baseline & unrealized <= gate
+        let ret_1m = if prev_close > 0.0 && bar_close > 0.0 {
+            (bar_close / prev_close).ln()
+        } else {
+            0.0
+        };
+        let baseline_z_adv = if self.entry_sigma_1m > 1e-6 {
+            (-d * ret_1m) / self.entry_sigma_1m
+        } else {
+            0.0
+        };
+        if !self.tranche1_filled
+            && curr_unreal_bps <= cal.sprt_min_loss_gate_bps
+            && ((self.entry_sigma_1m > 1e-6 && baseline_z_adv >= 4.2)
+                || (curr_unreal_bps <= -45.0 && (-d * ret_1m * 1e4) >= 35.0))
+        {
+            self.cusum_stat_1m = self.cusum_stat_1m.max(cal.cusum_b_1m_star);
+            return HardenedExitDecision::StopOutSprt1mClose {
+                exit_px: bar_close,
+                cusum_val: self.cusum_stat_1m,
+            };
+        }
+
         if curr_unreal_bps >= 0.0 {
             // Reset CUSUM when trade is in profit so noise never builds up prior to drawdown
             self.cusum_stat_1m = 0.0;
@@ -3850,15 +3887,26 @@ impl StallHazardExitManager {
             let adv_clv = (-d * clv).max(0.0);
             let psi_wick = (adv_body + 0.45 * adv_clv).clamp(0.15, 1.00);
 
-            let huber_c = 2.40;
-            let eff_e = psi_wick * huber_c * (std_innov_1m / huber_c).tanh();
+            let raw_adv_z = -d * std_innov_1m;
+            let shielded_z = if self.entry_sigma_1m > 1e-6 && baseline_z_adv > 2.0 {
+                raw_adv_z.max(baseline_z_adv / 1.5)
+            } else {
+                raw_adv_z
+            };
+            let signed_eff_e = if shielded_z >= 0.0 {
+                let huber_adv = 4.50;
+                psi_wick * huber_adv * (shielded_z / huber_adv).tanh()
+            } else {
+                let huber_fav = 2.00;
+                psi_wick * huber_fav * (shielded_z / huber_fav).tanh()
+            };
             let d1 = cal.cusum_delta_1m;
 
             // Exact AR(1) (rho_1 = -0.06 -> gamma = 0.8868) + Fourth-Cumulant Kurtosis Drift k_ref*
             let k_ref_star = 0.4434 * d1 * d1 + 0.50 * d1.powi(3);
             // Mean-centered OBI term (-d * obi - 0.15) prevents positive drift under H0!
             let obi_centered = 0.08 * psi_wick * (-d * obi_smooth - 0.15);
-            let s_inc = -d * d1 * eff_e - k_ref_star + obi_centered;
+            let s_inc = d1 * signed_eff_e - k_ref_star + obi_centered;
 
             // Only accumulate positive increments when drawdown exceeds -6.0 bps
             if s_inc < 0.0 || curr_unreal_bps <= -6.0 {
@@ -3867,11 +3915,18 @@ impl StallHazardExitManager {
             }
         }
 
-        // Check 1m Close-Confirmed SPRT Stop (Gated at cal.sprt_min_loss_gate_bps = -18 to -21 bps)
+        // Check 1m Close-Confirmed SPRT Stop (Package 6 calibrated barrier ~ 0.80 * B_1m* ~ 3.00–3.25
+        // and relaxed CLV gate <= -0.05 once unrealized <= -22 bps)
+        let eff_b_star = (cal.cusum_b_1m_star * 0.80).clamp(2.85, 3.35);
+        let clv_gate = if curr_unreal_bps <= -22.0 {
+            -0.05
+        } else {
+            -0.20
+        };
         if !self.tranche1_filled
-            && self.cusum_stat_1m >= cal.cusum_b_1m_star
+            && self.cusum_stat_1m >= eff_b_star
             && curr_unreal_bps <= cal.sprt_min_loss_gate_bps
-            && d * clv <= -0.20
+            && d * clv <= clv_gate
         {
             return HardenedExitDecision::StopOutSprt1mClose {
                 exit_px: bar_close,
@@ -5729,6 +5784,39 @@ mod tests {
             feat.z_15.abs() < 6.0,
             "expected realistic z_15 without 25+ sigma collapse artifact, got {}",
             feat.z_15
+        );
+    }
+
+    #[test]
+    fn test_package6_stall_hazard_tail_bypass_and_variance_shield() {
+        let sol_cal = asset_calibration("SOL");
+        // Baseline sigma_entry = 5 bps/min (0.0005). A single -25 bps (-5.0 sigma) bar breaches
+        // the -19 bps gate AND 4.2 sigma Tail Bypass immediately instead of waiting 5+ bars!
+        let mut mgr = StallHazardExitManager::new_with_sigma(Direction::Long, 100.0, 100.0, 0.0005);
+        let dec = mgr.on_1m_bar(
+            100.0, 100.0, 99.74, 99.75, 100.0, 100.35, 30.0, -1.5, -0.2, 1.5, &sol_cal,
+        );
+        match dec {
+            HardenedExitDecision::StopOutSprt1mClose { exit_px, .. } => {
+                assert!((exit_px - 99.75).abs() < 1e-6);
+            }
+            other => panic!(
+                "Expected immediate Tail Bypass StopOutSprt1mClose, got {:?}",
+                other
+            ),
+        }
+
+        // Variance Deflation Shield + Huber 4.50: even when rolling std_innov_1m is deflated to -1.2
+        // by volatility expansion, a -16 bps (3.2 sigma vs entry_sigma) bar accumulates fast (>= 0.85)
+        let mut mgr2 =
+            StallHazardExitManager::new_with_sigma(Direction::Long, 100.0, 100.0, 0.0005);
+        let _ = mgr2.on_1m_bar(
+            100.0, 100.0, 99.84, 99.84, 100.0, 100.35, 30.0, -1.2, -0.1, 1.5, &sol_cal,
+        );
+        assert!(
+            mgr2.cusum_stat_1m >= 0.50,
+            "Variance Deflation Shield + Huber 4.50 must accumulate >= 0.50 on 3.2σ shock, got {}",
+            mgr2.cusum_stat_1m
         );
     }
 }

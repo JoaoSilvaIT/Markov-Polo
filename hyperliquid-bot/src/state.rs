@@ -151,6 +151,10 @@ pub struct PositionState {
     pub tranche1_tp_filled: bool,
     #[serde(default)]
     pub last_peak_mins: f64,
+    #[serde(default)]
+    pub cusum_stat_1m: f64,
+    #[serde(default)]
+    pub entry_sigma_1m: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1807,6 +1811,8 @@ mod tests {
             last_fill_check: 0,
             tranche1_tp_filled: false,
             last_peak_mins: 0.0,
+            cusum_stat_1m: 0.0,
+            entry_sigma_1m: 0.0,
         };
         assert!(!empty_pos.is_occupied());
 

@@ -305,6 +305,20 @@ pub async fn execute_emergency_flatten_with_retry(
     Err(last_err)
 }
 
+pub fn is_symbol_live_capital_enabled(symbol: &str) -> bool {
+    let raw = std::env::var("HL_LIVE_SYMBOLS")
+        .unwrap_or_else(|_| "BTC,ETH,SOL,AVAX".to_string());
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("ALL") || trimmed == "*" {
+        return true;
+    }
+    let sym_norm = crate::config::normalize_trading_symbol(symbol);
+    trimmed.split(',').any(|tok| {
+        let t = tok.trim();
+        !t.is_empty() && crate::config::normalize_trading_symbol(t) == sym_norm
+    })
+}
+
 /// Computes the 2-tranche asymmetric TP plan `(tp_qty, tp_price, tranche_tag)` shared identically
 /// by `Fast-Sentinel` and adaptive/stall TP reprices so reprices never collapse an active 2-tranche split.
 pub fn compute_tp_order_plan(
@@ -668,6 +682,14 @@ async fn main() {
                 "   ↳ Payoff: {:.2} (Avg Win: {:+.1} bps | Avg Loss: -{:.1} bps) | Gross PnL: ${:+.2} | Fees Paid: ${:.2}",
                 payoff_ratio, avg_win_bps, avg_loss_bps, gross_usd, total_fees
             );
+            if !res.engine_b_vetoes.is_empty() {
+                let veto_str: Vec<String> = res
+                    .engine_b_vetoes
+                    .iter()
+                    .map(|(k, v)| format!("{}: {}", k, v))
+                    .collect();
+                println!("   ↳ [ENGINE B GATE BREAKDOWN]: {}", veto_str.join(" | "));
+            }
 
             let trade_display = if res.trades.len() > 3 {
                 println!(
@@ -1483,6 +1505,8 @@ async fn main() {
                         last_fill_check: 0,
                         tranche1_tp_filled: false,
                         last_peak_mins: 0.0,
+                        cusum_stat_1m: 0.0,
+                        entry_sigma_1m: 0.0,
                     },
                 );
             }
@@ -1564,6 +1588,8 @@ async fn main() {
                                 last_fill_check: 0,
                                 tranche1_tp_filled: false,
                                 last_peak_mins: 0.0,
+                                cusum_stat_1m: 0.0,
+                                entry_sigma_1m: 0.0,
                             };
                             state_lock.insert(trading_symbol.clone(), reconstructed);
                             let _ = save_state(&state_file_path, &state_lock);
@@ -2064,6 +2090,33 @@ async fn main() {
                                     );
                                     is_truly_dead = true;
                                     reported_status = "BTC_IMPULSE_ABORT".to_string();
+                                } else if pos.engine_type != "EngineB" && order_age_secs >= 45 && pos.entry_price > 0.0 {
+                                    // Package 6 Price-Runaway Early Cancel (45s Guard): free slot immediately if bounce already ran +12 bps without filling
+                                    let mid_run = {
+                                        let guard = watcher_obi.read().await;
+                                        if guard.is_fresh_and_uncrossed(now_ms, 5000) {
+                                            0.5 * (guard.best_bid + guard.best_ask)
+                                        } else {
+                                            0.0
+                                        }
+                                    };
+                                    let ran_away = if mid_run > 0.0 {
+                                        if pos.side == "LONG" {
+                                            (mid_run - pos.entry_price) / pos.entry_price >= 0.0012
+                                        } else {
+                                            (pos.entry_price - mid_run) / pos.entry_price >= 0.0012
+                                        }
+                                    } else {
+                                        false
+                                    };
+                                    if ran_away {
+                                        println!(
+                                            "⏱️ [FAST-SENTINEL PRICE-RUNAWAY CANCEL] {} {} entry {} unfilled after {}s while price ran >= +12 bps (mid: ${:.4} vs limit: ${:.4}). Releasing slot!",
+                                            watcher_symbol, pos.side, oid, order_age_secs, mid_run, pos.entry_price
+                                        );
+                                        is_truly_dead = true;
+                                        reported_status = "PRICE_RUNAWAY_ABORT".to_string();
+                                    }
                                 }
                             }
                         } else if pos_exists {
@@ -4467,7 +4520,7 @@ async fn main() {
                                                     stop_loss_px,
                                                 );
                                                 cf_tracker.register_opportunity(cf_opp);
-                                            } else if trend_engine_mode == "live" {
+                                            } else if trend_engine_mode == "live" && is_symbol_live_capital_enabled(&symbol_clone) {
                                                 let mut state_lock = state_clone.lock().await;
                                                 if !state_lock.contains_key(&symbol_clone) && !is_cluster_blocked {
                                                     let ttl_mins = (ttl_secs as f64) / 60.0;
@@ -4888,6 +4941,103 @@ async fn main() {
 
                                         let is_long = pos.side == "LONG";
                                         let entry_tick = effective_tick_size(pos.entry_price, sz_decimals);
+
+                                        // 1b. Hybrid 1-Minute Shadow StallHazardExitManager (Package 6):
+                                        // Evaluates Asymmetric Page-CUSUM & Tail Bypass internally on 1m Mid-Price
+                                        // WITHOUT disturbing resting TP queue priority until critical threshold breaches.
+                                        {
+                                            let cal_1m = asset_calibration(&symbol_clone);
+                                            let dir_1m = if is_long { Direction::Long } else { Direction::Short };
+                                            let prev_c_1m = rolling_closes.last().copied().unwrap_or(close_price);
+                                            let mid_eval_px = if l2_fresh && l2_bid_snap > 0.0 && l2_ask_snap > l2_bid_snap {
+                                                0.5 * (l2_bid_snap + l2_ask_snap)
+                                            } else {
+                                                close_price
+                                            };
+                                            let spread_bps_live = if l2_bid_snap > 0.0 && l2_ask_snap > l2_bid_snap {
+                                                ((l2_ask_snap - l2_bid_snap) / mid_eval_px.max(1e-9)) * 10_000.0
+                                            } else {
+                                                1.5
+                                            };
+                                            let baseline_sig_1m = if pos.entry_sigma_1m > 1e-6 {
+                                                pos.entry_sigma_1m
+                                            } else {
+                                                live_feat.sigma_1m_prev
+                                            };
+                                            let sigma_1m_est = live_feat.sigma_1m_prev.max(crate::ou_process::asset_min_sigma_1m_floor(&symbol_clone));
+                                            let std_innov_1m = if prev_c_1m > 0.0 && mid_eval_px > 0.0 {
+                                                ((mid_eval_px / prev_c_1m).ln() - (live_feat.kalman_slope / 5.0)) / sigma_1m_est
+                                            } else {
+                                                0.0
+                                            };
+                                            let sigma_eq_bps = if pos.frozen_sigma_eq_log > 1e-6 {
+                                                pos.frozen_sigma_eq_log * 10_000.0
+                                            } else {
+                                                25.0
+                                            };
+                                            let d_1m = dir_1m.sign();
+                                            let mfe_bps_curr = d_1m * ((pos.max_favorable_price - pos.entry_price) / pos.entry_price.max(1e-9)) * 10_000.0;
+                                            let mut stall_shadow = crate::ou_process::StallHazardExitManager::new_with_sigma(
+                                                dir_1m,
+                                                pos.entry_price,
+                                                ou_cfg.hard_disaster_stop_bps,
+                                                baseline_sig_1m,
+                                            );
+                                            stall_shadow.mfe_bps = mfe_bps_curr.max(0.0);
+                                            stall_shadow.elapsed_mins = (elapsed_mins.round() as usize).saturating_sub(1);
+                                            stall_shadow.last_peak_min = (pos.last_peak_mins.round() as usize).min(stall_shadow.elapsed_mins);
+                                            stall_shadow.tranche1_filled = pos.tranche1_tp_filled;
+                                            stall_shadow.cusum_stat_1m = pos.cusum_stat_1m;
+                                            if pos.stop_loss_price > 0.0 {
+                                                stall_shadow.hard_disaster_stop_px = pos.stop_loss_price;
+                                            }
+
+                                            let dec_1m = stall_shadow.on_1m_bar(
+                                                open_price,
+                                                high_price,
+                                                low_price,
+                                                mid_eval_px,
+                                                prev_c_1m,
+                                                if pos.frozen_center_price > 0.0 { pos.frozen_center_price } else { pos.take_profit_price },
+                                                sigma_eq_bps,
+                                                std_innov_1m,
+                                                l2_1s,
+                                                spread_bps_live,
+                                                &cal_1m,
+                                            );
+                                            pos.cusum_stat_1m = stall_shadow.cusum_stat_1m;
+
+                                            if let crate::ou_process::HardenedExitDecision::StopOutSprt1mClose { cusum_val, .. } = dec_1m {
+                                                let unreal_bps_mid = d_1m * ((mid_eval_px - pos.entry_price) / pos.entry_price.max(1e-9)) * 10_000.0;
+                                                if unreal_bps_mid >= -38.0 && !pos.tp_order_id.is_empty() {
+                                                    // Two-Stage Maker-Pegged Stop Conversion (-18..-38 bps): try passive Alo at 1 tick before Taker escape
+                                                    let peg_stop_px = quantize_price(mid_eval_px + d_1m * entry_tick, sz_decimals);
+                                                    let already_pegged = d_1m * (pos.effective_tp - pos.entry_price) < 0.0;
+                                                    if already_pegged {
+                                                        soft_invalidation_reason = Some("SPRT_1M_MAKER_PEG_TIMEOUT_FLATTEN");
+                                                    } else {
+                                                        println!(
+                                                            "🛡️ [1M SHADOW CUSUM -> MAKER-PEG STOP] {} CUSUM={:.2} at {:.1} bps -> converting TP to passive Alo @ ${:.4}",
+                                                            symbol_clone, cusum_val, unreal_bps_mid, peg_stop_px
+                                                        );
+                                                        should_reprice = true;
+                                                        reprice_exact_target = true;
+                                                        new_reprice_target = peg_stop_px;
+                                                        reprice_qty = pos.amount;
+                                                        reprice_is_buy = !is_long;
+                                                        old_tp_order_id = pos.tp_order_id.clone();
+                                                        pos.effective_tp = peg_stop_px;
+                                                        pos.last_reprice_time = chrono::Utc::now().timestamp_millis();
+                                                    }
+                                                } else {
+                                                    println!(
+                                                        "🚨 [1M SHADOW CUSUM ESCAPE] {} CUSUM={:.2} at {:.1} bps (< -38 bps) -> immediate escape flatten!",
+                                                        symbol_clone, cusum_val, unreal_bps_mid
+                                                    );
+                                                    soft_invalidation_reason = Some("SPRT_1M_ASYMMETRIC_CUSUM_ESCAPE");
+                                                }
+                                            }
+                                        }
 
                                         // 2. Tier 1 Multi-Bar 5-Minute Soft Structural Invalidation (`TwoTierInvalidationManager`)
                                         if is_5m_bar_close {
@@ -5933,6 +6083,57 @@ async fn main() {
                                                         continue;
                                                     }
 
+                                                    if !is_symbol_live_capital_enabled(&symbol_clone) {
+                                                        println!(
+                                                            "👻 [SHADOW_ONLY QUARANTINE] {} {} Engine A signal verified (${:.2} @ limit ${:.2}, Net Edge: {:.1} bps) -> logged in shadow (HL_LIVE_SYMBOLS quarantine).",
+                                                            symbol_clone, arm_side, trade_size_usdc, limit_price, net_edge_bps
+                                                        );
+                                                        let shadow_opp = crate::counterfactual::ActiveOpportunity::new(
+                                                            symbol_clone.clone(),
+                                                            "EngineA_MeanReversion".to_string(),
+                                                            if is_long_arm { "BUY".to_string() } else { "SELL".to_string() },
+                                                            format!("{:?}", controller.current_mode).to_uppercase(),
+                                                            now_ms_check,
+                                                            1800,
+                                                            crate::counterfactual::CounterfactualDecision {
+                                                                accepted: false,
+                                                                primary_veto: "SHADOW_QUARANTINE_PROMOTION_GATE".to_string(),
+                                                                all_vetos: vec!["SHADOW_QUARANTINE_PROMOTION_GATE".to_string()],
+                                                                threshold_sigma: 0.0,
+                                                                signal_value: live_feat.z_ou,
+                                                                hmm_probabilities: crate::counterfactual::HmmProbs {
+                                                                    consolidation: current_p_c,
+                                                                    trend: current_p_t,
+                                                                    shock: current_p_s,
+                                                                },
+                                                            },
+                                                            crate::counterfactual::MarketAtDecision {
+                                                                reference_price: limit_price,
+                                                                bid: best_bid_l2,
+                                                                ask: best_ask_l2,
+                                                                spread_bps: 1.0,
+                                                                l2_age_ms: 0,
+                                                                obi: l2_1s,
+                                                                volatility_z15: z_15,
+                                                                volatility_z60: Some(z_60),
+                                                            },
+                                                            crate::counterfactual::HypotheticalOrder {
+                                                                order_type: "post_only_limit".to_string(),
+                                                                limit_price,
+                                                                size: trade_size_usdc / limit_price.max(1e-9),
+                                                                time_in_force: "ALO".to_string(),
+                                                                assumed_cancel_rule: "ttl".to_string(),
+                                                                queue_ahead_estimate: None,
+                                                            },
+                                                            frozen_target,
+                                                            est_sl_px,
+                                                        );
+                                                        cf_tracker.register_opportunity(shadow_opp);
+                                                        armed_state.is_armed = false;
+                                                        save_armed_signal(&arm_path_clone, &armed_state);
+                                                        continue;
+                                                    }
+
                                                     funnel_counters.engine_a_orders_placed += 1;
                                                     let policy_str = if is_join_book { "JOIN-BOOK" } else { "RETEST-LIMIT" };
                                                     println!(
@@ -5959,6 +6160,11 @@ async fn main() {
                                                     .await
                                                     {
                                                         Ok(_) => {
+                                                            if let Some(p) = state_lock.get_mut(&symbol_clone) {
+                                                                p.entry_sigma_1m = live_feat.sigma_1m_prev;
+                                                                p.cusum_stat_1m = 0.0;
+                                                                let _ = crate::state::save_state(&state_path_clone, &state_lock);
+                                                            }
                                                             armed_state.is_armed = false;
                                                             save_armed_signal(&arm_path_clone, &armed_state);
                                                         }
@@ -6198,7 +6404,9 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_tp_order_plan, compute_tp_order_plan_with_mode};
+    use super::{
+        compute_tp_order_plan, compute_tp_order_plan_with_mode, is_symbol_live_capital_enabled,
+    };
 
     #[test]
     fn test_compute_tp_order_plan_preserves_two_tranche_splits() {
@@ -6236,5 +6444,25 @@ mod tests {
         let (_, px_exact, _) =
             compute_tp_order_plan_with_mode("EngineA", 909.35, 907.05, 0.11, false, true, 3);
         assert!((px_exact - 907.05).abs() < 1e-4, "expected 907.05, got {}", px_exact);
+    }
+
+    #[test]
+    fn test_package6_live_capital_quarantine_gate() {
+        std::env::remove_var("HL_LIVE_SYMBOLS");
+        assert!(is_symbol_live_capital_enabled("BTC"));
+        assert!(is_symbol_live_capital_enabled("ETH"));
+        assert!(is_symbol_live_capital_enabled("SOL"));
+        assert!(is_symbol_live_capital_enabled("AVAX"));
+        assert!(!is_symbol_live_capital_enabled("HYPE"));
+        assert!(!is_symbol_live_capital_enabled("XRP"));
+        assert!(!is_symbol_live_capital_enabled("xyz:GOLD"));
+
+        std::env::set_var("HL_LIVE_SYMBOLS", "BTC,ETH,SOL,AVAX,SUI");
+        assert!(is_symbol_live_capital_enabled("SUI"));
+        assert!(!is_symbol_live_capital_enabled("LINK"));
+
+        std::env::set_var("HL_LIVE_SYMBOLS", "ALL");
+        assert!(is_symbol_live_capital_enabled("xyz:NVDA"));
+        std::env::remove_var("HL_LIVE_SYMBOLS");
     }
 }

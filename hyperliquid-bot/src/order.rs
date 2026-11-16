@@ -306,6 +306,8 @@ pub async fn place_ou_maker_entry(
         last_fill_check: 0,
         tranche1_tp_filled: false,
         last_peak_mins: 0.0,
+        cusum_stat_1m: 0.0,
+        entry_sigma_1m: 0.0,
     };
 
     state.insert(symbol.to_string(), new_state.clone());
@@ -609,6 +611,8 @@ pub async fn place_trend_breakout_entry(
         last_fill_check: 0,
         tranche1_tp_filled: false,
         last_peak_mins: 0.0,
+        cusum_stat_1m: 0.0,
+        entry_sigma_1m: 0.0,
     };
 
     state.insert(symbol.to_string(), new_state.clone());

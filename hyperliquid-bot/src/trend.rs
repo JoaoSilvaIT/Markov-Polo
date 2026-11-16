@@ -2178,6 +2178,12 @@ impl EngineBTrendManager {
                     } else {
                         0.0
                     };
+                    // Package 6: Non-Hostile Book Floor (-0.15) + Aggressive Conviction/RelVol flow filter
+                    // Prevents resting ask/bid absorption walls on Hyperliquid L2 from killing valid breakouts.
+                    let non_hostile_book_with_flow = d * t.l2_obi >= -0.15
+                        && d * clv_5m >= cfg.min_clv_conviction
+                        && t.rel_vol_15m >= cfg.min_rel_volume
+                        && body_atr >= 0.06;
                     let eff_obi_hurdle = if t.rel_vol_15m >= 2.10 && d * clv_5m >= 0.60 {
                         (cfg.min_obi_retest * 0.50).max(0.10)
                     } else {
@@ -2188,7 +2194,10 @@ impl EngineBTrendManager {
                         && d * clv_5m >= 0.55
                         && t.rel_vol_15m >= 1.85
                         && body_atr >= 0.12;
-                    if d * t.l2_obi >= eff_obi_hurdle || clv_fallback_passed {
+                    if d * t.l2_obi >= eff_obi_hurdle
+                        || non_hostile_book_with_flow
+                        || clv_fallback_passed
+                    {
                         // 2 consecutive 5m bars confirmed + L2 OBI aligned: Post Stage 2 Alo Retest Order!
                         // When confirmation close has expanded > 0.35 * ATR beyond broken_donchian_px,
                         // anchor dynamically to a shallow 35% flag pullback so Stage 2 fills real runners.
@@ -2252,7 +2261,8 @@ impl EngineBTrendManager {
                         reason: "RETEST_TTL_EXPIRED",
                     };
                 }
-                if d * t.l2_obi < 0.0 || d * (t.bar_close - broken_donchian_px) < -0.10 * t.atr_15m
+                if d * t.l2_obi < -0.25
+                    || d * (t.bar_close - broken_donchian_px) < -0.10 * t.atr_15m
                 {
                     self.state = RetestState::Idle;
                     return TrendOrderAction::CancelRestingRetestOrder {

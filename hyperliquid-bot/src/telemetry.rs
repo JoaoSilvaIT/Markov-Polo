@@ -323,24 +323,26 @@ pub fn evaluate_btc_impulse_veto(
                 || btc.z_15 <= -1.8
                 || beta_ret_3m_bps <= -26.0
                 || beta_ret_5m_bps <= -32.0
+                || btc.ret_15m_bps <= -75.0
                 || (btc.ret_30m_bps <= -45.0 && btc.ret_15m_bps <= -15.0)
                 || (btc.is_severe_shock && btc.z_15 < -1.0)
             {
                 return Some(format!(
-                    "BTC Lead-Lag Cascade Veto (I={:.2}, beta={:.2}, BTC Z15={:.2}, 3m={:+.1}bps, 5m={:+.1}bps)",
-                    impulse_score, beta, btc.z_15, btc.ret_3m_bps, btc.ret_5m_bps
+                    "BTC Lead-Lag Cascade Veto (I={:.2}, beta={:.2}, BTC Z15={:.2}, 3m={:+.1}bps, 5m={:+.1}bps, 15m={:+.1}bps)",
+                    impulse_score, beta, btc.z_15, btc.ret_3m_bps, btc.ret_5m_bps, btc.ret_15m_bps
                 ));
             }
         } else if impulse_score >= 1.35
             || btc.z_15 >= 1.8
             || beta_ret_3m_bps >= 26.0
             || beta_ret_5m_bps >= 32.0
+            || btc.ret_15m_bps >= 75.0
             || (btc.ret_30m_bps >= 45.0 && btc.ret_15m_bps >= 15.0)
             || (btc.is_severe_shock && btc.z_15 > 1.0)
         {
             return Some(format!(
-                "BTC Lead-Lag Squeeze Veto (I={:.2}, beta={:.2}, BTC Z15={:.2}, 3m={:+.1}bps, 5m={:+.1}bps)",
-                impulse_score, beta, btc.z_15, btc.ret_3m_bps, btc.ret_5m_bps
+                "BTC Lead-Lag Squeeze Veto (I={:.2}, beta={:.2}, BTC Z15={:.2}, 3m={:+.1}bps, 5m={:+.1}bps, 15m={:+.1}bps)",
+                impulse_score, beta, btc.z_15, btc.ret_3m_bps, btc.ret_5m_bps, btc.ret_15m_bps
             ));
         }
     }

@@ -190,6 +190,7 @@ pub struct BacktestSummary {
     pub profit_factor: f64,
     pub max_drawdown_usd: f64,
     pub trades: Vec<SimulatedTradeResult>,
+    pub engine_b_vetoes: std::collections::BTreeMap<&'static str, usize>,
 }
 
 /// Builds a causal `BtcImpulseSnapshot` at `ts_ms` from the historical BTC 1m bar series.
@@ -905,8 +906,16 @@ pub fn run_engine_a_backtest_with_btc(
                 let init_sl_bps = ((entry_ord.limit_px - eff_hard_stop_px).abs()
                     / entry_ord.limit_px.max(1e-9))
                     * 10_000.0;
-                let mut stall_mgr =
-                    StallHazardExitManager::new(ord_dir, entry_ord.limit_px, init_sl_bps);
+                let entry_sigma_1m = cached_feat_opt
+                    .as_ref()
+                    .map(|f| f.sigma_1m_prev)
+                    .unwrap_or_else(|| crate::ou_process::asset_min_sigma_1m_floor(symbol));
+                let mut stall_mgr = StallHazardExitManager::new_with_sigma(
+                    ord_dir,
+                    entry_ord.limit_px,
+                    init_sl_bps,
+                    entry_sigma_1m,
+                );
                 stall_mgr.hard_disaster_stop_px = eff_hard_stop_px;
                 open_pos = Some(OpenSimulatedPosition {
                     side: entry_ord.side.clone(),
@@ -1298,7 +1307,7 @@ pub fn run_engine_a_backtest_with_btc(
                 let w1_frac = pos.asym_mgr.w1_fraction;
                 let w2_frac = pos.asym_mgr.w2_fraction;
 
-                if !has_native_l2 && elapsed_mins_1m >= 1.0 {
+                if elapsed_mins_1m >= 1.0 {
                     let prev_close = *closes_history.last().unwrap_or(&bar.open);
                     let sigma_1m_est = live_feat_opt
                         .as_ref()
@@ -2215,8 +2224,10 @@ pub fn run_engine_a_backtest_with_btc(
                                         summary.orders_expired_unfilled += 1;
                                     }
                                 }
-                                TrendOrderAction::LogShadowCounterfactual { .. }
-                                | TrendOrderAction::None => {}
+                                TrendOrderAction::LogShadowCounterfactual { reason, .. } => {
+                                    *summary.engine_b_vetoes.entry(reason).or_insert(0) += 1;
+                                }
+                                TrendOrderAction::None => {}
                             }
                         }
                     }
