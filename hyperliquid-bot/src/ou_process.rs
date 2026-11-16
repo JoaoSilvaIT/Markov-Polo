@@ -3831,7 +3831,7 @@ impl StallHazardExitManager {
 
         // 3. State-Contingent Stall-Hazard Trajectory for Tranche 1 Maker Limit
         let is_expanding = tau_stall < cal.stall_trigger_mins || m_rev >= 0.22;
-        let tp1_target_bps = if is_expanding || self.mfe_bps < 9.5 {
+        let tp1_target_bps = if is_expanding || self.mfe_bps < 15.0 {
             // Active expansion: DO NOT CAP WINNER! Keep TP1 at full Kalman equilibrium mean.
             mean_dist_bps
         } else {

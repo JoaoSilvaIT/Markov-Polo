@@ -4935,12 +4935,34 @@ async fn main() {
                                             45.0
                                         };
                                         max_allowed_mins = (3.5 * eff_hl).clamp(90.0, 360.0);
-                                        if elapsed_mins >= max_allowed_mins {
-                                            time_stop_triggered = true;
-                                        }
-
                                         let is_long = pos.side == "LONG";
                                         let entry_tick = effective_tick_size(pos.entry_price, sz_decimals);
+                                        if elapsed_mins >= max_allowed_mins {
+                                            // Package 6B: Passive Alo Maker-Peg conversion for TIME_DECAY_STOP (3m grace before Taker fallback)
+                                            let d_td = if is_long { 1.0 } else { -1.0 };
+                                            let td_peg_px = quantize_price(close_price + d_td * entry_tick, sz_decimals);
+                                            let already_td_pegged = (pos.effective_tp - td_peg_px).abs() <= 2.0 * entry_tick;
+                                            if elapsed_mins < max_allowed_mins + 3.0
+                                                && !pos.tp_order_id.is_empty()
+                                                && !already_td_pegged
+                                                && !should_reprice
+                                            {
+                                                println!(
+                                                    "⏱️ [TIME-DECAY -> MAKER-PEG] {} reached {:.1}m >= {:.1}m -> converting TP to passive Alo @ ${:.4}",
+                                                    symbol_clone, elapsed_mins, max_allowed_mins, td_peg_px
+                                                );
+                                                should_reprice = true;
+                                                reprice_exact_target = true;
+                                                new_reprice_target = td_peg_px;
+                                                reprice_qty = pos.amount;
+                                                reprice_is_buy = !is_long;
+                                                old_tp_order_id = pos.tp_order_id.clone();
+                                                pos.effective_tp = td_peg_px;
+                                                pos.last_reprice_time = chrono::Utc::now().timestamp_millis();
+                                            } else if elapsed_mins >= max_allowed_mins + 3.0 || pos.tp_order_id.is_empty() {
+                                                time_stop_triggered = true;
+                                            }
+                                        }
 
                                         // 1b. Hybrid 1-Minute Shadow StallHazardExitManager (Package 6):
                                         // Evaluates Asymmetric Page-CUSUM & Tail Bypass internally on 1m Mid-Price
