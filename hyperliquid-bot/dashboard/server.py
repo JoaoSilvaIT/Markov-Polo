@@ -263,6 +263,7 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
                         else (open_tracker.get(coin, {}).get("side", "LONG"))
                     )
                 )
+                has_real_open = coin in open_tracker
                 open_info = open_tracker.get(
                     coin,
                     {
@@ -280,24 +281,37 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
                     else px
                 )
                 open_ms = int(open_info.get("time") or ts_ms)
-                net_pnl = closed_pnl - fee - float(open_info.get("fee", 0.0) or 0.0)
-                open_info["fee"] = 0.0  # consume open fee once
-                if coin in open_tracker:
+                rem_open_fee = float(open_info.get("fee", 0.0) or 0.0)
+                alloc_open_fee = (
+                    rem_open_fee * min(1.0, sz / tot_op_sz) if has_real_open else 0.0
+                )
+                net_pnl = closed_pnl - fee - alloc_open_fee
+                if has_real_open:
+                    open_tracker[coin]["fee"] = max(0.0, rem_open_fee - alloc_open_fee)
                     open_tracker[coin]["sz"] -= sz
                     open_tracker[coin]["px_sz"] -= entry_px * sz
                     if open_tracker[coin]["sz"] <= 1e-5:
                         del open_tracker[coin]
 
-                # Merge partial fills belonging to the same close order or within 10s on same coin
-                if (
-                    grouped_closes
-                    and grouped_closes[-1]["symbol"] == coin
-                    and (
-                        grouped_closes[-1]["oid"] == oid
-                        or abs(ts_ms - grouped_closes[-1]["close_ms"]) <= 10_000
-                    )
-                ):
-                    prev = grouped_closes[-1]
+                # Merge partial fills / multi-tranche closes belonging to the same position
+                merge_target = None
+                for prev in reversed(grouped_closes):
+                    if prev["symbol"] != coin or prev["side"] != side:
+                        continue
+                    if (
+                        (
+                            has_real_open
+                            and prev.get("has_real_open")
+                            and prev["open_ms"] == open_ms
+                        )
+                        or prev["oid"] == oid
+                        or abs(ts_ms - prev["close_ms"]) <= 10_000
+                    ):
+                        merge_target = prev
+                        break
+
+                if merge_target is not None:
+                    prev = merge_target
                     total_sz = prev["lots"] + sz
                     if total_sz > 0:
                         prev["exit_price"] = (
@@ -308,7 +322,7 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
                     prev["close_ms"] = ts_ms
                     prev["close_date"] = fmt_ts_ms(ts_ms)
                     prev["day_key"] = fmt_date_slash(ts_ms)
-                    notional = max(entry_px * prev["lots"], 1e-6)
+                    notional = max(prev["entry_price"] * prev["lots"], 1e-6)
                     prev["pnl_bps"] = round((prev["pnl_usd"] / notional) * 10000.0, 2)
                     prev["pnl_pct"] = round((prev["pnl_usd"] / notional) * 100.0, 2)
                     prev["is_win"] = prev["pnl_usd"] > 0.0
@@ -326,6 +340,7 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
                             "exit_price": px,
                             "open_ms": open_ms,
                             "close_ms": ts_ms,
+                            "has_real_open": has_real_open,
                             "open_date": fmt_ts_ms(open_ms),
                             "close_date": fmt_ts_ms(ts_ms),
                             "day_key": fmt_date_slash(ts_ms),

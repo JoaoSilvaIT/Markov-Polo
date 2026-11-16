@@ -37,6 +37,8 @@ pub struct RegimeController {
     pub model_generation: u64,
     #[serde(default)]
     pub peak_shock_z: f64,
+    #[serde(default)]
+    pub shock_escalation_count: u8,
 }
 
 impl Default for RegimeController {
@@ -54,6 +56,7 @@ impl Default for RegimeController {
             cooldown_until_ms: 0,
             model_generation: 1,
             peak_shock_z: 0.0,
+            shock_escalation_count: 0,
         }
     }
 }
@@ -77,16 +80,18 @@ impl RegimeController {
             // Fresh shock initiation: start 15m countdown clock
             self.cooldown_until_ms = now_ms + 15 * 60 * 1000;
             self.peak_shock_z = current_shock_z;
+            self.shock_escalation_count = 0;
             self.last_reason = format!(
                 "Immediate Shock Downgrade (|Z15|={:.2}, |Z60|={:.2}) -> Neutral Cooldown (1 bar & 15m)",
                 z_15, z_60
             );
             self.last_transition_time = Utc::now().to_rfc3339();
             self.epoch += 1;
-        } else if current_shock_z >= self.peak_shock_z + 1.5 {
-            // Severe secondary shock escalation: restart clock
+        } else if current_shock_z >= self.peak_shock_z + 1.5 && self.shock_escalation_count < 3 {
+            // Severe secondary shock escalation (capped at 3 restarts per episode)
             self.cooldown_until_ms = now_ms + 15 * 60 * 1000;
             self.peak_shock_z = current_shock_z;
+            self.shock_escalation_count += 1;
             self.last_reason = format!(
                 "Secondary Shock Escalation (|Z15|={:.2}, |Z60|={:.2} vs peak {:.2}) -> Cooldown Clock Restarted (1 bar & 15m)",
                 z_15, z_60, self.peak_shock_z
@@ -195,6 +200,7 @@ impl RegimeController {
                 // Fresh shock initiation: start 15m countdown clock
                 self.cooldown_until_ms = now_ms + 15 * 60 * 1000;
                 self.peak_shock_z = current_shock_z;
+                self.shock_escalation_count = 0;
                 self.shock_cooldown_bars = 1; // 1 bar = minimum
                 self.last_reason = format!(
                     "Severe Volatility Shock Veto (|Z15|={:.2}, |Z60|={:.2}) -> Safe Neutral Cash Buffer (Cooldown 1 bar & 15m)",
@@ -202,10 +208,12 @@ impl RegimeController {
                 );
                 self.last_transition_time = Utc::now().to_rfc3339();
                 self.epoch += 1;
-            } else if current_shock_z >= self.peak_shock_z + 1.5 {
-                // Severe secondary shock escalation: restart clock
+            } else if current_shock_z >= self.peak_shock_z + 1.5 && self.shock_escalation_count < 3
+            {
+                // Severe secondary shock escalation (capped at 3 restarts per episode)
                 self.cooldown_until_ms = now_ms + 15 * 60 * 1000;
                 self.peak_shock_z = current_shock_z;
+                self.shock_escalation_count += 1;
                 self.shock_cooldown_bars = 1;
                 self.last_reason = format!(
                     "Secondary Severe Shock in Cooldown (|Z15|={:.2}, |Z60|={:.2} vs peak {:.2}) -> Cooldown Clock Restarted (1 bar & 15m)",
@@ -1230,6 +1238,15 @@ mod tests {
         assert!(controller
             .last_reason
             .contains("Secondary Shock Escalation"));
+
+        // Further escalations beyond cap (3 restarts) must preserve clock rather than locking indefinitely
+        let mut t = shock_start + 720_000;
+        for step in 1..=4 {
+            t += 60_000;
+            controller.force_shock_cooldown(5.0 + (step as f64) * 2.0, 1.5, t);
+        }
+        assert_eq!(controller.shock_escalation_count, 3);
+        assert!(controller.last_reason.contains("Clock preserved"));
     }
 
     #[test]

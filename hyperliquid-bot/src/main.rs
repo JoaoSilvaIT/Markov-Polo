@@ -315,6 +315,29 @@ pub fn compute_tp_order_plan(
     tranche1_tp_filled: bool,
     sz_decimals: u32,
 ) -> (f64, f64, &'static str) {
+    compute_tp_order_plan_with_mode(
+        engine_type,
+        entry_price,
+        raw_tp,
+        total_amt,
+        tranche1_tp_filled,
+        false,
+        sz_decimals,
+    )
+}
+
+/// Same as `compute_tp_order_plan`, with `exact_target = true` skipping the 0.65x T1 compression
+/// for explicit Stall-Hazard / Breakeven / State-3 Maker-Peg harvest targets, while enforcing a
+/// 20 bps minimum T1 profit floor whenever `raw_tp` is at least 20 bps away from `entry_price`.
+pub fn compute_tp_order_plan_with_mode(
+    engine_type: &str,
+    entry_price: f64,
+    raw_tp: f64,
+    total_amt: f64,
+    tranche1_tp_filled: bool,
+    exact_target: bool,
+    sz_decimals: u32,
+) -> (f64, f64, &'static str) {
     let total_notional = total_amt * entry_price;
     let t1_half = round_to_decimals(total_amt * 0.5, sz_decimals);
     let rem_half = round_to_decimals(total_amt - t1_half, sz_decimals);
@@ -326,10 +349,26 @@ pub fn compute_tp_order_plan(
         && rem_half * raw_tp >= 10.50;
 
     if use_two_tranche {
-        if engine_type == "EngineB" {
+        if engine_type == "EngineB" || exact_target {
             (t1_half, quantize_price(raw_tp, sz_decimals), "T1-50%")
         } else {
-            let t1_eng_a_px = entry_price + 0.65 * (raw_tp - entry_price);
+            let dist = raw_tp - entry_price;
+            let raw_dist_frac = if entry_price > 0.0 {
+                dist.abs() / entry_price
+            } else {
+                0.0
+            };
+            let min_t1_frac = 0.0020; // 20 bps floor matching One-Way Ratchet p_min / p_max
+            let t1_eng_a_px = if raw_dist_frac <= min_t1_frac {
+                raw_tp
+            } else {
+                let shaved = entry_price + 0.65 * dist;
+                if dist >= 0.0 {
+                    shaved.max(entry_price * (1.0 + min_t1_frac))
+                } else {
+                    shaved.min(entry_price * (1.0 - min_t1_frac))
+                }
+            };
             (t1_half, quantize_price(t1_eng_a_px, sz_decimals), "T1-50%")
         }
     } else {
@@ -1802,10 +1841,12 @@ async fn main() {
                         || p.disaster_stop_oid.is_some()
                         || p.last_fill_check < chrono::Utc::now().timestamp_millis() as u64 - 30_000;
 
-                    // Check if disaster stop ratchet should trigger (using live position size & fee-aware breakeven)
+                    // Check if disaster stop ratchet should trigger (Engine B only: T1 fills at +1.5 ATR, so BE stop sits outside 1m noise.
+                    // Per Stall-Hazard Policy Sec 1.2 State 3, Engine A must NOT choke Tranche 2 with a tight Taker Stop-Market at +5.5 bps.)
                     let mut dr = false;
                     let mut rp = None;
                     if (p.is_filled || pos_exists)
+                        && p.engine_type == "EngineB"
                         && (p.max_progress >= 0.55 || p.tranche1_tp_filled)
                         && !p.disaster_stop_ratcheted_to_be
                     {
@@ -2155,6 +2196,48 @@ async fn main() {
                         continue;
                     }
 
+                    // Guard against race with 1m loop reprice: check both live state and existing resting reduce-only orders
+                    let already_set_in_state = {
+                        let state_lock = watcher_state.lock().await;
+                        state_lock
+                            .get(&watcher_symbol)
+                            .map(|p| !p.tp_order_id.is_empty())
+                            .unwrap_or(true)
+                    };
+                    if already_set_in_state {
+                        continue;
+                    }
+
+                    let entry_oid_opt = pos.order_id.parse::<u64>().ok();
+                    let close_side_str = if tp_is_buy { "B" } else { "A" };
+                    let mut existing_tp_oid: Option<u64> = None;
+                    if let Ok(live_orders) = fetch_open_orders_for_coin(&watcher_info, user_address, &watcher_symbol).await {
+                        if let Some(found) = live_orders.iter().find(|o| {
+                            o.coin == watcher_symbol
+                                && o.side == close_side_str
+                                && Some(o.oid) != entry_oid_opt
+                                && Some(o.oid) != pos.disaster_stop_oid
+                        }) {
+                            existing_tp_oid = Some(found.oid);
+                        }
+                    }
+                    if let Some(adopted_oid) = existing_tp_oid {
+                        let mut state_lock = watcher_state.lock().await;
+                        if let Some(p) = state_lock.get_mut(&watcher_symbol) {
+                            if p.tp_order_id.is_empty() {
+                                p.tp_order_id = adopted_oid.to_string();
+                                p.is_filled = true;
+                                p.amount = total_amt;
+                                let _ = save_state(&watcher_state_path, &state_lock);
+                                println!(
+                                    "🔗 [FAST-SENTINEL] Adopted existing resting TP order {} for {} (prevented duplicate).",
+                                    adopted_oid, watcher_symbol
+                                );
+                            }
+                        }
+                        continue;
+                    }
+
                     let tp_cloid = uuid::Uuid::new_v4();
                     match place_reduce_only_tp_order(
                         &watcher_exchange,
@@ -2334,8 +2417,11 @@ async fn main() {
                 if is_tp_dead && !is_flat {
                     let mut state_lock = watcher_state.lock().await;
                     if let Some(p) = state_lock.get_mut(&watcher_symbol) {
-                        p.tp_order_id.clear();
-                        let _ = save_state(&watcher_state_path, &state_lock);
+                        // Only clear if the dead oid is still the active TP oid (avoids racing a newer 1m reprice)
+                        if p.tp_order_id == pos.tp_order_id {
+                            p.tp_order_id.clear();
+                            let _ = save_state(&watcher_state_path, &state_lock);
+                        }
                     }
                     continue;
                 }
@@ -2351,6 +2437,17 @@ async fn main() {
                 }
 
                 if is_tp_filled && !is_flat && !pos.tranche1_tp_filled {
+                    // Verify this TP oid is still the active TP oid and T1 hasn't been processed yet
+                    {
+                        let state_lock = watcher_state.lock().await;
+                        let valid_t1 = state_lock
+                            .get(&watcher_symbol)
+                            .map(|p| p.tp_order_id == pos.tp_order_id && !p.tranche1_tp_filled)
+                            .unwrap_or(false);
+                        if !valid_t1 {
+                            continue;
+                        }
+                    }
                     // Tranche 1 (50%) filled while Tranche 2 (50% runner) remains open on exchange!
                     let rem_amt = current_szi.abs();
                     let t1_amt = (pos.amount - rem_amt).max(0.0);
@@ -2359,14 +2456,14 @@ async fn main() {
                     } else {
                         pos.take_profit_price
                     };
-                    let t1_exit_px = if pos.engine_type == "EngineB" {
-                        quantize_price(raw_tp_t1, watcher_sz_decimals)
-                    } else {
-                        quantize_price(
-                            pos.entry_price + 0.65 * (raw_tp_t1 - pos.entry_price),
-                            watcher_sz_decimals,
-                        )
-                    };
+                    let (_, t1_exit_px, _) = compute_tp_order_plan(
+                        &pos.engine_type,
+                        pos.entry_price,
+                        raw_tp_t1,
+                        pos.amount,
+                        false,
+                        watcher_sz_decimals,
+                    );
                     if t1_amt > 0.0 && pos.entry_price > 0.0 && t1_exit_px > 0.0 {
                         let t1_pnl_usd = if pos.side == "LONG" {
                             (t1_exit_px - pos.entry_price) * t1_amt
@@ -2412,31 +2509,29 @@ async fn main() {
                         live_ask_ratchet <= 0.0 || be_px > live_ask_ratchet * 1.0005
                     };
 
-                    // 1. Update state and ratchet local protective stop monotonically to fee-covered breakeven
+                    // 1. Update state: Engine B ratchets protective stop monotonically to fee-covered breakeven;
+                    //    Engine A retains its wide catastrophe stop and relies on State 3 Maker-Pegged Profit Lock.
+                    let is_engine_b_pos = pos.engine_type == "EngineB";
                     {
                         let mut state_lock = watcher_state.lock().await;
                         if let Some(p) = state_lock.get_mut(&watcher_symbol) {
                             p.tranche1_tp_filled = true;
                             p.tp_order_id.clear();
                             p.amount = rem_amt;
-                            if safe_be_vs_bbo {
+                            if is_engine_b_pos && safe_be_vs_bbo {
                                 if is_long_pos {
                                     p.stop_loss_price = p.stop_loss_price.max(be_px);
-                                    if p.engine_type == "EngineB" {
-                                        p.chandelier_stop = p.chandelier_stop.max(be_px);
-                                    }
+                                    p.chandelier_stop = p.chandelier_stop.max(be_px);
                                 } else {
                                     if p.stop_loss_price > 0.0 {
                                         p.stop_loss_price = p.stop_loss_price.min(be_px);
                                     } else {
                                         p.stop_loss_price = be_px;
                                     }
-                                    if p.engine_type == "EngineB" {
-                                        if p.chandelier_stop > 0.0 {
-                                            p.chandelier_stop = p.chandelier_stop.min(be_px);
-                                        } else {
-                                            p.chandelier_stop = be_px;
-                                        }
+                                    if p.chandelier_stop > 0.0 {
+                                        p.chandelier_stop = p.chandelier_stop.min(be_px);
+                                    } else {
+                                        p.chandelier_stop = be_px;
                                     }
                                 }
                             }
@@ -2444,14 +2539,27 @@ async fn main() {
                         }
                     }
 
-                    // 2. Replace Exchange-Native Disaster Stop with exact remaining size & breakeven trigger
-                    if safe_be_vs_bbo {
+                    // 2. Replace Exchange-Native Disaster Stop with exact remaining size:
+                    //    Engine B ratchets trigger to BE; Engine A keeps original wide catastrophe stop.
+                    let (target_sl_px, mark_be_ratcheted) = if is_engine_b_pos {
+                        (if safe_be_vs_bbo { Some(be_px) } else { None }, true)
+                    } else if pos.stop_loss_price > 0.0 {
+                        let raw_wide_sl = if is_long_pos {
+                            pos.stop_loss_price * 0.9985
+                        } else {
+                            pos.stop_loss_price * 1.0015
+                        };
+                        (Some(quantize_price(raw_wide_sl, watcher_sz_decimals)), false)
+                    } else {
+                        (None, false)
+                    };
+                    if let Some(new_trigger_px) = target_sl_px {
                         if let Ok(new_sl_oid) = crate::hyperliquid::ratchet_disaster_stop_to_breakeven(
                             &watcher_exchange,
                             &watcher_symbol,
                             !is_long_pos,
                             rem_amt,
-                            be_px,
+                            new_trigger_px,
                             watcher_sz_decimals,
                             pos.disaster_stop_oid,
                             Some(uuid::Uuid::new_v4()),
@@ -2461,14 +2569,16 @@ async fn main() {
                             let mut state_lock = watcher_state.lock().await;
                             if let Some(p) = state_lock.get_mut(&watcher_symbol) {
                                 p.disaster_stop_oid = Some(new_sl_oid);
-                                p.disaster_stop_ratcheted_to_be = true;
+                                if mark_be_ratcheted {
+                                    p.disaster_stop_ratcheted_to_be = true;
+                                }
                                 let _ = save_state(&watcher_state_path, &state_lock);
                             }
                         }
                     }
 
                     // 3. Engine A places Tranche 2 TP at equilibrium target_mu; Engine B lets Chandelier trail uncapped
-                    if pos.engine_type != "EngineB" {
+                    if !is_engine_b_pos {
                         let t2_raw = if pos.effective_tp > 0.0 {
                             pos.effective_tp
                         } else {
@@ -2494,8 +2604,8 @@ async fn main() {
                             }
                         }
                         println!(
-                            "🎯 [ENGINE A TRANCHE 1 FILLED (50%)] {} locked 50% early profit! Tranche 2 ({:.4}) resting at ${:.2} with BE stop @ ${:.2}.",
-                            watcher_symbol, rem_amt, t2_px, be_px
+                            "🎯 [ENGINE A TRANCHE 1 FILLED (50%)] {} locked 50% early profit! Tranche 2 ({:.4}) resting at ${:.2} (Catastrophe stop resized to ${:.2}; State 3 Maker-Peg active).",
+                            watcher_symbol, rem_amt, t2_px, target_sl_px.unwrap_or(pos.stop_loss_price)
                         );
                     } else {
                         println!(
@@ -3345,7 +3455,11 @@ async fn main() {
                     let is_controller_shock_1m = live_feat.is_downside_shock
                         || (live_feat.is_upside_shock && (current_p_s >= 0.50 || z_15.abs() >= 3.5));
 
-                    if is_controller_shock_1m {
+                    let session_closed_for_shock = matches!(
+                        evaluate_session_lifecycle_gate(&symbol_clone, completed_bar.time_open as i64),
+                        SessionLifecycleAction::ForceFlat(_)
+                    );
+                    if is_controller_shock_1m && !session_closed_for_shock {
                         if last_shock_bar_ms != completed_bar.time_open {
                             last_shock_bar_ms = completed_bar.time_open;
                             let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
@@ -4616,6 +4730,7 @@ async fn main() {
                             let mut max_allowed_mins = 240.0;
 
                             let mut should_reprice = false;
+                            let mut reprice_exact_target = false;
                             let mut new_reprice_target = 0.0;
                             let mut reprice_qty = 0.0;
                             let mut reprice_is_buy = false;
@@ -4845,6 +4960,7 @@ async fn main() {
                                                     };
                                                     if valid_be_reprice {
                                                         should_reprice = true;
+                                                        reprice_exact_target = true;
                                                         new_reprice_target = be_px;
                                                         reprice_qty = pos.amount;
                                                         reprice_is_buy = !is_long;
@@ -4881,13 +4997,56 @@ async fn main() {
                                                 pos.last_peak_mins = elapsed_mins;
                                             }
 
-                                            // Arm Profit Protection once trade covers >= min(75% of target, 1.8 * min_net_edge_bps)
-                                            // Trigger profit-locked exit if price retraces by 20% giveback
+                                            // Arm Profit Protection & State 3 Maker-Pegged Profit Lock (per Stall-Hazard Policy Sec 1.2)
+                                            let d_dir = if is_long { 1.0 } else { -1.0 };
+                                            let curr_unreal_bps = d_dir
+                                                * ((close_price - pos.entry_price) / pos.entry_price.max(1e-9))
+                                                * 10_000.0;
+                                            let mfe_bps = d_dir
+                                                * ((pos.max_favorable_price - pos.entry_price) / pos.entry_price.max(1e-9))
+                                                * 10_000.0;
+                                            let bar_rng = (high_price - low_price).max(1e-12);
+                                            let clv_1m = ((2.0 * close_price - high_price - low_price) / bar_rng).clamp(-1.0, 1.0);
+                                            let prev_c = rolling_closes.last().copied().unwrap_or(close_price);
+                                            let price_vel_sign = (d_dir * (close_price - prev_c)).signum();
+                                            let m_rev = 0.50 * (d_dir * clv_1m) + 0.30 * (d_dir * l2_1s) + 0.20 * price_vel_sign;
+
+                                            // State 3 Passive Alo Inside-Peg Conversion: avoid 6.26 bps Maker-Taker stop-market fee drag
+                                            let lock_floor_bps = (0.58 * mfe_bps).max(6.5);
+                                            let min_maker_profit_bps = fee_sched.maker_maker_rt_bps() + 2.0;
+                                            if (pos.tranche1_tp_filled || mfe_bps >= 16.0)
+                                                && curr_unreal_bps <= lock_floor_bps
+                                                && curr_unreal_bps >= min_maker_profit_bps
+                                                && m_rev <= -0.15
+                                                && !should_reprice
+                                                && !pos.tp_order_id.is_empty()
+                                            {
+                                                let pegged_tp = quantize_price(close_price + d_dir * entry_tick, sz_decimals);
+                                                let valid_peg = if is_long {
+                                                    pegged_tp < pos.effective_tp
+                                                } else {
+                                                    pegged_tp > pos.effective_tp
+                                                };
+                                                if valid_peg {
+                                                    should_reprice = true;
+                                                    reprice_exact_target = true;
+                                                    new_reprice_target = pegged_tp;
+                                                    reprice_qty = pos.amount;
+                                                    reprice_is_buy = !is_long;
+                                                    old_tp_order_id = pos.tp_order_id.clone();
+                                                    pos.effective_tp = pegged_tp;
+                                                    pos.last_reprice_time = chrono::Utc::now().timestamp_millis();
+                                                }
+                                            }
+
+                                            // Trigger Taker giveback exit ONLY when net profit still clears Maker-Taker round-trip fees (+3 bps buffer)
                                             let q_be = 0.15; // covers fees + slippage
                                             let abs_arm_bps = 1.8 * ou_cfg.min_net_edge_bps;
                                             let arm_q_thresh = (abs_arm_bps / (d_0 / pos.entry_price.max(1e-9) * 1e4).max(1e-6)).min(0.75);
                                             if pos.max_progress >= arm_q_thresh
                                                 && q_t <= f64::max(q_be, pos.max_progress - 0.20)
+                                                && curr_unreal_bps >= fee_sched.maker_taker_rt_bps() + 3.0
+                                                && !should_reprice
                                             {
                                                 giveback_triggered = true;
                                             }
@@ -4902,7 +5061,6 @@ async fn main() {
                                             {
                                                 let cal_a = asset_calibration(&symbol_clone);
                                                 let tau_stall = (elapsed_mins - pos.last_peak_mins).max(0.0);
-                                                let d_dir = if is_long { 1.0 } else { -1.0 };
                                                 if tau_stall >= (cal_a.stall_trigger_mins as f64) * 2.0
                                                     && d_dir * l2_1s < 0.10
                                                 {
@@ -4922,6 +5080,7 @@ async fn main() {
                                                     };
                                                     if valid_stall_reprice {
                                                         should_reprice = true;
+                                                        reprice_exact_target = true;
                                                         new_reprice_target = stall_tp_q;
                                                         reprice_qty = pos.amount;
                                                         reprice_is_buy = !is_long;
@@ -4946,6 +5105,7 @@ async fn main() {
                                                 };
                                                 if valid_pre_close {
                                                     should_reprice = true;
+                                                    reprice_exact_target = true;
                                                     new_reprice_target = pre_close_tp;
                                                     reprice_qty = pos.amount;
                                                     reprice_is_buy = !is_long;
@@ -5059,12 +5219,13 @@ async fn main() {
                                     }
                                 }
                                 let rounded_target = quantize_price(new_reprice_target, sz_decimals);
-                                let (planned_qty, planned_px, planned_tag) = compute_tp_order_plan(
+                                let (planned_qty, planned_px, planned_tag) = compute_tp_order_plan_with_mode(
                                     &pos_eng_r,
                                     pos_entry_r,
                                     rounded_target,
                                     eff_qty_r,
                                     pos_t1_r,
+                                    reprice_exact_target,
                                     sz_decimals,
                                 );
 
@@ -6012,7 +6173,7 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::compute_tp_order_plan;
+    use super::{compute_tp_order_plan, compute_tp_order_plan_with_mode};
 
     #[test]
     fn test_compute_tp_order_plan_preserves_two_tranche_splits() {
@@ -6038,5 +6199,17 @@ mod tests {
         let (qty_sm, _, tag_sm) = compute_tp_order_plan("EngineA", 10.0, 10.2, 2.0, false, 2);
         assert_eq!(tag_sm, "FULL");
         assert!((qty_sm - 2.0).abs() < 1e-6);
+
+        // Package 5: ZEC Short ratchet to $907.05 (25.3 bps from $909.35) must honor 20 bps T1 floor ($907.53),
+        // NOT compress 0.65x down to $907.86 (16.4 bps)!
+        let (qty_z, px_z, tag_z) = compute_tp_order_plan("EngineA", 909.35, 907.05, 0.11, false, 3);
+        assert_eq!(tag_z, "T1-50%");
+        assert!((qty_z - 0.055).abs() < 1e-6);
+        assert!(px_z <= 909.35 * 0.9980 + 0.05, "T1 violated 20 bps floor: {}", px_z);
+
+        // Explicit harvest target (Stall-Hazard / State-3 Maker-Peg) bypasses 0.65x shaving completely
+        let (_, px_exact, _) =
+            compute_tp_order_plan_with_mode("EngineA", 909.35, 907.05, 0.11, false, true, 3);
+        assert!((px_exact - 907.05).abs() < 1e-4, "expected 907.05, got {}", px_exact);
     }
 }

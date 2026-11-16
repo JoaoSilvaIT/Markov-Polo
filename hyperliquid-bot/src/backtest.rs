@@ -241,7 +241,8 @@ pub fn build_historical_btc_impulse_snapshot(
                 rets.push((btc_bars[k].close / btc_bars[k - 1].close).ln());
             }
         }
-        let sigma_mad = calculate_mad_sigma(&rets);
+        let sigma_mad =
+            calculate_mad_sigma(&rets).max(crate::ou_process::asset_min_sigma_1m_floor("BTC"));
         let r15 = (b.close / btc_bars[idx - 15].close).ln();
         let r60 = (b.close / btc_bars[idx - 60].close).ln();
         z_15 = r15 / (sigma_mad * (15.0_f64).sqrt());
@@ -997,7 +998,11 @@ pub fn run_engine_a_backtest_with_btc(
         if let Some(ref feat) = live_feat_opt {
             let is_controller_shock_1m = feat.is_downside_shock
                 || (feat.is_upside_shock && (current_p_s >= 0.50 || feat.z_15.abs() >= 3.5));
-            if is_controller_shock_1m {
+            let session_closed_bt = matches!(
+                crate::ou_process::evaluate_session_lifecycle_gate(symbol, bar.timestamp_ms as i64),
+                crate::ou_process::SessionLifecycleAction::ForceFlat(_)
+            );
+            if is_controller_shock_1m && !session_closed_bt {
                 controller.force_shock_cooldown(feat.z_15, feat.z_60, bar.timestamp_ms);
             }
             if let Some(ref closed_15m) = finalized_15m_bar {

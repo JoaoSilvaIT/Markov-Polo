@@ -2057,6 +2057,18 @@ pub fn calculate_mad_sigma(returns: &[f64]) -> f64 {
     (1.4826 * med_dev).max(1e-5)
 }
 
+/// Asset-class 1-minute volatility floor preventing MAD collapse (e.g. during dead/closed sessions)
+/// from inflating normal price moves into 15-25 sigma false shocks.
+pub fn asset_min_sigma_1m_floor(symbol: &str) -> f64 {
+    match symbol.to_uppercase().as_str() {
+        "XYZ:GOLD" | "GOLD" | "XYZ:XYZ100" | "XYZ100" => 0.00018,
+        "BTC" | "ETH" => 0.00020,
+        "XYZ:SILVER" | "SILVER" | "XYZ:NVDA" | "NVDA" | "XYZ:TSLA" | "TSLA" | "XYZ:AAPL"
+        | "AAPL" => 0.00025,
+        _ => 0.00030,
+    }
+}
+
 /// Computes the directional expected edge in basis points between entry and exit price:
 pub fn calculate_directional_edge_bps(entry_price: f64, exit_target: f64, is_buy: bool) -> f64 {
     if entry_price <= 0.0 || exit_target <= 0.0 {
@@ -2415,7 +2427,7 @@ pub fn calculate_features_with_funding_at(
         for i in 1..n {
             returns_1m.push((closes_history[i] / closes_history[i - 1]).ln());
         }
-        sigma_mad = calculate_mad_sigma(&returns_1m);
+        sigma_mad = calculate_mad_sigma(&returns_1m).max(asset_min_sigma_1m_floor(symbol));
 
         ret_15 = (eval_close / closes_history[n - 15]).ln();
         z_15 = ret_15 / (sigma_mad * (15.0_f64).sqrt());
@@ -5695,5 +5707,28 @@ mod tests {
         assert!(gold_ou.base_entry_sigma >= 2.05 - 1e-9);
         assert!(gold_ou.min_net_edge_bps >= 26.0 - 1e-9);
         assert!(gold_ou.min_sigma_eq_bps >= 16.0 - 1e-9);
+    }
+
+    #[test]
+    fn test_package5_sigma_1m_floor_prevents_closed_session_z_explosion() {
+        // Simulate flat weekend equity history (100 bars at $163.00) followed by a 0.3% move to $163.50
+        let mut closes = vec![163.00; 110];
+        let eval_close = 163.50;
+        for i in 100..110 {
+            closes[i] = 163.00 + ((i - 99) as f64) * 0.05;
+        }
+        let feat = calculate_features_with_funding(&closes, eval_close, "xyz:NVDA", 0.0)
+            .expect("feature snapshot");
+        // Without the 2.5 bps/min floor, 1e-5 MAD yields z_15 ~ 79 sigma; with floor, z_15 stays realistic
+        assert!(
+            feat.sigma_1m_prev >= 0.00025 - 1e-9,
+            "expected NVDA sigma_1m >= 2.5 bps/min, got {}",
+            feat.sigma_1m_prev
+        );
+        assert!(
+            feat.z_15.abs() < 6.0,
+            "expected realistic z_15 without 25+ sigma collapse artifact, got {}",
+            feat.z_15
+        );
     }
 }
