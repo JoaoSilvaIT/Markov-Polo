@@ -3478,7 +3478,6 @@ async fn main() {
                     let is_downside_shock = live_feat.is_downside_shock;
                     let is_upside_shock = live_feat.is_upside_shock;
                     let thresholds_opt = live_feat.thresholds_opt.clone();
-                    let thresholds_175_opt = live_feat.thresholds_175_opt.clone();
 
                     let cb_lock = cb_clone.lock().await;
                     let symbol_cb_paused = cb_lock.is_paused();
@@ -6395,61 +6394,6 @@ async fn main() {
                                             sl_px,
                                         );
                                         cf_tracker.register_opportunity(cf_opp);
-                                    } else if !is_20_long && !is_20_short {
-                                        if let Some(ref th175) = thresholds_175_opt {
-                                            let is_175_long = close_price <= th175.entry_long;
-                                            let is_175_short = close_price >= th175.entry_short;
-
-                                            if is_175_long || is_175_short {
-                                                let side_str = if is_175_long { "BUY" } else { "SELL" };
-                                                let limit_px = if is_175_long { th175.entry_long } else { th175.entry_short };
-                                                let tp_px = if is_175_long { th175.exit_long } else { th175.exit_short };
-                                                let sl_px = if is_175_long { limit_px * 0.99 } else { limit_px * 1.01 };
-                                                let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-
-                                                let cf_opp = crate::counterfactual::ActiveOpportunity::new(
-                                                    symbol_clone.clone(),
-                                                    "EngineA_MeanReversion".to_string(),
-                                                    side_str.to_string(),
-                                                    format!("{:?}", controller.current_mode).to_uppercase(),
-                                                    now_ms,
-                                                    1800,
-                                                    crate::counterfactual::CounterfactualDecision {
-                                                        accepted: false,
-                                                        primary_veto: "RELAXED_BOUNDARY_1.25_SIGMA".to_string(),
-                                                        all_vetos: vec!["RELAXED_BOUNDARY_1.25_SIGMA".to_string()],
-                                                        threshold_sigma: 1.25,
-                                                        signal_value: z_15,
-                                                        hmm_probabilities: crate::counterfactual::HmmProbs {
-                                                            consolidation: current_p_c,
-                                                            trend: current_p_t,
-                                                            shock: current_p_s,
-                                                        },
-                                                    },
-                                                    crate::counterfactual::MarketAtDecision {
-                                                        reference_price: close_price,
-                                                        bid: close_price,
-                                                        ask: close_price,
-                                                        spread_bps: 1.0,
-                                                        l2_age_ms: 0,
-                                                        obi: l2_1s,
-                                                        volatility_z15: z_15,
-                                                        volatility_z60: Some(z_60),
-                                                    },
-                                                    crate::counterfactual::HypotheticalOrder {
-                                                        order_type: "post_only_limit".to_string(),
-                                                        limit_price: limit_px,
-                                                        size: ((cf_bank * 0.5).max(11.0)) / limit_px,
-                                                        time_in_force: "GTC".to_string(),
-                                                        assumed_cancel_rule: "timeout_or_reversion".to_string(),
-                                                        queue_ahead_estimate: None,
-                                                    },
-                                                    tp_px,
-                                                    sl_px,
-                                                );
-                                                cf_tracker.register_opportunity(cf_opp);
-                                            }
-                                        }
                                     }
                                 }
                             }

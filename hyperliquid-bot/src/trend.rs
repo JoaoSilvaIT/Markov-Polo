@@ -632,13 +632,7 @@ pub fn append_l2_telemetry_record(
     });
     if let Ok(line) = serde_json::to_string(&record) {
         let file_path = format!("hl_l2_telemetry_{}.jsonl", symbol);
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&file_path)
-        {
-            let _ = writeln!(file, "{}", line);
-        }
+        crate::state::append_capped_jsonl_line(&file_path, &line, 1_000_000);
     }
 }
 
@@ -666,13 +660,7 @@ pub struct EngineBCandidateLog {
 pub fn append_candidate_log(log_entry: &EngineBCandidateLog) {
     if let Ok(line) = serde_json::to_string(log_entry) {
         let file_path = format!("hl_candidates_{}.jsonl", log_entry.symbol);
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&file_path)
-        {
-            let _ = writeln!(file, "{}", line);
-        }
+        crate::state::append_capped_jsonl_line(&file_path, &line, 1_000_000);
     }
 }
 
@@ -1507,16 +1495,8 @@ pub fn record_shadow_entry(
         "atr": trade.atr_at_entry,
         "is_portfolio_selected": trade.is_portfolio_selected,
     });
-    if let Ok(mut f) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(SHADOW_TREND_JOURNAL)
-    {
-        let _ = writeln!(
-            f,
-            "{}",
-            serde_json::to_string(&log_entry).unwrap_or_default()
-        );
+    if let Ok(line) = serde_json::to_string(&log_entry) {
+        crate::state::append_capped_jsonl_line(SHADOW_TREND_JOURNAL, &line, 1_000_000);
     }
 
     trade
@@ -1575,16 +1555,8 @@ pub fn record_shadow_exit(trade: &mut ShadowTrade, exit_price: f64, exit_reason:
         "exit_reason": exit_reason,
         "is_portfolio_selected": trade.is_portfolio_selected,
     });
-    if let Ok(mut f) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(SHADOW_TREND_JOURNAL)
-    {
-        let _ = writeln!(
-            f,
-            "{}",
-            serde_json::to_string(&log_entry).unwrap_or_default()
-        );
+    if let Ok(line) = serde_json::to_string(&log_entry) {
+        crate::state::append_capped_jsonl_line(SHADOW_TREND_JOURNAL, &line, 1_000_000);
     }
 
     net_pnl

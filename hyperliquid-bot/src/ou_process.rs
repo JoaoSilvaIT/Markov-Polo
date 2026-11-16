@@ -2173,7 +2173,6 @@ pub fn calculate_garman_klass_sigma(
 #[allow(dead_code)]
 pub struct FeatureSnapshot {
     pub thresholds_opt: Option<OptimalThresholds>,
-    pub thresholds_175_opt: Option<OptimalThresholds>,
     pub total_drift_pct: f64,
     pub is_drifting: bool,
     pub half_life_m: f64,
@@ -2286,75 +2285,64 @@ pub fn calculate_features_with_funding_at(
 
     let (ou_5m_opt, sigma_eq_log, llt_out) = estimate_ou_5m_kalman(&closes_5m, &cfg);
 
-    let (thresholds_opt, thresholds_175_opt, half_life_m, z_ou) =
-        if let Some(mut ou_params) = ou_5m_opt {
-            let hl = ou_params.half_life_minutes();
-            let is_stationary_hl = hl > 0.0 && hl <= cfg.max_half_life_m;
-            if hourly_funding_rate.is_finite()
-                && hourly_funding_rate.abs() > 1e-7
-                && ou_params.theta > 1e-5
-            {
-                let carry_shift =
-                    (-hourly_funding_rate / (60.0 * ou_params.theta)).clamp(-0.0015, 0.0015);
-                ou_params.mu *= 1.0 + carry_shift;
-            }
-            let mu_dev = (ou_params.mu - hist_last_price).abs() / hist_last_price;
-            let is_mu_ok = mu_dev <= 0.07;
+    let (thresholds_opt, half_life_m, z_ou) = if let Some(mut ou_params) = ou_5m_opt {
+        let hl = ou_params.half_life_minutes();
+        let is_stationary_hl = hl > 0.0 && hl <= cfg.max_half_life_m;
+        if hourly_funding_rate.is_finite()
+            && hourly_funding_rate.abs() > 1e-7
+            && ou_params.theta > 1e-5
+        {
+            let carry_shift =
+                (-hourly_funding_rate / (60.0 * ou_params.theta)).clamp(-0.0015, 0.0015);
+            ou_params.mu *= 1.0 + carry_shift;
+        }
+        let mu_dev = (ou_params.mu - hist_last_price).abs() / hist_last_price;
+        let is_mu_ok = mu_dev <= 0.07;
 
-            let z_ou_curr = if ou_params.mu > 0.0 && sigma_eq_log > 1e-6 {
-                (eval_close / ou_params.mu).ln() / sigma_eq_log
+        let z_ou_curr = if ou_params.mu > 0.0 && sigma_eq_log > 1e-6 {
+            (eval_close / ou_params.mu).ln() / sigma_eq_log
+        } else {
+            0.0
+        };
+
+        if is_stationary_hl && is_mu_ok {
+            let tx_cost = hist_last_price * 0.0005;
+            let session_offset = if hourly_funding_rate.abs() > 1e-9 {
+                use chrono::{Datelike, Timelike};
+                let ref_utc = eval_timestamp_ms
+                    .and_then(|ms| chrono::DateTime::from_timestamp_millis(ms as i64))
+                    .unwrap_or_else(chrono::Utc::now);
+                let is_weekend = matches!(
+                    ref_utc.weekday(),
+                    chrono::Weekday::Sat | chrono::Weekday::Sun
+                );
+                utc_session_sigma_offset(ref_utc.hour(), is_weekend)
             } else {
                 0.0
             };
-
-            if is_stationary_hl && is_mu_ok {
-                let tx_cost = hist_last_price * 0.0005;
-                let session_offset = if hourly_funding_rate.abs() > 1e-9 {
-                    use chrono::{Datelike, Timelike};
-                    let ref_utc = eval_timestamp_ms
-                        .and_then(|ms| chrono::DateTime::from_timestamp_millis(ms as i64))
-                        .unwrap_or_else(chrono::Utc::now);
-                    let is_weekend = matches!(
-                        ref_utc.weekday(),
-                        chrono::Weekday::Sat | chrono::Weekday::Sun
-                    );
-                    utc_session_sigma_offset(ref_utc.hour(), is_weekend)
-                } else {
-                    0.0
-                };
-                let macro_state = eval_timestamp_ms
-                    .map(evaluate_macro_hazard)
-                    .unwrap_or_default();
-                let hazard_mult = if macro_state.is_hard_blackout {
-                    1.0
-                } else {
-                    1.0 + 0.35 * macro_state.lambda_exo
-                };
-                let th = calculate_carry_adjusted_thresholds(
-                    &ou_params,
-                    tx_cost,
-                    (cfg.base_entry_sigma + session_offset) * hazard_mult,
-                    hourly_funding_rate,
-                    cfg.min_entry_sigma,
-                    cfg.max_entry_sigma * hazard_mult,
-                );
-                // Per both research audits, Tier 2 (1.25\sigma) premature entries are disabled in production;
-                // `thresholds_175_opt` is kept populated for counterfactual telemetry compatibility.
-                let th_125 = calculate_carry_adjusted_thresholds(
-                    &ou_params,
-                    tx_cost,
-                    1.25 + session_offset * 0.5,
-                    hourly_funding_rate,
-                    1.15,
-                    1.45,
-                );
-                (Some(th), Some(th_125), hl, z_ou_curr)
+            let macro_state = eval_timestamp_ms
+                .map(evaluate_macro_hazard)
+                .unwrap_or_default();
+            let hazard_mult = if macro_state.is_hard_blackout {
+                1.0
             } else {
-                (None, None, hl, z_ou_curr)
-            }
+                1.0 + 0.35 * macro_state.lambda_exo
+            };
+            let th = calculate_carry_adjusted_thresholds(
+                &ou_params,
+                tx_cost,
+                (cfg.base_entry_sigma + session_offset) * hazard_mult,
+                hourly_funding_rate,
+                cfg.min_entry_sigma,
+                cfg.max_entry_sigma * hazard_mult,
+            );
+            (Some(th), hl, z_ou_curr)
         } else {
-            (None, None, 999.0, 0.0)
-        };
+            (None, hl, z_ou_curr)
+        }
+    } else {
+        (None, 999.0, 0.0)
+    };
 
     // Scale-Invariant Log-Price OLS Slope Drift Test with Student's t-statistic
     let valid_lps: Vec<(f64, f64)> = closes_history
@@ -2523,7 +2511,6 @@ pub fn calculate_features_with_funding_at(
 
     Some(FeatureSnapshot {
         thresholds_opt,
-        thresholds_175_opt,
         total_drift_pct,
         is_drifting,
         half_life_m,

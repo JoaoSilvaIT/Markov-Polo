@@ -1,7 +1,5 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::fs::OpenOptions;
-use std::io::Write;
 use uuid::Uuid;
 
 pub const COUNTERFACTUAL_JOURNAL: &str = "hl_counterfactual_trades.jsonl";
@@ -630,13 +628,7 @@ impl CounterfactualTracker {
 
     fn append_to_journal(&self, record: &CounterfactualRecord) {
         if let Ok(serialized) = serde_json::to_string(record) {
-            if let Ok(mut file) = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.journal_path)
-            {
-                let _ = writeln!(file, "{}", serialized);
-            }
+            crate::state::append_capped_jsonl_line(&self.journal_path, &serialized, 2_000_000);
         }
     }
 }

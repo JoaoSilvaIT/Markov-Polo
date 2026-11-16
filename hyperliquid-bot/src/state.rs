@@ -1492,6 +1492,42 @@ pub fn has_active_cluster_position_for_side(
     }
 }
 
+/// Appends a single JSONL line to `file_path` and automatically rotates/trims the oldest 50%
+/// of lines whenever the file exceeds `max_bytes`, preventing unbounded NAS growth.
+pub fn append_capped_jsonl_line(file_path: &str, line: &str, max_bytes: u64) {
+    let lock_name = format!(
+        "{}.trim.lock",
+        std::path::Path::new(file_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("jsonl")
+    );
+    let _guard = FlockGuard::acquire(&lock_name).ok();
+
+    let needs_trim = std::fs::metadata(file_path)
+        .map(|m| m.len() > max_bytes)
+        .unwrap_or(false);
+    if needs_trim {
+        if let Ok(content) = std::fs::read_to_string(file_path) {
+            let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+            let keep_from = lines.len() / 2;
+            let trimmed = if keep_from < lines.len() {
+                format!("{}\n", lines[keep_from..].join("\n"))
+            } else {
+                String::new()
+            };
+            let temp = format!("{}.tmp.{}", file_path, std::process::id());
+            if std::fs::write(&temp, trimmed.as_bytes()).is_ok() {
+                let _ = std::fs::rename(&temp, file_path);
+            }
+        }
+    }
+
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(file_path) {
+        let _ = writeln!(file, "{}", line);
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Serialize)]
 struct JournalEntry {
@@ -2159,5 +2195,23 @@ mod tests {
         let _ = fs::remove_file(CLUSTER_LOCK_FILE);
         let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
         let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
+    }
+
+    #[test]
+    fn test_append_capped_jsonl_line_rotates_on_cap() {
+        let p = "/tmp/opencode_test_capped.jsonl";
+        let _ = fs::remove_file(p);
+        for i in 0..20 {
+            append_capped_jsonl_line(p, &format!("{{\"idx\":{}}}", i), 120);
+        }
+        let content = fs::read_to_string(p).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert!(
+            lines.len() < 20,
+            "expected rotation below 20 lines, got {}",
+            lines.len()
+        );
+        assert!(lines.last().unwrap().contains("\"idx\":19"));
+        let _ = fs::remove_file(p);
     }
 }
