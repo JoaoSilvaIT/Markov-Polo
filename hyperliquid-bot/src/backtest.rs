@@ -211,6 +211,11 @@ pub fn build_historical_btc_impulse_snapshot(
     if ts_ms.saturating_sub(b.timestamp_ms) > 90_000 || b.close <= 0.0 {
         return None;
     }
+    let ret_1m_bps = if idx >= 1 && btc_bars[idx - 1].close > 0.0 {
+        (b.close / btc_bars[idx - 1].close).ln() * 1e4
+    } else {
+        0.0
+    };
     let ret_3m_bps = if idx >= 3 && btc_bars[idx - 3].close > 0.0 {
         (b.close / btc_bars[idx - 3].close).ln() * 1e4
     } else {
@@ -252,6 +257,7 @@ pub fn build_historical_btc_impulse_snapshot(
 
     Some(BtcImpulseSnapshot {
         timestamp_ms: b.timestamp_ms,
+        ret_1m_bps,
         ret_3m_bps,
         ret_5m_bps,
         ret_15m_bps,
@@ -2074,6 +2080,18 @@ pub fn run_engine_a_backtest_with_btc(
                                 &rolling_15m_bars,
                                 current_atr,
                             );
+                            let (squeeze_pre_ratio, squeeze_pre_pct60) =
+                                crate::trend::calculate_lagged_squeeze_and_pct60(prior_15m);
+                            let sep_flag_long_ok =
+                                crate::trend::evaluate_separated_impulse_shelf_v2(
+                                    prior_15m,
+                                    crate::trend::TrendDirection::Long,
+                                );
+                            let sep_flag_short_ok =
+                                crate::trend::evaluate_separated_impulse_shelf_v2(
+                                    prior_15m,
+                                    crate::trend::TrendDirection::Short,
+                                );
                             let tel = BreakoutTelemetry {
                                 bar_open: closed_5m.open,
                                 bar_high: closed_5m.high,
@@ -2091,7 +2109,12 @@ pub fn run_engine_a_backtest_with_btc(
                                 flag_compression_ratio_60m: flag_comp_60m,
                                 p_trend: current_p_t,
                                 ker_15m,
-                                enable_flag_compression_branch_b: true, // Package 4 Branch B active in native backtest
+                                enable_flag_compression_branch_b: true, // Package 7 Dual-Path active in backtest ablation
+                                squeeze_pre_ratio,
+                                squeeze_pre_pct60,
+                                p_shock: current_p_s,
+                                sep_flag_long_ok,
+                                sep_flag_short_ok,
                             };
                             let is_mode_mr =
                                 controller.current_mode == ControllerMode::MeanReversion;
@@ -2418,11 +2441,34 @@ pub fn run_engine_a_backtest_with_btc(
                                         && feat.ker_30m <= 0.45
                                         && lambda_dir >= 0.50
                                 };
+                                // Package 7 Tier-2 Alt Knife-Catch Stabilization Guard (-35 bps / 5m unless CLV >= +0.10)
+                                let is_tier2_alt = !matches!(
+                                    symbol.to_uppercase().as_str(),
+                                    "BTC" | "ETH" | "SOL" | "AVAX"
+                                ) && !symbol.to_lowercase().starts_with("xyz:");
+                                let knife_catch_vetoed =
+                                    if is_tier2_alt && closes_history.len() >= 5 {
+                                        let c5 = closes_history[closes_history.len() - 5];
+                                        let ret_5m_bps = if c5 > 0.0 {
+                                            (bar.close / c5).ln() * 1e4
+                                        } else {
+                                            0.0
+                                        };
+                                        let bar_rng_kc = (bar.high - bar.low).max(1e-12);
+                                        let clv_1m = ((2.0 * bar.close - bar.high - bar.low)
+                                            / bar_rng_kc)
+                                            .clamp(-1.0, 1.0);
+                                        dir_cand.sign() * ret_5m_bps <= -35.0
+                                            && dir_cand.sign() * clv_1m < 0.10
+                                    } else {
+                                        false
+                                    };
 
                                 if btc_veto.is_some() {
                                     summary.btc_impulse_vetoes += 1;
                                     is_armed = false;
-                                } else if !obi_confirm_ok || lambda_dir <= 0.0 {
+                                } else if !obi_confirm_ok || lambda_dir <= 0.0 || knife_catch_vetoed
+                                {
                                     is_armed = false;
                                 } else {
                                     is_armed = false;

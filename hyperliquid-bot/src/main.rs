@@ -3885,6 +3885,15 @@ async fn main() {
                         active_engine,
                         account_equity: *cached_equity_loop.read().await,
                         high_water_mark: *high_water_mark_equity.read().await,
+                        ret_1m_bps: if let Some(&prev1) = rolling_closes.last() {
+                            if prev1 > 0.0 {
+                                (close_price / prev1).ln() * 1e4
+                            } else {
+                                0.0
+                            }
+                        } else {
+                            0.0
+                        },
                         ret_3m_bps: if rolling_closes.len() >= 4 && rolling_closes[rolling_closes.len() - 4] > 0.0 {
                             (close_price / rolling_closes[rolling_closes.len() - 4]).ln() * 1e4
                         } else {
@@ -4247,6 +4256,9 @@ async fn main() {
 
                                     let min_squeeze_ratio_90m = calculate_min_squeeze_ratio_90m(&rolling_15m_bars);
                                     let flag_compression_ratio_60m = calculate_flag_compression_ratio_60m(&rolling_15m_bars, current_atr);
+                                    let (squeeze_pre_ratio, squeeze_pre_pct60) = crate::trend::calculate_lagged_squeeze_and_pct60(engine_b_donchian_bars);
+                                    let sep_flag_long_ok = crate::trend::evaluate_separated_impulse_shelf_v2(engine_b_donchian_bars, crate::trend::TrendDirection::Long);
+                                    let sep_flag_short_ok = crate::trend::evaluate_separated_impulse_shelf_v2(engine_b_donchian_bars, crate::trend::TrendDirection::Short);
                                     let rel_vol_15m = calculate_rel_vol_15m(
                                         engine_b_donchian_bars,
                                         &rolling_5m_bars,
@@ -4286,7 +4298,12 @@ async fn main() {
                                         flag_compression_ratio_60m,
                                         p_trend: current_p_t,
                                         ker_15m,
-                                        enable_flag_compression_branch_b: false, // Keep live production (<= 0.90) untouched for 10-14 days on xyz:GOLD
+                                        enable_flag_compression_branch_b: false, // Keep live production untouched until Package 7 native ablation clears gates
+                                        squeeze_pre_ratio,
+                                        squeeze_pre_pct60,
+                                        p_shock: current_p_s,
+                                        sep_flag_long_ok,
+                                        sep_flag_short_ok,
                                     };
 
                                     let live_eq_pre = *cached_equity_loop.read().await;
@@ -4937,45 +4954,19 @@ async fn main() {
                                         max_allowed_mins = (3.5 * eff_hl).clamp(90.0, 360.0);
                                         let is_long = pos.side == "LONG";
                                         let entry_tick = effective_tick_size(pos.entry_price, sz_decimals);
-                                        if elapsed_mins >= max_allowed_mins {
-                                            // Package 6B: Passive Alo Maker-Peg conversion for TIME_DECAY_STOP (3m grace before Taker fallback)
-                                            let d_td = if is_long { 1.0 } else { -1.0 };
-                                            let td_peg_px = quantize_price(close_price + d_td * entry_tick, sz_decimals);
-                                            let already_td_pegged = (pos.effective_tp - td_peg_px).abs() <= 2.0 * entry_tick;
-                                            if elapsed_mins < max_allowed_mins + 3.0
-                                                && !pos.tp_order_id.is_empty()
-                                                && !already_td_pegged
-                                                && !should_reprice
-                                            {
-                                                println!(
-                                                    "⏱️ [TIME-DECAY -> MAKER-PEG] {} reached {:.1}m >= {:.1}m -> converting TP to passive Alo @ ${:.4}",
-                                                    symbol_clone, elapsed_mins, max_allowed_mins, td_peg_px
-                                                );
-                                                should_reprice = true;
-                                                reprice_exact_target = true;
-                                                new_reprice_target = td_peg_px;
-                                                reprice_qty = pos.amount;
-                                                reprice_is_buy = !is_long;
-                                                old_tp_order_id = pos.tp_order_id.clone();
-                                                pos.effective_tp = td_peg_px;
-                                                pos.last_reprice_time = chrono::Utc::now().timestamp_millis();
-                                            } else if elapsed_mins >= max_allowed_mins + 3.0 || pos.tp_order_id.is_empty() {
-                                                time_stop_triggered = true;
-                                            }
-                                        }
 
-                                        // 1b. Hybrid 1-Minute Shadow StallHazardExitManager (Package 6):
+                                        // 1b. Hybrid 1-Minute Shadow StallHazardExitManager (Package 6 + Package 7 Candidate C):
                                         // Evaluates Asymmetric Page-CUSUM & Tail Bypass internally on 1m Mid-Price
                                         // WITHOUT disturbing resting TP queue priority until critical threshold breaches.
+                                        let cal_1m = asset_calibration(&symbol_clone);
+                                        let prev_c_1m = rolling_closes.last().copied().unwrap_or(close_price);
+                                        let mid_eval_px = if l2_fresh && l2_bid_snap > 0.0 && l2_ask_snap > l2_bid_snap {
+                                            0.5 * (l2_bid_snap + l2_ask_snap)
+                                        } else {
+                                            close_price
+                                        };
                                         {
-                                            let cal_1m = asset_calibration(&symbol_clone);
                                             let dir_1m = if is_long { Direction::Long } else { Direction::Short };
-                                            let prev_c_1m = rolling_closes.last().copied().unwrap_or(close_price);
-                                            let mid_eval_px = if l2_fresh && l2_bid_snap > 0.0 && l2_ask_snap > l2_bid_snap {
-                                                0.5 * (l2_bid_snap + l2_ask_snap)
-                                            } else {
-                                                close_price
-                                            };
                                             let spread_bps_live = if l2_bid_snap > 0.0 && l2_ask_snap > l2_bid_snap {
                                                 ((l2_ask_snap - l2_bid_snap) / mid_eval_px.max(1e-9)) * 10_000.0
                                             } else {
@@ -5058,6 +5049,49 @@ async fn main() {
                                                     );
                                                     soft_invalidation_reason = Some("SPRT_1M_ASYMMETRIC_CUSUM_ESCAPE");
                                                 }
+                                            }
+                                        }
+
+                                        // 1c. Package 7 Conditional Calm-Book Alo Maker-Peg for TIME_DECAY_STOP
+                                        if elapsed_mins >= max_allowed_mins && soft_invalidation_reason.is_none() {
+                                            let d_td = if is_long { 1.0 } else { -1.0 };
+                                            let ret_1m_abs_bps = if prev_c_1m > 0.0 && mid_eval_px > 0.0 {
+                                                ((mid_eval_px / prev_c_1m).ln().abs()) * 1e4
+                                            } else {
+                                                0.0
+                                            };
+                                            let eff_b_td = (cal_1m.cusum_b_1m_star * 0.80).clamp(2.85, 3.35);
+                                            let calm_book_ok = pos.cusum_stat_1m < 0.60 * eff_b_td
+                                                && ret_1m_abs_bps < 10.0
+                                                && d_td * l2_1s >= -0.20;
+                                            let unreal_bps_td = d_td * ((mid_eval_px - pos.entry_price) / pos.entry_price.max(1e-9)) * 10_000.0;
+                                            let td_peg_px = quantize_price(close_price + d_td * entry_tick, sz_decimals);
+                                            let already_td_pegged = (pos.effective_tp - td_peg_px).abs() <= 2.0 * entry_tick;
+                                            if calm_book_ok
+                                                && unreal_bps_td > -8.0
+                                                && elapsed_mins < max_allowed_mins + 1.0
+                                                && !pos.tp_order_id.is_empty()
+                                                && !already_td_pegged
+                                                && !should_reprice
+                                            {
+                                                println!(
+                                                    "⏱️ [CALM-BOOK TIME-DECAY -> MAKER-PEG] {} ({:.1}m >= {:.1}m, CUSUM={:.2}, |r1m|={:.1}bps) -> passive Alo @ ${:.4}",
+                                                    symbol_clone, elapsed_mins, max_allowed_mins, pos.cusum_stat_1m, ret_1m_abs_bps, td_peg_px
+                                                );
+                                                should_reprice = true;
+                                                reprice_exact_target = true;
+                                                new_reprice_target = td_peg_px;
+                                                reprice_qty = pos.amount;
+                                                reprice_is_buy = !is_long;
+                                                old_tp_order_id = pos.tp_order_id.clone();
+                                                pos.effective_tp = td_peg_px;
+                                                pos.last_reprice_time = chrono::Utc::now().timestamp_millis();
+                                            } else if !calm_book_ok
+                                                || unreal_bps_td <= -8.0
+                                                || elapsed_mins >= max_allowed_mins + 1.0
+                                                || pos.tp_order_id.is_empty()
+                                            {
+                                                time_stop_triggered = true;
                                             }
                                         }
 
@@ -5988,6 +6022,24 @@ async fn main() {
                                                 &symbol_clone,
                                                 Some(&arm_side),
                                             );
+                                            let is_tier2_alt_live = !matches!(
+                                                symbol_clone.to_uppercase().as_str(),
+                                                "BTC" | "ETH" | "SOL" | "AVAX"
+                                            ) && !symbol_clone.to_lowercase().starts_with("xyz:");
+                                            let knife_catch_wait_live = if is_tier2_alt_live && rolling_closes.len() >= 5 {
+                                                let c5 = rolling_closes[rolling_closes.len() - 5];
+                                                let ret_5m_kc = if c5 > 0.0 {
+                                                    (close_price / c5).ln() * 1e4
+                                                } else {
+                                                    0.0
+                                                };
+                                                let rng_kc = (high_price - low_price).max(1e-12);
+                                                let clv_1m_kc = ((2.0 * close_price - high_price - low_price) / rng_kc).clamp(-1.0, 1.0);
+                                                let d_kc = if is_long_arm { 1.0 } else { -1.0 };
+                                                d_kc * ret_5m_kc <= -35.0 && d_kc * clv_1m_kc < 0.10
+                                            } else {
+                                                false
+                                            };
                                             if let Some(veto_reason) = btc_lead_veto {
                                                 println!(
                                                     "🛡️ [BTC IMPULSE VETO] {} {} reversal bounce disarmed due to adverse BTC impulse: {}.",
@@ -5995,6 +6047,11 @@ async fn main() {
                                                 );
                                                 armed_state.is_armed = false;
                                                 save_armed_signal(&arm_path_clone, &armed_state);
+                                            } else if knife_catch_wait_live {
+                                                println!(
+                                                    "⏸️ [KNIFE-CATCH STABILIZATION] {} {} deferred (trailing 5m adverse >= 35 bps without constructive 1m CLV >= +0.10).",
+                                                    symbol_clone, arm_side
+                                                );
                                             } else if let Some(ref corr_blk) = side_cluster_blocked_a {
                                                 funnel_counters.portfolio_lock_congested += 1;
                                                 println!(

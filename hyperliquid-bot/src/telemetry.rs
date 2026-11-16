@@ -63,6 +63,8 @@ pub struct LiveTelemetry {
     #[serde(default)]
     pub high_water_mark: f64,
     #[serde(default)]
+    pub ret_1m_bps: f64,
+    #[serde(default)]
     pub ret_3m_bps: f64,
     #[serde(default)]
     pub ret_5m_bps: f64,
@@ -220,6 +222,8 @@ pub fn empirical_btc_beta(symbol: &str, is_stress: bool) -> f64 {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct BtcImpulseSnapshot {
     pub timestamp_ms: u64,
+    #[serde(default)]
+    pub ret_1m_bps: f64,
     pub ret_3m_bps: f64,
     pub ret_5m_bps: f64,
     pub ret_15m_bps: f64,
@@ -321,28 +325,32 @@ pub fn evaluate_btc_impulse_veto(
         if proposed_is_long {
             if impulse_score <= -1.35
                 || btc.z_15 <= -1.8
+                || btc.ret_1m_bps <= -22.0
+                || btc.ret_3m_bps <= -40.0
+                || btc.ret_15m_bps <= -65.0
                 || beta_ret_3m_bps <= -26.0
                 || beta_ret_5m_bps <= -32.0
-                || btc.ret_15m_bps <= -75.0
                 || (btc.ret_30m_bps <= -45.0 && btc.ret_15m_bps <= -15.0)
                 || (btc.is_severe_shock && btc.z_15 < -1.0)
             {
                 return Some(format!(
-                    "BTC Lead-Lag Cascade Veto (I={:.2}, beta={:.2}, BTC Z15={:.2}, 3m={:+.1}bps, 5m={:+.1}bps, 15m={:+.1}bps)",
-                    impulse_score, beta, btc.z_15, btc.ret_3m_bps, btc.ret_5m_bps, btc.ret_15m_bps
+                    "BTC Lead-Lag Cascade Veto (I={:.2}, beta={:.2}, BTC Z15={:.2}, 1m={:+.1}bps, 3m={:+.1}bps, 5m={:+.1}bps, 15m={:+.1}bps)",
+                    impulse_score, beta, btc.z_15, btc.ret_1m_bps, btc.ret_3m_bps, btc.ret_5m_bps, btc.ret_15m_bps
                 ));
             }
         } else if impulse_score >= 1.35
             || btc.z_15 >= 1.8
+            || btc.ret_1m_bps >= 22.0
+            || btc.ret_3m_bps >= 40.0
+            || btc.ret_15m_bps >= 65.0
             || beta_ret_3m_bps >= 26.0
             || beta_ret_5m_bps >= 32.0
-            || btc.ret_15m_bps >= 75.0
             || (btc.ret_30m_bps >= 45.0 && btc.ret_15m_bps >= 15.0)
             || (btc.is_severe_shock && btc.z_15 > 1.0)
         {
             return Some(format!(
-                "BTC Lead-Lag Squeeze Veto (I={:.2}, beta={:.2}, BTC Z15={:.2}, 3m={:+.1}bps, 5m={:+.1}bps, 15m={:+.1}bps)",
-                impulse_score, beta, btc.z_15, btc.ret_3m_bps, btc.ret_5m_bps, btc.ret_15m_bps
+                "BTC Lead-Lag Squeeze Veto (I={:.2}, beta={:.2}, BTC Z15={:.2}, 1m={:+.1}bps, 3m={:+.1}bps, 5m={:+.1}bps, 15m={:+.1}bps)",
+                impulse_score, beta, btc.z_15, btc.ret_1m_bps, btc.ret_3m_bps, btc.ret_5m_bps, btc.ret_15m_bps
             ));
         }
     }
@@ -453,6 +461,7 @@ pub fn check_btc_lead_lag_veto(
 
     let snap = BtcImpulseSnapshot {
         timestamp_ms: bench_telem.timestamp_ms,
+        ret_1m_bps: bench_telem.ret_1m_bps,
         ret_3m_bps: bench_telem.ret_3m_bps,
         ret_5m_bps: bench_telem.ret_5m_bps,
         ret_15m_bps: bench_telem.ret_15m_bps,
@@ -619,6 +628,7 @@ mod tests {
         // 1. Calm BTC -> no veto on SOL Long or BTC Short
         let calm_btc = BtcImpulseSnapshot {
             timestamp_ms: 1_760_000_000_000,
+            ret_1m_bps: -1.0,
             ret_3m_bps: -4.0,
             ret_5m_bps: -6.0,
             ret_15m_bps: -8.0,
@@ -664,5 +674,12 @@ mod tests {
             &dump_btc,
         );
         assert!(nvda_veto_by_xyz100.is_some());
+
+        // 5. Package 7 Sub-15m Multi-Horizon BTC Cascade Veto: |btc_1m| >= 22 bps catches flash drops
+        let flash_1m_btc = BtcImpulseSnapshot {
+            ret_1m_bps: -24.0,
+            ..calm_btc
+        };
+        assert!(evaluate_btc_impulse_veto("HYPE", true, false, &flash_1m_btc).is_some());
     }
 }

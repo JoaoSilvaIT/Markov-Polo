@@ -1891,6 +1891,12 @@ pub struct BreakoutTelemetry {
     pub p_trend: f64,
     pub ker_15m: f64,
     pub enable_flag_compression_branch_b: bool,
+    // Package 7 Dual-Path Engine B inputs
+    pub squeeze_pre_ratio: f64,
+    pub squeeze_pre_pct60: f64,
+    pub p_shock: f64,
+    pub sep_flag_long_ok: bool,
+    pub sep_flag_short_ok: bool,
 }
 
 impl BreakoutFilter {
@@ -1909,33 +1915,57 @@ impl BreakoutFilter {
             return Err("REJECT_INVALID_TELEMETRY");
         }
 
+        let range = (t.bar_high - t.bar_low).max(1e-12);
+        let clv = ((2.0 * t.bar_close - t.bar_high - t.bar_low) / range).clamp(-1.0, 1.0);
+        let d = dir.sign();
+
         // Branch A: Primary 5h Coiled Spring (min_squeeze_ratio_90m <= max_squeeze_ratio)
-        // Branch B: Package 4 60m Tight Continuation Flag After Leg 1:
-        // Pass if P_T >= 0.85 && KER_15m >= 0.70 && flag_compression_ratio_60m <= 1.45 (enabled in --backtest --native)
+        // Branch B (Legacy): P_T >= 0.85 && KER_15m >= 0.70 && flag_compression_ratio_60m <= 1.45
+        // Package 7 Dual-Path Engine B (when enable_flag_compression_branch_b = true):
+        //   Path 1 (Mode-Bypass Compression Ignition): lagged Squeeze_pre(t-1) <= 1.05 & Pct60 <= 0.35,
+        //           P_Shock < 0.45, RelVol >= 1.80x, d*CLV >= 0.55, OI_delta >= 0.0%
+        //   Path 2 (Separated Impulse-Shelf Continuation): P_T >= 0.75, decoupled Impulse(t-9..t-5) + Shelf(t-4..t-1),
+        //           RelVol >= 1.65x, d*CLV >= 0.50, OI_delta >= 0.0%
         let primary_squeeze_ok =
             t.min_squeeze_ratio_90m.is_finite() && t.min_squeeze_ratio_90m <= cfg.max_squeeze_ratio;
-        let flag_compression_branch_b_ok = t.enable_flag_compression_branch_b
+        let legacy_branch_b_ok = t.enable_flag_compression_branch_b
             && t.p_trend >= 0.85
             && t.ker_15m >= 0.70
             && t.flag_compression_ratio_60m.is_finite()
             && t.flag_compression_ratio_60m <= 1.45;
+        let path1_compression_ignition_ok = t.enable_flag_compression_branch_b
+            && t.p_shock < 0.45
+            && t.squeeze_pre_ratio.is_finite()
+            && t.squeeze_pre_ratio <= 1.05
+            && t.squeeze_pre_pct60.is_finite()
+            && t.squeeze_pre_pct60 <= 0.35
+            && t.rel_vol_15m >= 1.80
+            && d * clv >= 0.55
+            && t.oi_delta_15m_pct >= 0.0;
+        let sep_flag_dir_ok = match dir {
+            TrendDirection::Long => t.sep_flag_long_ok,
+            TrendDirection::Short => t.sep_flag_short_ok,
+        };
+        let path2_separated_flag_ok = t.enable_flag_compression_branch_b
+            && t.p_trend >= 0.75
+            && sep_flag_dir_ok
+            && t.rel_vol_15m >= 1.65
+            && d * clv >= 0.50
+            && t.oi_delta_15m_pct >= 0.0;
+        let dual_path_active = path1_compression_ignition_ok || path2_separated_flag_ok;
 
-        if !primary_squeeze_ok && !flag_compression_branch_b_ok {
+        if !primary_squeeze_ok && !legacy_branch_b_ok && !dual_path_active {
             return Err("REJECT_NO_PRE_BREAKOUT_SQUEEZE");
         }
         if !t.rel_vol_15m.is_finite() || t.rel_vol_15m < cfg.min_rel_volume {
             return Err("REJECT_LOW_VOLUME_DRIFT_BREAKOUT");
         }
-        if !t.hurst_60m.is_finite() || t.hurst_60m < cfg.min_hurst_60m {
+        if !dual_path_active && (!t.hurst_60m.is_finite() || t.hurst_60m < cfg.min_hurst_60m) {
             return Err("REJECT_LOW_HURST_MEAN_REVERTING_REGIME");
         }
         if !t.oi_delta_15m_pct.is_finite() || t.oi_delta_15m_pct < -0.15 {
             return Err("REJECT_LIQUIDATION_FLUSH_COLLAPSING_OI");
         }
-
-        let range = (t.bar_high - t.bar_low).max(1e-12);
-        let clv = ((2.0 * t.bar_close - t.bar_high - t.bar_low) / range).clamp(-1.0, 1.0);
-        let d = dir.sign();
 
         if d * clv < cfg.min_clv_conviction {
             return Err("REJECT_WEAK_CANDLE_CLOSE_CONVICTION");
@@ -2095,12 +2125,26 @@ impl EngineBTrendManager {
                     return TrendOrderAction::None;
                 };
 
-                // 1. Check Session Gating first
+                // 1. Check Session Gating first (allow Package 7 Path 1 Mode-Bypass Compression Ignition)
+                let rng_idle = (t.bar_high - t.bar_low).max(1e-12);
+                let clv_idle =
+                    ((2.0 * t.bar_close - t.bar_high - t.bar_low) / rng_idle).clamp(-1.0, 1.0);
+                let path1_mode_bypass = t.enable_flag_compression_branch_b
+                    && is_mode_mean_reversion
+                    && t.p_shock < 0.45
+                    && t.squeeze_pre_ratio.is_finite()
+                    && t.squeeze_pre_ratio <= 1.05
+                    && t.squeeze_pre_pct60.is_finite()
+                    && t.squeeze_pre_pct60 <= 0.35
+                    && t.rel_vol_15m >= 1.80
+                    && dir.sign() * clv_idle >= 0.55
+                    && t.oi_delta_15m_pct >= 0.0
+                    && dir.sign() * t.l2_obi >= -0.15;
                 let mode = SessionTrendGate::evaluate_session_mode(
                     cfg,
                     timestamp_sec,
                     weekday_utc,
-                    is_mode_mean_reversion,
+                    is_mode_mean_reversion && !path1_mode_bypass,
                     ker_15m,
                     t.rel_vol_15m,
                     btc_ret_60m_abs,
@@ -2138,12 +2182,13 @@ impl EngineBTrendManager {
                 confirm_bars_5m,
                 armed_at_sec,
             } => {
-                // Re-verify session mode before promoting Stage 1 -> Stage 2
+                // Re-verify session mode before promoting Stage 1 -> Stage 2 (preserve Path 1 Mode-Bypass if armed via Path 1)
                 let mode = SessionTrendGate::evaluate_session_mode(
                     cfg,
                     timestamp_sec,
                     weekday_utc,
-                    is_mode_mean_reversion,
+                    is_mode_mean_reversion
+                        && !(t.enable_flag_compression_branch_b && t.p_shock < 0.45),
                     ker_15m,
                     t.rel_vol_15m,
                     btc_ret_60m_abs,
@@ -2309,6 +2354,94 @@ pub fn calculate_min_squeeze_ratio_90m(bars_15m: &[CandleBar]) -> f64 {
     } else {
         1.0
     }
+}
+
+/// Computes the Package 7 lagged pre-breakout squeeze ratio `ATR_12(t-1) / ATR_48(t-1)`
+/// and its empirical percentile over the trailing 60 bars (`prior_15m` strictly ends at `t-1`).
+pub fn calculate_lagged_squeeze_and_pct60(prior_15m: &[CandleBar]) -> (f64, f64) {
+    let n = prior_15m.len();
+    if n < 49 {
+        return (f64::MAX, 1.0);
+    }
+    let start_k = n.saturating_sub(59).max(49);
+    let mut series = Vec::with_capacity(n - start_k + 1);
+    for k in start_k..=n {
+        if let (Some(a12), Some(a48)) = (
+            calculate_atr(&prior_15m[..k], 12),
+            calculate_atr(&prior_15m[..k], 48),
+        ) {
+            if a12.is_finite() && a48.is_finite() && a48 > 1e-12 {
+                series.push(a12 / a48);
+            }
+        }
+    }
+    let Some(&curr) = series.last() else {
+        return (f64::MAX, 1.0);
+    };
+    let below_cnt = series.iter().filter(|&&v| v <= curr).count();
+    let pct60 = below_cnt as f64 / (series.len().max(1) as f64);
+    (curr, pct60)
+}
+
+/// Evaluates Package 7 Path 2 (Separated Impulse-Shelf Continuation — Branch B v2) on `prior_15m`
+/// ending at `t-1`:
+/// - Impulse (`t-9..t-5`): `d * (C_{t-5} - C_{t-9}) / ATR_{15m}(t-5) >= 1.60` & `KER_imp >= 0.55`
+/// - Shelf (`t-4..t-1`): `FlagComp_60m,HL <= 1.85`, `KER_shelf <= 0.55`, `ShelfRetrace <= 0.45`
+pub fn evaluate_separated_impulse_shelf_v2(prior_15m: &[CandleBar], dir: TrendDirection) -> bool {
+    let m = prior_15m.len();
+    if m < 26 {
+        return false;
+    }
+    let d = dir.sign();
+    // prior_15m[m-1] is t-1; [m-4..m] is t-4..t-1; m-5 is t-5; m-9 is t-9
+    let c_t5 = prior_15m[m - 5].close;
+    let c_t9 = prior_15m[m - 9].close;
+    let imp_move = d * (c_t5 - c_t9);
+    if imp_move <= 0.0 || !imp_move.is_finite() {
+        return false;
+    }
+    let Some(atr_t5) =
+        calculate_atr(&prior_15m[..m - 4], 20).filter(|&a| a.is_finite() && a > 1e-12)
+    else {
+        return false;
+    };
+    if imp_move / atr_t5 < 1.60 {
+        return false;
+    }
+    let mut imp_abs_sum = 0.0;
+    for i in (m - 8)..=(m - 5) {
+        imp_abs_sum += (prior_15m[i].close - prior_15m[i - 1].close).abs();
+    }
+    let ker_imp = (c_t5 - c_t9).abs() / imp_abs_sum.max(1e-12);
+    if ker_imp < 0.55 {
+        return false;
+    }
+
+    let Some(atr_t1) = calculate_atr(prior_15m, 20).filter(|&a| a.is_finite() && a > 1e-12) else {
+        return false;
+    };
+    let shelf = &prior_15m[m - 4..m];
+    let max_h = shelf.iter().map(|b| b.high).fold(f64::MIN, f64::max);
+    let min_l = shelf.iter().map(|b| b.low).fold(f64::MAX, f64::min);
+    if max_h <= min_l || ((max_h - min_l) / atr_t1) > 1.85 {
+        return false;
+    }
+
+    let mut shelf_abs_sum = 0.0;
+    for i in (m - 4)..m {
+        shelf_abs_sum += (prior_15m[i].close - prior_15m[i - 1].close).abs();
+    }
+    let shelf_net = (prior_15m[m - 1].close - c_t5).abs();
+    let ker_shelf = shelf_net / shelf_abs_sum.max(1e-12);
+    if ker_shelf > 0.55 {
+        return false;
+    }
+
+    let max_retrace = shelf
+        .iter()
+        .map(|b| (d * (c_t5 - b.close)) / imp_move)
+        .fold(0.0_f64, f64::max);
+    max_retrace <= 0.45
 }
 
 /// Computes the Package 4 4-bar (60-minute) continuation flag compression ratio relative to ATR_20:
@@ -3114,6 +3247,11 @@ mod tests {
             p_trend: 0.90,
             ker_15m: 0.75,
             enable_flag_compression_branch_b: false,
+            squeeze_pre_ratio: 0.85,
+            squeeze_pre_pct60: 0.25,
+            p_shock: 0.0,
+            sep_flag_long_ok: false,
+            sep_flag_short_ok: false,
         }
     }
 
@@ -3506,6 +3644,11 @@ mod tests {
             p_trend: 0.90,
             ker_15m: 0.75,
             enable_flag_compression_branch_b: false,
+            squeeze_pre_ratio: 0.85,
+            squeeze_pre_pct60: 0.25,
+            p_shock: 0.0,
+            sep_flag_long_ok: false,
+            sep_flag_short_ok: false,
         };
         assert_eq!(
             mgr.on_5m_bar_close(&cfg, &bar1, t0, 3, 560.0, false, 0.50, 0.005),
@@ -3582,6 +3725,11 @@ mod tests {
             p_trend: 0.90,
             ker_15m: 0.75,
             enable_flag_compression_branch_b: false,
+            squeeze_pre_ratio: 0.85,
+            squeeze_pre_pct60: 0.25,
+            p_shock: 0.0,
+            sep_flag_long_ok: false,
+            sep_flag_short_ok: false,
         };
         assert_eq!(
             mgr.on_5m_bar_close(&cfg, &bar1, t_ts, 3, 560.0, false, 0.55, 0.005),
@@ -3622,6 +3770,11 @@ mod tests {
             p_trend: 1.0,
             ker_15m: 0.85,
             enable_flag_compression_branch_b: false,
+            squeeze_pre_ratio: 1.30,
+            squeeze_pre_pct60: 0.80,
+            p_shock: 0.0,
+            sep_flag_long_ok: false,
+            sep_flag_short_ok: false,
         };
 
         let res_live = BreakoutFilter::check_coiled_spring_gates(&cfg, &tel, TrendDirection::Short);
@@ -3639,5 +3792,105 @@ mod tests {
         tel.flag_compression_ratio_60m = 2.10;
         let res_wide = BreakoutFilter::check_coiled_spring_gates(&cfg, &tel, TrendDirection::Short);
         assert_eq!(res_wide, Err("REJECT_NO_PRE_BREAKOUT_SQUEEZE"));
+    }
+
+    #[test]
+    fn test_package7_dual_path_engine_b_mode_bypass_and_separated_flag() {
+        let cfg = TrendEngineConfig::for_symbol("BTC", 0.35, 0.28);
+        let mut mgr = EngineBTrendManager::new();
+        let t_ts = chrono::Utc
+            .with_ymd_and_hms(2026, 11, 11, 14, 30, 0)
+            .unwrap()
+            .timestamp() as u64;
+
+        // Path 1: Mode is still MeanReversion (`is_mode_mean_reversion = true`), Squeeze > 0.90,
+        // but lagged Squeeze_pre <= 1.05 & Pct60 <= 0.35 with RelVol >= 1.80, CLV >= 0.55, OI >= 0!
+        let path1_bar1 = BreakoutTelemetry {
+            bar_open: 70000.0,
+            bar_high: 70250.0,
+            bar_low: 69980.0,
+            bar_close: 70230.0,
+            donchian_high_12_15m: 70100.0,
+            donchian_low_12_15m: 69500.0,
+            atr_15m: 150.0,
+            min_squeeze_ratio_90m: 1.35, // fails legacy Branch A
+            rel_vol_15m: 1.90,
+            hurst_60m: 0.44, // bypassed when Dual-Path is active
+            l2_obi: -0.05,   // non-hostile L2 book
+            oi_delta_15m_pct: 0.12,
+            flag_compression_ratio_60m: 2.0,
+            p_trend: 0.45, // HMM hasn't flipped yet
+            ker_15m: 0.40,
+            enable_flag_compression_branch_b: true,
+            squeeze_pre_ratio: 0.96,
+            squeeze_pre_pct60: 0.28,
+            p_shock: 0.10,
+            sep_flag_long_ok: false,
+            sep_flag_short_ok: false,
+        };
+        assert_eq!(
+            mgr.on_5m_bar_close_with_l2_fallback(
+                &cfg,
+                &path1_bar1,
+                t_ts,
+                3,
+                560.0,
+                true,
+                0.40,
+                0.005,
+                false
+            ),
+            TrendOrderAction::None // Armed Stage 1!
+        );
+        assert!(mgr.is_stage1_armed());
+
+        // Path 2: Separated Impulse-Shelf Continuation (`t-9..t-5` impulse, `t-4..t-1` shelf)
+        let mut bars_15m = Vec::new();
+        for i in 0..24 {
+            let base = 100.0 + (i as f64) * 0.05;
+            bars_15m.push(CandleBar {
+                time_open: (i as u64) * 900_000,
+                open: base,
+                high: base + 0.30,
+                low: base - 0.30,
+                close: base,
+                volume: 100.0,
+            });
+        }
+        // Impulse bars t-9..t-5 (indices 24..=28): clean upward thrust from 101.2 to 104.2
+        for i in 0..5 {
+            let prev_c = bars_15m.last().unwrap().close;
+            let next_c = prev_c + 0.75;
+            bars_15m.push(CandleBar {
+                time_open: ((24 + i) as u64) * 900_000,
+                open: prev_c,
+                high: next_c + 0.05,
+                low: prev_c - 0.05,
+                close: next_c,
+                volume: 200.0,
+            });
+        }
+        // Shelf bars t-4..t-1 (indices 29..=32): tight horizontal pause holding >= 55% of impulse
+        let c_t5 = bars_15m.last().unwrap().close;
+        for (j, dc) in [-0.15, 0.10, -0.10, 0.05].iter().enumerate() {
+            let prev_c = bars_15m.last().unwrap().close;
+            let c = c_t5 + dc;
+            bars_15m.push(CandleBar {
+                time_open: ((29 + j) as u64) * 900_000,
+                open: prev_c,
+                high: c_t5 + 0.25,
+                low: c_t5 - 0.30,
+                close: c,
+                volume: 90.0,
+            });
+        }
+        assert!(evaluate_separated_impulse_shelf_v2(
+            &bars_15m,
+            TrendDirection::Long
+        ));
+        assert!(!evaluate_separated_impulse_shelf_v2(
+            &bars_15m,
+            TrendDirection::Short
+        ));
     }
 }

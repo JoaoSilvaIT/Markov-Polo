@@ -2889,7 +2889,7 @@ pub fn asset_calibration(symbol: &str) -> AssetCalibration {
             beta_overshoot: 0.50,
             w2_min: 0.35,
             w2_max: 0.65,
-            stall_trigger_mins: 4,
+            stall_trigger_mins: 3,
             cusum_delta_1m: 0.38,
             cusum_b_1m_star: 4.15,
             sprt_min_loss_gate_bps: -16.0,
@@ -2945,7 +2945,7 @@ pub fn asset_calibration(symbol: &str) -> AssetCalibration {
             beta_overshoot: 0.52,
             w2_min: 0.35,
             w2_max: 0.65,
-            stall_trigger_mins: 4,
+            stall_trigger_mins: 3,
             cusum_delta_1m: 0.36,
             cusum_b_1m_star: 4.05,
             sprt_min_loss_gate_bps: -16.0,
@@ -3029,7 +3029,7 @@ pub fn asset_calibration(symbol: &str) -> AssetCalibration {
             beta_overshoot: 0.58,
             w2_min: 0.35,
             w2_max: 0.65,
-            stall_trigger_mins: 4,
+            stall_trigger_mins: 3,
             cusum_delta_1m: 0.35,
             cusum_b_1m_star: 4.00,
             sprt_min_loss_gate_bps: -18.0,
@@ -3829,7 +3829,7 @@ impl StallHazardExitManager {
             .max(cal.min_gross_entry_bps * 0.85);
         let tp2_overshoot_bps = mean_dist_bps + cal.beta_overshoot * sigma_eq_bps;
 
-        // 3. State-Contingent Stall-Hazard Trajectory for Tranche 1 Maker Limit
+        // 3. State-Contingent Stall-Hazard Trajectory for Tranche 1 Maker Limit (Package 7 Candidate B)
         let is_expanding = tau_stall < cal.stall_trigger_mins || m_rev >= 0.22;
         let tp1_target_bps = if is_expanding || self.mfe_bps < 15.0 {
             // Active expansion: DO NOT CAP WINNER! Keep TP1 at full Kalman equilibrium mean.
@@ -4711,17 +4711,18 @@ pub fn evaluate_session_lifecycle_gate(
             return SessionLifecycleAction::ForceFlat("US_EQUITY_WEEKEND");
         }
         // US RTH: 09:30 - 16:00 ET -> EDT: 810..1200 UTC mins, EST: 870..1260 UTC mins
+        // Package 7 Legacy Gap Quarantine: +15m open / -30m close
         let (rth_open, rth_close) = if is_us_dst { (810, 1200) } else { (870, 1260) };
         if total_day_mins < rth_open || total_day_mins >= rth_close - 3 {
             return SessionLifecycleAction::ForceFlat("US_EQUITY_RTH_CLOSE");
         }
-        if total_day_mins < rth_open + 5 {
+        if total_day_mins < rth_open + 15 {
             return SessionLifecycleAction::BlockNewEntriesAndRatchetTp(
-                "US_EQUITY_OPEN_AUCTION_5M",
+                "US_EQUITY_OPEN_AUCTION_15M",
             );
         }
-        if total_day_mins >= rth_close - 20 {
-            return SessionLifecycleAction::BlockNewEntriesAndRatchetTp("US_EQUITY_PRE_CLOSE_20M");
+        if total_day_mins >= rth_close - 30 {
+            return SessionLifecycleAction::BlockNewEntriesAndRatchetTp("US_EQUITY_PRE_CLOSE_30M");
         }
     } else if is_cme_metal {
         // CME Globex daily maintenance: 17:00 - 18:00 ET -> EDT: 1260..1320, EST: 1320..1380
@@ -4745,6 +4746,104 @@ pub fn evaluate_session_lifecycle_gate(
     }
 
     SessionLifecycleAction::AllowNormalTrading
+}
+
+/// Bailey & López de Prado (2012) Probabilistic Sharpe Ratio `PSR(0)` accounting for
+/// non-normal skewness (`gamma_3`) and Pearson kurtosis (`gamma_4`) of per-trade bps returns.
+#[allow(dead_code)]
+pub fn compute_probabilistic_sharpe_ratio_zero(returns_bps: &[f64]) -> f64 {
+    let n = returns_bps.len();
+    if n < 5 {
+        return 0.0;
+    }
+    let nf = n as f64;
+    let mean = returns_bps.iter().sum::<f64>() / nf;
+    let var = returns_bps.iter().map(|&r| (r - mean).powi(2)).sum::<f64>() / (nf - 1.0);
+    if !var.is_finite() || var <= 1e-12 {
+        return 0.0;
+    }
+    let std = var.sqrt();
+    let sr = mean / std;
+    let m3 = returns_bps
+        .iter()
+        .map(|&r| ((r - mean) / std).powi(3))
+        .sum::<f64>()
+        / nf;
+    let m4 = returns_bps
+        .iter()
+        .map(|&r| ((r - mean) / std).powi(4))
+        .sum::<f64>()
+        / nf;
+    let denom_sq = (1.0 - m3 * sr + ((m4 - 1.0) / 4.0) * sr * sr).max(1e-6);
+    let z_psr = (sr * (nf - 1.0).sqrt()) / denom_sq.sqrt();
+    // Standard normal CDF via Abramowitz-Stegun / erf
+    0.5 * (1.0 + erf_approx(z_psr / std::f64::consts::SQRT_2))
+}
+
+fn erf_approx(x: f64) -> f64 {
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let ax = x.abs();
+    let t = 1.0 / (1.0 + 0.3275911 * ax);
+    let y = 1.0
+        - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t
+            + 0.254829592)
+            * t
+            * (-ax * ax).exp();
+    sign * y
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum AssetPromotionTier {
+    ShadowOnly,
+    Probation035x,
+    CoreLive100x,
+}
+
+/// Package 7 Two-Stage Probationary Graduation Ladder (`N >= 40 -> 80`, `PSR(0) >= 0.85 -> 0.95`)
+/// with dynamic HIP-3 Maker fee-scale verification (`<= 1.50 bps` for `xyz:` RWAs).
+#[allow(dead_code)]
+pub fn evaluate_tier2_promotion_stage(
+    symbol: &str,
+    returns_bps: &[f64],
+    fee_drag_ratio: f64,
+    profit_factor: f64,
+    max_single_loss_bps: f64,
+    shock_stops_gt_60bps: usize,
+) -> AssetPromotionTier {
+    let n = returns_bps.len();
+    if n < 40 {
+        return AssetPromotionTier::ShadowOnly;
+    }
+    if symbol.to_lowercase().starts_with("xyz:")
+        && AssetFeeSchedule::for_symbol(symbol).maker_bps > 1.50
+    {
+        return AssetPromotionTier::ShadowOnly;
+    }
+    let wins = returns_bps.iter().filter(|&&r| r > 0.0).count();
+    let wr = wins as f64 / n as f64;
+    let expectancy = returns_bps.iter().sum::<f64>() / (n as f64);
+    let psr0 = compute_probabilistic_sharpe_ratio_zero(returns_bps);
+
+    if n >= 80
+        && psr0 >= 0.95
+        && expectancy >= 7.0
+        && profit_factor >= 2.0
+        && fee_drag_ratio <= 0.30
+        && shock_stops_gt_60bps == 0
+    {
+        return AssetPromotionTier::CoreLive100x;
+    }
+    if wr >= 0.75
+        && expectancy >= 6.0
+        && profit_factor >= 1.80
+        && fee_drag_ratio <= 0.35
+        && psr0 >= 0.85
+        && max_single_loss_bps <= 55.0
+    {
+        return AssetPromotionTier::Probation035x;
+    }
+    AssetPromotionTier::ShadowOnly
 }
 
 #[cfg(test)]
@@ -5501,7 +5600,7 @@ mod tests {
             } => {
                 assert!(
                     tp1_stalled < 100.20 && tp1_stalled > 100.12,
-                    "After 3m stall, TP1 must ratchet down to upper-quartile of MFE (~100.142), got {:.4}",
+                    "After 3m stall with MFE >= 15 bps, TP1 must ratchet down to upper-quartile of MFE (~100.15), got {:.4}",
                     tp1_stalled
                 );
             }
@@ -5651,7 +5750,7 @@ mod tests {
             .timestamp_millis();
         assert_eq!(
             evaluate_session_lifecycle_gate("xyz:NVDA", ts_est_open_auction),
-            SessionLifecycleAction::BlockNewEntriesAndRatchetTp("US_EQUITY_OPEN_AUCTION_5M")
+            SessionLifecycleAction::BlockNewEntriesAndRatchetTp("US_EQUITY_OPEN_AUCTION_15M")
         );
         assert_eq!(
             evaluate_session_lifecycle_gate("xyz:NVDA", ts_est_active),
@@ -5659,7 +5758,7 @@ mod tests {
         );
         assert_eq!(
             evaluate_session_lifecycle_gate("xyz:NVDA", ts_est_preclose),
-            SessionLifecycleAction::BlockNewEntriesAndRatchetTp("US_EQUITY_PRE_CLOSE_20M")
+            SessionLifecycleAction::BlockNewEntriesAndRatchetTp("US_EQUITY_PRE_CLOSE_30M")
         );
         assert_eq!(
             evaluate_session_lifecycle_gate("xyz:NVDA", ts_est_flat),
@@ -5817,6 +5916,42 @@ mod tests {
             mgr2.cusum_stat_1m >= 0.50,
             "Variance Deflation Shield + Huber 4.50 must accumulate >= 0.50 on 3.2σ shock, got {}",
             mgr2.cusum_stat_1m
+        );
+    }
+
+    #[test]
+    fn test_package7_psr_and_probationary_graduation_ladder() {
+        // N = 25 (< 40) stays in ShadowOnly even with high WR
+        let short_hist: Vec<f64> = (0..25)
+            .map(|i| if i % 5 == 0 { -35.0 } else { 25.0 })
+            .collect();
+        assert_eq!(
+            evaluate_tier2_promotion_stage("SUI", &short_hist, 0.22, 2.8, 35.0, 0),
+            AssetPromotionTier::ShadowOnly
+        );
+
+        // N = 45 strong stats -> Probation035x
+        let prob_hist: Vec<f64> = (0..45)
+            .map(|i| if i % 5 == 0 { -35.0 } else { 24.0 })
+            .collect();
+        assert_eq!(
+            evaluate_tier2_promotion_stage("SUI", &prob_hist, 0.22, 2.7, 35.0, 0),
+            AssetPromotionTier::Probation035x
+        );
+
+        // N = 85 strong stats -> CoreLive100x
+        let core_hist: Vec<f64> = (0..85)
+            .map(|i| if i % 5 == 0 { -35.0 } else { 24.0 })
+            .collect();
+        assert_eq!(
+            evaluate_tier2_promotion_stage("SUI", &core_hist, 0.22, 2.7, 35.0, 0),
+            AssetPromotionTier::CoreLive100x
+        );
+
+        // xyz:GOLD (non-Growth-Mode 2.88 bps Maker > 1.50 bps cap) stays ShadowOnly in fee assertion
+        assert_eq!(
+            evaluate_tier2_promotion_stage("xyz:GOLD", &core_hist, 0.22, 2.7, 35.0, 0),
+            AssetPromotionTier::ShadowOnly
         );
     }
 }
