@@ -434,8 +434,10 @@ async fn main() {
             all_symbols
                 .iter()
                 .filter(|&&sym| {
-                    let path = format!("hl_history_native_{}.jsonl", sym.to_lowercase());
-                    std::path::Path::new(&path).exists()
+                    let native_path = format!("hl_history_native_{}.jsonl", sym.to_lowercase());
+                    let hist_path = format!("hl_history_{}.jsonl", sym.to_lowercase());
+                    std::path::Path::new(&native_path).exists()
+                        || std::path::Path::new(&hist_path).exists()
                 })
                 .copied()
                 .collect()
@@ -517,6 +519,17 @@ async fn main() {
                 let native_file = format!("hl_history_native_{}.jsonl", sym.to_lowercase());
                 let bars = if native_only && std::path::Path::new(&native_file).exists() {
                     crate::backtest::load_bars_from_path(&native_file)
+                } else if native_only {
+                    let all_bars = crate::backtest::load_historical_bars(sym);
+                    if all_bars.len() > 100_000 {
+                        // Separate real live-captured L1 bars from multi-year synthetic Binance archives
+                        all_bars
+                            .into_iter()
+                            .filter(|b| b.open_interest > 0.0 || b.obi_ewma_tau1.is_some())
+                            .collect()
+                    } else {
+                        all_bars
+                    }
                 } else {
                     crate::backtest::load_historical_bars(sym)
                 };
@@ -538,6 +551,18 @@ async fn main() {
             t_ingest.elapsed().as_secs_f64()
         );
 
+        let loaded_portfolio: Vec<(
+            &'static str,
+            Vec<crate::backtest::HistoricalMarketBarRecord>,
+            u32,
+        )> = loaded_portfolio
+            .into_iter()
+            .filter(|(_, bars, _)| !bars.is_empty())
+            .collect();
+        if loaded_portfolio.is_empty() {
+            eprintln!("⚠️ [BACKTEST] No historical bar records found in current working directory.");
+            return;
+        }
         let btc_idx = loaded_portfolio
             .iter()
             .position(|(s, _, _)| *s == "BTC")
