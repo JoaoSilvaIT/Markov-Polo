@@ -21,14 +21,15 @@ use crate::hmm::{compute_hmm_posteriors, train_hmm_offline, GaussianHMM};
 use crate::hyperliquid::{effective_tick_size, optimal_engine_b_tp_atr_multiple, quantize_price};
 use crate::ou_process::{
     asset_calibration, asset_ou_config, calculate_directional_edge_bps,
-    calculate_features_with_funding_at, calculate_mad_sigma, check_macro_calendar_veto,
-    compute_engine_a_disaster_stop_distance, compute_engine_a_soft_risk_capped_notional,
-    compute_fee_adjusted_kelly_scalar, evaluate_armed_reversal_1m_step,
-    evaluate_engine_c_hourly_squeeze, evaluate_engine_d_cascade_reversal,
-    evaluate_session_lifecycle_gate, verify_maker_touch_absorption, AssetCalibration,
-    AsymmetricExitManager, Direction, ExitSignal, HardenedAssetCalibration, HardenedExitDecision,
-    MicroRegimeState, OneMinBarTick, OrderPlacementAction, SessionLifecycleAction,
-    StallHazardExitManager, TwoTierInvalidationManager,
+    calculate_features_with_funding_at, calculate_mad_sigma, check_engine_a_us_open_blackout,
+    check_macro_calendar_veto, compute_engine_a_disaster_stop_distance,
+    compute_engine_a_soft_risk_capped_notional, compute_fee_adjusted_kelly_scalar,
+    evaluate_armed_reversal_1m_step, evaluate_engine_c_hourly_squeeze,
+    evaluate_engine_d_cascade_reversal, evaluate_session_lifecycle_gate,
+    verify_maker_touch_absorption, AssetCalibration, AsymmetricExitManager, Direction, ExitSignal,
+    HardenedAssetCalibration, HardenedExitDecision, MicroRegimeState, OneMinBarTick,
+    OrderPlacementAction, SessionLifecycleAction, StallHazardExitManager,
+    TwoTierInvalidationManager,
 };
 use crate::state::{ClusterCircuitBreaker, Side, DEFAULT_MAX_DAILY_CLUSTER_DD_FRAC};
 use crate::telemetry::{evaluate_btc_impulse_veto, BtcImpulseSnapshot};
@@ -2261,6 +2262,7 @@ pub fn run_engine_a_backtest_with_btc(
         if open_pos.is_none() && resting_entry.is_none() && !session_blocks_entries {
             if let Some(ref feat) = live_feat_opt {
                 let macro_veto = check_macro_calendar_veto(bar.timestamp_ms);
+                let us_open_blackout = check_engine_a_us_open_blackout(bar.timestamp_ms);
                 let cb_veto = cluster_cb.evaluate_equity_drawdown(
                     bar.timestamp_ms,
                     sim_cfg.account_equity_usdc + cumulative_pnl_usd,
@@ -2345,7 +2347,7 @@ pub fn run_engine_a_backtest_with_btc(
                                 || feat.lambda_dir_short <= 0.0
                         }
                     };
-                    if macro_veto.is_some() {
+                    if macro_veto.is_some() || us_open_blackout.is_some() {
                         summary.macro_calendar_vetoes += 1;
                         is_armed = false;
                     } else if cb_veto.is_some() {
@@ -2601,7 +2603,7 @@ pub fn run_engine_a_backtest_with_btc(
                             && !feat.is_upside_shock
                             && kalman_short_ok;
                         if wants_long || wants_short {
-                            if macro_veto.is_some() {
+                            if macro_veto.is_some() || us_open_blackout.is_some() {
                                 summary.macro_calendar_vetoes += 1;
                             } else if cb_veto.is_some() {
                                 summary.cluster_cb_vetoes += 1;

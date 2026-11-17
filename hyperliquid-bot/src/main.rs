@@ -38,14 +38,14 @@ use crate::hyperliquid::{
     get_user_position, optimal_engine_b_tp_atr_multiple, place_disaster_stop_trigger_order,
     place_reduce_only_tp_order, quantize_price, round_to_decimals,
 };
-use crate::order::{emergency_flatten, place_ou_maker_entry};
+use crate::order::{emergency_flatten_fast, place_ou_maker_entry};
 use crate::ou_process::{
     asset_calibration, calculate_directional_edge_bps, calculate_features_with_funding,
-    check_macro_calendar_veto, check_single_bar_adverse_acceleration_override,
-    compute_engine_a_disaster_stop_distance, compute_engine_a_soft_risk_capped_notional,
-    compute_fee_adjusted_kelly_scalar, engine_a_min_soft_inv_excursion_bps,
-    evaluate_session_lifecycle_gate, verify_maker_touch_absorption, AssetFeeSchedule, Direction,
-    SessionLifecycleAction,
+    check_engine_a_us_open_blackout, check_macro_calendar_veto,
+    check_single_bar_adverse_acceleration_override, compute_engine_a_disaster_stop_distance,
+    compute_engine_a_soft_risk_capped_notional, compute_fee_adjusted_kelly_scalar,
+    engine_a_min_soft_inv_excursion_bps, evaluate_session_lifecycle_gate,
+    verify_maker_touch_absorption, AssetFeeSchedule, Direction, SessionLifecycleAction,
 };
 use crate::state::{
     check_cluster_circuit_breaker, has_active_cluster_position,
@@ -261,7 +261,17 @@ async fn resolve_trade_bank(
     config.position_size_usdc
 }
 
-pub async fn execute_emergency_flatten_with_retry(
+fn spawn_discord_alert_bg(discord_url: Option<String>, msg: String) {
+    if let Some(url) = discord_url {
+        if !url.trim().is_empty() {
+            tokio::spawn(async move {
+                crate::discord::send_alert(Some(&url), &msg).await;
+            });
+        }
+    }
+}
+
+pub async fn execute_emergency_flatten_with_retry_bbo(
     state_file_path: &str,
     exchange: &ExchangeClient,
     info: &InfoClient,
@@ -270,10 +280,12 @@ pub async fn execute_emergency_flatten_with_retry(
     symbol: &str,
     sz_decimals: u32,
     discord_url: Option<String>,
+    fast_bbo: Option<(f64, f64)>,
 ) -> Result<(), String> {
     let mut last_err = String::new();
     for attempt in 1..=3 {
-        match emergency_flatten(
+        let bbo_for_attempt = if attempt == 1 { fast_bbo } else { None };
+        match emergency_flatten_fast(
             state_file_path,
             exchange,
             info,
@@ -282,6 +294,7 @@ pub async fn execute_emergency_flatten_with_retry(
             symbol,
             sz_decimals,
             discord_url.clone(),
+            bbo_for_attempt,
         )
         .await
         {
@@ -301,8 +314,32 @@ pub async fn execute_emergency_flatten_with_retry(
         symbol, last_err
     );
     eprintln!("{}", critical_msg);
-    crate::discord::send_alert(discord_url.as_deref(), &critical_msg).await;
+    spawn_discord_alert_bg(discord_url, critical_msg);
     Err(last_err)
+}
+
+pub async fn execute_emergency_flatten_with_retry(
+    state_file_path: &str,
+    exchange: &ExchangeClient,
+    info: &InfoClient,
+    wallet_address: H160,
+    state: &mut StateMap,
+    symbol: &str,
+    sz_decimals: u32,
+    discord_url: Option<String>,
+) -> Result<(), String> {
+    execute_emergency_flatten_with_retry_bbo(
+        state_file_path,
+        exchange,
+        info,
+        wallet_address,
+        state,
+        symbol,
+        sz_decimals,
+        discord_url,
+        None,
+    )
+    .await
 }
 
 pub fn is_symbol_live_capital_enabled(symbol: &str) -> bool {
@@ -2504,14 +2541,115 @@ async fn main() {
                     continue;
                 }
 
-                // Sync late partial entry fill (e.g. final 4% filled right after initial TP placement)
+                // Sync late partial entry fill (e.g. initial 12% filled, then remaining 88% filled after initial TP/SL placement)
                 let sz_step_eps = 0.5 * 10f64.powi(-(watcher_sz_decimals as i32));
                 if !is_tp_filled && !is_flat && current_szi.abs() > pos.amount + sz_step_eps {
-                    let mut state_lock = watcher_state.lock().await;
-                    if let Some(p) = state_lock.get_mut(&watcher_symbol) {
-                        p.amount = current_szi.abs();
-                        let _ = save_state(&watcher_state_path, &state_lock);
+                    let new_total_amt = current_szi.abs();
+                    println!(
+                        "🔄 [FAST-SENTINEL PARTIAL FILL SYNC] {} size grew from {:.4} -> {:.4}. Resizing TP & Disaster Stop!",
+                        watcher_symbol, pos.amount, new_total_amt
+                    );
+                    {
+                        let mut state_lock = watcher_state.lock().await;
+                        if let Some(p) = state_lock.get_mut(&watcher_symbol) {
+                            p.amount = new_total_amt;
+                            let _ = save_state(&watcher_state_path, &state_lock);
+                        }
                     }
+
+                    // 1. Replace resting TP order for the full position size
+                    if !pos.tp_order_id.is_empty() && !(pos.engine_type == "EngineB" && pos.tranche1_tp_filled) {
+                        if let Ok(old_tp_oid) = pos.tp_order_id.parse::<u64>() {
+                            let _ = cancel_order(&watcher_exchange, &watcher_symbol, old_tp_oid).await;
+                        }
+                        let raw_tp_sync = if pos.effective_tp > 0.0 {
+                            pos.effective_tp
+                        } else {
+                            pos.take_profit_price
+                        };
+                        let (new_tp_qty, new_tp_px, new_tranche_tag) = compute_tp_order_plan(
+                            &pos.engine_type,
+                            pos.entry_price,
+                            raw_tp_sync,
+                            new_total_amt,
+                            pos.tranche1_tp_filled,
+                            watcher_sz_decimals,
+                        );
+                        let tp_is_buy_sync = pos.side == "SHORT";
+                        match place_reduce_only_tp_order(
+                            &watcher_exchange,
+                            &watcher_info,
+                            &watcher_symbol,
+                            tp_is_buy_sync,
+                            new_tp_px,
+                            new_tp_qty,
+                            watcher_sz_decimals,
+                            Some(uuid::Uuid::new_v4()),
+                        )
+                        .await
+                        {
+                            Ok(new_tp_oid) => {
+                                let mut state_lock = watcher_state.lock().await;
+                                if let Some(p) = state_lock.get_mut(&watcher_symbol) {
+                                    p.tp_order_id = new_tp_oid.to_string();
+                                    let _ = save_state(&watcher_state_path, &state_lock);
+                                }
+                                println!(
+                                    "🎯 [FAST-SENTINEL PARTIAL FILL SYNC] {} {} TP resized to {:.4} @ ${:.4} (oid: {})",
+                                    watcher_symbol, new_tranche_tag, new_tp_qty, new_tp_px, new_tp_oid
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "⚠️ [FAST-SENTINEL PARTIAL FILL SYNC] Failed to replace TP for {}: {}. Clearing tp_order_id for immediate Scenario 1 recovery.",
+                                    watcher_symbol, e
+                                );
+                                let mut state_lock = watcher_state.lock().await;
+                                if let Some(p) = state_lock.get_mut(&watcher_symbol) {
+                                    p.tp_order_id.clear();
+                                    let _ = save_state(&watcher_state_path, &state_lock);
+                                }
+                            }
+                        }
+                    }
+
+                    // 2. Replace exchange-native Disaster Stop trigger order for the full position size
+                    if pos.stop_loss_price > 0.0 {
+                        let is_long_sync = pos.side == "LONG";
+                        let sl_px_sync = if pos.disaster_stop_ratcheted_to_be || pos.engine_type == "EngineB" {
+                            quantize_price(pos.stop_loss_price, watcher_sz_decimals)
+                        } else {
+                            let raw_sl = if is_long_sync {
+                                pos.stop_loss_price * 0.9985
+                            } else {
+                                pos.stop_loss_price * 1.0015
+                            };
+                            quantize_price(raw_sl, watcher_sz_decimals)
+                        };
+                        if let Ok(new_sl_oid) = crate::hyperliquid::ratchet_disaster_stop_to_breakeven(
+                            &watcher_exchange,
+                            &watcher_symbol,
+                            !is_long_sync,
+                            new_total_amt,
+                            sl_px_sync,
+                            watcher_sz_decimals,
+                            pos.disaster_stop_oid,
+                            Some(uuid::Uuid::new_v4()),
+                        )
+                        .await
+                        {
+                            let mut state_lock = watcher_state.lock().await;
+                            if let Some(p) = state_lock.get_mut(&watcher_symbol) {
+                                p.disaster_stop_oid = Some(new_sl_oid);
+                                let _ = save_state(&watcher_state_path, &state_lock);
+                            }
+                            println!(
+                                "🛡️ [FAST-SENTINEL PARTIAL FILL SYNC] {} Disaster Stop resized to {:.4} @ ${:.4} (oid: {})",
+                                watcher_symbol, new_total_amt, sl_px_sync, new_sl_oid
+                            );
+                        }
+                    }
+                    continue;
                 }
 
                 if is_tp_filled && !is_flat && !pos.tranche1_tp_filled {
@@ -5021,8 +5159,8 @@ async fn main() {
 
                                             if let crate::ou_process::HardenedExitDecision::StopOutSprt1mClose { cusum_val, .. } = dec_1m {
                                                 let unreal_bps_mid = d_1m * ((mid_eval_px - pos.entry_price) / pos.entry_price.max(1e-9)) * 10_000.0;
-                                                if unreal_bps_mid >= -38.0 && !pos.tp_order_id.is_empty() {
-                                                    // Two-Stage Maker-Pegged Stop Conversion (-18..-38 bps): try passive Alo at 1 tick before Taker escape
+                                                if unreal_bps_mid > -32.0 && !pos.tp_order_id.is_empty() {
+                                                    // Two-Stage Maker-Pegged Stop Conversion (-18..-32 bps): try passive Alo at 1 tick before Taker escape
                                                     let peg_stop_px = quantize_price(mid_eval_px + d_1m * entry_tick, sz_decimals);
                                                     let already_pegged = d_1m * (pos.effective_tp - pos.entry_price) < 0.0;
                                                     if already_pegged {
@@ -5043,7 +5181,7 @@ async fn main() {
                                                     }
                                                 } else {
                                                     println!(
-                                                        "🚨 [1M SHADOW CUSUM ESCAPE] {} CUSUM={:.2} at {:.1} bps (< -38 bps) -> immediate escape flatten!",
+                                                        "🚨 [1M SHADOW CUSUM ESCAPE] {} CUSUM={:.2} at {:.1} bps (<= -32 bps) -> immediate escape flatten!",
                                                         symbol_clone, cusum_val, unreal_bps_mid
                                                     );
                                                     soft_invalidation_reason = Some("SPRT_1M_ASYMMETRIC_CUSUM_ESCAPE");
@@ -5522,6 +5660,11 @@ async fn main() {
                                 }
                             }
 
+                            let fast_flatten_bbo = if l2_fresh && l2_bid_snap > 0.0 && l2_ask_snap >= l2_bid_snap {
+                                Some((l2_bid_snap, l2_ask_snap))
+                            } else {
+                                None
+                            };
                             if hard_sl_triggered {
                                 let sl_px = state_lock
                                     .get(&symbol_clone)
@@ -5535,8 +5678,8 @@ async fn main() {
                                     "🛑 **CATASTROPHE STOP-LOSS EXECUTED (HL):** {} breached hard stop at ${:.2} (Close: ${:.2}). Emergency flattening position.",
                                     symbol_clone, sl_px, close_price
                                 );
-                                crate::discord::send_alert(discord_clone.as_deref(), &sl_msg).await;
-                                let _ = execute_emergency_flatten_with_retry(
+                                spawn_discord_alert_bg(discord_clone.clone(), sl_msg);
+                                let _ = execute_emergency_flatten_with_retry_bbo(
                                     &state_path_clone,
                                     &exchange_clone,
                                     &info_clone,
@@ -5545,6 +5688,7 @@ async fn main() {
                                     &symbol_clone,
                                     sz_decimals,
                                     discord_clone.clone(),
+                                    fast_flatten_bbo,
                                 )
                                 .await;
                                 drop(state_lock);
@@ -5564,8 +5708,8 @@ async fn main() {
                                     "🛑 **CHANDELIER TRAILING STOP EXECUTED (HL):** {} stopped out at ${:.2} (Trailing Stop: ${:.2}). Emergency flattening position.",
                                     symbol_clone, close_price, sl_px
                                 );
-                                crate::discord::send_alert(discord_clone.as_deref(), &ch_msg).await;
-                                let flatten_res = execute_emergency_flatten_with_retry(
+                                spawn_discord_alert_bg(discord_clone.clone(), ch_msg);
+                                let flatten_res = execute_emergency_flatten_with_retry_bbo(
                                     &state_path_clone,
                                     &exchange_clone,
                                     &info_clone,
@@ -5574,6 +5718,7 @@ async fn main() {
                                     &symbol_clone,
                                     sz_decimals,
                                     discord_clone.clone(),
+                                    fast_flatten_bbo,
                                 )
                                 .await;
                                 if flatten_res.is_ok() {
@@ -5604,7 +5749,7 @@ async fn main() {
                                     "⏱️ [ENTRY TTL EXPIRED] Resting order for {} unfilled after {:.1}m. Cancelling unfilled entry.",
                                     symbol_clone, elapsed_mins
                                 );
-                                let _ = execute_emergency_flatten_with_retry(
+                                let _ = execute_emergency_flatten_with_retry_bbo(
                                     &state_path_clone,
                                     &exchange_clone,
                                     &info_clone,
@@ -5613,6 +5758,7 @@ async fn main() {
                                     &symbol_clone,
                                     sz_decimals,
                                     discord_clone.clone(),
+                                    fast_flatten_bbo,
                                 )
                                 .await;
                             } else if giveback_triggered {
@@ -5632,8 +5778,8 @@ async fn main() {
                                     "🏆 **PROFIT RATCHET EXECUTED (HL):** {} reached {:.1}% peak progress. Retracement triggered profit lock at ${:.2} (Entry: ${:.2}). Banking profit.",
                                     symbol_clone, peak_prog, close_price, ent_px
                                 );
-                                crate::discord::send_alert(discord_clone.as_deref(), &ratchet_msg).await;
-                                let _ = execute_emergency_flatten_with_retry(
+                                spawn_discord_alert_bg(discord_clone.clone(), ratchet_msg);
+                                let _ = execute_emergency_flatten_with_retry_bbo(
                                     &state_path_clone,
                                     &exchange_clone,
                                     &info_clone,
@@ -5642,6 +5788,7 @@ async fn main() {
                                     &symbol_clone,
                                     sz_decimals,
                                     discord_clone.clone(),
+                                    fast_flatten_bbo,
                                 )
                                 .await;
                             } else if let Some(reason) = soft_invalidation_reason {
@@ -5653,8 +5800,8 @@ async fn main() {
                                     "🚨 **5M TWO-TIER SOFT INVALIDATION (HL):** {}\n**Reason:** {}\n**Close:** ${:.2} (Z_OU: {:.2}, Z15: {:.2})",
                                     symbol_clone, reason, close_price, live_feat.z_ou, z_15
                                 );
-                                crate::discord::send_alert(discord_clone.as_deref(), &inv_msg).await;
-                                let _ = execute_emergency_flatten_with_retry(
+                                spawn_discord_alert_bg(discord_clone.clone(), inv_msg);
+                                let _ = execute_emergency_flatten_with_retry_bbo(
                                     &state_path_clone,
                                     &exchange_clone,
                                     &info_clone,
@@ -5663,6 +5810,7 @@ async fn main() {
                                     &symbol_clone,
                                     sz_decimals,
                                     discord_clone.clone(),
+                                    fast_flatten_bbo,
                                 )
                                 .await;
                                 drop(state_lock);
@@ -5682,7 +5830,7 @@ async fn main() {
                                     "🚨 [SHOCK VETO ON POSITION] Severe adverse shock on {} (Z15: {:.2}, Z60: {:.2}, Engine: {})! Flattening.",
                                     symbol_clone, z_15, z_60, pos_engine_type
                                 );
-                                let _ = execute_emergency_flatten_with_retry(
+                                let _ = execute_emergency_flatten_with_retry_bbo(
                                     &state_path_clone,
                                     &exchange_clone,
                                     &info_clone,
@@ -5691,6 +5839,7 @@ async fn main() {
                                     &symbol_clone,
                                     sz_decimals,
                                     discord_clone.clone(),
+                                    fast_flatten_bbo,
                                 )
                                 .await;
                             } else if time_stop_triggered {
@@ -5698,7 +5847,7 @@ async fn main() {
                                     "⏱️ [TIME-STOP] {} reached max hold {:.1}m >= limit {:.1}m. Flattening.",
                                     symbol_clone, elapsed_mins, max_allowed_mins
                                 );
-                                let _ = execute_emergency_flatten_with_retry(
+                                let _ = execute_emergency_flatten_with_retry_bbo(
                                     &state_path_clone,
                                     &exchange_clone,
                                     &info_clone,
@@ -5707,6 +5856,7 @@ async fn main() {
                                     &symbol_clone,
                                     sz_decimals,
                                     discord_clone.clone(),
+                                    fast_flatten_bbo,
                                 )
                                 .await;
                                 drop(state_lock);
@@ -5814,10 +5964,17 @@ async fn main() {
                                 && ret_240 < max_short_drift_240 * 1.25
                                 && (ma60_vs_240 <= 0.0055 || live_feat.hurst_60m < 0.42 || (ret_720 < -0.0150 && ma60_vs_240 <= 0.0080));
                             let macro_calendar_veto = check_macro_calendar_veto(now_ms_cb);
+                            let us_open_blackout = check_engine_a_us_open_blackout(now_ms_cb);
                             if let Some(ref m_veto) = macro_calendar_veto {
                                 println!(
                                     "🛡️ [MACRO CALENDAR SHIELD] {} Engine A gated during scheduled release window: {}",
                                     symbol_clone, m_veto
+                                );
+                            }
+                            if let Some(open_veto) = us_open_blackout {
+                                println!(
+                                    "🛡️ [US OPEN BLACKOUT] {} Engine A gated during 09:25-09:45 ET cash open window: {}",
+                                    symbol_clone, open_veto
                                 );
                             }
                             let is_eligible = !candle_feed_degraded
@@ -5829,6 +5986,7 @@ async fn main() {
                                 && !is_cb_paused
                                 && !is_cluster_blocked
                                 && macro_calendar_veto.is_none()
+                                && us_open_blackout.is_none()
                                 && controller.current_mode == ControllerMode::MeanReversion;
 
                             if controller.current_mode != ControllerMode::MeanReversion {
@@ -5845,6 +6003,7 @@ async fn main() {
                                 && (!consolidation_vol_ok
                                     || controller.current_mode != ControllerMode::MeanReversion
                                     || macro_calendar_veto.is_some()
+                                    || us_open_blackout.is_some()
                                     || session_blocks_new_entries)
                             {
                                 println!(

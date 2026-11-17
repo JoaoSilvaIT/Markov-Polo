@@ -2033,6 +2033,26 @@ pub fn check_macro_calendar_veto(ts_ms: u64) -> Option<String> {
     }
 }
 
+/// Engine A US Equity Cash Open Blackout (`09:25 - 09:45 America/New_York` on weekdays Mon-Fri):
+/// In EDT: `13:25 - 13:45 UTC` (`805..825` mins); in EST: `14:25 - 14:45 UTC` (`865..885` mins).
+/// Prevents Engine A mean-reversion entries from fading the 09:30 ET cash equity opening wave.
+pub fn check_engine_a_us_open_blackout(ts_ms: u64) -> Option<&'static str> {
+    use chrono::{Datelike, TimeZone, Utc};
+    let dt = Utc.timestamp_millis_opt(ts_ms as i64).single()?;
+    let dow = dt.weekday().num_days_from_sunday();
+    if dow == 0 || dow == 6 {
+        return None;
+    }
+    let is_edt = is_us_daylight_saving_date(dt.year(), dt.month(), dt.day());
+    let rth_open_mins = if is_edt { 810 } else { 870 };
+    let total_day_mins = ((ts_ms / 60_000) % 1440) as u32;
+    if total_day_mins >= rth_open_mins - 5 && total_day_mins < rth_open_mins + 15 {
+        Some("US_EQUITY_CASH_OPEN_BLACKOUT_0925_0945_ET")
+    } else {
+        None
+    }
+}
+
 /// Computes the robust Median Absolute Deviation (MAD) of a return series,
 /// scaled by 1.4826 for normal consistency and floored at 1e-5.
 pub fn calculate_mad_sigma(returns: &[f64]) -> f64 {
@@ -3904,16 +3924,23 @@ impl StallHazardExitManager {
 
         // Check 1m Close-Confirmed SPRT Stop (Package 6 calibrated barrier ~ 0.80 * B_1m* ~ 3.00–3.25
         // and relaxed CLV gate <= -0.05 once unrealized <= -22 bps)
+        // Package 7B Unconditional Loss Ceiling: once unrealized <= -35.0 bps (pre-T1),
+        // bypass CLV wick gating and slow-grind CUSUM lag to cap Engine A tail losses.
         let eff_b_star = (cal.cusum_b_1m_star * 0.80).clamp(2.85, 3.35);
         let clv_gate = if curr_unreal_bps <= -22.0 {
             -0.05
         } else {
             -0.20
         };
-        if !self.tranche1_filled
-            && self.cusum_stat_1m >= eff_b_star
-            && curr_unreal_bps <= cal.sprt_min_loss_gate_bps
-            && d * clv <= clv_gate
+        let cusum_bypass_wick_at_35 =
+            !self.tranche1_filled && self.cusum_stat_1m >= eff_b_star && curr_unreal_bps <= -35.0;
+        let unconditional_hard_loss = !self.tranche1_filled && curr_unreal_bps <= -45.0;
+        if unconditional_hard_loss
+            || cusum_bypass_wick_at_35
+            || (!self.tranche1_filled
+                && self.cusum_stat_1m >= eff_b_star
+                && curr_unreal_bps <= cal.sprt_min_loss_gate_bps
+                && d * clv <= clv_gate)
         {
             return HardenedExitDecision::StopOutSprt1mClose {
                 exit_px: bar_close,
@@ -5940,5 +5967,69 @@ mod tests {
             evaluate_tier2_promotion_stage("xyz:GOLD", &core_hist, 0.22, 2.7, 35.0, 0),
             AssetPromotionTier::ShadowOnly
         );
+    }
+
+    #[test]
+    fn test_package7b_unconditional_35bps_stop_and_us_open_blackout() {
+        use chrono::{TimeZone, Utc};
+        let sol_cal = asset_calibration("SOL");
+
+        // 1. Even with favorable upper wick (CLV > 0 on SHORT), once CUSUM >= eff_b_star and <= -35.0 bps it exits immediately
+        let mut mgr =
+            StallHazardExitManager::new_with_sigma(Direction::Short, 100.0, 120.0, 0.0005);
+        mgr.cusum_stat_1m = 3.50;
+        let dec = mgr.on_1m_bar(
+            100.32, // open
+            100.40, // high -> upper wick, so clv is negative (-0.25) -> d*clv = +0.25 (would fail clv_gate!)
+            100.30, // low
+            100.36, // close = -36 bps for SHORT
+            100.32, 99.80, 25.0, 0.8, 0.0, 1.5, &sol_cal,
+        );
+        assert!(
+            matches!(dec, HardenedExitDecision::StopOutSprt1mClose { .. }),
+            "CUSUM >= barrier at <= -35 bps must bypass CLV wick gate, got {:?}",
+            dec
+        );
+
+        // 1b. Unconditional slow-grind hard ceiling at <= -45.0 bps even with low CUSUM
+        let mut mgr_grind =
+            StallHazardExitManager::new_with_sigma(Direction::Short, 100.0, 120.0, 0.0005);
+        let dec_grind = mgr_grind.on_1m_bar(
+            100.42, 100.50, 100.40, 100.46, 100.42, 99.80, 25.0, -0.2, 0.0, 1.5, &sol_cal,
+        );
+        assert!(
+            matches!(dec_grind, HardenedExitDecision::StopOutSprt1mClose { .. }),
+            "Unconditional -45 bps hard stop must fire on slow grind despite low CUSUM, got {:?}",
+            dec_grind
+        );
+
+        // 2. US Equity Cash Open Blackout:
+        // Mon 2026-11-16 (EST) at 14:32 UTC -> blocked
+        let est_open_ms = Utc
+            .with_ymd_and_hms(2026, 11, 16, 14, 32, 0)
+            .unwrap()
+            .timestamp_millis() as u64;
+        assert!(check_engine_a_us_open_blackout(est_open_ms).is_some());
+
+        // Mon 2026-11-16 (EST) at 14:46 UTC -> allowed
+        let est_post_ms = Utc
+            .with_ymd_and_hms(2026, 11, 16, 14, 46, 0)
+            .unwrap()
+            .timestamp_millis() as u64;
+        assert!(check_engine_a_us_open_blackout(est_post_ms).is_none());
+
+        // Mon 2026-07-13 (EDT) at 13:30 UTC -> blocked
+        let edt_open_ms = Utc
+            .with_ymd_and_hms(2026, 7, 13, 13, 30, 0)
+            .unwrap()
+            .timestamp_millis() as u64;
+        assert!(check_engine_a_us_open_blackout(edt_open_ms).is_some());
+
+        // Sun 2026-11-15 (weekend) at 14:32 UTC -> allowed (24/7 crypto)
+        let weekend_ms = Utc
+            .with_ymd_and_hms(2026, 11, 15, 14, 32, 0)
+            .unwrap()
+            .timestamp_millis() as u64;
+        assert!(check_engine_a_us_open_blackout(weekend_ms).is_none());
     }
 }

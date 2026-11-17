@@ -365,7 +365,8 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
                         if not line:
                             continue
                         rec = json.loads(line)
-                        sym = str(rec.get("symbol", "")).upper()
+                        sym = normalize_hl_symbol(rec.get("symbol", ""))
+                        rec_side = str(rec.get("side", "LONG")).upper()
                         closed_dt = parse_iso_time(rec.get("closed_at"))
                         opened_dt = parse_iso_time(rec.get("opened_at"))
                         close_ms = (
@@ -379,10 +380,22 @@ def build_real_trades_and_stats(valid_dirs, assets_telemetry, open_positions):
                         if close_ms < CLEAN_SLATE_EPOCH_MS:
                             continue
 
-                        # Deduplicate against exchange fills within 90s on same coin
+                        # Deduplicate against consolidated exchange fills:
+                        # 1) Exact close timestamp within 90s on normalized symbol, OR
+                        # 2) Any partial/T1 record whose close_ms falls inside an EXCHANGE_FILL trade's [open_ms, close_ms] span
                         is_dup = any(
                             t["symbol"] == sym
-                            and abs(t["close_ms"] - close_ms) <= 90_000
+                            and (
+                                abs(t["close_ms"] - close_ms) <= 90_000
+                                or (
+                                    t.get("exit_reason") == "EXCHANGE_FILL"
+                                    and t.get("has_real_open")
+                                    and t.get("side") == rec_side
+                                    and (t["open_ms"] - 120_000)
+                                    <= close_ms
+                                    <= (t["close_ms"] + 90_000)
+                                )
+                            )
                             for t in real_trades
                         )
                         if not is_dup:

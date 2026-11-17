@@ -1,5 +1,5 @@
 use crate::hyperliquid::{
-    cancel_order, close_market_position, effective_tick_size, fetch_book_ticker,
+    cancel_order, close_market_position_with_bbo, effective_tick_size, fetch_book_ticker,
     fetch_open_orders_for_coin, get_user_position, optimal_engine_b_tp_atr_multiple,
     place_post_only_order, quantize_price, quantize_size_for_notional,
 };
@@ -634,6 +634,17 @@ pub async fn place_trend_breakout_entry(
     Ok(json!({"status": "DISPATCHED", "order_id": oid, "side": side.to_string()}))
 }
 
+fn spawn_discord_alert(discord_url: Option<String>, msg: String) {
+    if let Some(url) = discord_url {
+        if !url.trim().is_empty() {
+            tokio::spawn(async move {
+                crate::discord::send_alert(Some(&url), &msg).await;
+            });
+        }
+    }
+}
+
+#[allow(dead_code)]
 pub async fn emergency_flatten(
     state_file_path: &str,
     exchange: &ExchangeClient,
@@ -644,15 +655,86 @@ pub async fn emergency_flatten(
     sz_decimals: u32,
     discord_url: Option<String>,
 ) -> Result<(), String> {
+    emergency_flatten_fast(
+        state_file_path,
+        exchange,
+        info,
+        wallet_address,
+        state,
+        symbol,
+        sz_decimals,
+        discord_url,
+        None,
+    )
+    .await
+}
+
+pub async fn emergency_flatten_fast(
+    state_file_path: &str,
+    exchange: &ExchangeClient,
+    info: &InfoClient,
+    wallet_address: H160,
+    state: &mut StateMap,
+    symbol: &str,
+    sz_decimals: u32,
+    discord_url: Option<String>,
+    fast_bbo: Option<(f64, f64)>,
+) -> Result<(), String> {
     let pos = match state.get(symbol).cloned() {
         Some(p) => p,
         None => return Ok(()),
     };
 
-    println!(
-        "🚨 [EMERGENCY FLATTEN] Invalidation triggered for {}. Checking order & position status...",
-        symbol
-    );
+    let eps = 1e-5;
+    let mut fast_close_attempted = false;
+
+    // Fast Path (< 200ms): For an already-filled live position, submit the reduce-only IOC market close
+    // IMMEDIATELY using in-memory L2 BBO BEFORE any Discord webhook or sequential REST order-cancel queries!
+    if pos.is_filled && pos.amount > eps {
+        let est_szi = if pos.side == "LONG" {
+            pos.amount
+        } else {
+            -pos.amount
+        };
+        println!(
+            "🚨 [EMERGENCY FLATTEN FAST] Closing filled {} position FIRST (est_szi: {:.5}, bbo_cached: {})...",
+            symbol,
+            est_szi,
+            fast_bbo.is_some()
+        );
+        fast_close_attempted = true;
+        if let Err(e) = close_market_position_with_bbo(
+            exchange,
+            info,
+            symbol,
+            est_szi,
+            0.02,
+            sz_decimals,
+            fast_bbo,
+        )
+        .await
+        {
+            // Do not abort here: if TP/SL filled milliseconds earlier, step 4 reconciliation below
+            // will verify flat=0 and clean up cleanly; if residual remains, step 4 retries close.
+            eprintln!(
+                "⚠️ [EMERGENCY FLATTEN FAST] Initial fast market close attempt returned notice for {}: {}. Proceeding to order/position reconciliation...",
+                symbol, e
+            );
+        } else {
+            spawn_discord_alert(
+                discord_url.clone(),
+                format!(
+                    "🚨 **FAST EMERGENCY FLATTEN:** Liquidated {} (Est. Size: {:.5}) via immediate Market Close.",
+                    symbol, est_szi
+                ),
+            );
+        }
+    } else {
+        println!(
+            "🚨 [EMERGENCY FLATTEN] Invalidation triggered for {}. Checking order & position status...",
+            symbol
+        );
+    }
 
     // 1. Cancel resting entry order if it was active
     if !pos.order_id.is_empty() {
@@ -661,11 +743,14 @@ pub async fn emergency_flatten(
         }
     }
 
-    // 2. Cancel resting TP order if active
+    // 2. Cancel resting TP order and disaster stop trigger if active
     if !pos.tp_order_id.is_empty() {
         if let Ok(tp_oid) = pos.tp_order_id.parse::<u64>() {
             let _ = cancel_order(exchange, symbol, tp_oid).await;
         }
+    }
+    if let Some(sl_oid) = pos.disaster_stop_oid {
+        let _ = cancel_order(exchange, symbol, sl_oid).await;
     }
 
     // 3. Reconcile open orders on exchange: cancel any sibling orders and confirm entry order is no longer resting
@@ -685,36 +770,43 @@ pub async fn emergency_flatten(
                         entry_oid
                     );
                     eprintln!("❌ [EMERGENCY FLATTEN BLOCKED] {}", err);
-                    crate::discord::send_alert(discord_url.as_deref(), &format!("🚨 {}", err)).await;
+                    spawn_discord_alert(discord_url.clone(), format!("🚨 {}", err));
                     return Err(err);
                 }
             }
         }
     }
 
-    // 4. Query actual live position on Hyperliquid with epsilon tolerance
+    // 4. Query actual live position on Hyperliquid with epsilon tolerance (handles unfilled partial entries or fast-path residual)
     let (szi, _) = get_user_position(info, wallet_address, symbol).await?;
-    let eps = 1e-5;
 
     if szi.abs() > eps {
         println!(
             "🚨 [EMERGENCY FLATTEN] Active open position detected for {} (szi: {:.5}). Executing Market Close...",
             symbol, szi
         );
-        let msg = format!(
-            "🚨 **REGIME INVALIDATION / TIME-STOP!** Liquidating open position for {} (Size: {:.5}) via Market Close.",
-            symbol, szi
+        spawn_discord_alert(
+            discord_url.clone(),
+            format!(
+                "🚨 **REGIME INVALIDATION / TIME-STOP!** Liquidating open position for {} (Size: {:.5}) via Market Close.",
+                symbol, szi
+            ),
         );
-        crate::discord::send_alert(discord_url.as_deref(), &msg).await;
 
-        if let Err(e) = close_market_position(exchange, info, symbol, szi, 0.02, sz_decimals).await {
+        let fallback_bbo = if fast_close_attempted { None } else { fast_bbo };
+        if let Err(e) =
+            close_market_position_with_bbo(exchange, info, symbol, szi, 0.02, sz_decimals, fallback_bbo)
+                .await
+        {
             eprintln!("❌ [EMERGENCY FLATTEN FAILED] Close failed for {}: {}", symbol, e);
-            let err_msg = format!("❌ **EMERGENCY FLATTEN FAILED:** Close failed for {}: {}", symbol, e);
-            crate::discord::send_alert(discord_url.as_deref(), &err_msg).await;
+            spawn_discord_alert(
+                discord_url.clone(),
+                format!("❌ **EMERGENCY FLATTEN FAILED:** Close failed for {}: {}", symbol, e),
+            );
             return Err(e);
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(650)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
 
     // 5. Final multi-step verification: position == 0 AND no orders remain for symbol
@@ -771,7 +863,11 @@ pub async fn emergency_flatten(
         );
         if (pos.is_filled || szi.abs() > eps) && pos.entry_price > 0.0 && pos.amount > 0.0 {
             let mut exit_px = pos.entry_price;
-            if let Ok((bid, ask)) = fetch_book_ticker(info, symbol).await {
+            if let Some((bid, ask)) = fast_bbo {
+                if bid > 0.0 && ask > 0.0 {
+                    exit_px = if pos.side == "LONG" { bid } else { ask };
+                }
+            } else if let Ok((bid, ask)) = fetch_book_ticker(info, symbol).await {
                 if bid > 0.0 && ask > 0.0 {
                     exit_px = if pos.side == "LONG" { bid } else { ask };
                 }
@@ -803,11 +899,13 @@ pub async fn emergency_flatten(
         }
         state.remove(symbol);
         let _ = save_state(state_file_path, state);
-        let ok_msg = format!(
-            "✅ **EMERGENCY FLATTEN COMPLETE:** Position and all orders for {} flattened and verified zero.",
-            symbol
+        spawn_discord_alert(
+            discord_url,
+            format!(
+                "✅ **EMERGENCY FLATTEN COMPLETE:** Position and all orders for {} flattened and verified zero.",
+                symbol
+            ),
         );
-        crate::discord::send_alert(discord_url.as_deref(), &ok_msg).await;
         Ok(())
     } else {
         let reason = if final_szi.abs() > eps {
@@ -819,11 +917,13 @@ pub async fn emergency_flatten(
             "⚠️ [EMERGENCY FLATTEN WARNING] {} on {}. Retaining state and lease for supervisor retry!",
             reason, symbol
         );
-        let warn_msg = format!(
-            "⚠️ **EMERGENCY FLATTEN INCOMPLETE:** {} on {}. Retaining state for supervisor retry.",
-            reason, symbol
+        spawn_discord_alert(
+            discord_url,
+            format!(
+                "⚠️ **EMERGENCY FLATTEN INCOMPLETE:** {} on {}. Retaining state for supervisor retry.",
+                reason, symbol
+            ),
         );
-        crate::discord::send_alert(discord_url.as_deref(), &warn_msg).await;
         Err(format!("Emergency flatten reconciliation incomplete: {}", reason))
     }
 }

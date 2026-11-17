@@ -554,14 +554,16 @@ pub async fn cancel_order(exchange: &ExchangeClient, coin: &str, oid: u64) -> Re
     }
 }
 
-/// Closes open position at market with slippage protection
-pub async fn close_market_position(
+/// Closes open position at market with slippage protection, optionally using a fresh in-memory
+/// L2 `(bid, ask)` BBO to avoid a pre-order `fetch_book_ticker` REST roundtrip during emergency exits.
+pub async fn close_market_position_with_bbo(
     exchange: &ExchangeClient,
     info: &InfoClient,
     coin: &str,
     szi: f64,
     slippage: f64,
     sz_decimals: u32,
+    fast_bbo: Option<(f64, f64)>,
 ) -> Result<(), String> {
     let eps = 1e-5;
     if szi.abs() <= eps {
@@ -574,7 +576,10 @@ pub async fn close_market_position(
         return Ok(());
     }
 
-    let (top_bid, top_ask) = fetch_book_ticker(info, coin).await?;
+    let (top_bid, top_ask) = match fast_bbo {
+        Some((bid, ask)) if bid > 0.0 && ask >= bid => (bid, ask),
+        _ => fetch_book_ticker(info, coin).await?,
+    };
     let raw_px = if is_buy {
         top_ask * (1.0 + slippage)
     } else {
@@ -622,6 +627,19 @@ pub async fn close_market_position(
         }
         ExchangeResponseStatus::Err(e) => Err(format!("Market close exchange error: {}", e)),
     }
+}
+
+/// Closes open position at market with slippage protection
+#[allow(dead_code)]
+pub async fn close_market_position(
+    exchange: &ExchangeClient,
+    info: &InfoClient,
+    coin: &str,
+    szi: f64,
+    slippage: f64,
+    sz_decimals: u32,
+) -> Result<(), String> {
+    close_market_position_with_bbo(exchange, info, coin, szi, slippage, sz_decimals, None).await
 }
 
 /// Queries user's current open position size (szi) and entry price for a coin
