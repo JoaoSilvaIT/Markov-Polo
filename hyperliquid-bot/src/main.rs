@@ -4963,6 +4963,7 @@ async fn main() {
 
                             let mut should_reprice = false;
                             let mut reprice_exact_target = false;
+                            let mut reprice_full_close = false;
                             let mut new_reprice_target = 0.0;
                             let mut reprice_qty = 0.0;
                             let mut reprice_is_buy = false;
@@ -5159,37 +5160,15 @@ async fn main() {
 
                                             if let crate::ou_process::HardenedExitDecision::StopOutSprt1mClose { cusum_val, .. } = dec_1m {
                                                 let unreal_bps_mid = d_1m * ((mid_eval_px - pos.entry_price) / pos.entry_price.max(1e-9)) * 10_000.0;
-                                                if unreal_bps_mid > -32.0 && !pos.tp_order_id.is_empty() {
-                                                    // Two-Stage Maker-Pegged Stop Conversion (-18..-32 bps): try passive Alo at 1 tick before Taker escape
-                                                    let peg_stop_px = quantize_price(mid_eval_px + d_1m * entry_tick, sz_decimals);
-                                                    let already_pegged = d_1m * (pos.effective_tp - pos.entry_price) < 0.0;
-                                                    if already_pegged {
-                                                        soft_invalidation_reason = Some("SPRT_1M_MAKER_PEG_TIMEOUT_FLATTEN");
-                                                    } else {
-                                                        println!(
-                                                            "🛡️ [1M SHADOW CUSUM -> MAKER-PEG STOP] {} CUSUM={:.2} at {:.1} bps -> converting TP to passive Alo @ ${:.4}",
-                                                            symbol_clone, cusum_val, unreal_bps_mid, peg_stop_px
-                                                        );
-                                                        should_reprice = true;
-                                                        reprice_exact_target = true;
-                                                        new_reprice_target = peg_stop_px;
-                                                        reprice_qty = pos.amount;
-                                                        reprice_is_buy = !is_long;
-                                                        old_tp_order_id = pos.tp_order_id.clone();
-                                                        pos.effective_tp = peg_stop_px;
-                                                        pos.last_reprice_time = chrono::Utc::now().timestamp_millis();
-                                                    }
-                                                } else {
-                                                    println!(
-                                                        "🚨 [1M SHADOW CUSUM ESCAPE] {} CUSUM={:.2} at {:.1} bps (<= -32 bps) -> immediate escape flatten!",
-                                                        symbol_clone, cusum_val, unreal_bps_mid
-                                                    );
-                                                    soft_invalidation_reason = Some("SPRT_1M_ASYMMETRIC_CUSUM_ESCAPE");
-                                                }
+                                                println!(
+                                                    "🚨 [1M SHADOW CUSUM STOP] {} CUSUM={:.2} at {:.1} bps -> immediate 100% stop flatten (matching backtest; TP never moved into loss)!",
+                                                    symbol_clone, cusum_val, unreal_bps_mid
+                                                );
+                                                soft_invalidation_reason = Some("SPRT_1M_ASYMMETRIC_CUSUM_ESCAPE");
                                             }
                                         }
 
-                                        // 1c. Package 7 Conditional Calm-Book Alo Maker-Peg for TIME_DECAY_STOP
+                                        // 1c. Package 7 Conditional Calm-Book Alo Maker-Peg for TIME_DECAY_STOP (non-loss only, FULL size)
                                         if elapsed_mins >= max_allowed_mins && soft_invalidation_reason.is_none() {
                                             let d_td = if is_long { 1.0 } else { -1.0 };
                                             let ret_1m_abs_bps = if prev_c_1m > 0.0 && mid_eval_px > 0.0 {
@@ -5203,20 +5182,23 @@ async fn main() {
                                                 && d_td * l2_1s >= -0.20;
                                             let unreal_bps_td = d_td * ((mid_eval_px - pos.entry_price) / pos.entry_price.max(1e-9)) * 10_000.0;
                                             let td_peg_px = quantize_price(close_price + d_td * entry_tick, sz_decimals);
+                                            let td_is_non_loss = d_td * (td_peg_px - pos.entry_price) >= 0.0;
                                             let already_td_pegged = (pos.effective_tp - td_peg_px).abs() <= 2.0 * entry_tick;
                                             if calm_book_ok
-                                                && unreal_bps_td > -8.0
+                                                && unreal_bps_td >= 0.0
+                                                && td_is_non_loss
                                                 && elapsed_mins < max_allowed_mins + 1.0
                                                 && !pos.tp_order_id.is_empty()
                                                 && !already_td_pegged
                                                 && !should_reprice
                                             {
                                                 println!(
-                                                    "⏱️ [CALM-BOOK TIME-DECAY -> MAKER-PEG] {} ({:.1}m >= {:.1}m, CUSUM={:.2}, |r1m|={:.1}bps) -> passive Alo @ ${:.4}",
+                                                    "⏱️ [CALM-BOOK TIME-DECAY -> MAKER-PEG] {} ({:.1}m >= {:.1}m, CUSUM={:.2}, |r1m|={:.1}bps) -> passive FULL Alo @ ${:.4}",
                                                     symbol_clone, elapsed_mins, max_allowed_mins, pos.cusum_stat_1m, ret_1m_abs_bps, td_peg_px
                                                 );
                                                 should_reprice = true;
                                                 reprice_exact_target = true;
+                                                reprice_full_close = true;
                                                 new_reprice_target = td_peg_px;
                                                 reprice_qty = pos.amount;
                                                 reprice_is_buy = !is_long;
@@ -5224,7 +5206,8 @@ async fn main() {
                                                 pos.effective_tp = td_peg_px;
                                                 pos.last_reprice_time = chrono::Utc::now().timestamp_millis();
                                             } else if !calm_book_ok
-                                                || unreal_bps_td <= -8.0
+                                                || unreal_bps_td < 0.0
+                                                || !td_is_non_loss
                                                 || elapsed_mins >= max_allowed_mins + 1.0
                                                 || pos.tp_order_id.is_empty()
                                             {
@@ -5587,15 +5570,19 @@ async fn main() {
                                     }
                                 }
                                 let rounded_target = quantize_price(new_reprice_target, sz_decimals);
-                                let (planned_qty, planned_px, planned_tag) = compute_tp_order_plan_with_mode(
-                                    &pos_eng_r,
-                                    pos_entry_r,
-                                    rounded_target,
-                                    eff_qty_r,
-                                    pos_t1_r,
-                                    reprice_exact_target,
-                                    sz_decimals,
-                                );
+                                let (planned_qty, planned_px, planned_tag) = if reprice_full_close {
+                                    (eff_qty_r, rounded_target, "FULL")
+                                } else {
+                                    compute_tp_order_plan_with_mode(
+                                        &pos_eng_r,
+                                        pos_entry_r,
+                                        rounded_target,
+                                        eff_qty_r,
+                                        pos_t1_r,
+                                        reprice_exact_target,
+                                        sz_decimals,
+                                    )
+                                };
 
                                 // Strictly cancel old TP before placing replacement so reduceOnly orders never split/accumulate
                                 let mut old_tp_cleared = old_tp_order_id.is_empty();
@@ -5643,11 +5630,18 @@ async fn main() {
                                                 p.tp_order_id = new_oid.to_string();
                                                 let _ = crate::state::save_state(&state_path_clone, &state_lock);
                                             }
-                                            let reprice_msg = format!(
-                                                "🔄 **TP ADAPTIVELY REPRICED ({} HL):** {}\n**New Target:** ${:.4} (Qty: {:.4})\n**Live Mean Ratchet Active**",
-                                                planned_tag, symbol_clone, planned_px, planned_qty
-                                            );
-                                            crate::discord::send_alert(discord_clone.as_deref(), &reprice_msg).await;
+                                            let reprice_msg = if reprice_full_close {
+                                                format!(
+                                                    "⏱️ **TIME-DECAY MAKER-PEG EXIT ({} HL):** {}\n**Exit Limit:** ${:.4} (Qty: {:.4})",
+                                                    planned_tag, symbol_clone, planned_px, planned_qty
+                                                )
+                                            } else {
+                                                format!(
+                                                    "🔄 **TP ADAPTIVELY REPRICED ({} HL):** {}\n**New Target:** ${:.4} (Qty: {:.4})\n**Live Mean Ratchet Active**",
+                                                    planned_tag, symbol_clone, planned_px, planned_qty
+                                                )
+                                            };
+                                            spawn_discord_alert_bg(discord_clone.clone(), reprice_msg);
                                         }
                                         Err(e) => {
                                             eprintln!("❌ [REPRICE FAILED HL] Could not replace TP order for {}: {}", symbol_clone, e);
