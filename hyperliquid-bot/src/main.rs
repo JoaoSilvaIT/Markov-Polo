@@ -41,11 +41,12 @@ use crate::hyperliquid::{
 use crate::order::{emergency_flatten_fast, place_ou_maker_entry};
 use crate::ou_process::{
     asset_calibration, calculate_directional_edge_bps, calculate_features_with_funding,
-    check_engine_a_us_open_blackout, check_macro_calendar_veto,
-    check_single_bar_adverse_acceleration_override, compute_engine_a_disaster_stop_distance,
-    compute_engine_a_soft_risk_capped_notional, compute_fee_adjusted_kelly_scalar,
-    engine_a_min_soft_inv_excursion_bps, evaluate_session_lifecycle_gate,
-    verify_maker_touch_absorption, AssetFeeSchedule, Direction, SessionLifecycleAction,
+    check_engine_a_us_open_blackout, check_kalman_velocity_entry_guard, check_macro_calendar_veto,
+    check_retest_limit_falling_knife_guard, check_single_bar_adverse_acceleration_override,
+    compute_engine_a_disaster_stop_distance, compute_engine_a_soft_risk_capped_notional,
+    compute_fee_adjusted_kelly_scalar, engine_a_min_soft_inv_excursion_bps,
+    evaluate_session_lifecycle_gate, verify_maker_touch_absorption, AssetFeeSchedule, Direction,
+    SessionLifecycleAction,
 };
 use crate::state::{
     check_cluster_circuit_breaker, has_active_cluster_position,
@@ -54,12 +55,15 @@ use crate::state::{
     StateMap,
 };
 use crate::trend::{
-    append_candidate_log, calculate_atr, calculate_donchian, calculate_flag_compression_ratio_60m,
-    calculate_ker_n, calculate_min_squeeze_ratio_90m, calculate_rel_vol_15m, check_trend_alignment,
-    load_shadow_trade, record_shadow_entry, record_shadow_exit, save_shadow_trade,
-    BreakoutTelemetry, CandleBar, ChandelierExitState, EngineBCandidateLog, EngineBTrendManager,
-    L2ObiTracker, MarketCrowdingTracker, TrendAlignment, TrendEngineConfig, TrendOrderAction,
+    append_candidate_log, calculate_atr, calculate_donchian, calculate_effective_squeeze_ratio,
+    calculate_flag_compression_ratio_60m, calculate_ker_n, calculate_rel_vol_15m,
+    check_trend_alignment, compute_rolling_5m_impulse_metrics, load_shadow_trade,
+    record_shadow_entry, record_shadow_exit, save_shadow_trade, BreakoutTelemetry, CandleBar,
+    ChandelierExitState, EngineBCandidateLog, EngineBTrendManager, L2ObiTracker,
+    MarketCrowdingTracker, TrendAlignment, TrendEngineConfig, TrendOrderAction,
 };
+
+const L2_ORDERBOOK_FRESH_MS: u64 = 16_500;
 
 async fn backfill_missing_1m_candles(
     info_client: &InfoClient,
@@ -356,6 +360,28 @@ pub fn is_symbol_live_capital_enabled(symbol: &str) -> bool {
     })
 }
 
+/// Package 8B Fast-Sentinel intrabar escape guard for live Engine A positions:
+/// Prevents waiting up to 59s for a 1m close during sudden flash dumps.
+pub fn check_fast_sentinel_intrabar_escape(
+    unreal_bps: f64,
+    ms_below_hard_cap: u64,
+    live_intrabar_cusum: f64,
+    eff_b_star: f64,
+    cur_1m_bar_adverse_bps: f64,
+    btc_adverse_ret_5m_bps: f64,
+) -> Option<&'static str> {
+    if unreal_bps <= -48.5 || (unreal_bps <= -45.0 && ms_below_hard_cap >= 2_500) {
+        return Some("FAST_SENTINEL_INTRABAR_HARD_CAP_45BPS");
+    }
+    if unreal_bps <= -34.0
+        && live_intrabar_cusum >= eff_b_star
+        && (cur_1m_bar_adverse_bps <= -24.0 || btc_adverse_ret_5m_bps <= -40.0)
+    {
+        return Some("FAST_SENTINEL_INTRABAR_CUSUM_CRASH_ESCAPE");
+    }
+    None
+}
+
 /// Computes the 2-tranche asymmetric TP plan `(tp_qty, tp_price, tranche_tag)` shared identically
 /// by `Fast-Sentinel` and adaptive/stall TP reprices so reprices never collapse an active 2-tranche split.
 pub fn compute_tp_order_plan(
@@ -379,7 +405,8 @@ pub fn compute_tp_order_plan(
 
 /// Same as `compute_tp_order_plan`, with `exact_target = true` skipping the 0.65x T1 compression
 /// for explicit Stall-Hazard / Breakeven / State-3 Maker-Peg harvest targets, while enforcing a
-/// 20 bps minimum T1 profit floor whenever `raw_tp` is at least 20 bps away from `entry_price`.
+/// 22 bps minimum T1 profit floor whenever `raw_tp` is at least 22 bps away from `entry_price`.
+/// Package 8B: Engine A uses a 35% Tranche 1 / 65% Tranche 2 split (`T1-35%`) to expand Avg Win.
 pub fn compute_tp_order_plan_with_mode(
     engine_type: &str,
     entry_price: f64,
@@ -390,18 +417,21 @@ pub fn compute_tp_order_plan_with_mode(
     sz_decimals: u32,
 ) -> (f64, f64, &'static str) {
     let total_notional = total_amt * entry_price;
-    let t1_half = round_to_decimals(total_amt * 0.5, sz_decimals);
-    let rem_half = round_to_decimals(total_amt - t1_half, sz_decimals);
+    let t1_frac = if engine_type == "EngineB" { 0.50 } else { 0.35 };
+    let t1_qty = round_to_decimals(total_amt * t1_frac, sz_decimals);
+    let rem_qty = round_to_decimals(total_amt - t1_qty, sz_decimals);
     let use_two_tranche = !tranche1_tp_filled
         && total_notional >= 28.0
-        && t1_half > 0.0
-        && rem_half > 0.0
-        && t1_half * raw_tp >= 10.50
-        && rem_half * raw_tp >= 10.50;
+        && t1_qty > 0.0
+        && rem_qty > 0.0
+        && t1_qty * raw_tp >= 10.50
+        && rem_qty * raw_tp >= 10.50;
 
     if use_two_tranche {
-        if engine_type == "EngineB" || exact_target {
-            (t1_half, quantize_price(raw_tp, sz_decimals), "T1-50%")
+        if engine_type == "EngineB" {
+            (t1_qty, quantize_price(raw_tp, sz_decimals), "T1-50%")
+        } else if exact_target {
+            (t1_qty, quantize_price(raw_tp, sz_decimals), "T1-35%")
         } else {
             let dist = raw_tp - entry_price;
             let raw_dist_frac = if entry_price > 0.0 {
@@ -409,7 +439,7 @@ pub fn compute_tp_order_plan_with_mode(
             } else {
                 0.0
             };
-            let min_t1_frac = 0.0020; // 20 bps floor matching One-Way Ratchet p_min / p_max
+            let min_t1_frac = 0.0022; // 22 bps floor (Package 8B)
             let t1_eng_a_px = if raw_dist_frac <= min_t1_frac {
                 raw_tp
             } else {
@@ -420,7 +450,7 @@ pub fn compute_tp_order_plan_with_mode(
                     shaved.min(entry_price * (1.0 - min_t1_frac))
                 }
             };
-            (t1_half, quantize_price(t1_eng_a_px, sz_decimals), "T1-50%")
+            (t1_qty, quantize_price(t1_eng_a_px, sz_decimals), "T1-35%")
         }
     } else {
         (total_amt, quantize_price(raw_tp, sz_decimals), "FULL")
@@ -1082,6 +1112,7 @@ async fn main() {
     // INGESTION: Pre-fill 960 1m historical candles via REST
     // ------------------------------------------------------------------------
     let mut rolling_closes: Vec<f64> = Vec::with_capacity(960);
+    let mut prev_kalman_vel_bps_min: f64 = 0.0;
     println!(
         "⏳ [INGESTION] Pre-filling 960-minute rolling window for {} via Hyperliquid REST...",
         trading_symbol
@@ -1714,10 +1745,13 @@ async fn main() {
     let high_water_mark_equity = Arc::new(RwLock::new(initial_equity));
     let sentinel_notify = Arc::new(Notify::new());
     let watcher_notify = sentinel_notify.clone();
+    let last_1m_close_shared = Arc::new(RwLock::new(0.0_f64));
+    let watcher_last_1m_close = last_1m_close_shared.clone();
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(1500));
         let mut stop_breach_streak: u8 = 0;
+        let mut hard_cap_breach_since_ms: Option<u64> = None;
         loop {
             tokio::select! {
                 _ = interval.tick() => {},
@@ -1734,6 +1768,7 @@ async fn main() {
                 Some(p) => p,
                 None => {
                     stop_breach_streak = 0;
+                    hard_cap_breach_since_ms = None;
                     continue;
                 }
             };
@@ -1795,7 +1830,7 @@ async fn main() {
                 let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
                 let (ws_quotes, ws_micro_px) = {
                     let guard = watcher_obi.read().await;
-                    if guard.is_fresh_and_uncrossed(now_ms, 2500) {
+                    if guard.is_fresh_and_uncrossed(now_ms, L2_ORDERBOOK_FRESH_MS) {
                         let micro = guard.compute_micro_price();
                         (Some((guard.best_bid, guard.best_ask)), micro)
                     } else {
@@ -1906,6 +1941,96 @@ async fn main() {
                         }
                         save_circuit_breaker(&watcher_cb_path, &cb_lock);
                         continue;
+                    }
+
+                    // Defense Layer 1b (Package 8B): Fast-Sentinel Intrabar Escape for live Engine A positions
+                    if pos.is_filled && pos.engine_type == "EngineA" && !pos.tranche1_tp_filled && pos.entry_price > 0.0 {
+                        let d_fs = if pos.side == "LONG" { 1.0 } else { -1.0 };
+                        let eval_px_fs = if mark_fresh && mark_px_now > 0.0 { mark_px_now } else { mid_now };
+                        let unreal_bps_fs = d_fs * ((eval_px_fs - pos.entry_price) / pos.entry_price) * 10_000.0;
+                        if unreal_bps_fs <= -45.0 {
+                            if hard_cap_breach_since_ms.is_none() {
+                                hard_cap_breach_since_ms = Some(now_ms);
+                            }
+                        } else {
+                            hard_cap_breach_since_ms = None;
+                        }
+                        let ms_below_hard = hard_cap_breach_since_ms
+                            .map(|t0| now_ms.saturating_sub(t0))
+                            .unwrap_or(0);
+                        let last_1m_c = *watcher_last_1m_close.read().await;
+                        let cur_1m_adv_bps = if last_1m_c > 0.0 && eval_px_fs > 0.0 {
+                            d_fs * (eval_px_fs / last_1m_c).ln() * 1e4
+                        } else {
+                            0.0
+                        };
+                        let cal_fs = asset_calibration(&watcher_symbol);
+                        let eff_b_fs = (cal_fs.cusum_b_1m_star * 0.80).clamp(2.85, 3.35);
+                        let baseline_sig_fs = pos.entry_sigma_1m.max(crate::ou_process::asset_min_sigma_1m_floor(&watcher_symbol));
+                        let intrabar_z_adv = if last_1m_c > 0.0 && eval_px_fs > 0.0 {
+                            (-d_fs * (eval_px_fs / last_1m_c).ln()) / baseline_sig_fs
+                        } else {
+                            0.0
+                        };
+                        let live_intrabar_cusum = if intrabar_z_adv > 0.0 {
+                            let h_adv = 4.50;
+                            let eff_e = h_adv * (intrabar_z_adv / h_adv).tanh();
+                            let d1 = cal_fs.cusum_delta_1m;
+                            let k_ref = 0.4434 * d1 * d1 + 0.50 * d1.powi(3);
+                            (pos.cusum_stat_1m + (d1 * eff_e - k_ref).max(0.0)).max(0.0)
+                        } else {
+                            pos.cusum_stat_1m
+                        };
+                        let btc_adv_5m_bps = if watcher_symbol.eq_ignore_ascii_case("BTC") {
+                            0.0
+                        } else {
+                            std::fs::read_to_string("hl_telemetry_BTC.json")
+                                .ok()
+                                .and_then(|c| serde_json::from_str::<LiveTelemetry>(&c).ok())
+                                .filter(|t| now_ms.saturating_sub(t.timestamp_ms) <= 90_000)
+                                .map(|t| d_fs * t.ret_5m_bps)
+                                .unwrap_or(0.0)
+                        };
+                        if let Some(esc_reason) = check_fast_sentinel_intrabar_escape(
+                            unreal_bps_fs,
+                            ms_below_hard,
+                            live_intrabar_cusum,
+                            eff_b_fs,
+                            cur_1m_adv_bps,
+                            btc_adv_5m_bps,
+                        ) {
+                            println!(
+                                "🚨 [FAST-SENTINEL INTRABAR ESCAPE] {} ({}) {} @ {:.1} bps (1m_adv={:.1} bps, btc_adv_5m={:.1} bps, live_cusum={:.2}) -> immediate flatten!",
+                                watcher_symbol, pos.side, esc_reason, unreal_bps_fs, cur_1m_adv_bps, btc_adv_5m_bps, live_intrabar_cusum
+                            );
+                            spawn_discord_alert_bg(
+                                watcher_discord.clone(),
+                                format!(
+                                    "🚨 **FAST-SENTINEL INTRABAR ESCAPE ({}):** {} ({}) at {:.1} bps -> immediate market flatten.",
+                                    esc_reason, watcher_symbol, pos.side, unreal_bps_fs
+                                ),
+                            );
+                            {
+                                let mut state_lock = watcher_state.lock().await;
+                                let _ = execute_emergency_flatten_with_retry_bbo(
+                                    &watcher_state_path,
+                                    &watcher_exchange,
+                                    &watcher_info,
+                                    user_address,
+                                    &mut state_lock,
+                                    &watcher_symbol,
+                                    watcher_sz_decimals,
+                                    watcher_discord.clone(),
+                                    Some((best_bid, best_ask)),
+                                )
+                                .await;
+                            }
+                            let mut cb_lock = watcher_cb.lock().await;
+                            cb_lock.record_loss();
+                            save_circuit_breaker(&watcher_cb_path, &cb_lock);
+                            hard_cap_breach_since_ms = None;
+                            continue;
+                        }
                     }
                 }
             }
@@ -2131,7 +2256,7 @@ async fn main() {
                                     // Package 6 Price-Runaway Early Cancel (45s Guard): free slot immediately if bounce already ran +12 bps without filling
                                     let mid_run = {
                                         let guard = watcher_obi.read().await;
-                                        if guard.is_fresh_and_uncrossed(now_ms, 5000) {
+                                        if guard.is_fresh_and_uncrossed(now_ms, L2_ORDERBOOK_FRESH_MS) {
                                             0.5 * (guard.best_bid + guard.best_ask)
                                         } else {
                                             0.0
@@ -3604,7 +3729,7 @@ async fn main() {
                     (None, None)
                 };
 
-                if let Some(live_feat) = live_features {
+                if let Some(ref live_feat) = live_features {
                     let _hist_last_price = live_feat.hist_last_price;
                     let is_stationary = live_feat.is_stationary;
                     let is_consolidation = live_feat.is_consolidation;
@@ -3968,7 +4093,7 @@ async fn main() {
                             guard.ewma_250ms_obi,
                             guard.ewma_1s_obi,
                             guard.ewma_5s_obi,
-                            guard.is_fresh_and_uncrossed(chrono::Utc::now().timestamp_millis() as u64, 7500),
+                            guard.is_fresh_and_uncrossed(chrono::Utc::now().timestamp_millis() as u64, L2_ORDERBOOK_FRESH_MS),
                             guard.best_bid,
                             guard.best_ask,
                         )
@@ -4252,6 +4377,28 @@ async fn main() {
                                                 "⚡ [SYNTHETIC-15M HMM PROMOTION] {} promoted directly to TREND on 5m close (P_T: {:.1}%, P_C: {:.1}%, P_S: {:.1}%).",
                                                 symbol_clone, syn_p_t * 100.0, syn_p_c * 100.0, syn_p_s * 100.0
                                             );
+                                        } else {
+                                            let (er_5m, vol_z_5m, adx_5m, adx_slope_pos) =
+                                                compute_rolling_5m_impulse_metrics(&rolling_5m_bars);
+                                            if controller.promote_synthetic_5m_fast_track(
+                                                er_5m,
+                                                vol_z_5m,
+                                                adx_5m,
+                                                adx_slope_pos,
+                                                true,
+                                                is_severe_shock_syn,
+                                                z_60,
+                                                now_ms_syn,
+                                            ) {
+                                                current_p_c = syn_p_c;
+                                                current_p_t = syn_p_t;
+                                                current_p_s = syn_p_s;
+                                                save_controller_state(&symbol_clone, &controller);
+                                                println!(
+                                                    "⚡ [FAST-TRACK 5M IMPULSE PROMOTION] {} promoted to TREND (ER_5m={:.2}, VolZ={:.2}, ADX={:.1}).",
+                                                    symbol_clone, er_5m, vol_z_5m, adx_5m
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -4391,7 +4538,7 @@ async fn main() {
                                     };
                                     let _ = l2_age_ms_b;
 
-                                    let min_squeeze_ratio_90m = calculate_min_squeeze_ratio_90m(&rolling_15m_bars);
+                                    let min_squeeze_ratio_90m = calculate_effective_squeeze_ratio(engine_b_donchian_bars, &rolling_5m_bars);
                                     let flag_compression_ratio_60m = calculate_flag_compression_ratio_60m(&rolling_15m_bars, current_atr);
                                     let (squeeze_pre_ratio, squeeze_pre_pct60) = crate::trend::calculate_lagged_squeeze_and_pct60(engine_b_donchian_bars);
                                     let sep_flag_long_ok = crate::trend::evaluate_separated_impulse_shelf_v2(engine_b_donchian_bars, crate::trend::TrendDirection::Long);
@@ -4435,7 +4582,7 @@ async fn main() {
                                         flag_compression_ratio_60m,
                                         p_trend: current_p_t,
                                         ker_15m,
-                                        enable_flag_compression_branch_b: false, // Keep live production untouched until Package 7 native ablation clears gates
+                                        enable_flag_compression_branch_b: true, // Package 8 Dual-Path live parity with backtest
                                         squeeze_pre_ratio,
                                         squeeze_pre_pct60,
                                         p_shock: current_p_s,
@@ -4443,18 +4590,26 @@ async fn main() {
                                         sep_flag_short_ok,
                                     };
 
+                                    let btc_atr_chop_b = symbol_clone.eq_ignore_ascii_case("BTC")
+                                        && (current_atr / closed_5m.close.max(1e-9)) * 1e4 < 14.0;
                                     let live_eq_pre = *cached_equity_loop.read().await;
-                                    let action = engine_b_mgr.on_5m_bar_close_with_l2_fallback(
-                                        &trend_cfg,
-                                        &telemetry_b,
-                                        timestamp_sec_b,
-                                        weekday_utc_b,
-                                        live_eq_pre,
-                                        is_mode_mean_reversion,
-                                        ker_15m,
-                                        btc_ret_60m_abs,
-                                        allow_clv_fallback,
-                                    );
+                                    let action = if btc_atr_chop_b {
+                                        engine_b_mgr.on_order_cancelled_or_rejected();
+                                        TrendOrderAction::None
+                                    } else {
+                                        engine_b_mgr.on_5m_bar_close_full(
+                                            &trend_cfg,
+                                            &telemetry_b,
+                                            timestamp_sec_b,
+                                            weekday_utc_b,
+                                            live_eq_pre,
+                                            is_mode_mean_reversion,
+                                            ker_15m,
+                                            btc_ret_60m_abs,
+                                            allow_clv_fallback,
+                                            true,
+                                        )
+                                    };
 
                                     match action {
                                         TrendOrderAction::LogShadowCounterfactual {
@@ -5363,9 +5518,10 @@ async fn main() {
                                             let m_rev = 0.50 * (d_dir * clv_1m) + 0.30 * (d_dir * l2_1s) + 0.20 * price_vel_sign;
 
                                             // State 3 Passive Alo Inside-Peg Conversion: avoid 6.26 bps Maker-Taker stop-market fee drag
-                                            let lock_floor_bps = (0.58 * mfe_bps).max(6.5);
-                                            let min_maker_profit_bps = fee_sched.maker_maker_rt_bps() + 2.0;
-                                            if (pos.tranche1_tp_filled || mfe_bps >= 16.0)
+                                            let cal_s3 = asset_calibration(&symbol_clone);
+                                            let lock_floor_bps = (0.55 * mfe_bps).max(10.0);
+                                            let min_maker_profit_bps = (fee_sched.maker_maker_rt_bps() + 2.0).max(8.0);
+                                            if (pos.tranche1_tp_filled || mfe_bps >= cal_s3.mfe_gate_bps)
                                                 && curr_unreal_bps <= lock_floor_bps
                                                 && curr_unreal_bps >= min_maker_profit_bps
                                                 && m_rev <= -0.15
@@ -6192,10 +6348,89 @@ async fn main() {
                                             } else {
                                                 false
                                             };
+
+                                            // Package 8B Anti-Falling-Knife Guard (RETEST-LIMIT) & Kalman Velocity Deceleration Guard
+                                            let asset_ret_5m_live = if rolling_closes.len() >= 5 && rolling_closes[rolling_closes.len() - 5] > 0.0 {
+                                                (close_price / rolling_closes[rolling_closes.len() - 5]).ln() * 1e4
+                                            } else {
+                                                0.0
+                                            };
+                                            let mut worst_1m_last3_live = 0.0_f64;
+                                            if rolling_closes.len() >= 3 {
+                                                let nr = rolling_closes.len();
+                                                let mut pc = rolling_closes[nr - 3];
+                                                for &ci in &[rolling_closes[nr - 2], rolling_closes[nr - 1], close_price] {
+                                                    if pc > 0.0 && ci > 0.0 {
+                                                        let r = (ci / pc).ln() * 1e4;
+                                                        let adv = if is_long_arm { r } else { -r };
+                                                        if adv < worst_1m_last3_live {
+                                                            worst_1m_last3_live = adv;
+                                                        }
+                                                    }
+                                                    pc = ci;
+                                                }
+                                                if !is_long_arm {
+                                                    worst_1m_last3_live = -worst_1m_last3_live;
+                                                }
+                                            }
+                                            let (btc_ret_5m_live, btc_ret_30m_live) = if symbol_clone.eq_ignore_ascii_case("BTC") {
+                                                let r30 = if rolling_closes.len() >= 30 && rolling_closes[rolling_closes.len() - 30] > 0.0 {
+                                                    (close_price / rolling_closes[rolling_closes.len() - 30]).ln() * 1e4
+                                                } else {
+                                                    0.0
+                                                };
+                                                (asset_ret_5m_live, r30)
+                                            } else {
+                                                std::fs::read_to_string("hl_telemetry_BTC.json")
+                                                    .ok()
+                                                    .and_then(|c| serde_json::from_str::<LiveTelemetry>(&c).ok())
+                                                    .filter(|t| now_ms_check.saturating_sub(t.timestamp_ms) <= 90_000)
+                                                    .map(|t| (t.ret_5m_bps, t.ret_30m_bps))
+                                                    .unwrap_or((0.0, 0.0))
+                                            };
+                                            let retest_knife_ok_live = is_join_book
+                                                || check_retest_limit_falling_knife_guard(
+                                                    is_long_arm,
+                                                    consumed_ratio,
+                                                    asset_ret_5m_live,
+                                                    worst_1m_last3_live,
+                                                    btc_ret_5m_live,
+                                                    btc_ret_30m_live,
+                                                );
+                                            let curr_kalman_vel_live = (live_feat.kalman_slope / 5.0) * 1e4;
+                                            let _kalman_vel_ok_live = check_kalman_velocity_entry_guard(
+                                                is_long_arm,
+                                                curr_kalman_vel_live,
+                                                prev_kalman_vel_bps_min,
+                                            );
+                                            let btc_atr_chop_a = symbol_clone.eq_ignore_ascii_case("BTC")
+                                                && calculate_atr(&rolling_15m_bars, 20)
+                                                    .map(|a| (a / close_price.max(1e-9)) * 1e4 < 14.0)
+                                                    .unwrap_or(false);
+                                            let silver_spread_veto = (symbol_clone.eq_ignore_ascii_case("xyz:SILVER")
+                                                || symbol_clone.eq_ignore_ascii_case("SILVER"))
+                                                && best_ask_l2 > best_bid_l2
+                                                && best_bid_l2 > 0.0
+                                                && ((best_ask_l2 - best_bid_l2) / close_price.max(1e-9)) * 1e4 > 2.6;
+
                                             if let Some(veto_reason) = btc_lead_veto {
                                                 println!(
                                                     "🛡️ [BTC IMPULSE VETO] {} {} reversal bounce disarmed due to adverse BTC impulse: {}.",
                                                     symbol_clone, arm_side, veto_reason
+                                                );
+                                                armed_state.is_armed = false;
+                                                save_armed_signal(&arm_path_clone, &armed_state);
+                                            } else if !retest_knife_ok_live {
+                                                println!(
+                                                    "🛡️ [FALLING-KNIFE VETO] {} {} disarmed (consumed={:.1}%, 5m={:+.1}bps, btc_5m={:+.1}bps, v_k={:+.2}bps/m).",
+                                                    symbol_clone, arm_side, consumed_ratio * 100.0, asset_ret_5m_live, btc_ret_5m_live, curr_kalman_vel_live
+                                                );
+                                                armed_state.is_armed = false;
+                                                save_armed_signal(&arm_path_clone, &armed_state);
+                                            } else if btc_atr_chop_a || silver_spread_veto {
+                                                println!(
+                                                    "⏸️ [MICROSTRUCTURE ENTRY VETO] {} {} blocked (btc_atr_chop={}, silver_spread_veto={}). Disarming.",
+                                                    symbol_clone, arm_side, btc_atr_chop_a, silver_spread_veto
                                                 );
                                                 armed_state.is_armed = false;
                                                 save_armed_signal(&arm_path_clone, &armed_state);
@@ -6553,7 +6788,12 @@ async fn main() {
                         }
                     }
 
-                    // Advance rolling window with finalized 1m close
+                    // Advance rolling window with finalized 1m close & shared Fast-Sentinel price
+                    *last_1m_close_shared.write().await = close_price;
+                    prev_kalman_vel_bps_min = live_features
+                        .as_ref()
+                        .map(|f| (f.kalman_slope / 5.0) * 1e4)
+                        .unwrap_or(prev_kalman_vel_bps_min);
                     if rolling_closes.len() >= 960 {
                         rolling_closes.remove(0);
                     }
@@ -6581,21 +6821,22 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_tp_order_plan, compute_tp_order_plan_with_mode, is_symbol_live_capital_enabled,
+        check_fast_sentinel_intrabar_escape, compute_tp_order_plan,
+        compute_tp_order_plan_with_mode, is_symbol_live_capital_enabled,
     };
 
     #[test]
     fn test_compute_tp_order_plan_preserves_two_tranche_splits() {
-        // Engine A Short AVAX: 14.6 AVAX @ $8.6032 ($125.61 >= $28) -> T1-50% = 7.3 @ 65% target
+        // Engine A Short AVAX: 14.6 AVAX @ $8.6032 ($125.61 >= $28) -> T1-35% = 5.11 @ 65% target
         let (qty1, px1, tag1) = compute_tp_order_plan("EngineA", 8.6032, 8.5362, 14.6, false, 2);
-        assert_eq!(tag1, "T1-50%");
-        assert!((qty1 - 7.3).abs() < 1e-6);
+        assert_eq!(tag1, "T1-35%");
+        assert!((qty1 - 5.11).abs() < 1e-6);
         assert!(px1 < 8.6032 && px1 > 8.5362, "got {}", px1);
 
-        // Engine A Tranche 2 after T1 filled -> FULL remaining 7.3 @ target_mu
-        let (qty2, px2, tag2) = compute_tp_order_plan("EngineA", 8.6032, 8.5469, 7.3, true, 2);
+        // Engine A Tranche 2 after T1 filled -> FULL remaining 9.49 @ target_mu
+        let (qty2, px2, tag2) = compute_tp_order_plan("EngineA", 8.6032, 8.5469, 9.49, true, 2);
         assert_eq!(tag2, "FULL");
-        assert!((qty2 - 7.3).abs() < 1e-6);
+        assert!((qty2 - 9.49).abs() < 1e-6);
         assert!((px2 - 8.5469).abs() < 1e-6);
 
         // Engine B Long -> T1-50% directly at 1.5 ATR target
@@ -6609,17 +6850,38 @@ mod tests {
         assert_eq!(tag_sm, "FULL");
         assert!((qty_sm - 2.0).abs() < 1e-6);
 
-        // Package 5: ZEC Short ratchet to $907.05 (25.3 bps from $909.35) must honor 20 bps T1 floor ($907.53),
-        // NOT compress 0.65x down to $907.86 (16.4 bps)!
+        // Package 5/8B: ZEC Short ratchet to $907.05 (25.3 bps from $909.35) must honor 22 bps T1 floor
         let (qty_z, px_z, tag_z) = compute_tp_order_plan("EngineA", 909.35, 907.05, 0.11, false, 3);
-        assert_eq!(tag_z, "T1-50%");
-        assert!((qty_z - 0.055).abs() < 1e-6);
-        assert!(px_z <= 909.35 * 0.9980 + 0.05, "T1 violated 20 bps floor: {}", px_z);
+        assert_eq!(tag_z, "T1-35%");
+        assert!((qty_z - 0.039).abs() < 1e-6);
+        assert!(px_z <= 909.35 * 0.9978 + 0.05, "T1 violated 22 bps floor: {}", px_z);
 
         // Explicit harvest target (Stall-Hazard / State-3 Maker-Peg) bypasses 0.65x shaving completely
         let (_, px_exact, _) =
             compute_tp_order_plan_with_mode("EngineA", 909.35, 907.05, 0.11, false, true, 3);
         assert!((px_exact - 907.05).abs() < 1e-4, "expected 907.05, got {}", px_exact);
+    }
+
+    #[test]
+    fn test_package8b_fast_sentinel_intrabar_escape_avax_crash_and_normal_wick_preservation() {
+        // 1. AVAX 17/11 15:02-15:06 flash dump: -34.8 bps 1m bar + BTC -50.5 bps/5m + CUSUM >= eff_b_star
+        //    -> Fast-Sentinel cuts intrabar at -34.5 bps instead of waiting 59s for -60.7 bps!
+        let esc_crash = check_fast_sentinel_intrabar_escape(-34.5, 0, 3.15, 3.08, -34.8, -50.5);
+        assert_eq!(esc_crash, Some("FAST_SENTINEL_INTRABAR_CUSUM_CRASH_ESCAPE"));
+
+        // 2. Hard cap intrabar persistence: -45.5 bps sustained >= 2.5s OR -49.0 bps instant
+        assert!(check_fast_sentinel_intrabar_escape(-45.5, 1000, 1.0, 3.08, -5.0, 0.0).is_none());
+        assert_eq!(
+            check_fast_sentinel_intrabar_escape(-45.5, 2600, 1.0, 3.08, -5.0, 0.0),
+            Some("FAST_SENTINEL_INTRABAR_HARD_CAP_45BPS")
+        );
+        assert_eq!(
+            check_fast_sentinel_intrabar_escape(-49.0, 0, 1.0, 3.08, -5.0, 0.0),
+            Some("FAST_SENTINEL_INTRABAR_HARD_CAP_45BPS")
+        );
+
+        // 3. Normal reversible MAE (-39.9 bps, low CUSUM 1.8, no active 1m/BTC crash) is PRESERVED!
+        assert!(check_fast_sentinel_intrabar_escape(-39.9, 0, 1.80, 3.08, -12.0, -8.0).is_none());
     }
 
     #[test]

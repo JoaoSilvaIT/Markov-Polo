@@ -1759,6 +1759,7 @@ pub struct SessionTrendGate;
 
 impl SessionTrendGate {
     #[inline]
+    #[allow(dead_code)]
     pub fn evaluate_session_mode(
         cfg: &TrendEngineConfig,
         timestamp_sec: u64,
@@ -1767,6 +1768,30 @@ impl SessionTrendGate {
         ker_15m: f64,
         rel_vol_15m: f64,
         btc_ret_60m_abs: f64,
+    ) -> ExecutionMode {
+        Self::evaluate_session_mode_with_bar(
+            cfg,
+            timestamp_sec,
+            weekday_utc,
+            is_mode_mean_reversion,
+            ker_15m,
+            rel_vol_15m,
+            btc_ret_60m_abs,
+            0.0,
+        )
+    }
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_session_mode_with_bar(
+        cfg: &TrendEngineConfig,
+        timestamp_sec: u64,
+        weekday_utc: u8,
+        is_mode_mean_reversion: bool,
+        ker_15m: f64,
+        rel_vol_15m: f64,
+        btc_ret_60m_abs: f64,
+        body_to_range: f64,
     ) -> ExecutionMode {
         // 1. Respect Engine A MODE_MEANREVERSION exclusivity lock (Alpha-Protective)
         if is_mode_mean_reversion {
@@ -1824,6 +1849,28 @@ impl SessionTrendGate {
         }
 
         // 3. Off-Peak Asian/European Chop Window:
+        // Package 8: Restrict hardest block to strict dead-liquidity zone (03:00-06:30 UTC),
+        // while allowing verified high-conviction impulse breakouts in transitions for 24/7 assets.
+        if cfg.tier != TrendAssetTier::Hip3UsEquity
+            && body_to_range.is_finite()
+            && body_to_range > 0.0
+        {
+            if cfg.tier == TrendAssetTier::Hip3Commodity && (120..360).contains(&min_of_day) {
+                if body_to_range >= 0.70 && rel_vol_15m >= 2.40 {
+                    return ExecutionMode::Live;
+                }
+            } else {
+                let in_strict_dead_zone = (180..=390).contains(&min_of_day); // 03:00 - 06:30 UTC
+                if in_strict_dead_zone {
+                    if body_to_range >= 0.70 && rel_vol_15m >= 2.30 {
+                        return ExecutionMode::Live;
+                    }
+                } else if body_to_range >= 0.50 && rel_vol_15m >= 1.65 && ker_15m >= 0.45 {
+                    return ExecutionMode::Live;
+                }
+            }
+        }
+
         // Force Shadow unless tier supports verified 3-sigma Macro Volatility Ignition override
         if let (Some(min_ker), Some(min_rv)) = (cfg.offpeak_min_ker, cfg.offpeak_min_rel_vol) {
             let btc_ok = match cfg.offpeak_min_btc_ret_60m {
@@ -1913,7 +1960,7 @@ impl BreakoutFilter {
             && t.squeeze_pre_pct60 <= 0.35
             && t.rel_vol_15m >= 1.80
             && d * clv >= 0.55
-            && t.oi_delta_15m_pct >= 0.0;
+            && t.oi_delta_15m_pct >= -0.08;
         let sep_flag_dir_ok = match dir {
             TrendDirection::Long => t.sep_flag_long_ok,
             TrendDirection::Short => t.sep_flag_short_ok,
@@ -1923,7 +1970,7 @@ impl BreakoutFilter {
             && sep_flag_dir_ok
             && t.rel_vol_15m >= 1.65
             && d * clv >= 0.50
-            && t.oi_delta_15m_pct >= 0.0;
+            && t.oi_delta_15m_pct >= -0.08;
         let dual_path_active = path1_compression_ignition_ok || path2_separated_flag_ok;
 
         if !primary_squeeze_ok && !legacy_branch_b_ok && !dual_path_active {
@@ -1932,7 +1979,9 @@ impl BreakoutFilter {
         if !t.rel_vol_15m.is_finite() || t.rel_vol_15m < cfg.min_rel_volume {
             return Err("REJECT_LOW_VOLUME_DRIFT_BREAKOUT");
         }
-        if !dual_path_active && (!t.hurst_60m.is_finite() || t.hurst_60m < cfg.min_hurst_60m) {
+        // Package 8: 1m microstructure negative-autocorrelation induces ~-0.04 downward Hurst bias vs 15m
+        let eff_min_hurst = (cfg.min_hurst_60m - 0.04).max(0.42);
+        if !dual_path_active && (!t.hurst_60m.is_finite() || t.hurst_60m < eff_min_hurst) {
             return Err("REJECT_LOW_HURST_MEAN_REVERTING_REGIME");
         }
         if !t.oi_delta_15m_pct.is_finite() || t.oi_delta_15m_pct < -0.15 {
@@ -2083,6 +2132,34 @@ impl EngineBTrendManager {
         btc_ret_60m_abs: f64,
         allow_clv_fallback: bool,
     ) -> TrendOrderAction {
+        self.on_5m_bar_close_full(
+            cfg,
+            t,
+            timestamp_sec,
+            weekday_utc,
+            account_equity_usdc,
+            is_mode_mean_reversion,
+            ker_15m,
+            btc_ret_60m_abs,
+            allow_clv_fallback,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_5m_bar_close_full(
+        &mut self,
+        cfg: &TrendEngineConfig,
+        t: &BreakoutTelemetry,
+        timestamp_sec: u64,
+        weekday_utc: u8,
+        account_equity_usdc: f64,
+        is_mode_mean_reversion: bool,
+        ker_15m: f64,
+        btc_ret_60m_abs: f64,
+        allow_clv_fallback: bool,
+        has_native_l2: bool,
+    ) -> TrendOrderAction {
         let candidate_dir = if t.bar_close > t.donchian_high_12_15m {
             Some((TrendDirection::Long, t.donchian_high_12_15m))
         } else if t.bar_close < t.donchian_low_12_15m {
@@ -2091,16 +2168,18 @@ impl EngineBTrendManager {
             None
         };
 
+        let rng_bar = (t.bar_high - t.bar_low).max(1e-12);
+        let body_to_range_bar = ((t.bar_close - t.bar_open).abs() / rng_bar).clamp(0.0, 1.0);
+
         match self.state {
             RetestState::Idle => {
                 let Some((dir, bound_px)) = candidate_dir else {
                     return TrendOrderAction::None;
                 };
 
-                // 1. Check Session Gating first (allow Package 7 Path 1 Mode-Bypass Compression Ignition)
-                let rng_idle = (t.bar_high - t.bar_low).max(1e-12);
+                // 1. Check Session Gating first (allow Package 7 Path 1 + Package 8 Path 2 Mode-Bypass)
                 let clv_idle =
-                    ((2.0 * t.bar_close - t.bar_high - t.bar_low) / rng_idle).clamp(-1.0, 1.0);
+                    ((2.0 * t.bar_close - t.bar_high - t.bar_low) / rng_bar).clamp(-1.0, 1.0);
                 let path1_mode_bypass = t.enable_flag_compression_branch_b
                     && is_mode_mean_reversion
                     && t.p_shock < 0.45
@@ -2110,16 +2189,29 @@ impl EngineBTrendManager {
                     && t.squeeze_pre_pct60 <= 0.35
                     && t.rel_vol_15m >= 1.80
                     && dir.sign() * clv_idle >= 0.55
-                    && t.oi_delta_15m_pct >= 0.0
+                    && t.oi_delta_15m_pct >= -0.08
                     && dir.sign() * t.l2_obi >= -0.15;
-                let mode = SessionTrendGate::evaluate_session_mode(
+                let sep_flag_dir_idle = match dir {
+                    TrendDirection::Long => t.sep_flag_long_ok,
+                    TrendDirection::Short => t.sep_flag_short_ok,
+                };
+                let path2_mode_bypass = t.enable_flag_compression_branch_b
+                    && is_mode_mean_reversion
+                    && t.p_trend >= 0.75
+                    && sep_flag_dir_idle
+                    && t.ker_15m >= 0.60
+                    && t.rel_vol_15m >= 1.85
+                    && dir.sign() * clv_idle >= 0.50
+                    && t.oi_delta_15m_pct >= -0.08;
+                let mode = SessionTrendGate::evaluate_session_mode_with_bar(
                     cfg,
                     timestamp_sec,
                     weekday_utc,
-                    is_mode_mean_reversion && !path1_mode_bypass,
+                    is_mode_mean_reversion && !path1_mode_bypass && !path2_mode_bypass,
                     ker_15m,
                     t.rel_vol_15m,
                     btc_ret_60m_abs,
+                    body_to_range_bar,
                 );
                 if let ExecutionMode::Shadow { reason } = mode {
                     return TrendOrderAction::LogShadowCounterfactual {
@@ -2154,8 +2246,8 @@ impl EngineBTrendManager {
                 confirm_bars_5m,
                 armed_at_sec,
             } => {
-                // Re-verify session mode before promoting Stage 1 -> Stage 2 (preserve Path 1 Mode-Bypass if armed via Path 1)
-                let mode = SessionTrendGate::evaluate_session_mode(
+                // Re-verify session mode before promoting Stage 1 -> Stage 2 (preserve Path 1/2 Mode-Bypass if armed)
+                let mode = SessionTrendGate::evaluate_session_mode_with_bar(
                     cfg,
                     timestamp_sec,
                     weekday_utc,
@@ -2164,6 +2256,7 @@ impl EngineBTrendManager {
                     ker_15m,
                     t.rel_vol_15m,
                     btc_ret_60m_abs,
+                    body_to_range_bar,
                 );
                 if let ExecutionMode::Shadow { reason } = mode {
                     self.state = RetestState::Idle;
@@ -2175,7 +2268,7 @@ impl EngineBTrendManager {
                 }
 
                 let d = dir.sign();
-                let still_outside = d * (t.bar_close - broken_donchian_px) >= 0.05 * t.atr_15m;
+                let still_outside = d * (t.bar_close - broken_donchian_px) >= -0.05 * t.atr_15m;
                 if !still_outside || timestamp_sec.saturating_sub(armed_at_sec) > 600 {
                     // Failed 2-bar persistence (Immediate fakeout snapback caught!)
                     self.state = RetestState::Idle;
@@ -2195,13 +2288,16 @@ impl EngineBTrendManager {
                     } else {
                         0.0
                     };
-                    // Package 6: Non-Hostile Book Floor (-0.15) + Aggressive Conviction/RelVol flow filter
-                    // Prevents resting ask/bid absorption walls on Hyperliquid L2 from killing valid breakouts.
+                    // Package 6 & Package 8:
+                    // Native L2 top-of-book OBI during a retest pullback absorbs taker tests near neutral (-0.02),
+                    // whereas simulated CLV-proxy OBI requires stronger alignment (0.15..cfg.min_obi_retest).
                     let non_hostile_book_with_flow = d * t.l2_obi >= -0.15
                         && d * clv_5m >= cfg.min_clv_conviction
                         && t.rel_vol_15m >= cfg.min_rel_volume
                         && body_atr >= 0.06;
-                    let eff_obi_hurdle = if t.rel_vol_15m >= 2.10 && d * clv_5m >= 0.60 {
+                    let eff_obi_hurdle = if has_native_l2 {
+                        -0.02
+                    } else if t.rel_vol_15m >= 2.10 && d * clv_5m >= 0.60 {
                         (cfg.min_obi_retest * 0.50).max(0.10)
                     } else {
                         cfg.min_obi_retest
@@ -2292,8 +2388,8 @@ impl EngineBTrendManager {
     }
 }
 
-/// Computes the Policy C 90-minute rolling minimum Bollinger-to-Keltner squeeze ratio:
-/// `min_{k in 1..=6} (2.0 * sigma_{20, 15m}(t - k) / (1.5 * ATR_{20, 15m}(t - k)))`.
+/// Computes the Policy C rolling minimum Bollinger-to-Keltner squeeze ratio:
+/// `min_{k in 1..=8} (2.0 * sigma_{20, 15m}(t - k) / (1.5 * ATR_{20, 15m}(t - k)))`.
 /// Returns `1.0` (no squeeze) when fewer than 21 15m bars or valid ATRs are available.
 pub fn calculate_min_squeeze_ratio_90m(bars_15m: &[CandleBar]) -> f64 {
     let n15 = bars_15m.len();
@@ -2301,7 +2397,7 @@ pub fn calculate_min_squeeze_ratio_90m(bars_15m: &[CandleBar]) -> f64 {
         return 1.0;
     }
     let mut min_sq = f64::MAX;
-    for k in 1..=6 {
+    for k in 1..=8 {
         let end = n15.saturating_sub(k);
         if end >= 20 {
             let sub = &bars_15m[end - 20..end];
@@ -2326,6 +2422,157 @@ pub fn calculate_min_squeeze_ratio_90m(bars_15m: &[CandleBar]) -> f64 {
     } else {
         1.0
     }
+}
+
+/// Package 8 non-contaminated pre-breakout squeeze ratio combining:
+/// 1) `prior_15m` over up to 8 completed 15m bars (`120m`, excluding the current 15m bar), and
+/// 2) `bars_5m` over the 9 closed 5m bars (`45m`) immediately preceding the trigger bar (`[..n5-1]`).
+pub fn calculate_effective_squeeze_ratio(prior_15m: &[CandleBar], bars_5m: &[CandleBar]) -> f64 {
+    let n15 = prior_15m.len();
+    let mut min_sq_15m = f64::MAX;
+    if n15 >= 20 {
+        for k in 0..8 {
+            let end = n15.saturating_sub(k);
+            if end >= 20 {
+                let sub = &prior_15m[end - 20..end];
+                let mean_c = sub.iter().map(|b| b.close).sum::<f64>() / 20.0;
+                let var_c = sub.iter().map(|b| (b.close - mean_c).powi(2)).sum::<f64>() / 20.0;
+                let std_20 = var_c.sqrt();
+                let atr_opt = if end >= 21 {
+                    calculate_atr(&prior_15m[..end], 20)
+                } else {
+                    calculate_atr(sub, 19)
+                };
+                if let Some(atr_sub) = atr_opt.filter(|&a| a.is_finite() && a > 1e-9) {
+                    let sq = (2.0 * std_20) / (1.5 * atr_sub);
+                    if sq.is_finite() && sq < min_sq_15m {
+                        min_sq_15m = sq;
+                    }
+                }
+            }
+        }
+    }
+
+    let n5 = bars_5m.len();
+    let mut min_sq_5m = f64::MAX;
+    if n5 >= 22 {
+        for k in 1..=9 {
+            let end = n5.saturating_sub(k);
+            if end >= 20 {
+                let sub = &bars_5m[end - 20..end];
+                let mean_c = sub.iter().map(|b| b.close).sum::<f64>() / 20.0;
+                let var_c = sub.iter().map(|b| (b.close - mean_c).powi(2)).sum::<f64>() / 20.0;
+                let std_20 = var_c.sqrt();
+                let atr_opt = if end >= 21 {
+                    calculate_atr(&bars_5m[..end], 20)
+                } else {
+                    calculate_atr(sub, 19)
+                };
+                if let Some(atr_sub) = atr_opt.filter(|&a| a.is_finite() && a > 1e-9) {
+                    let sq = (2.0 * std_20) / (1.5 * atr_sub);
+                    if sq.is_finite() && sq < min_sq_5m {
+                        min_sq_5m = sq;
+                    }
+                }
+            }
+        }
+    }
+
+    let s15 = if min_sq_15m < f64::MAX {
+        min_sq_15m
+    } else {
+        1.0
+    };
+    if min_sq_5m < f64::MAX {
+        s15.min(min_sq_5m * 1.03)
+    } else {
+        s15
+    }
+}
+
+/// Computes `(er_5m, vol_z_5m, adx_14, adx_slope_pos)` over closed 5-minute bars for
+/// the Package 8 Fast-Track 5m Impulse Promotion Bridge.
+pub fn compute_rolling_5m_impulse_metrics(bars_5m: &[CandleBar]) -> (f64, f64, f64, bool) {
+    let n = bars_5m.len();
+    if n < 30 {
+        return (0.0, 0.0, 0.0, false);
+    }
+    let er_5m = calculate_ker_n(bars_5m, 3);
+    let last_vol = bars_5m[n - 1].volume;
+    let vol_slice = &bars_5m[n - 21..n - 1];
+    let mean_v = vol_slice.iter().map(|b| b.volume).sum::<f64>() / 20.0;
+    let var_v = vol_slice
+        .iter()
+        .map(|b| (b.volume - mean_v).powi(2))
+        .sum::<f64>()
+        / 19.0;
+    let std_v = var_v.sqrt().max(1e-9);
+    let vol_z_5m = if last_vol.is_finite() {
+        (last_vol - mean_v) / std_v
+    } else {
+        0.0
+    };
+
+    // Wilder 14-period ADX over recent 5m bars
+    let start = n.saturating_sub(60);
+    let slice = &bars_5m[start..];
+    let period = 14usize;
+    if slice.len() <= period * 2 {
+        return (er_5m, vol_z_5m, 0.0, false);
+    }
+    let mut tr_sum = 0.0;
+    let mut pdm_sum = 0.0;
+    let mut ndm_sum = 0.0;
+    for i in 1..=period {
+        let h = slice[i].high;
+        let l = slice[i].low;
+        let pc = slice[i - 1].close;
+        let tr = (h - l).max((h - pc).abs()).max((l - pc).abs());
+        let up = h - slice[i - 1].high;
+        let dn = slice[i - 1].low - l;
+        tr_sum += tr;
+        pdm_sum += if up > dn && up > 0.0 { up } else { 0.0 };
+        ndm_sum += if dn > up && dn > 0.0 { dn } else { 0.0 };
+    }
+    let mut dx_series = Vec::with_capacity(slice.len() - period);
+    let push_dx = |tr_s: f64, p_s: f64, n_s: f64, out: &mut Vec<f64>| {
+        if tr_s > 1e-12 {
+            let pdi = 100.0 * (p_s / tr_s);
+            let ndi = 100.0 * (n_s / tr_s);
+            let sum_di = pdi + ndi;
+            if sum_di > 1e-12 {
+                out.push(100.0 * ((pdi - ndi).abs() / sum_di));
+            } else {
+                out.push(0.0);
+            }
+        }
+    };
+    push_dx(tr_sum, pdm_sum, ndm_sum, &mut dx_series);
+    let pf = period as f64;
+    for i in (period + 1)..slice.len() {
+        let h = slice[i].high;
+        let l = slice[i].low;
+        let pc = slice[i - 1].close;
+        let tr = (h - l).max((h - pc).abs()).max((l - pc).abs());
+        let up = h - slice[i - 1].high;
+        let dn = slice[i - 1].low - l;
+        let pdm = if up > dn && up > 0.0 { up } else { 0.0 };
+        let ndm = if dn > up && dn > 0.0 { dn } else { 0.0 };
+        tr_sum = tr_sum - (tr_sum / pf) + tr;
+        pdm_sum = pdm_sum - (pdm_sum / pf) + pdm;
+        ndm_sum = ndm_sum - (ndm_sum / pf) + ndm;
+        push_dx(tr_sum, pdm_sum, ndm_sum, &mut dx_series);
+    }
+    if dx_series.len() < period + 1 {
+        return (er_5m, vol_z_5m, 0.0, false);
+    }
+    let mut adx = dx_series[..period].iter().sum::<f64>() / pf;
+    let mut prev_adx = adx;
+    for &dx in &dx_series[period..] {
+        prev_adx = adx;
+        adx = ((adx * (pf - 1.0)) + dx) / pf;
+    }
+    (er_5m, vol_z_5m, adx, adx > prev_adx)
 }
 
 /// Computes the Package 7 lagged pre-breakout squeeze ratio `ATR_12(t-1) / ATR_48(t-1)`

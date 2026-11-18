@@ -127,7 +127,7 @@ pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
             rebound_gamma: 0.35,
             max_join_consumption_ratio: 0.25,
             max_retest_consumption_ratio: 0.50,
-            min_net_edge_bps: 22.0,
+            min_net_edge_bps: 26.0,
             target_notional_cap_usdc: 68.0,
             soft_z_ou_threshold: 2.75,
             soft_z15_shock_threshold: 3.00,
@@ -193,9 +193,9 @@ pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
             min_half_life_m: 15.0,
             max_half_life_m: 135.0,
             min_sigma_eq_bps: 34.0,
-            base_entry_sigma: 1.95,
-            min_entry_sigma: 1.75,
-            max_entry_sigma: 2.30,
+            base_entry_sigma: 2.10,
+            min_entry_sigma: 1.85,
+            max_entry_sigma: 2.45,
             rebound_gamma: 0.30,
             max_join_consumption_ratio: 0.22,
             max_retest_consumption_ratio: 0.45,
@@ -283,13 +283,13 @@ pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
             min_half_life_m: 8.0,
             max_half_life_m: 75.0,
             min_sigma_eq_bps: 20.0,
-            base_entry_sigma: 1.58,
-            min_entry_sigma: 1.40,
-            max_entry_sigma: 1.88,
+            base_entry_sigma: 1.75,
+            min_entry_sigma: 1.55,
+            max_entry_sigma: 2.20,
             rebound_gamma: 0.35,
             max_join_consumption_ratio: 0.25,
             max_retest_consumption_ratio: 0.50,
-            min_net_edge_bps: 19.0,
+            min_net_edge_bps: 20.0,
             target_notional_cap_usdc: 65.0,
             soft_z_ou_threshold: 2.50,
             soft_z15_shock_threshold: 2.80,
@@ -300,14 +300,14 @@ pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
             lookback_5m_bars: 120,
             min_half_life_m: 8.0,
             max_half_life_m: 75.0,
-            min_sigma_eq_bps: 16.0,
-            base_entry_sigma: 1.52,
-            min_entry_sigma: 1.38,
-            max_entry_sigma: 1.82,
+            min_sigma_eq_bps: 18.0,
+            base_entry_sigma: 1.70,
+            min_entry_sigma: 1.50,
+            max_entry_sigma: 2.20,
             rebound_gamma: 0.35,
             max_join_consumption_ratio: 0.25,
             max_retest_consumption_ratio: 0.50,
-            min_net_edge_bps: 16.0,
+            min_net_edge_bps: 19.0,
             target_notional_cap_usdc: 72.0,
             soft_z_ou_threshold: 2.45,
             soft_z15_shock_threshold: 2.75,
@@ -318,15 +318,15 @@ pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
             lookback_5m_bars: 144,
             min_half_life_m: 8.0,
             max_half_life_m: 60.0,
-            min_sigma_eq_bps: 16.0,
-            base_entry_sigma: 2.05,
-            min_entry_sigma: 1.85,
-            max_entry_sigma: 2.35,
+            min_sigma_eq_bps: 18.0,
+            base_entry_sigma: 2.20,
+            min_entry_sigma: 1.95,
+            max_entry_sigma: 2.45,
             rebound_gamma: 0.35,
             max_join_consumption_ratio: 0.25,
             max_retest_consumption_ratio: 0.50,
-            // Non-growth HIP-3 GOLD pays 5.76 bps MM / 12.12 bps MT RT: reserve Engine A for extreme >=2.05σ tails
-            min_net_edge_bps: 26.0,
+            // Non-growth HIP-3 GOLD pays 5.76 bps MM / 12.12 bps MT RT: reserve Engine A for extreme >=2.20σ tails
+            min_net_edge_bps: 30.0,
             target_notional_cap_usdc: 75.0,
             soft_z_ou_threshold: 2.40,
             soft_z15_shock_threshold: 2.70,
@@ -337,14 +337,14 @@ pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
             lookback_5m_bars: 120,
             min_half_life_m: 8.0,
             max_half_life_m: 60.0,
-            min_sigma_eq_bps: 20.0,
-            base_entry_sigma: 1.62,
-            min_entry_sigma: 1.42,
-            max_entry_sigma: 1.92,
+            min_sigma_eq_bps: 22.0,
+            base_entry_sigma: 1.95,
+            min_entry_sigma: 1.75,
+            max_entry_sigma: 2.40,
             rebound_gamma: 0.34,
             max_join_consumption_ratio: 0.24,
             max_retest_consumption_ratio: 0.48,
-            min_net_edge_bps: 20.0,
+            min_net_edge_bps: 25.0,
             target_notional_cap_usdc: 64.0,
             soft_z_ou_threshold: 2.55,
             soft_z15_shock_threshold: 2.85,
@@ -356,13 +356,13 @@ pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
             min_half_life_m: 8.0,
             max_half_life_m: 75.0,
             min_sigma_eq_bps: 22.0,
-            base_entry_sigma: 1.65,
-            min_entry_sigma: 1.42,
-            max_entry_sigma: 1.95,
+            base_entry_sigma: 1.80,
+            min_entry_sigma: 1.60,
+            max_entry_sigma: 2.30,
             rebound_gamma: 0.32,
             max_join_consumption_ratio: 0.22,
             max_retest_consumption_ratio: 0.48,
-            min_net_edge_bps: 22.0,
+            min_net_edge_bps: 23.0,
             target_notional_cap_usdc: 60.0,
             soft_z_ou_threshold: 2.60,
             soft_z15_shock_threshold: 2.90,
@@ -373,10 +373,10 @@ pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
             lookback_5m_bars: 96,
             min_half_life_m: 10.0,
             max_half_life_m: 135.0,
-            min_sigma_eq_bps: 26.0,
-            base_entry_sigma: 1.92,
-            min_entry_sigma: 1.72,
-            max_entry_sigma: 2.25,
+            min_sigma_eq_bps: 28.0,
+            base_entry_sigma: 2.10,
+            min_entry_sigma: 1.85,
+            max_entry_sigma: 2.45,
             rebound_gamma: 0.34,
             max_join_consumption_ratio: 0.22,
             max_retest_consumption_ratio: 0.48,
@@ -392,9 +392,9 @@ pub fn asset_ou_config(symbol: &str) -> AssetOuConfig {
             min_half_life_m: 15.0,
             max_half_life_m: 150.0,
             min_sigma_eq_bps: 26.0,
-            base_entry_sigma: 1.60,
-            min_entry_sigma: 1.40,
-            max_entry_sigma: 1.90,
+            base_entry_sigma: 1.75,
+            min_entry_sigma: 1.55,
+            max_entry_sigma: 2.20,
             rebound_gamma: 0.35,
             max_join_consumption_ratio: 0.25,
             max_retest_consumption_ratio: 0.50,
@@ -2583,6 +2583,8 @@ pub struct AssetCalibration {
     pub w2_min: f64,
     pub w2_max: f64,
     pub stall_trigger_mins: usize,
+    pub mfe_gate_bps: f64,
+    pub tranche1_fraction: f64,
     pub cusum_delta_1m: f64,
     pub cusum_b_1m_star: f64,
     pub sprt_min_loss_gate_bps: f64,
@@ -2616,7 +2618,9 @@ pub fn asset_calibration(symbol: &str) -> AssetCalibration {
             beta_overshoot: 0.58,
             w2_min: 0.35,
             w2_max: 0.65,
-            stall_trigger_mins: 4,
+            stall_trigger_mins: 6,
+            mfe_gate_bps: 22.0,
+            tranche1_fraction: 0.35,
             cusum_delta_1m: 0.34,
             cusum_b_1m_star: 4.10,
             sprt_min_loss_gate_bps: -18.0,
@@ -2644,7 +2648,9 @@ pub fn asset_calibration(symbol: &str) -> AssetCalibration {
             beta_overshoot: 0.58,
             w2_min: 0.35,
             w2_max: 0.65,
-            stall_trigger_mins: 4,
+            stall_trigger_mins: 6,
+            mfe_gate_bps: 23.0,
+            tranche1_fraction: 0.35,
             cusum_delta_1m: 0.35,
             cusum_b_1m_star: 4.00,
             sprt_min_loss_gate_bps: -18.0,
@@ -2672,7 +2678,9 @@ pub fn asset_calibration(symbol: &str) -> AssetCalibration {
             beta_overshoot: 0.62,
             w2_min: 0.35,
             w2_max: 0.65,
-            stall_trigger_mins: 3,
+            stall_trigger_mins: 6,
+            mfe_gate_bps: 25.0,
+            tranche1_fraction: 0.35,
             cusum_delta_1m: 0.36,
             cusum_b_1m_star: 3.85,
             sprt_min_loss_gate_bps: -19.0,
@@ -2700,7 +2708,9 @@ pub fn asset_calibration(symbol: &str) -> AssetCalibration {
             beta_overshoot: 0.55,
             w2_min: 0.35,
             w2_max: 0.62,
-            stall_trigger_mins: 3,
+            stall_trigger_mins: 6,
+            mfe_gate_bps: 24.0,
+            tranche1_fraction: 0.35,
             cusum_delta_1m: 0.36,
             cusum_b_1m_star: 3.85,
             sprt_min_loss_gate_bps: -19.0,
@@ -2728,7 +2738,9 @@ pub fn asset_calibration(symbol: &str) -> AssetCalibration {
             beta_overshoot: 0.65,
             w2_min: 0.35,
             w2_max: 0.65,
-            stall_trigger_mins: 3,
+            stall_trigger_mins: 6,
+            mfe_gate_bps: 26.0,
+            tranche1_fraction: 0.35,
             cusum_delta_1m: 0.35,
             cusum_b_1m_star: 3.80,
             sprt_min_loss_gate_bps: -20.0,
@@ -2756,7 +2768,9 @@ pub fn asset_calibration(symbol: &str) -> AssetCalibration {
             beta_overshoot: 0.58,
             w2_min: 0.35,
             w2_max: 0.62,
-            stall_trigger_mins: 3,
+            stall_trigger_mins: 6,
+            mfe_gate_bps: 25.0,
+            tranche1_fraction: 0.35,
             cusum_delta_1m: 0.36,
             cusum_b_1m_star: 3.85,
             sprt_min_loss_gate_bps: -19.0,
@@ -2784,7 +2798,9 @@ pub fn asset_calibration(symbol: &str) -> AssetCalibration {
             beta_overshoot: 0.55,
             w2_min: 0.35,
             w2_max: 0.62,
-            stall_trigger_mins: 3,
+            stall_trigger_mins: 6,
+            mfe_gate_bps: 24.0,
+            tranche1_fraction: 0.35,
             cusum_delta_1m: 0.36,
             cusum_b_1m_star: 3.85,
             sprt_min_loss_gate_bps: -19.0,
@@ -2812,7 +2828,9 @@ pub fn asset_calibration(symbol: &str) -> AssetCalibration {
             beta_overshoot: 0.62,
             w2_min: 0.35,
             w2_max: 0.60,
-            stall_trigger_mins: 3,
+            stall_trigger_mins: 6,
+            mfe_gate_bps: 25.0,
+            tranche1_fraction: 0.35,
             cusum_delta_1m: 0.33,
             cusum_b_1m_star: 3.75,
             sprt_min_loss_gate_bps: -20.0,
@@ -2834,13 +2852,15 @@ pub fn asset_calibration(symbol: &str) -> AssetCalibration {
             symbol: "HYPE",
             sz_decimals: 2,
             ou_horizon_mins: 5,
-            min_gross_entry_bps: 26.0,
+            min_gross_entry_bps: 28.0,
             sigma_min: 1.66,
             sigma_max: 2.42,
             beta_overshoot: 0.68,
             w2_min: 0.35,
             w2_max: 0.65,
-            stall_trigger_mins: 3,
+            stall_trigger_mins: 7,
+            mfe_gate_bps: 28.0,
+            tranche1_fraction: 0.35,
             cusum_delta_1m: 0.32,
             cusum_b_1m_star: 3.75,
             sprt_min_loss_gate_bps: -21.0,
@@ -2862,13 +2882,15 @@ pub fn asset_calibration(symbol: &str) -> AssetCalibration {
             symbol: "xyz:NVDA",
             sz_decimals: 3,
             ou_horizon_mins: 5,
-            min_gross_entry_bps: 18.0,
+            min_gross_entry_bps: 20.0,
             sigma_min: 1.55,
             sigma_max: 2.25,
             beta_overshoot: 0.55,
             w2_min: 0.35,
             w2_max: 0.65,
-            stall_trigger_mins: 3,
+            stall_trigger_mins: 6,
+            mfe_gate_bps: 23.0,
+            tranche1_fraction: 0.35,
             cusum_delta_1m: 0.35,
             cusum_b_1m_star: 3.85,
             sprt_min_loss_gate_bps: -18.0,
@@ -2890,13 +2912,15 @@ pub fn asset_calibration(symbol: &str) -> AssetCalibration {
             symbol: "xyz:GOLD",
             sz_decimals: 4,
             ou_horizon_mins: 15,
-            min_gross_entry_bps: 25.0,
+            min_gross_entry_bps: 30.0,
             sigma_min: 1.52,
             sigma_max: 2.15,
             beta_overshoot: 0.50,
             w2_min: 0.35,
             w2_max: 0.65,
-            stall_trigger_mins: 3,
+            stall_trigger_mins: 7,
+            mfe_gate_bps: 26.0,
+            tranche1_fraction: 0.30,
             cusum_delta_1m: 0.38,
             cusum_b_1m_star: 4.15,
             sprt_min_loss_gate_bps: -16.0,
@@ -2918,13 +2942,15 @@ pub fn asset_calibration(symbol: &str) -> AssetCalibration {
             symbol: "xyz:SILVER",
             sz_decimals: 2,
             ou_horizon_mins: 10,
-            min_gross_entry_bps: 18.0,
+            min_gross_entry_bps: 25.0,
             sigma_min: 1.56,
             sigma_max: 2.25,
             beta_overshoot: 0.54,
             w2_min: 0.35,
             w2_max: 0.65,
-            stall_trigger_mins: 3,
+            stall_trigger_mins: 6,
+            mfe_gate_bps: 26.0,
+            tranche1_fraction: 0.30,
             cusum_delta_1m: 0.35,
             cusum_b_1m_star: 3.90,
             sprt_min_loss_gate_bps: -18.0,
@@ -2946,13 +2972,15 @@ pub fn asset_calibration(symbol: &str) -> AssetCalibration {
             symbol: "xyz:XYZ100",
             sz_decimals: 4,
             ou_horizon_mins: 10,
-            min_gross_entry_bps: 16.0,
+            min_gross_entry_bps: 19.0,
             sigma_min: 1.52,
             sigma_max: 2.15,
             beta_overshoot: 0.52,
             w2_min: 0.35,
             w2_max: 0.65,
-            stall_trigger_mins: 3,
+            stall_trigger_mins: 6,
+            mfe_gate_bps: 21.0,
+            tranche1_fraction: 0.35,
             cusum_delta_1m: 0.36,
             cusum_b_1m_star: 4.05,
             sprt_min_loss_gate_bps: -16.0,
@@ -2974,13 +3002,15 @@ pub fn asset_calibration(symbol: &str) -> AssetCalibration {
             symbol: "xyz:TSLA",
             sz_decimals: 3,
             ou_horizon_mins: 5,
-            min_gross_entry_bps: 20.0,
+            min_gross_entry_bps: 23.0,
             sigma_min: 1.62,
             sigma_max: 2.35,
             beta_overshoot: 0.58,
             w2_min: 0.35,
             w2_max: 0.65,
-            stall_trigger_mins: 3,
+            stall_trigger_mins: 6,
+            mfe_gate_bps: 25.0,
+            tranche1_fraction: 0.35,
             cusum_delta_1m: 0.34,
             cusum_b_1m_star: 3.80,
             sprt_min_loss_gate_bps: -19.0,
@@ -3002,13 +3032,15 @@ pub fn asset_calibration(symbol: &str) -> AssetCalibration {
             symbol: "ZEC",
             sz_decimals: 3,
             ou_horizon_mins: 5,
-            min_gross_entry_bps: 24.0,
+            min_gross_entry_bps: 28.0,
             sigma_min: 1.60,
             sigma_max: 2.32,
             beta_overshoot: 0.60,
             w2_min: 0.35,
             w2_max: 0.65,
-            stall_trigger_mins: 3,
+            stall_trigger_mins: 7,
+            mfe_gate_bps: 27.0,
+            tranche1_fraction: 0.35,
             cusum_delta_1m: 0.34,
             cusum_b_1m_star: 3.80,
             sprt_min_loss_gate_bps: -20.0,
@@ -3036,7 +3068,9 @@ pub fn asset_calibration(symbol: &str) -> AssetCalibration {
             beta_overshoot: 0.58,
             w2_min: 0.35,
             w2_max: 0.65,
-            stall_trigger_mins: 3,
+            stall_trigger_mins: 6,
+            mfe_gate_bps: 23.0,
+            tranche1_fraction: 0.35,
             cusum_delta_1m: 0.35,
             cusum_b_1m_star: 4.00,
             sprt_min_loss_gate_bps: -18.0,
@@ -3836,16 +3870,16 @@ impl StallHazardExitManager {
             .max(cal.min_gross_entry_bps * 0.85);
         let tp2_overshoot_bps = mean_dist_bps + cal.beta_overshoot * sigma_eq_bps;
 
-        // 3. State-Contingent Stall-Hazard Trajectory for Tranche 1 Maker Limit (Package 7 Candidate B)
+        // 3. State-Contingent Stall-Hazard Trajectory for Tranche 1 Maker Limit (Package 8 Payoff Expansion)
         let is_expanding = tau_stall < cal.stall_trigger_mins || m_rev >= 0.22;
-        let tp1_target_bps = if is_expanding || self.mfe_bps < 15.0 {
-            // Active expansion: DO NOT CAP WINNER! Keep TP1 at full Kalman equilibrium mean.
+        let tp1_target_bps = if is_expanding || self.mfe_bps < cal.mfe_gate_bps {
+            // Active expansion or below MFE gate: keep TP1 at full Kalman equilibrium mean.
             mean_dist_bps
         } else {
             // Verified mid-air stall: Harvest passively at upper-quartile of achieved MFE
             let stall_steps = (tau_stall.saturating_sub(cal.stall_trigger_mins - 1)).min(12) as f64;
             let mfe_retention = 0.88 - 0.045 * stall_steps;
-            let stalled_bps = (self.mfe_bps * mfe_retention).max(2.88 + 3.8); // Min +3.8 bps net after 2.88 bps MM fee
+            let stalled_bps = (self.mfe_bps * mfe_retention).max(2.88 + 6.0); // Min +6.0 bps net after MM fee
             stalled_bps.min(mean_dist_bps)
         };
 
@@ -3967,12 +4001,15 @@ impl StallHazardExitManager {
                 };
             }
 
-            // Passive Alo Inside-Peg Conversion: Avoids 6.26 bps Maker-Taker stop-market fee!
-            let lock_floor_bps = (0.58 * self.mfe_bps).max(6.5);
+            // Passive Alo Inside-Peg Conversion: Avoids 6.26 bps Maker-Taker stop-market fee
+            // while protecting 55% of MFE once MFE >= cal.mfe_gate_bps (min +10 bps floor).
+            let lock_floor_bps = (0.55 * self.mfe_bps).max(10.0);
             if curr_unreal_bps <= lock_floor_bps && m_rev <= -0.15 {
                 let passive_peg_offset = (spread_bps * 0.35).max(0.5) * 1e-4;
                 let pegged_maker_px = bar_close * (1.0 + d * passive_peg_offset);
-                if d * (fav_px - pegged_maker_px) >= 0.0 || curr_unreal_bps >= 4.5 {
+                if (d * (fav_px - pegged_maker_px) >= 0.0 && curr_unreal_bps >= 8.0)
+                    || curr_unreal_bps >= 8.0
+                {
                     self.tranche2_filled = true;
                     return HardenedExitDecision::FillTranche2Maker {
                         fill_px: pegged_maker_px.clamp(bar_low, bar_high),
@@ -4523,7 +4560,72 @@ pub fn engine_a_min_soft_inv_excursion_bps(symbol: &str) -> f64 {
     }
 }
 
-/// Computes the Engine A Soft-Invalidation Dollar Risk Capped Notional (Package 4):
+/// Package 8B per-asset Engine A risk cap multiplier (`risk_cap_mult`).
+#[inline]
+pub fn asset_risk_cap_mult(symbol: &str) -> f64 {
+    match symbol.to_uppercase().as_str() {
+        "SOL" | "AVAX" | "SUI" => 1.00,
+        "LINK" | "XRP" => 0.95,
+        "ETH" => 0.90,
+        "NEAR" => 0.85,
+        "XYZ:NVDA" | "NVDA" | "XYZ:XYZ100" | "XYZ100" => 0.80,
+        "XYZ:TSLA" | "TSLA" => 0.70,
+        "BTC" => 0.65,
+        "HYPE" => 0.60,
+        "ZEC" => 0.55,
+        "XYZ:GOLD" | "GOLD" | "XYZ:SILVER" | "SILVER" => 0.50,
+        _ => 0.80,
+    }
+}
+
+/// Package 8B Anti-Falling-Knife Guard for Engine A `RETEST-LIMIT` entries:
+/// Rejects catching a falling knife during an accelerating local or BTC-contagion cascade.
+#[inline]
+pub fn check_retest_limit_falling_knife_guard(
+    is_long: bool,
+    consumed_frac: f64,
+    asset_ret_5m_bps: f64,
+    worst_1m_bar_last3_bps: f64,
+    btc_ret_5m_bps: f64,
+    btc_ret_30m_bps: f64,
+) -> bool {
+    let dir = if is_long { 1.0 } else { -1.0 };
+    let adv_asset_5m = dir * asset_ret_5m_bps;
+    let adv_asset_1m = dir * worst_1m_bar_last3_bps;
+    let adv_btc_5m = dir * btc_ret_5m_bps;
+    let adv_btc_30m = dir * btc_ret_30m_bps;
+
+    // 1. High consumed edge into an active 5m displacement (e.g. AVAX 17/11 Consumed 40.6% @ -95 bps/5m)
+    if consumed_frac > 0.33 && adv_asset_5m <= -55.0 {
+        return false;
+    }
+    // 2. Local 5m or 1m impulse crash/squeeze against entry direction
+    if adv_asset_5m <= -70.0 || adv_asset_1m <= -28.0 {
+        return false;
+    }
+    // 3. Macro BTC contagion in the adverse direction
+    if adv_btc_5m <= -38.0 || (adv_btc_5m <= -28.0 && adv_btc_30m <= -75.0) {
+        return false;
+    }
+    true
+}
+
+/// Package 8B Kalman Velocity Deceleration Guard for Engine A entries:
+/// Requires Kalman velocity (in bps/min) to be bounded and no longer accelerating against the position.
+#[inline]
+pub fn check_kalman_velocity_entry_guard(
+    is_long: bool,
+    kalman_vel_bps_min: f64,
+    prev_kalman_vel_bps_min: f64,
+) -> bool {
+    if is_long {
+        kalman_vel_bps_min >= -1.80 && kalman_vel_bps_min >= prev_kalman_vel_bps_min - 0.25
+    } else {
+        kalman_vel_bps_min <= 1.80 && kalman_vel_bps_min <= prev_kalman_vel_bps_min + 0.25
+    }
+}
+
+/// Computes the Engine A Soft-Invalidation Dollar Risk Capped Notional (Package 4 + Package 8B risk_cap_mult):
 /// Enforces max dollar risk at 0.125% of account equity (~$0.70 on $559 equity)
 /// when exiting at min_soft_inv_excursion_bps + round-trip MT fee friction.
 #[inline]
@@ -4539,7 +4641,8 @@ pub fn compute_engine_a_soft_risk_capped_notional(
     let mt_fee_bps = AssetFeeSchedule::for_symbol(symbol).maker_taker_rt_bps();
     let expected_soft_stop_bps = (soft_inv_bps + mt_fee_bps).max(30.0);
     let dd_mult = drawdown_multiplier.clamp(0.40, 1.0);
-    let max_soft_inv_loss_usd = live_equity * 0.00125 * dd_mult;
+    let risk_mult = asset_risk_cap_mult(symbol);
+    let max_soft_inv_loss_usd = live_equity * 0.00125 * dd_mult * risk_mult;
     (max_soft_inv_loss_usd / (expected_soft_stop_bps * 1e-4)).max(0.0)
 }
 
@@ -4756,6 +4859,19 @@ pub fn evaluate_session_lifecycle_gate(
         }
         if total_day_mins >= maint_start - 20 && total_day_mins < maint_start - 5 {
             return SessionLifecycleAction::BlockNewEntriesAndRatchetTp("CME_PRE_MAINT_20M");
+        }
+        // Package 8B: 08:20-08:40 ET COMEX cash open & US Tier-1 macro release window
+        let comex_open_start = if is_us_dst { 740 } else { 800 }; // 12:20 UTC EDT / 13:20 UTC EST
+        if total_day_mins >= comex_open_start && total_day_mins < comex_open_start + 20 {
+            return SessionLifecycleAction::BlockNewEntriesAndRatchetTp(
+                "CME_COMEX_OPEN_MACRO_SHIELD",
+            );
+        }
+        // Package 8B: 02:00-06:00 UTC Asian illiquidity / thin-book spread expansion window
+        if (120..360).contains(&total_day_mins) {
+            return SessionLifecycleAction::BlockNewEntriesAndRatchetTp(
+                "CME_ASIAN_ILLIQUIDITY_WINDOW",
+            );
         }
     }
 
@@ -5578,11 +5694,11 @@ mod tests {
         );
 
         // 2. Verify StallHazardExitManager keeps TP1 at full Kalman mean during active expansion,
-        // then ratchets to Upper-Quartile MFE Re-Touch Price after tau_stall >= 3 mins!
+        // then ratchets to Upper-Quartile MFE Re-Touch Price after tau_stall >= 6 mins with MFE >= 25 bps!
         let mut stall_mgr = StallHazardExitManager::new(Direction::Long, 100.00, 42.0);
-        // Minute 1: expands to +18 bps (100.18), Kalman mean is at 100.35 (+35 bps)
+        // Minute 1: expands to +28 bps (100.28), Kalman mean is at 100.45 (+45 bps)
         let d1 = stall_mgr.on_1m_bar(
-            100.00, 100.18, 99.98, 100.16, 100.00, 100.35, 25.0, 0.5, 0.25, 1.5, &sol_cal,
+            100.00, 100.28, 99.98, 100.26, 100.00, 100.45, 25.0, 0.5, 0.25, 1.5, &sol_cal,
         );
         match d1 {
             HardenedExitDecision::Hold {
@@ -5590,31 +5706,30 @@ mod tests {
                 ..
             } => {
                 assert!(
-                    (tp1 - 100.35).abs() < 1e-4,
-                    "During active expansion, TP1 must remain unshaved at full Kalman mean 100.35, got {:.4}",
+                    (tp1 - 100.45).abs() < 1e-4,
+                    "During active expansion, TP1 must remain unshaved at full Kalman mean 100.45, got {:.4}",
                     tp1
                 );
             }
             other => panic!("Expected Hold at full mean, got {:?}", other),
         }
-        // Minutes 2, 3, 4: trade stalls below 100.18 with waning momentum -> tau_stall reaches 3 mins!
-        let _ = stall_mgr.on_1m_bar(
-            100.16, 100.17, 100.10, 100.12, 100.16, 100.35, 25.0, -0.2, -0.05, 1.5, &sol_cal,
+        // Minutes 2..7: trade stalls below 100.28 with waning momentum -> tau_stall reaches 6 mins!
+        for _ in 0..5 {
+            let _ = stall_mgr.on_1m_bar(
+                100.22, 100.24, 100.16, 100.18, 100.22, 100.45, 25.0, -0.2, -0.05, 1.5, &sol_cal,
+            );
+        }
+        let d7 = stall_mgr.on_1m_bar(
+            100.18, 100.20, 100.14, 100.16, 100.18, 100.45, 25.0, -0.3, -0.10, 1.5, &sol_cal,
         );
-        let _ = stall_mgr.on_1m_bar(
-            100.12, 100.14, 100.08, 100.10, 100.12, 100.35, 25.0, -0.2, -0.05, 1.5, &sol_cal,
-        );
-        let d4 = stall_mgr.on_1m_bar(
-            100.10, 100.12, 100.07, 100.08, 100.10, 100.35, 25.0, -0.3, -0.10, 1.5, &sol_cal,
-        );
-        match d4 {
+        match d7 {
             HardenedExitDecision::Hold {
                 tp1_maker_px: Some(tp1_stalled),
                 ..
             } => {
                 assert!(
-                    tp1_stalled < 100.20 && tp1_stalled > 100.12,
-                    "After 3m stall with MFE >= 15 bps, TP1 must ratchet down to upper-quartile of MFE (~100.15), got {:.4}",
+                    tp1_stalled < 100.28 && tp1_stalled > 100.18,
+                    "After 6m stall with MFE >= 25 bps, TP1 must ratchet down to upper-quartile of MFE (~100.24), got {:.4}",
                     tp1_stalled
                 );
             }
@@ -5827,10 +5942,10 @@ mod tests {
         assert_eq!(engine_a_min_soft_inv_excursion_bps("ETH"), 40.0);
         assert_eq!(engine_a_min_soft_inv_excursion_bps("xyz:XYZ100"), 32.0);
 
-        // Package 4: Soft-invalidation risk budget (~$0.70 / 0.125% equity)
+        // Package 4 + 8B: Soft-invalidation risk budget scaled by asset_risk_cap_mult (BTC = 0.65)
         let btc_soft_cap = compute_engine_a_soft_risk_capped_notional("BTC", 559.04, 1.0);
-        // expected stop: 36.0 + 6.26 = 42.26 bps -> $559.04 * 0.00125 / 0.004226 = $165.36
-        assert!((btc_soft_cap - 165.36).abs() < 0.10);
+        // expected stop: 36.0 + 6.26 = 42.26 bps -> $559.04 * 0.00125 * 0.65 / 0.004226 = $107.48
+        assert!((btc_soft_cap - 107.48).abs() < 0.15);
 
         // Package 4: Single-bar adverse acceleration override
         let override_triggered = check_single_bar_adverse_acceleration_override(
@@ -6031,5 +6146,55 @@ mod tests {
             .unwrap()
             .timestamp_millis() as u64;
         assert!(check_engine_a_us_open_blackout(weekend_ms).is_none());
+    }
+
+    #[test]
+    fn test_package8b_falling_knife_avax_replay_kalman_vel_and_silver_blackouts() {
+        use chrono::{TimeZone, Utc};
+
+        // 1. Replay exact AVAX LONG 17/11 15:02 UTC: Consumed 40.6%, 5m=-95.2 bps, 1m=-34.8 bps, BTC 5m=-50.5 bps
+        assert!(!check_retest_limit_falling_knife_guard(
+            true, 0.406, -95.2, -34.8, -50.5, -106.0
+        ));
+        // Even with normal local 1m, BTC contagion (-40 bps/5m) blocks knife catch
+        assert!(!check_retest_limit_falling_knife_guard(
+            true, 0.20, -20.0, -10.0, -40.0, -50.0
+        ));
+        // Clean calm pullback passes
+        assert!(check_retest_limit_falling_knife_guard(
+            true, 0.25, -18.0, -8.0, -10.0, -15.0
+        ));
+
+        // 2. Kalman Velocity Deceleration Guard
+        assert!(!check_kalman_velocity_entry_guard(true, -2.5, -1.5)); // accelerating down > -1.8 bps/min
+        assert!(check_kalman_velocity_entry_guard(true, -0.8, -1.2)); // decelerating toward mean
+
+        // 3. xyz:SILVER & xyz:GOLD COMEX 08:20-08:40 ET (13:20-13:40 UTC EST) and 02:00-06:00 UTC blackouts
+        let silver_comex_open_est = Utc
+            .with_ymd_and_hms(2026, 11, 17, 13, 28, 0)
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            evaluate_session_lifecycle_gate("xyz:SILVER", silver_comex_open_est),
+            SessionLifecycleAction::BlockNewEntriesAndRatchetTp("CME_COMEX_OPEN_MACRO_SHIELD")
+        );
+
+        let silver_asian_est = Utc
+            .with_ymd_and_hms(2026, 11, 17, 2, 15, 0)
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            evaluate_session_lifecycle_gate("xyz:SILVER", silver_asian_est),
+            SessionLifecycleAction::BlockNewEntriesAndRatchetTp("CME_ASIAN_ILLIQUIDITY_WINDOW")
+        );
+
+        let silver_ny_active = Utc
+            .with_ymd_and_hms(2026, 11, 17, 15, 30, 0)
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            evaluate_session_lifecycle_gate("xyz:SILVER", silver_ny_active),
+            SessionLifecycleAction::AllowNormalTrading
+        );
     }
 }

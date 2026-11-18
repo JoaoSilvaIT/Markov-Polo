@@ -527,6 +527,50 @@ impl RegimeController {
         true
     }
 
+    /// Fast-Track 5m Impulse Promotion Bridge (Package 8):
+    /// Promotes `ControllerMode::MeanReversion` / `Neutral` to `ControllerMode::Trend` on a 5-minute
+    /// close when rolling 5m bars show a high-efficiency directional breakout with volume expansion,
+    /// eliminating the 1-14 minute 15m-clock Catch-22 lag.
+    #[allow(clippy::too_many_arguments)]
+    pub fn promote_synthetic_5m_fast_track(
+        &mut self,
+        er_5m: f64,
+        vol_z_5m: f64,
+        adx_14: f64,
+        adx_slope_pos: bool,
+        has_breakout: bool,
+        is_severe_shock: bool,
+        z_60: f64,
+        now_ms: u64,
+    ) -> bool {
+        let wall_clock_cd_active = self.cooldown_until_ms > 0 && now_ms < self.cooldown_until_ms;
+        if self.current_mode == ControllerMode::Trend
+            || is_severe_shock
+            || self.shock_cooldown_bars > 0
+            || wall_clock_cd_active
+            || z_60 <= -2.5
+            || !has_breakout
+        {
+            return false;
+        }
+        let high_efficiency_impulse = er_5m >= 0.55 && vol_z_5m >= 1.25;
+        let trend_strength_forming = adx_14 >= 16.0 || (adx_14 >= 13.0 && adx_slope_pos);
+        if !(high_efficiency_impulse && trend_strength_forming) {
+            return false;
+        }
+        self.current_mode = ControllerMode::Trend;
+        self.trend_streak = self.trend_streak.max(1);
+        self.consolidation_streak = 0;
+        self.breakout_seen_in_streak = true;
+        self.last_transition_time = Utc::now().to_rfc3339();
+        self.last_reason = format!(
+            "Fast-Track 5m Impulse Promotion (ER_5m={:.2}, VolZ={:.2}, ADX={:.1})",
+            er_5m, vol_z_5m, adx_14
+        );
+        self.epoch += 1;
+        true
+    }
+
     /// Returns gate funnel inspection status for diagnostic telemetry
     pub fn inspect_gates(
         &self,

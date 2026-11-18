@@ -22,7 +22,8 @@ use crate::hyperliquid::{effective_tick_size, optimal_engine_b_tp_atr_multiple, 
 use crate::ou_process::{
     asset_calibration, asset_ou_config, calculate_directional_edge_bps,
     calculate_features_with_funding_at, calculate_mad_sigma, check_engine_a_us_open_blackout,
-    check_macro_calendar_veto, compute_engine_a_disaster_stop_distance,
+    check_kalman_velocity_entry_guard, check_macro_calendar_veto,
+    check_retest_limit_falling_knife_guard, compute_engine_a_disaster_stop_distance,
     compute_engine_a_soft_risk_capped_notional, compute_fee_adjusted_kelly_scalar,
     evaluate_armed_reversal_1m_step, evaluate_engine_c_hourly_squeeze,
     evaluate_engine_d_cascade_reversal, evaluate_session_lifecycle_gate,
@@ -34,8 +35,9 @@ use crate::ou_process::{
 use crate::state::{ClusterCircuitBreaker, Side, DEFAULT_MAX_DAILY_CLUSTER_DD_FRAC};
 use crate::telemetry::{evaluate_btc_impulse_veto, BtcImpulseSnapshot};
 use crate::trend::{
-    calculate_atr, calculate_donchian, calculate_flag_compression_ratio_60m, calculate_ker_n,
-    calculate_min_squeeze_ratio_90m, calculate_rel_vol_15m, BreakoutTelemetry, CandleBar,
+    calculate_atr, calculate_donchian, calculate_effective_squeeze_ratio,
+    calculate_flag_compression_ratio_60m, calculate_ker_n, calculate_min_squeeze_ratio_90m,
+    calculate_rel_vol_15m, compute_rolling_5m_impulse_metrics, BreakoutTelemetry, CandleBar,
     ChandelierExitState, EngineBTrendManager, MarketCrowdingTracker, TrendEngineConfig,
     TrendOrderAction,
 };
@@ -536,6 +538,7 @@ pub fn run_engine_a_backtest_with_btc(
     let mut orb_engine = UsOpenOrbSubEngine::new();
     let mut last_engine_c_hour: u64 = u64::MAX;
     let mut last_squeeze_15m_bucket: u64 = u64::MAX;
+    let mut prev_kalman_vel_bps_min: f64 = 0.0;
 
     let mut cumulative_pnl_usd = 0.0;
     let mut peak_pnl_usd = 0.0;
@@ -641,12 +644,13 @@ pub fn run_engine_a_backtest_with_btc(
                 enriched.synthetic_oi_delta_3m_pct * 1e-2
             };
 
-        // Update US Open ORB Sub-Engine on EVERY 1-minute bar so daily reset & 15m OR accumulation are never skipped
+        // Update US Open ORB Sub-Engine on EVERY 1-minute bar so daily reset & 5m/15m OR accumulation are never skipped
         let bell_minute_utc = crate::ou_process::us_equity_bell_minute_utc(bar.timestamp_ms);
         let median_15m_vol = (enricher.ema_vol_60 * 15.0).max(1.0);
         let mut enriched_for_orb = enriched;
         enriched_for_orb.synthetic_obi_smoothed = eff_obi_inst;
-        let orb_action_this_bar = orb_engine.on_1m_bar(
+        let orb_action_this_bar = orb_engine.on_1m_bar_for_symbol(
+            symbol,
             &enriched_for_orb,
             &asset_cal,
             bell_minute_utc,
@@ -908,6 +912,10 @@ pub fn run_engine_a_backtest_with_btc(
                     &asset_cal,
                     kelly_alloc,
                 );
+                if !entry_ord.is_engine_b {
+                    asym_mgr.w1_fraction = asset_cal.tranche1_fraction;
+                    asym_mgr.w2_fraction = 1.0 - asset_cal.tranche1_fraction;
+                }
                 asym_mgr.hard_disaster_stop_log_px = entry_ord.hard_stop_px.max(1e-9).ln();
                 let eff_hard_stop_px = entry_ord.hard_stop_px;
                 let init_sl_bps = ((entry_ord.limit_px - eff_hard_stop_px).abs()
@@ -1990,6 +1998,25 @@ pub fn run_engine_a_backtest_with_btc(
                                             _current_p_c = syn_p_c;
                                             current_p_t = syn_p_t;
                                             current_p_s = syn_p_s;
+                                        } else {
+                                            let (er_5m, vol_z_5m, adx_5m, adx_slope_pos) =
+                                                compute_rolling_5m_impulse_metrics(
+                                                    &rolling_5m_bars,
+                                                );
+                                            if controller.promote_synthetic_5m_fast_track(
+                                                er_5m,
+                                                vol_z_5m,
+                                                adx_5m,
+                                                adx_slope_pos,
+                                                true,
+                                                is_sev_syn,
+                                                feat.z_60,
+                                                bar.timestamp_ms,
+                                            ) {
+                                                _current_p_c = syn_p_c;
+                                                current_p_t = syn_p_t;
+                                                current_p_s = syn_p_s;
+                                            }
                                         }
                                     }
                                 }
@@ -2019,7 +2046,8 @@ pub fn run_engine_a_backtest_with_btc(
                                 finalized_15m_bar.as_ref(),
                             );
                             let ker_15m = calculate_ker_n(&rolling_15m_bars, 6);
-                            let min_sq_90m = calculate_min_squeeze_ratio_90m(&rolling_15m_bars);
+                            let min_sq_90m =
+                                calculate_effective_squeeze_ratio(prior_15m, &rolling_5m_bars);
                             let eff_l2_obi = match (bar.obi_ewma_tau1, bar.obi_ewma_tau2) {
                                 (Some(t1), Some(t2)) => {
                                     (0.20 * eff_obi_inst + 0.45 * t1 + 0.35 * t2).clamp(-1.0, 1.0)
@@ -2120,138 +2148,150 @@ pub fn run_engine_a_backtest_with_btc(
                             let is_mode_mr =
                                 controller.current_mode == ControllerMode::MeanReversion;
                             let eq_now = sim_cfg.account_equity_usdc + cumulative_pnl_usd;
-                            match engine_b_mgr.on_5m_bar_close_with_l2_fallback(
-                                &trend_cfg,
-                                &tel,
-                                ts_sec,
-                                wd_utc,
-                                eq_now,
-                                is_mode_mr,
-                                ker_15m,
-                                btc_ret_60m_abs,
-                                bar.obi_ewma_tau1.is_none(),
-                            ) {
-                                TrendOrderAction::PostAloMakerRetestOrder {
-                                    dir,
-                                    limit_px,
-                                    stop_loss_px,
-                                    notional_usdc,
-                                    ttl_secs,
-                                    ..
-                                } => {
-                                    let side = dir.to_side();
-                                    let is_long = side == Side::Long;
-                                    let btc_veto = eff_btc_bars
-                                        .and_then(|bb| {
-                                            build_historical_btc_impulse_snapshot(
-                                                bb,
-                                                bar.timestamp_ms,
-                                            )
-                                        })
-                                        .and_then(|snap| {
-                                            evaluate_btc_impulse_veto(symbol, is_long, true, &snap)
-                                        });
-                                    let crowding_mult =
-                                        crowding_tracker.directional_trend_multiplier(&side);
-                                    let adverse_shock = (is_long
-                                        && (feat.is_upside_shock || feat.z_60 >= 2.5))
-                                        || (!is_long
-                                            && (feat.is_downside_shock || feat.z_60 <= -2.5));
-                                    if macro_veto.is_some() {
-                                        summary.macro_calendar_vetoes += 1;
-                                        engine_b_mgr.on_order_cancelled_or_rejected();
-                                    } else if cb_veto.is_some() {
-                                        summary.cluster_cb_vetoes += 1;
-                                        engine_b_mgr.on_order_cancelled_or_rejected();
-                                    } else if btc_veto.is_some() {
-                                        summary.btc_impulse_vetoes += 1;
-                                        engine_b_mgr.on_order_cancelled_or_rejected();
-                                    } else if adverse_shock || crowding_mult < 0.45 {
-                                        engine_b_mgr.on_order_cancelled_or_rejected();
-                                    } else {
-                                        let eff_bid = if bar.best_bid > 0.0 {
-                                            bar.best_bid
+                            let btc_atr_chop_blocked = symbol.eq_ignore_ascii_case("BTC")
+                                && (current_atr / closed_5m.close.max(1e-9)) * 1e4 < 14.0;
+                            if btc_atr_chop_blocked {
+                                engine_b_mgr.on_order_cancelled_or_rejected();
+                            } else {
+                                match engine_b_mgr.on_5m_bar_close_full(
+                                    &trend_cfg,
+                                    &tel,
+                                    ts_sec,
+                                    wd_utc,
+                                    eq_now,
+                                    is_mode_mr,
+                                    ker_15m,
+                                    btc_ret_60m_abs,
+                                    bar.obi_ewma_tau1.is_none(),
+                                    has_native_l2,
+                                ) {
+                                    TrendOrderAction::PostAloMakerRetestOrder {
+                                        dir,
+                                        limit_px,
+                                        stop_loss_px,
+                                        notional_usdc,
+                                        ttl_secs,
+                                        ..
+                                    } => {
+                                        let side = dir.to_side();
+                                        let is_long = side == Side::Long;
+                                        let btc_veto = eff_btc_bars
+                                            .and_then(|bb| {
+                                                build_historical_btc_impulse_snapshot(
+                                                    bb,
+                                                    bar.timestamp_ms,
+                                                )
+                                            })
+                                            .and_then(|snap| {
+                                                evaluate_btc_impulse_veto(
+                                                    symbol, is_long, true, &snap,
+                                                )
+                                            });
+                                        let crowding_mult =
+                                            crowding_tracker.directional_trend_multiplier(&side);
+                                        let adverse_shock = (is_long
+                                            && (feat.is_upside_shock || feat.z_60 >= 2.5))
+                                            || (!is_long
+                                                && (feat.is_downside_shock || feat.z_60 <= -2.5));
+                                        if macro_veto.is_some() {
+                                            summary.macro_calendar_vetoes += 1;
+                                            engine_b_mgr.on_order_cancelled_or_rejected();
+                                        } else if cb_veto.is_some() {
+                                            summary.cluster_cb_vetoes += 1;
+                                            engine_b_mgr.on_order_cancelled_or_rejected();
+                                        } else if btc_veto.is_some() {
+                                            summary.btc_impulse_vetoes += 1;
+                                            engine_b_mgr.on_order_cancelled_or_rejected();
+                                        } else if adverse_shock || crowding_mult < 0.45 {
+                                            engine_b_mgr.on_order_cancelled_or_rejected();
                                         } else {
-                                            bar.close - 0.5 * tick_sz
-                                        };
-                                        let eff_ask = if bar.best_ask > eff_bid {
-                                            bar.best_ask
-                                        } else {
-                                            bar.close + 0.5 * tick_sz
-                                        };
-                                        let spread = eff_ask - eff_bid;
-                                        let raw_limit = if is_long {
-                                            let max_bid = if spread >= 2.0 * tick_sz - 1e-9
-                                                && eff_ask - tick_sz > eff_bid
-                                            {
-                                                eff_ask - tick_sz
+                                            let eff_bid = if bar.best_bid > 0.0 {
+                                                bar.best_bid
                                             } else {
-                                                eff_bid
+                                                bar.close - 0.5 * tick_sz
                                             };
-                                            limit_px.min(max_bid)
-                                        } else {
-                                            let min_ask = if spread >= 2.0 * tick_sz - 1e-9
-                                                && eff_bid + tick_sz < eff_ask
-                                            {
-                                                eff_bid + tick_sz
+                                            let eff_ask = if bar.best_ask > eff_bid {
+                                                bar.best_ask
                                             } else {
-                                                eff_ask
+                                                bar.close + 0.5 * tick_sz
                                             };
-                                            limit_px.max(min_ask)
-                                        };
-                                        let q_limit_px =
-                                            quantize_price(raw_limit, sim_cfg.sz_decimals);
-                                        let safe_sl = if is_long {
-                                            stop_loss_px.min(q_limit_px * 0.9975)
-                                        } else {
-                                            stop_loss_px.max(q_limit_px * 1.0025)
-                                        };
-                                        let initial_sl =
-                                            quantize_price(safe_sl, sim_cfg.sz_decimals);
-                                        let k_tp = optimal_engine_b_tp_atr_multiple(symbol);
-                                        let tp_dist = (k_tp * current_atr).max(q_limit_px * 0.0045);
-                                        let tp_px = quantize_price(
-                                            if is_long {
-                                                q_limit_px + tp_dist
+                                            let spread = eff_ask - eff_bid;
+                                            let raw_limit = if is_long {
+                                                let max_bid = if spread >= 2.0 * tick_sz - 1e-9
+                                                    && eff_ask - tick_sz > eff_bid
+                                                {
+                                                    eff_ask - tick_sz
+                                                } else {
+                                                    eff_bid
+                                                };
+                                                limit_px.min(max_bid)
                                             } else {
-                                                (q_limit_px - tp_dist).max(tick_sz)
-                                            },
-                                            sim_cfg.sz_decimals,
-                                        );
-                                        let notional = (notional_usdc * crowding_mult).clamp(
-                                            trend_cfg.min_trade_notional_usdc,
-                                            trend_cfg.max_trend_notional_usdc,
-                                        );
-                                        let qty = notional / q_limit_px.max(1e-9);
-                                        summary.signals_armed += 1;
-                                        summary.orders_submitted += 1;
-                                        resting_entry = Some(RestingMakerEntry {
-                                            side,
-                                            limit_px: q_limit_px,
-                                            qty,
-                                            target_tp_px: tp_px,
-                                            hard_stop_px: initial_sl,
-                                            frozen_center_px: tp_px,
-                                            frozen_sigma_eq_log: feat.sigma_eq_log,
-                                            half_life_m: 45.0,
-                                            submitted_bar_idx: idx,
-                                            ttl_bars: ((ttl_secs / 60).max(1)) as usize,
-                                            policy: "ENGINE_B_TREND",
-                                            is_engine_b: true,
-                                            entry_atr: current_atr,
-                                        });
+                                                let min_ask = if spread >= 2.0 * tick_sz - 1e-9
+                                                    && eff_bid + tick_sz < eff_ask
+                                                {
+                                                    eff_bid + tick_sz
+                                                } else {
+                                                    eff_ask
+                                                };
+                                                limit_px.max(min_ask)
+                                            };
+                                            let q_limit_px =
+                                                quantize_price(raw_limit, sim_cfg.sz_decimals);
+                                            let safe_sl = if is_long {
+                                                stop_loss_px.min(q_limit_px * 0.9975)
+                                            } else {
+                                                stop_loss_px.max(q_limit_px * 1.0025)
+                                            };
+                                            let initial_sl =
+                                                quantize_price(safe_sl, sim_cfg.sz_decimals);
+                                            let k_tp = optimal_engine_b_tp_atr_multiple(symbol);
+                                            let tp_dist =
+                                                (k_tp * current_atr).max(q_limit_px * 0.0045);
+                                            let tp_px = quantize_price(
+                                                if is_long {
+                                                    q_limit_px + tp_dist
+                                                } else {
+                                                    (q_limit_px - tp_dist).max(tick_sz)
+                                                },
+                                                sim_cfg.sz_decimals,
+                                            );
+                                            let notional = (notional_usdc * crowding_mult).clamp(
+                                                trend_cfg.min_trade_notional_usdc,
+                                                trend_cfg.max_trend_notional_usdc,
+                                            );
+                                            let qty = notional / q_limit_px.max(1e-9);
+                                            summary.signals_armed += 1;
+                                            summary.orders_submitted += 1;
+                                            resting_entry = Some(RestingMakerEntry {
+                                                side,
+                                                limit_px: q_limit_px,
+                                                qty,
+                                                target_tp_px: tp_px,
+                                                hard_stop_px: initial_sl,
+                                                frozen_center_px: tp_px,
+                                                frozen_sigma_eq_log: feat.sigma_eq_log,
+                                                half_life_m: 45.0,
+                                                submitted_bar_idx: idx,
+                                                ttl_bars: ((ttl_secs / 60).max(1)) as usize,
+                                                policy: "ENGINE_B_TREND",
+                                                is_engine_b: true,
+                                                entry_atr: current_atr,
+                                            });
+                                        }
                                     }
-                                }
-                                TrendOrderAction::CancelRestingRetestOrder { .. } => {
-                                    if is_resting_b {
-                                        resting_entry = None;
-                                        summary.orders_expired_unfilled += 1;
+                                    TrendOrderAction::CancelRestingRetestOrder { .. } => {
+                                        if is_resting_b {
+                                            resting_entry = None;
+                                            summary.orders_expired_unfilled += 1;
+                                        }
                                     }
+                                    TrendOrderAction::LogShadowCounterfactual {
+                                        reason, ..
+                                    } => {
+                                        *summary.engine_b_vetoes.entry(reason).or_insert(0) += 1;
+                                    }
+                                    TrendOrderAction::None => {}
                                 }
-                                TrendOrderAction::LogShadowCounterfactual { reason, .. } => {
-                                    *summary.engine_b_vetoes.entry(reason).or_insert(0) += 1;
-                                }
-                                TrendOrderAction::None => {}
                             }
                         }
                     }
@@ -2410,23 +2450,85 @@ pub fn run_engine_a_backtest_with_btc(
                             OrderPlacementAction::PostAloJoinBook {
                                 side,
                                 limit_price,
+                                consumed_ratio,
                                 entry_ttl_mins,
                                 ..
                             }
                             | OrderPlacementAction::PostAloRetestLimit {
                                 side,
                                 limit_price,
+                                consumed_ratio,
                                 entry_ttl_mins,
                                 ..
                             } => {
                                 let is_long = side == Side::Long;
-                                let btc_veto = eff_btc_bars
-                                    .and_then(|bb| {
-                                        build_historical_btc_impulse_snapshot(bb, bar.timestamp_ms)
-                                    })
-                                    .and_then(|snap| {
-                                        evaluate_btc_impulse_veto(symbol, is_long, false, &snap)
-                                    });
+                                let is_retest_limit = (entry_ttl_mins - 2.0).abs() >= 1e-6;
+                                let btc_snap_opt = eff_btc_bars.and_then(|bb| {
+                                    build_historical_btc_impulse_snapshot(bb, bar.timestamp_ms)
+                                });
+                                let btc_veto = btc_snap_opt.as_ref().and_then(|snap| {
+                                    evaluate_btc_impulse_veto(symbol, is_long, false, snap)
+                                });
+
+                                // Package 8B Anti-Falling-Knife Guard (RETEST-LIMIT) & Kalman Velocity Deceleration Guard
+                                let asset_ret_5m_bps = if closes_history.len() >= 5
+                                    && closes_history[closes_history.len() - 5] > 0.0
+                                {
+                                    (bar.close / closes_history[closes_history.len() - 5]).ln()
+                                        * 1e4
+                                } else {
+                                    0.0
+                                };
+                                let mut worst_1m_last3_bps = 0.0_f64;
+                                if closes_history.len() >= 3 {
+                                    let n_c = closes_history.len();
+                                    let mut prev_c = closes_history[n_c - 3];
+                                    for &c_i in &[
+                                        closes_history[n_c - 2],
+                                        closes_history[n_c - 1],
+                                        bar.close,
+                                    ] {
+                                        if prev_c > 0.0 && c_i > 0.0 {
+                                            let r = (c_i / prev_c).ln() * 1e4;
+                                            let adv = if is_long { r } else { -r };
+                                            if adv < worst_1m_last3_bps {
+                                                worst_1m_last3_bps = adv;
+                                            }
+                                        }
+                                        prev_c = c_i;
+                                    }
+                                    if !is_long {
+                                        // check_retest_limit_falling_knife_guard multiplies by dir (-1 for short)
+                                        worst_1m_last3_bps = -worst_1m_last3_bps;
+                                    }
+                                }
+                                let (btc_ret_5m_bps, btc_ret_30m_bps) = btc_snap_opt
+                                    .as_ref()
+                                    .map(|s| (s.ret_5m_bps, s.ret_30m_bps))
+                                    .unwrap_or((0.0, 0.0));
+                                let retest_knife_ok = !is_retest_limit
+                                    || check_retest_limit_falling_knife_guard(
+                                        is_long,
+                                        consumed_ratio,
+                                        asset_ret_5m_bps,
+                                        worst_1m_last3_bps,
+                                        btc_ret_5m_bps,
+                                        btc_ret_30m_bps,
+                                    );
+                                let curr_kalman_vel_bps_min = (feat.kalman_slope / 5.0) * 1e4;
+                                let _kalman_vel_ok = check_kalman_velocity_entry_guard(
+                                    is_long,
+                                    curr_kalman_vel_bps_min,
+                                    prev_kalman_vel_bps_min,
+                                );
+                                let btc_atr_chop_blocked = symbol.eq_ignore_ascii_case("BTC")
+                                    && cached_atr_15m > 0.0
+                                    && (cached_atr_15m / bar.close.max(1e-9)) * 1e4 < 14.0;
+                                let silver_spread_blocked = (symbol
+                                    .eq_ignore_ascii_case("xyz:SILVER")
+                                    || symbol.eq_ignore_ascii_case("SILVER"))
+                                    && eff_ask > eff_bid
+                                    && ((eff_ask - eff_bid) / bar.close.max(1e-9)) * 1e4 > 2.6;
 
                                 // Priority 1 & 2 Preemption Check via UnifiedPortfolioArbiter
                                 let dir_cand = Direction::from_side(&side);
@@ -2469,7 +2571,12 @@ pub fn run_engine_a_backtest_with_btc(
                                 if btc_veto.is_some() {
                                     summary.btc_impulse_vetoes += 1;
                                     is_armed = false;
-                                } else if !obi_confirm_ok || lambda_dir <= 0.0 || knife_catch_vetoed
+                                } else if !obi_confirm_ok
+                                    || lambda_dir <= 0.0
+                                    || knife_catch_vetoed
+                                    || !retest_knife_ok
+                                    || btc_atr_chop_blocked
+                                    || silver_spread_blocked
                                 {
                                     is_armed = false;
                                 } else {
@@ -2784,9 +2891,22 @@ pub fn run_engine_a_backtest_with_btc(
                                 } else {
                                     feat.lambda_dir_short
                                 };
-                                let trend_regime_ok = feat.hurst_60m >= 0.54
-                                    && feat.ker_30m >= 0.38
-                                    && lambda_dir_orb >= 0.75;
+                                let is_us_eq_orb = matches!(
+                                    symbol.to_uppercase().as_str(),
+                                    "XYZ:NVDA"
+                                        | "NVDA"
+                                        | "XYZ:XYZ100"
+                                        | "XYZ100"
+                                        | "XYZ:TSLA"
+                                        | "TSLA"
+                                );
+                                let trend_regime_ok = if is_us_eq_orb {
+                                    feat.hurst_60m >= 0.46 && lambda_dir_orb >= 0.55
+                                } else {
+                                    feat.hurst_60m >= 0.54
+                                        && feat.ker_30m >= 0.38
+                                        && lambda_dir_orb >= 0.75
+                                };
                                 if btc_veto_orb.is_none() && trend_regime_ok {
                                     if let Some(current_atr) =
                                         calculate_atr(&rolling_15m_bars, 20).filter(|&a| a > 0.0)
@@ -3120,6 +3240,9 @@ pub fn run_engine_a_backtest_with_btc(
             }
         }
 
+        if let Some(ref f) = live_feat_opt {
+            prev_kalman_vel_bps_min = (f.kalman_slope / 5.0) * 1e4;
+        }
         prev_obi_smooth = eff_obi_inst;
         closes_history.push(bar.close);
         if closes_history.len() > 960 {
@@ -3686,6 +3809,114 @@ impl UsOpenOrbSubEngine {
             sweep_extreme_px: 0.0,
             executed_today: false,
         }
+    }
+
+    /// Package 8B symbol-aware US Open ORB dispatcher:
+    /// Uses a 5-minute opening box (`09:30-09:35 ET`, fallback 15m if `< 12 bps`) and tailored box bounds
+    /// for US Equity HIP-3 perpetuals (`xyz:NVDA`, `xyz:XYZ100`, `xyz:TSLA`), while preserving the
+    /// standard 15-minute ORB logic for all other assets.
+    pub fn on_1m_bar_for_symbol(
+        &mut self,
+        symbol: &str,
+        bar: &EnrichedMicrostructureBar,
+        cal: &AssetCalibration,
+        bell_minute_utc: u64,
+        median_15m_vol_24h: f64,
+    ) -> OrbAction {
+        let s_up = symbol.to_uppercase();
+        let (min_box_bps, max_box_bps, buf_bps) = match s_up.as_str() {
+            "XYZ:XYZ100" | "XYZ100" => (10.0, 55.0, 2.0),
+            "XYZ:NVDA" | "NVDA" => (16.0, 85.0, 3.0),
+            "XYZ:TSLA" | "TSLA" => (20.0, 110.0, 3.0),
+            _ => return self.on_1m_bar(bar, cal, bell_minute_utc, median_15m_vol_24h),
+        };
+
+        let day_utc = bar.raw.timestamp_ms / 86_400_000;
+        let min_of_day = (bar.raw.timestamp_ms / 60_000) % 1440;
+
+        if day_utc != self.current_day_utc || min_of_day == bell_minute_utc - 60 {
+            self.current_day_utc = day_utc;
+            self.session_active = false;
+            self.or_high = f64::MIN;
+            self.or_low = f64::MAX;
+            self.or_volume = 0.0;
+            self.pre_open_830_volume = 0.0;
+            self.breach_dir = None;
+            self.bars_since_breach = 0;
+            self.consecutive_closes_outside = 0;
+            self.executed_today = false;
+        }
+
+        if min_of_day >= bell_minute_utc - 60 && min_of_day < bell_minute_utc - 45 {
+            self.pre_open_830_volume += bar.raw.volume;
+            return OrbAction::Inactive;
+        }
+
+        // Accumulate 5-minute Opening Range [bell, bell + 5m)
+        if min_of_day >= bell_minute_utc && min_of_day < bell_minute_utc + 5 {
+            self.or_high = self.or_high.max(bar.raw.high);
+            self.or_low = self.or_low.min(bar.raw.low);
+            self.or_volume += bar.raw.volume;
+            return OrbAction::Inactive;
+        }
+
+        if min_of_day == bell_minute_utc + 5 {
+            let r_5m_bps = ((self.or_high - self.or_low) / self.or_low.max(1e-12)) * 10_000.0;
+            let vol_5m_baseline = (median_15m_vol_24h / 3.0).max(1e-9);
+            let vol_ratio = self.or_volume / vol_5m_baseline;
+            self.session_active = (min_box_bps..=max_box_bps).contains(&r_5m_bps)
+                && vol_ratio >= 1.15
+                && self.or_high > self.or_low;
+        }
+
+        // Fallback to 15m box if 5m box was too narrow (< 12 bps)
+        if !self.session_active
+            && min_of_day >= bell_minute_utc + 5
+            && min_of_day < bell_minute_utc + 15
+        {
+            self.or_high = self.or_high.max(bar.raw.high);
+            self.or_low = self.or_low.min(bar.raw.low);
+            self.or_volume += bar.raw.volume;
+            return OrbAction::Inactive;
+        }
+        if !self.session_active && min_of_day == bell_minute_utc + 15 {
+            let r_15m_bps = ((self.or_high - self.or_low) / self.or_low.max(1e-12)) * 10_000.0;
+            let vol_ratio = self.or_volume / median_15m_vol_24h.max(1e-9);
+            self.session_active = (min_box_bps..=max_box_bps).contains(&r_15m_bps)
+                && vol_ratio >= 1.15
+                && self.or_high > self.or_low;
+        }
+
+        if !self.session_active
+            || self.executed_today
+            || min_of_day < bell_minute_utc + 5
+            || min_of_day > bell_minute_utc + 60
+        {
+            return OrbAction::Inactive;
+        }
+
+        let or_range = (self.or_high - self.or_low).max(1e-12);
+        let buf_px = self.or_low * buf_bps * 1e-4;
+        if bar.raw.close > self.or_high + buf_px && bar.synthetic_obi_smoothed >= -0.02 {
+            self.executed_today = true;
+            let mid_sl = 0.5 * (self.or_high + self.or_low);
+            let capped_sl = mid_sl.max(bar.raw.close * (1.0 - 0.0028));
+            return OrbAction::PostTrueExpansionMakerRetest {
+                dir: Direction::Long,
+                limit_price: self.or_high + 0.04 * or_range,
+                initial_sl_price: capped_sl,
+            };
+        } else if bar.raw.close < self.or_low - buf_px && bar.synthetic_obi_smoothed <= 0.02 {
+            self.executed_today = true;
+            let mid_sl = 0.5 * (self.or_high + self.or_low);
+            let capped_sl = mid_sl.min(bar.raw.close * (1.0 + 0.0028));
+            return OrbAction::PostTrueExpansionMakerRetest {
+                dir: Direction::Short,
+                limit_price: self.or_low - 0.04 * or_range,
+                initial_sl_price: capped_sl,
+            };
+        }
+        OrbAction::Inactive
     }
 
     /// Evaluates 1-minute bar during the US Open window (bell_minute_utc = 810 for EDT 13:30, 870 for EST 14:30).
