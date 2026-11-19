@@ -38,9 +38,9 @@ use crate::hyperliquid::{
     get_user_position, optimal_engine_b_tp_atr_multiple, place_disaster_stop_trigger_order,
     place_reduce_only_tp_order, quantize_price, round_to_decimals,
 };
-use crate::order::{emergency_flatten_fast, place_ou_maker_entry};
+use crate::order::{emergency_flatten_fast, place_ou_maker_entry, place_trend_1h_ioc_entry};
 use crate::ou_process::{
-    asset_calibration, calculate_directional_edge_bps, calculate_features_with_funding,
+    asset_calibration, calculate_directional_edge_bps, calculate_features_with_funding_at,
     check_engine_a_us_open_blackout, check_kalman_velocity_entry_guard, check_macro_calendar_veto,
     check_retest_limit_falling_knife_guard, check_single_bar_adverse_acceleration_override,
     compute_engine_a_disaster_stop_distance, compute_engine_a_soft_risk_capped_notional,
@@ -61,6 +61,7 @@ use crate::trend::{
     record_shadow_entry, record_shadow_exit, save_shadow_trade, BreakoutTelemetry, CandleBar,
     ChandelierExitState, EngineBCandidateLog, EngineBTrendManager, L2ObiTracker,
     MarketCrowdingTracker, TrendAlignment, TrendEngineConfig, TrendOrderAction,
+    TrendPullback1hEngine,
 };
 
 const L2_ORDERBOOK_FRESH_MS: u64 = 16_500;
@@ -758,7 +759,8 @@ async fn main() {
                 println!("   ↳ [ENGINE B GATE BREAKDOWN]: {}", veto_str.join(" | "));
             }
 
-            let trade_display = if res.trades.len() > 3 {
+            let show_all_trades = std::env::var("HL_BACKTEST_VERBOSE").as_deref() == Ok("1");
+            let trade_display = if !show_all_trades && res.trades.len() > 3 {
                 println!(
                     "   ... [{} earlier trades omitted; showing latest 3]",
                     res.trades.len() - 3
@@ -810,6 +812,7 @@ async fn main() {
             .iter()
             .filter(|t| {
                 t.entry_policy == "ENGINE_B_TREND"
+                    || t.entry_policy == "ENGINE_B_1H_PULLBACK"
                     || t.entry_policy == "ENGINE_B_HANDOFF"
                     || t.entry_policy == "ENGINE_B_US_OPEN_ORB"
             })
@@ -847,6 +850,29 @@ async fn main() {
                 "   ↳ {}: {} trades ({}W/{}L, {:.1}% WR) | Payoff: {:.2} (Avg W: +{:.1} / Avg L: -{:.1} bps) | Net: ${:+.2} | Fees: ${:.2}",
                 name, n, w, l, wr, payoff, avg_win, avg_loss, net_usd, fees_usd
             );
+        }
+        if native_only {
+            const SPLIT_MS: u64 = 1_794_096_000_000; // 2026-11-08 00:00 UTC
+            for (label, filt) in [
+                ("Policy JOIN_BOOK   ", all_trades.iter().filter(|t| t.entry_policy == "JOIN_BOOK").copied().collect::<Vec<_>>()),
+                ("Policy RETEST_LIMIT", all_trades.iter().filter(|t| t.entry_policy == "RETEST_LIMIT").copied().collect::<Vec<_>>()),
+                ("Policy 1H_PULLBACK ", all_trades.iter().filter(|t| t.entry_policy == "ENGINE_B_1H_PULLBACK").copied().collect::<Vec<_>>()),
+                ("H1 (< Nov 08 UTC)  ", all_trades.iter().filter(|t| t.entry_time_ms < SPLIT_MS).copied().collect::<Vec<_>>()),
+                ("H2 (>= Nov 08 UTC) ", all_trades.iter().filter(|t| t.entry_time_ms >= SPLIT_MS).copied().collect::<Vec<_>>()),
+            ] {
+                if filt.is_empty() { continue; }
+                let n = filt.len();
+                let w = filt.iter().filter(|t| t.net_bps > 0.0).count();
+                let net_u: f64 = filt.iter().map(|t| t.net_pnl_usd).sum();
+                let net_b: f64 = filt.iter().map(|t| t.net_bps).sum();
+                let gp: f64 = filt.iter().filter(|t| t.net_pnl_usd > 0.0).map(|t| t.net_pnl_usd).sum();
+                let gl: f64 = filt.iter().filter(|t| t.net_pnl_usd <= 0.0).map(|t| t.net_pnl_usd.abs()).sum();
+                let pf = if gl > 1e-9 { gp / gl } else if gp > 0.0 { 99.9 } else { 0.0 };
+                println!(
+                    "   ↳ [SPLIT] {}: {:3} trades ({:2}W/{:2}L, {:5.1}% WR) | PF: {:5.2} | Net: ${:+6.2} ({:+6.1} bps, {:+.1}/tr)",
+                    label, n, w, n - w, (w as f64 / n as f64) * 100.0, pf, net_u, net_b, net_b / n as f64
+                );
+            }
         }
 
         use std::collections::HashMap;
@@ -1356,6 +1382,79 @@ async fn main() {
         }
     }
 
+    // Package 9: Pre-fill 260 historical 1h bars for Engine B v2 (1H EMA12/EMA50/EMA200 Pullback-in-Trend)
+    let mut engine_b_1h = TrendPullback1hEngine::new();
+    let mut current_1h_bar: Option<CandleBar> = None;
+    let start_1h_ms = now_ms.saturating_sub(260 * 60 * 60 * 1000);
+    println!(
+        "⏳ [INGESTION] Pre-filling 260h historical 1h candles for {} via Hyperliquid REST...",
+        trading_symbol
+    );
+    let mut res_1h_candles = Err("Unattempted".to_string());
+    for attempt in 0..3 {
+        match info_client
+            .candles_snapshot(trading_symbol.clone(), "1h".to_string(), start_1h_ms, now_ms)
+            .await
+        {
+            Ok(c) => {
+                res_1h_candles = Ok(c);
+                break;
+            }
+            Err(e) => {
+                res_1h_candles = Err(format!("{:?}", e));
+                if attempt < 2 {
+                    tokio::time::sleep(Duration::from_millis(500 * (1 << attempt))).await;
+                }
+            }
+        }
+    }
+    match res_1h_candles {
+        Ok(mut candles) => {
+            candles.sort_by_key(|c| c.time_open);
+            candles.dedup_by_key(|c| c.time_open);
+            let mut bars_1h_init = Vec::with_capacity(candles.len());
+            for c in candles {
+                if let (Ok(open_f), Ok(high_f), Ok(low_f), Ok(close_f)) = (
+                    c.open.parse::<f64>(),
+                    c.high.parse::<f64>(),
+                    c.low.parse::<f64>(),
+                    c.close.parse::<f64>(),
+                ) {
+                    let vol_f = c.vlm.parse::<f64>().unwrap_or(0.0);
+                    let bar_1h = CandleBar {
+                        time_open: c.time_open,
+                        open: open_f,
+                        high: high_f,
+                        low: low_f,
+                        close: close_f,
+                        volume: vol_f,
+                    };
+                    if c.time_open + 3_600_000 > now_ms {
+                        current_1h_bar = Some(bar_1h);
+                    } else {
+                        bars_1h_init.push(bar_1h);
+                    }
+                }
+            }
+            engine_b_1h.warmup_from_1h_bars(&bars_1h_init);
+            println!(
+                "✅ [INGESTION] Warmed up Engine B v2 (1H EMA50 Pullback) with {} closed 1h bars for {} (EMA12=${:.2}, EMA50=${:.2}, EMA200=${:.2}, ATR_1h=${:.4}).",
+                engine_b_1h.bars_seen,
+                trading_symbol,
+                engine_b_1h.ema12,
+                engine_b_1h.ema50,
+                engine_b_1h.ema200,
+                engine_b_1h.atr_1h
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "❌ [INGESTION ERROR] Failed to fetch 1h candles for {}: {}",
+                trading_symbol, e
+            );
+        }
+    }
+
     crate::discord::send_alert(
         discord_url.as_deref(),
         &format!(
@@ -1494,7 +1593,7 @@ async fn main() {
                 if pos.stop_loss_price <= 0.0 {
                     pos.stop_loss_price = default_sl;
                 }
-                if pos.take_profit_price <= 0.0 {
+                if pos.take_profit_price <= 0.0 && pos.engine_type != "EngineB1h" {
                     let base_px = if pos.entry_price > 0.0 { pos.entry_price } else { ep };
                     let k_tp = optimal_engine_b_tp_atr_multiple(&trading_symbol);
                     let tp_dist = (k_tp * pos.current_atr).max(base_px * 0.0045);
@@ -1631,12 +1730,16 @@ async fn main() {
                                 reprice_count: 0,
                                 candidate_lower_count: 0,
                                 engine_type: intent.engine_type.clone(),
-                                chandelier_stop: if intent.engine_type == "EngineB" {
+                                chandelier_stop: if intent.engine_type == "EngineB"
+                                    || intent.engine_type == "EngineB1h"
+                                {
                                     intent.stop_loss
                                 } else {
                                     0.0
                                 },
-                                active_multiplier: if intent.engine_type == "EngineB" {
+                                active_multiplier: if intent.engine_type == "EngineB1h" {
+                                    4.0
+                                } else if intent.engine_type == "EngineB" {
                                     2.0
                                 } else {
                                     0.0
@@ -2557,6 +2660,41 @@ async fn main() {
                             );
                         }
                     }
+                } else if pos_exists
+                    && pos.engine_type == "EngineB1h"
+                    && pos.stop_loss_price > 0.0
+                    && pos.disaster_stop_oid.is_none()
+                {
+                    let sl_is_buy = pos.side == "SHORT";
+                    let total_amt = if current_szi.abs() > 0.0 {
+                        current_szi.abs()
+                    } else {
+                        pos.amount
+                    };
+                    let sl_px = quantize_price(pos.stop_loss_price, watcher_sz_decimals);
+                    let sl_cloid = uuid::Uuid::new_v4();
+                    if let Ok(sl_oid) = place_disaster_stop_trigger_order(
+                        &watcher_exchange,
+                        &watcher_symbol,
+                        sl_is_buy,
+                        sl_px,
+                        total_amt,
+                        watcher_sz_decimals,
+                        Some(sl_cloid),
+                    )
+                    .await
+                    {
+                        let mut state_lock = watcher_state.lock().await;
+                        if let Some(p) = state_lock.get_mut(&watcher_symbol) {
+                            p.disaster_stop_oid = Some(sl_oid);
+                            p.amount = total_amt;
+                            let _ = save_state(&watcher_state_path, &state_lock);
+                        }
+                        println!(
+                            "🛡️ [FAST-SENTINEL] Placed missing Exchange-Native StopMarket for EngineB1h {} at ${:.4} (oid: {}, sz: {:.4})",
+                            watcher_symbol, sl_px, sl_oid, total_amt
+                        );
+                    }
                 } else if is_truly_dead {
                     if let Ok(oid) = pos.order_id.parse::<u64>() {
                         let _ = cancel_order(&watcher_exchange, &watcher_symbol, oid).await;
@@ -2741,7 +2879,10 @@ async fn main() {
                     // 2. Replace exchange-native Disaster Stop trigger order for the full position size
                     if pos.stop_loss_price > 0.0 {
                         let is_long_sync = pos.side == "LONG";
-                        let sl_px_sync = if pos.disaster_stop_ratcheted_to_be || pos.engine_type == "EngineB" {
+                        let sl_px_sync = if pos.disaster_stop_ratcheted_to_be
+                            || pos.engine_type == "EngineB"
+                            || pos.engine_type == "EngineB1h"
+                        {
                             quantize_price(pos.stop_loss_price, watcher_sz_decimals)
                         } else {
                             let raw_sl = if is_long_sync {
@@ -3689,6 +3830,56 @@ async fn main() {
                     }
                 }
 
+                // Package 9: Aggregate finalized 1-hour candles for Engine B v2 (1H EMA50 Pullback-in-Trend)
+                let candle_bucket_1h = (completed_bar.time_open / 3_600_000) * 3_600_000;
+                let is_last_1m_of_1h = completed_bar.time_open + 60_000 >= candle_bucket_1h + 3_600_000;
+                let mut finalized_1h_bar: Option<CandleBar> = None;
+                if let Some(mut cur_1h) = current_1h_bar.take() {
+                    if cur_1h.time_open == candle_bucket_1h {
+                        cur_1h.high = cur_1h.high.max(high_price);
+                        cur_1h.low = cur_1h.low.min(low_price);
+                        cur_1h.close = close_price;
+                        cur_1h.volume += vol_val;
+                        if is_last_1m_of_1h {
+                            finalized_1h_bar = Some(cur_1h);
+                        } else {
+                            current_1h_bar = Some(cur_1h);
+                        }
+                    } else {
+                        finalized_1h_bar = Some(cur_1h);
+                        let nb1h = CandleBar {
+                            time_open: candle_bucket_1h,
+                            open: open_price,
+                            high: high_price,
+                            low: low_price,
+                            close: close_price,
+                            volume: vol_val,
+                        };
+                        if is_last_1m_of_1h {
+                            finalized_1h_bar = Some(nb1h);
+                        } else {
+                            current_1h_bar = Some(nb1h);
+                        }
+                    }
+                } else {
+                    let nb1h = CandleBar {
+                        time_open: candle_bucket_1h,
+                        open: open_price,
+                        high: high_price,
+                        low: low_price,
+                        close: close_price,
+                        volume: vol_val,
+                    };
+                    if is_last_1m_of_1h {
+                        finalized_1h_bar = Some(nb1h);
+                    } else {
+                        current_1h_bar = Some(nb1h);
+                    }
+                }
+                let engine_b_1h_sig_opt = finalized_1h_bar
+                    .as_ref()
+                    .and_then(|b1h| engine_b_1h.on_1h_bar_close(b1h, true));
+
                 let exchange_clone = exchange.clone();
                 let info_clone = info_client.clone();
                 let state_clone = active_state.clone();
@@ -3701,22 +3892,42 @@ async fn main() {
                 let sz_decimals = trading_sz_decimals;
 
                 // Causal Feature Isolation: evaluate live 1m features and 15m cutoff decision features
+                // Package 9: Pass completed_bar.time_open for exact live-backtest parity (horizon_scale + min_gross_entry_bps + macro hazard)
                 let current_close = close_price;
                 let closes_clone = rolling_closes.clone();
                 let finalized_15m_clone = finalized_15m_bar.clone();
+                let eval_bar_ts_ms = completed_bar.time_open;
 
                 let current_funding_1h = *live_funding_rate.read().await;
                 let (live_features, decision_features) = if closes_clone.len() >= 100 {
                     let symbol_for_feat = symbol_clone.clone();
                     tokio::task::spawn_blocking(move || {
-                        let live_feat = calculate_features_with_funding(&closes_clone, current_close, &symbol_for_feat, current_funding_1h);
+                        let live_feat = calculate_features_with_funding_at(
+                            &closes_clone,
+                            current_close,
+                            &symbol_for_feat,
+                            current_funding_1h,
+                            Some(eval_bar_ts_ms),
+                        );
                         let decision_feat = if let Some(ref closed_15m) = finalized_15m_clone {
                             if (closed_15m.close - current_close).abs() < 1e-9 {
                                 live_feat.clone()
                             } else if closes_clone.len() > 1 {
-                                calculate_features_with_funding(&closes_clone[..closes_clone.len() - 1], closed_15m.close, &symbol_for_feat, current_funding_1h)
+                                calculate_features_with_funding_at(
+                                    &closes_clone[..closes_clone.len() - 1],
+                                    closed_15m.close,
+                                    &symbol_for_feat,
+                                    current_funding_1h,
+                                    Some(eval_bar_ts_ms),
+                                )
                             } else {
-                                calculate_features_with_funding(&closes_clone, closed_15m.close, &symbol_for_feat, current_funding_1h)
+                                calculate_features_with_funding_at(
+                                    &closes_clone,
+                                    closed_15m.close,
+                                    &symbol_for_feat,
+                                    current_funding_1h,
+                                    Some(eval_bar_ts_ms),
+                                )
                             }
                         } else {
                             None
@@ -4298,8 +4509,97 @@ async fn main() {
                     }
 
                     // ------------------------------------------------------------------
-                    // ENGINE B (POLICY C): Risk-Parity Sizing, Session Gating,
-                    // Coiled-Spring Squeeze Filter & Two-Stage Alo Maker Retest
+                    // ENGINE B v2 (PACKAGE 9): 1-Hour Macro EMA12/EMA50/EMA200 Pullback-in-Trend
+                    // Replaces negative-edge 5m/15m Donchian breakouts (16.7% WR) with
+                    // 7-year & 2026 Native L1 verified 1H macro trend pullbacks (PF 2.40 native, PF 1.20+ 7y).
+                    // ------------------------------------------------------------------
+                    if let Some(ref sig_1h) = engine_b_1h_sig_opt {
+                        let session_ok_1h = matches!(
+                            evaluate_session_lifecycle_gate(&symbol_clone, now_ms_cb as i64),
+                            SessionLifecycleAction::AllowNormalTrading
+                        );
+                        let macro_veto_1h = check_macro_calendar_veto(now_ms_cb);
+                        let side_label_1h = if sig_1h.side == Side::Long { "LONG" } else { "SHORT" };
+                        let side_cluster_blocked_1h = has_active_cluster_position_for_side(
+                            &symbol_clone,
+                            Some(side_label_1h),
+                        )
+                        .is_some();
+                        let mut state_lock_1h = state_clone.lock().await;
+                        let already_in_pos_1h = state_lock_1h.contains_key(&symbol_clone);
+                        if !already_in_pos_1h
+                            && session_ok_1h
+                            && !candle_feed_degraded
+                            && !is_candle_gap
+                            && !is_cb_paused
+                            && !is_cluster_blocked
+                            && !side_cluster_blocked_1h
+                            && macro_veto_1h.is_none()
+                            && trend_engine_mode == "live"
+                            && is_symbol_live_capital_enabled(&symbol_clone)
+                        {
+                            let _ = resolve_trade_bank(&info_clone, user_address, &config, &cached_equity_loop).await;
+                            let live_eq_1h = *cached_equity_loop.read().await;
+                            let hwm_eq_1h = *high_water_mark_equity.read().await;
+                            let dd_mult_1h = compute_drawdown_risk_multiplier(live_eq_1h, hwm_eq_1h);
+                            let sl_dist_1h = (sig_1h.ref_price - sig_1h.initial_stop_px).abs();
+                            let notional_1h = calculate_risk_scaled_notional(
+                                live_eq_1h,
+                                trend_cfg.max_trend_notional_usdc,
+                                0.0022 * dd_mult_1h, // 0.22% equity risk (~$1.22 loss-parity with Engine A)
+                                sig_1h.ref_price,
+                                sig_1h.initial_stop_px,
+                                config.hl_leverage,
+                                crate::state::max_concurrent_cluster_positions(),
+                                22.0,
+                                trend_cfg.max_trend_notional_usdc,
+                            );
+                            println!(
+                                "🚀 [ENGINE B v2 1H PULLBACK SIGNAL] {} {:?} | Ref: ${:.4} | SL: ${:.4} | EMA12=${:.2} EMA50=${:.2} EMA200=${:.2} | Slope12h={:+.2}*ATR | ATR_1h=${:.4} | Notional=${:.2}",
+                                symbol_clone, sig_1h.side, sig_1h.ref_price, sig_1h.initial_stop_px,
+                                sig_1h.ema12, sig_1h.ema50, sig_1h.ema200, sig_1h.slope_12h_atr, sig_1h.atr_1h, notional_1h
+                            );
+                            match place_trend_1h_ioc_entry(
+                                &state_path_clone,
+                                &exchange_clone,
+                                &info_clone,
+                                &mut state_lock_1h,
+                                &symbol_clone,
+                                sig_1h.side.clone(),
+                                sl_dist_1h,
+                                sig_1h.atr_1h,
+                                sig_1h.trail_atr_mult,
+                                notional_1h,
+                                sz_decimals,
+                                discord_clone.clone(),
+                            )
+                            .await
+                            {
+                                Ok(res) => {
+                                    funnel_counters.engine_b_orders_placed += 1;
+                                    let mut armed_clear = load_armed_signal(&arm_path_clone);
+                                    if armed_clear.is_armed {
+                                        armed_clear.is_armed = false;
+                                        save_armed_signal(&arm_path_clone, &armed_clear);
+                                    }
+                                    println!("✅ [ENGINE B v2 1H ENTRY EXECUTED] {} -> {:?}", symbol_clone, res);
+                                }
+                                Err(e) => {
+                                    funnel_counters.engine_b_orders_rejected += 1;
+                                    eprintln!("❌ [ENGINE B v2 1H ENTRY ERROR] {}: {}", symbol_clone, e);
+                                }
+                            }
+                        } else {
+                            println!(
+                                "⏸️ [ENGINE B v2 1H SIGNAL GATED] {} {:?} (pos={}, sess={}, cb={}, cluster={}, side_blk={}, macro={})",
+                                symbol_clone, sig_1h.side, already_in_pos_1h, session_ok_1h, is_cb_paused,
+                                is_cluster_blocked, side_cluster_blocked_1h, macro_veto_1h.is_some()
+                            );
+                        }
+                    }
+
+                    // ------------------------------------------------------------------
+                    // LEGACY ENGINE B (5m/15m Donchian): Routed to Shadow-Only in Package 9
                     // ------------------------------------------------------------------
                     let active_shadow = load_shadow_trade(&symbol_clone);
                     let (state_has_symbol, state_is_filled, state_is_engine_b) = {
@@ -4829,7 +5129,7 @@ async fn main() {
                                                     stop_loss_px,
                                                 );
                                                 cf_tracker.register_opportunity(cf_opp);
-                                            } else if trend_engine_mode == "live" && is_symbol_live_capital_enabled(&symbol_clone) {
+                                            } else if false && trend_engine_mode == "live" && is_symbol_live_capital_enabled(&symbol_clone) {
                                                 let mut state_lock = state_clone.lock().await;
                                                 if !state_lock.contains_key(&symbol_clone) && !is_cluster_blocked {
                                                     let ttl_mins = (ttl_secs as f64) / 60.0;
@@ -5123,6 +5423,7 @@ async fn main() {
                             let mut reprice_qty = 0.0;
                             let mut reprice_is_buy = false;
                             let mut old_tp_order_id = String::new();
+                            let mut sl_ratchet_sync_opt: Option<(f64, f64, bool, Option<u64>)> = None;
 
                             let pos_engine_type = state_lock.get(&symbol_clone).map(|p| p.engine_type.clone()).unwrap_or_else(|| "EngineA".to_string());
                             let ou_cfg = crate::ou_process::asset_ou_config(&symbol_clone);
@@ -5145,6 +5446,75 @@ async fn main() {
                                         };
                                         if elapsed_mins >= ttl_limit {
                                             entry_ttl_expired = true;
+                                        }
+                                    } else if pos.engine_type == "EngineB1h" {
+                                        // Package 9 Engine B v2: 1H EMA50 Pullback-in-Trend monotonic 4.0*ATR_1h Chandelier + 96h max hold
+                                        let side_enum = if pos.side == "LONG" { Side::Long } else { Side::Short };
+                                        let is_long_1h = pos.side == "LONG";
+                                        let prev_stop = if pos.chandelier_stop > 0.0 {
+                                            pos.chandelier_stop
+                                        } else {
+                                            pos.stop_loss_price
+                                        };
+                                        if (is_long_1h && (low_price <= prev_stop || close_price <= prev_stop))
+                                            || (!is_long_1h && (high_price >= prev_stop || close_price >= prev_stop))
+                                        {
+                                            chandelier_stopped = true;
+                                        } else {
+                                            if is_long_1h && high_price > pos.max_favorable_price {
+                                                pos.max_favorable_price = high_price;
+                                            } else if !is_long_1h
+                                                && (pos.max_favorable_price <= 0.0 || low_price < pos.max_favorable_price)
+                                            {
+                                                pos.max_favorable_price = low_price;
+                                            }
+                                            let trail_m = if pos.active_multiplier > 0.0 {
+                                                pos.active_multiplier
+                                            } else {
+                                                engine_b_1h.trail_atr
+                                            };
+                                            let cur_atr_1h = if engine_b_1h.atr_1h > 0.0 {
+                                                engine_b_1h.atr_1h
+                                            } else {
+                                                pos.current_atr
+                                            };
+                                            let new_stop = quantize_price(
+                                                TrendPullback1hEngine::update_trailing_stop(
+                                                    &side_enum,
+                                                    prev_stop,
+                                                    pos.max_favorable_price,
+                                                    cur_atr_1h,
+                                                    pos.current_atr,
+                                                    trail_m,
+                                                ),
+                                                sz_decimals,
+                                            );
+                                            let stop_improved_bps = if prev_stop > 0.0 {
+                                                let d_s = if is_long_1h { 1.0 } else { -1.0 };
+                                                d_s * ((new_stop - prev_stop) / prev_stop) * 1e4
+                                            } else {
+                                                0.0
+                                            };
+                                            if stop_improved_bps > 0.0 {
+                                                pos.chandelier_stop = new_stop;
+                                                pos.stop_loss_price = new_stop;
+                                            }
+                                            if stop_improved_bps >= 15.0 {
+                                                sl_ratchet_sync_opt = Some((
+                                                    new_stop,
+                                                    pos.amount,
+                                                    !is_long_1h,
+                                                    pos.disaster_stop_oid,
+                                                ));
+                                            }
+                                            max_allowed_mins = (engine_b_1h.max_hold_hours as f64) * 60.0;
+                                            if elapsed_mins >= max_allowed_mins {
+                                                time_stop_triggered = true;
+                                            }
+                                            println!(
+                                                "🚀 [ENGINE B v2 1H RUNNER] {} {} | Px: ${:.4} | Trail SL: ${:.4} | Extreme: ${:.4} | Hold: {:.1}h/96h",
+                                                symbol_clone, pos.side, close_price, pos.stop_loss_price, pos.max_favorable_price, elapsed_mins / 60.0
+                                            );
                                         }
                                     } else if pos.engine_type == "EngineB" {
                                         let current_atr = calculate_atr(&rolling_15m_bars, 20).unwrap_or(pos.current_atr);
@@ -5312,6 +5682,20 @@ async fn main() {
                                                 &cal_1m,
                                             );
                                             pos.cusum_stat_1m = stall_shadow.cusum_stat_1m;
+                                            // Package 9: Mirror Pre-T1 Profit Protection (+42 bps MFE -> lock stop at +12 bps)
+                                            if !pos.tranche1_tp_filled && stall_shadow.hard_disaster_stop_px > 0.0 {
+                                                let d_sl = if is_long { 1.0 } else { -1.0 };
+                                                if d_sl * (stall_shadow.hard_disaster_stop_px - pos.stop_loss_price) > 0.0
+                                                    && d_sl * (stall_shadow.hard_disaster_stop_px - pos.entry_price) > 0.0
+                                                {
+                                                    let locked_px = quantize_price(stall_shadow.hard_disaster_stop_px, sz_decimals);
+                                                    pos.stop_loss_price = locked_px;
+                                                    println!(
+                                                        "🔒 [PRE-T1 PROFIT LOCK] {} MFE={:.1} bps >= 42 bps -> ratcheted protective stop to ${:.4} (+12 bps)!",
+                                                        symbol_clone, stall_shadow.mfe_bps, locked_px
+                                                    );
+                                                }
+                                            }
 
                                             if let crate::ou_process::HardenedExitDecision::StopOutSprt1mClose { cusum_val, .. } = dec_1m {
                                                 let unreal_bps_mid = d_1m * ((mid_eval_px - pos.entry_price) / pos.entry_price.max(1e-9)) * 10_000.0;
@@ -5320,6 +5704,8 @@ async fn main() {
                                                     symbol_clone, cusum_val, unreal_bps_mid
                                                 );
                                                 soft_invalidation_reason = Some("SPRT_1M_ASYMMETRIC_CUSUM_ESCAPE");
+                                            } else if let crate::ou_process::HardenedExitDecision::StopOutIntrabarDisaster { .. } = dec_1m {
+                                                hard_sl_triggered = true;
                                             }
                                         }
 
@@ -5704,6 +6090,31 @@ async fn main() {
                                 }
                             }
                             let _ = crate::state::save_state(&state_path_clone, &state_lock);
+
+                            // Package 9: Sync exchange-native StopMarket trigger when EngineB1h Chandelier ratchets >= 15 bps
+                            if let Some((new_sl_px, sl_amt, sl_is_buy, old_sl_oid)) = sl_ratchet_sync_opt {
+                                if let Ok(new_sl_oid) = crate::hyperliquid::ratchet_disaster_stop_to_breakeven(
+                                    &exchange_clone,
+                                    &symbol_clone,
+                                    sl_is_buy,
+                                    sl_amt,
+                                    new_sl_px,
+                                    sz_decimals,
+                                    old_sl_oid,
+                                    Some(uuid::Uuid::new_v4()),
+                                )
+                                .await
+                                {
+                                    if let Some(p) = state_lock.get_mut(&symbol_clone) {
+                                        p.disaster_stop_oid = Some(new_sl_oid);
+                                        let _ = crate::state::save_state(&state_path_clone, &state_lock);
+                                    }
+                                    println!(
+                                        "🛡️ [ENGINE B v2 STOP RATCHET] {} updated Exchange-Native StopMarket to ${:.4} (oid: {})",
+                                        symbol_clone, new_sl_px, new_sl_oid
+                                    );
+                                }
+                            }
 
                             // Handle Adaptive Reprice Execution on Hyperliquid
                             if should_reprice && new_reprice_target > 0.0 && reprice_qty > 0.0 {
@@ -6413,7 +6824,14 @@ async fn main() {
                                                 && best_bid_l2 > 0.0
                                                 && ((best_ask_l2 - best_bid_l2) / close_price.max(1e-9)) * 1e4 > 2.6;
 
-                                            if let Some(veto_reason) = btc_lead_veto {
+                                            if !is_join_book {
+                                                println!(
+                                                    "🛡️ [PKG9 RETEST-LIMIT DISABLED] {} {} disarmed (consumed={:.1}% > join_cap; adverse-selection filter).",
+                                                    symbol_clone, arm_side, consumed_ratio * 100.0
+                                                );
+                                                armed_state.is_armed = false;
+                                                save_armed_signal(&arm_path_clone, &armed_state);
+                                            } else if let Some(veto_reason) = btc_lead_veto {
                                                 println!(
                                                     "🛡️ [BTC IMPULSE VETO] {} {} reversal bounce disarmed due to adverse BTC impulse: {}.",
                                                     symbol_clone, arm_side, veto_reason

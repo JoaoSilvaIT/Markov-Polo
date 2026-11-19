@@ -629,6 +629,63 @@ pub async fn close_market_position_with_bbo(
     }
 }
 
+/// Submits a marketable IOC entry order (slippage-capped) for Engine B v2 (`1H EMA50 Pullback-in-Trend`).
+/// Returns `Ok((oid, avg_fill_px, filled_sz))` on immediate fill.
+pub async fn place_ioc_entry_order(
+    exchange: &ExchangeClient,
+    coin: &str,
+    is_buy: bool,
+    limit_px: f64,
+    sz: f64,
+    cloid: Option<uuid::Uuid>,
+) -> Result<(u64, f64, f64), String> {
+    let order_req = ClientOrderRequest {
+        asset: coin.to_string(),
+        is_buy,
+        reduce_only: false,
+        limit_px,
+        sz,
+        cloid,
+        order_type: ClientOrder::Limit(ClientLimit {
+            tif: "Ioc".to_string(),
+        }),
+    };
+
+    let res = tokio::time::timeout(HL_REST_TIMEOUT, exchange.order(order_req, None))
+        .await
+        .map_err(|_| format!("IOC entry submission timed out after 10s for {}", coin))?
+        .map_err(|e| format!("IOC entry submission failed: {}", e))?;
+
+    match res {
+        ExchangeResponseStatus::Ok(resp) => {
+            if let Some(data) = resp.data {
+                if let Some(first) = data.statuses.first() {
+                    match first {
+                        ExchangeDataStatus::Filled(filled) => {
+                            let avg_px = filled.avg_px.parse::<f64>().unwrap_or(limit_px);
+                            let total_sz = filled.total_sz.parse::<f64>().unwrap_or(sz);
+                            Ok((filled.oid, avg_px, total_sz))
+                        }
+                        ExchangeDataStatus::Resting(resting) => Err(format!(
+                            "IOC entry unexpectedly rested (oid={})",
+                            resting.oid
+                        )),
+                        ExchangeDataStatus::Error(msg) => {
+                            Err(format!("Exchange rejected IOC entry order: {}", msg))
+                        }
+                        other => Err(format!("IOC entry did not fill: {:?}", other)),
+                    }
+                } else {
+                    Err("Empty status response from exchange on IOC entry".to_string())
+                }
+            } else {
+                Err("Empty data response from exchange on IOC entry".to_string())
+            }
+        }
+        ExchangeResponseStatus::Err(e) => Err(format!("IOC entry exchange error: {}", e)),
+    }
+}
+
 /// Closes open position at market with slippage protection
 #[allow(dead_code)]
 pub async fn close_market_position(

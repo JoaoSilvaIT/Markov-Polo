@@ -3886,11 +3886,31 @@ impl StallHazardExitManager {
         let tp1_px = self.entry_px * (1.0 + d * tp1_target_bps * 1e-4);
         let mut tp2_px = self.entry_px * (1.0 + d * tp2_overshoot_bps * 1e-4);
 
-        // 4. Check Intrabar Catastrophe Guard on bar_low / bar_high
+        // 4. Check Intrabar Catastrophe Guard on bar_low / bar_high against the PRIOR bar's protective stop
         let adv_px = if d > 0.0 { bar_low } else { bar_high };
         if d * (adv_px - self.hard_disaster_stop_px) <= 0.0 {
             return HardenedExitDecision::StopOutIntrabarDisaster {
                 exit_px: self.hard_disaster_stop_px.clamp(bar_low, bar_high),
+            };
+        }
+        // Package 9: Pre-T1 Profit-Protection Ratchet (strictly causal: arms AFTER checking this bar's prior stop,
+        // protecting subsequent bars once an unrealized winner reaches >= 42.0 bps so big winners never flip into full stops!)
+        if !self.tranche1_filled && self.mfe_bps >= 42.0 {
+            let pre_t1_lock_px = self.entry_px * (1.0 + d * 12.0 * 1e-4);
+            if d > 0.0 {
+                self.hard_disaster_stop_px = self.hard_disaster_stop_px.max(pre_t1_lock_px);
+            } else {
+                self.hard_disaster_stop_px = self.hard_disaster_stop_px.min(pre_t1_lock_px);
+            }
+        }
+        // Package 9 Fast-Sentinel Intrabar Hard Ceiling Parity (-48.5 bps):
+        // Matches live Fast-Sentinel check_fast_sentinel_intrabar_escape(-48.5 bps) so 1m flash candles never bleed to -65 bps.
+        let intrabar_adv_bps = d * ((adv_px - self.entry_px) / self.entry_px) * 10_000.0;
+        if !self.tranche1_filled && intrabar_adv_bps <= -48.5 {
+            let cap_px = (self.entry_px * (1.0 - d * 48.5 * 1e-4)).clamp(bar_low, bar_high);
+            return HardenedExitDecision::StopOutSprt1mClose {
+                exit_px: cap_px,
+                cusum_val: self.cusum_stat_1m.max(cal.cusum_b_1m_star),
             };
         }
 
@@ -6196,5 +6216,61 @@ mod tests {
             evaluate_session_lifecycle_gate("xyz:SILVER", silver_ny_active),
             SessionLifecycleAction::AllowNormalTrading
         );
+    }
+
+    #[test]
+    fn test_package9_stall_hazard_pre_t1_profit_lock_and_intrabar_48_5_cap() {
+        let sol_cal = asset_calibration("SOL");
+
+        // 1. Pre-T1 Profit Protection: Short entry at 100.00 spikes +55 bps in profit (low = 99.45,
+        //    missing a distant 70 bps target at 99.30), then reverses sharply to 100.20 -> must exit at locked +12 bps stop (99.88)!
+        let mut mgr =
+            StallHazardExitManager::new_with_sigma(Direction::Short, 100.0, 120.0, 0.0005);
+        let d1 = mgr.on_1m_bar(
+            100.0, 100.02, 99.45, 99.60, 100.0, 99.30, 30.0, -0.5, -0.2, 1.5, &sol_cal,
+        );
+        assert!(matches!(d1, HardenedExitDecision::Hold { .. }));
+        assert!(
+            mgr.hard_disaster_stop_px <= 99.881,
+            "Expected +12 bps pre-T1 lock <= 99.88, got {}",
+            mgr.hard_disaster_stop_px
+        );
+
+        let d2 = mgr.on_1m_bar(
+            99.60, 100.20, 99.60, 100.15, 99.60, 99.30, 30.0, 0.5, 0.2, 1.5, &sol_cal,
+        );
+        match d2 {
+            HardenedExitDecision::StopOutIntrabarDisaster { exit_px } => {
+                assert!(
+                    exit_px < 100.0,
+                    "Pre-T1 locked stop must exit in profit (< 100.0), got {}",
+                    exit_px
+                );
+            }
+            other => panic!(
+                "Expected StopOutIntrabarDisaster at locked profit stop, got {:?}",
+                other
+            ),
+        }
+
+        // 2. Intrabar -48.5 bps Fast-Sentinel parity cap prevents -65 bps single-bar close bleed
+        let mut mgr2 =
+            StallHazardExitManager::new_with_sigma(Direction::Long, 100.0, 150.0, 0.0005);
+        let d_cap = mgr2.on_1m_bar(
+            99.90, 99.90, 99.35, 99.40, 99.90, 100.40, 30.0, -2.0, -0.3, 1.5, &sol_cal,
+        );
+        match d_cap {
+            HardenedExitDecision::StopOutSprt1mClose { exit_px, .. } => {
+                assert!(
+                    (exit_px - 99.515).abs() < 0.01,
+                    "Expected intrabar cap near 99.515 (-48.5 bps), got {}",
+                    exit_px
+                );
+            }
+            other => panic!(
+                "Expected StopOutSprt1mClose at -48.5 bps cap, got {:?}",
+                other
+            ),
+        }
     }
 }

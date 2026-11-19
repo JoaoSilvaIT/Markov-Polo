@@ -39,7 +39,7 @@ use crate::trend::{
     calculate_flag_compression_ratio_60m, calculate_ker_n, calculate_min_squeeze_ratio_90m,
     calculate_rel_vol_15m, compute_rolling_5m_impulse_metrics, BreakoutTelemetry, CandleBar,
     ChandelierExitState, EngineBTrendManager, MarketCrowdingTracker, TrendEngineConfig,
-    TrendOrderAction,
+    TrendOrderAction, TrendPullback1hEngine,
 };
 
 /// Single 1-minute historical market bar + L2 microstructure + derivatives context record
@@ -371,11 +371,13 @@ pub fn run_engine_a_backtest_with_btc(
     let warmup = 720usize.min(bars.len().saturating_sub(30));
     let mut closes_history: Vec<f64> = bars[..warmup].iter().map(|b| b.close).collect();
 
-    // Pre-aggregate 5m/15m bars & warm up SyntheticMicrostructureEnricher from warmup history
+    // Pre-aggregate 5m/15m/1h bars & warm up SyntheticMicrostructureEnricher from warmup history
     let mut rolling_5m_bars: Vec<CandleBar> = Vec::with_capacity(300);
     let mut current_5m_bar: Option<CandleBar> = None;
     let mut rolling_15m_bars: Vec<CandleBar> = Vec::with_capacity(100);
     let mut current_15m_bar: Option<CandleBar> = None;
+    let mut current_1h_bar: Option<CandleBar> = None;
+    let mut engine_b_1h = TrendPullback1hEngine::new();
     let mut all_15m_closes: Vec<f64> = Vec::with_capacity(1024);
     for b in &bars[..warmup] {
         let _ = enricher.enrich_next_bar(
@@ -504,6 +506,50 @@ pub fn run_engine_a_backtest_with_btc(
                 }
             } else {
                 current_15m_bar = Some(nb);
+            }
+        }
+        let bucket_1h = (b.timestamp_ms / 3_600_000) * 3_600_000;
+        let is_last_1m_1h = b.timestamp_ms + 60_000 >= bucket_1h + 3_600_000;
+        if let Some(mut cur_1h) = current_1h_bar.take() {
+            if cur_1h.time_open == bucket_1h {
+                cur_1h.high = cur_1h.high.max(b.high);
+                cur_1h.low = cur_1h.low.min(b.low);
+                cur_1h.close = b.close;
+                cur_1h.volume += b.volume;
+                if is_last_1m_1h {
+                    let _ = engine_b_1h.on_1h_bar_close(&cur_1h, false);
+                } else {
+                    current_1h_bar = Some(cur_1h);
+                }
+            } else {
+                let _ = engine_b_1h.on_1h_bar_close(&cur_1h, false);
+                let nb1h = CandleBar {
+                    time_open: bucket_1h,
+                    open: b.open,
+                    high: b.high,
+                    low: b.low,
+                    close: b.close,
+                    volume: b.volume,
+                };
+                if is_last_1m_1h {
+                    let _ = engine_b_1h.on_1h_bar_close(&nb1h, false);
+                } else {
+                    current_1h_bar = Some(nb1h);
+                }
+            }
+        } else {
+            let nb1h = CandleBar {
+                time_open: bucket_1h,
+                open: b.open,
+                high: b.high,
+                low: b.low,
+                close: b.close,
+                volume: b.volume,
+            };
+            if is_last_1m_1h {
+                let _ = engine_b_1h.on_1h_bar_close(&nb1h, false);
+            } else {
+                current_1h_bar = Some(nb1h);
             }
         }
     }
@@ -792,6 +838,55 @@ pub fn run_engine_a_backtest_with_btc(
                 current_15m_bar = Some(nb);
             }
         }
+
+        let candle_bucket_1h = (bar.timestamp_ms / 3_600_000) * 3_600_000;
+        let is_last_1m_of_1h = bar.timestamp_ms + 60_000 >= candle_bucket_1h + 3_600_000;
+        let mut finalized_1h_bar: Option<CandleBar> = None;
+        if let Some(mut cur_1h) = current_1h_bar.take() {
+            if cur_1h.time_open == candle_bucket_1h {
+                cur_1h.high = cur_1h.high.max(bar.high);
+                cur_1h.low = cur_1h.low.min(bar.low);
+                cur_1h.close = bar.close;
+                cur_1h.volume += bar.volume;
+                if is_last_1m_of_1h {
+                    finalized_1h_bar = Some(cur_1h);
+                } else {
+                    current_1h_bar = Some(cur_1h);
+                }
+            } else {
+                finalized_1h_bar = Some(cur_1h);
+                let nb1h = CandleBar {
+                    time_open: candle_bucket_1h,
+                    open: bar.open,
+                    high: bar.high,
+                    low: bar.low,
+                    close: bar.close,
+                    volume: bar.volume,
+                };
+                if is_last_1m_of_1h {
+                    finalized_1h_bar = Some(nb1h);
+                } else {
+                    current_1h_bar = Some(nb1h);
+                }
+            }
+        } else {
+            let nb1h = CandleBar {
+                time_open: candle_bucket_1h,
+                open: bar.open,
+                high: bar.high,
+                low: bar.low,
+                close: bar.close,
+                volume: bar.volume,
+            };
+            if is_last_1m_of_1h {
+                finalized_1h_bar = Some(nb1h);
+            } else {
+                current_1h_bar = Some(nb1h);
+            }
+        }
+        let engine_b_1h_sig_opt = finalized_1h_bar
+            .as_ref()
+            .and_then(|b1h| engine_b_1h.on_1h_bar_close(b1h, true));
 
         let session_action = evaluate_session_lifecycle_gate(symbol, bar.timestamp_ms as i64);
         let session_force_flat = matches!(session_action, SessionLifecycleAction::ForceFlat(_));
@@ -1135,7 +1230,64 @@ pub fn run_engine_a_backtest_with_btc(
             let elapsed_mins_1m =
                 bar.timestamp_ms.saturating_sub(pos.entry_time_ms) as f64 / 60_000.0;
 
-            if pos.is_engine_b {
+            if pos.policy == "ENGINE_B_1H_PULLBACK" {
+                // Package 9 Engine B v2: 1H EMA50 Pullback-in-Trend monotonic 4.0*ATR_1h trailing stop + 96h max hold
+                let sl_hit_1h = match pos.side {
+                    Side::Long => bar.low <= pos.hard_stop_px,
+                    Side::Short => bar.high >= pos.hard_stop_px,
+                };
+                if sl_hit_1h {
+                    let is_profit_locked = match pos.side {
+                        Side::Long => pos.hard_stop_px > pos.entry_px,
+                        Side::Short => pos.hard_stop_px > 0.0 && pos.hard_stop_px < pos.entry_px,
+                    };
+                    let stop_lbl = if is_profit_locked {
+                        "CHANDELIER_PROFIT_LOCK"
+                    } else {
+                        "CHANDELIER_STOP"
+                    };
+                    let exec_px = match pos.side {
+                        Side::Long => pos.hard_stop_px.min(bar.open),
+                        Side::Short => pos.hard_stop_px.max(bar.open),
+                    };
+                    let slip = match pos.side {
+                        Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
+                        Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
+                    };
+                    closed_outcome = Some((exec_px * slip, false, stop_lbl));
+                } else if elapsed_mins_1m >= (engine_b_1h.max_hold_hours as f64) * 60.0 {
+                    let slip = match pos.side {
+                        Side::Long => 1.0 - sim_cfg.stop_slippage_bps * 1e-4,
+                        Side::Short => 1.0 + sim_cfg.stop_slippage_bps * 1e-4,
+                    };
+                    closed_outcome = Some((bar.close * slip, false, "TIME_DECAY_STOP"));
+                } else {
+                    if let Some(ref mut chand) = pos.chandelier_opt {
+                        match pos.side {
+                            Side::Long => {
+                                if bar.high > chand.extreme_favorable_price {
+                                    chand.extreme_favorable_price = bar.high;
+                                }
+                            }
+                            Side::Short => {
+                                if bar.low < chand.extreme_favorable_price {
+                                    chand.extreme_favorable_price = bar.low;
+                                }
+                            }
+                        }
+                        let new_sl = TrendPullback1hEngine::update_trailing_stop(
+                            &pos.side,
+                            pos.hard_stop_px,
+                            chand.extreme_favorable_price,
+                            engine_b_1h.atr_1h,
+                            pos.entry_atr,
+                            engine_b_1h.trail_atr,
+                        );
+                        pos.hard_stop_px = quantize_price(new_sl, sim_cfg.sz_decimals);
+                        chand.current_stop = pos.hard_stop_px;
+                    }
+                }
+            } else if pos.is_engine_b {
                 let current_atr = calculate_atr(&rolling_15m_bars, 20).unwrap_or(pos.entry_atr);
                 let mut chandelier_hit = false;
                 if let Some(ref mut chand) = pos.chandelier_opt {
@@ -1939,9 +2091,107 @@ pub fn run_engine_a_backtest_with_btc(
         }
 
         // ------------------------------------------------------------------
-        // 3. DUAL-ENGINE EVALUATION: Engine B (15m Donchian Trend) & Engine A (5m O-U Mean Reversion)
+        // 3. DUAL-ENGINE EVALUATION: Engine B v2 (1H EMA50 Pullback) & Engine A (5m O-U Mean Reversion)
         // ------------------------------------------------------------------
-        if open_pos.is_none() && !is_armed && !session_blocks_entries {
+        if open_pos.is_none() && resting_entry.is_none() && !session_blocks_entries {
+            if let Some(sig_1h) = engine_b_1h_sig_opt {
+                let macro_veto_1h = check_macro_calendar_veto(bar.timestamp_ms);
+                let cb_veto_1h = cluster_cb.evaluate_equity_drawdown(
+                    bar.timestamp_ms,
+                    sim_cfg.account_equity_usdc + cumulative_pnl_usd,
+                    DEFAULT_MAX_DAILY_CLUSTER_DD_FRAC,
+                );
+                if macro_veto_1h.is_some() {
+                    summary.macro_calendar_vetoes += 1;
+                } else if cb_veto_1h.is_some() {
+                    summary.cluster_cb_vetoes += 1;
+                } else {
+                    is_armed = false;
+                    let is_long_1h = sig_1h.side == Side::Long;
+                    let slip_mult = if is_long_1h {
+                        1.0 + sim_cfg.stop_slippage_bps * 1e-4
+                    } else {
+                        1.0 - sim_cfg.stop_slippage_bps * 1e-4
+                    };
+                    let entry_px = quantize_price(bar.close * slip_mult, sim_cfg.sz_decimals);
+                    let sl_dist = (sig_1h.ref_price - sig_1h.initial_stop_px).abs();
+                    let raw_sl = if is_long_1h {
+                        (entry_px - sl_dist).max(tick_sz)
+                    } else {
+                        entry_px + sl_dist
+                    };
+                    let sl_px = quantize_price(raw_sl, sim_cfg.sz_decimals);
+                    let eq_now_1h = sim_cfg.account_equity_usdc + cumulative_pnl_usd;
+                    let max_b_ntl = trend_cfg.max_trend_notional_usdc;
+                    let notional = crate::hyperliquid::calculate_risk_scaled_notional(
+                        eq_now_1h,
+                        max_b_ntl,
+                        0.0022, // 0.22% equity risk per 1H trend pullback (~$1.22 max risk, loss-parity with Engine A)
+                        entry_px,
+                        sl_px,
+                        3,
+                        crate::state::max_concurrent_cluster_positions(),
+                        22.0,
+                        max_b_ntl,
+                    );
+                    let qty = notional / entry_px.max(1e-9);
+                    let entry_fee = (qty * entry_px) * (sim_cfg.taker_fee_bps * 1e-4);
+                    summary.signals_armed += 1;
+                    summary.orders_submitted += 1;
+                    summary.orders_filled += 1;
+                    let chand_1h = ChandelierExitState {
+                        side: sig_1h.side.clone(),
+                        entry_price: entry_px,
+                        extreme_favorable_price: entry_px,
+                        current_stop: sl_px,
+                        initial_stop: sl_px,
+                        base_multiplier: sig_1h.trail_atr_mult,
+                        active_multiplier: sig_1h.trail_atr_mult,
+                    };
+                    let ord_dir = Direction::from_side(&sig_1h.side);
+                    let init_sl_bps = ((entry_px - sl_px).abs() / entry_px.max(1e-9)) * 1e4;
+                    open_pos = Some(OpenSimulatedPosition {
+                        side: sig_1h.side.clone(),
+                        entry_px,
+                        qty,
+                        initial_qty: qty,
+                        entry_time_ms: bar.timestamp_ms,
+                        initial_tp_px: entry_px,
+                        tp_limit_px: if is_long_1h { f64::MAX } else { 0.0 },
+                        hard_stop_px: sl_px,
+                        frozen_center_px: entry_px,
+                        frozen_sigma_eq_log: 0.003,
+                        entry_fee_usd: entry_fee,
+                        accrued_funding_usd: 0.0,
+                        mfe_bps: 0.0,
+                        mae_bps: 0.0,
+                        max_progress: 0.0,
+                        candidate_lower_count: 0,
+                        reprice_count: 0,
+                        last_reprice_time_ms: bar.timestamp_ms,
+                        inv_mgr: TwoTierInvalidationManager::new(
+                            sig_1h.side.clone(),
+                            entry_px,
+                            320.0,
+                            3.0,
+                            3.0,
+                            60.0,
+                        ),
+                        asym_mgr: AsymmetricExitManager::new(ord_dir, entry_px, 0.0, 0.003),
+                        stall_mgr: StallHazardExitManager::new(ord_dir, entry_px, init_sl_bps),
+                        tranche1_realized_pnl_usd: 0.0,
+                        tranche1_exit_fee_usd: 0.0,
+                        prev_residual_x: 0.0,
+                        policy: "ENGINE_B_1H_PULLBACK",
+                        is_engine_b: true,
+                        chandelier_opt: Some(chand_1h),
+                        entry_atr: sig_1h.atr_1h,
+                    });
+                }
+            }
+        }
+
+        if open_pos.is_none() && !is_armed && !session_blocks_entries && false {
             if let Some(ref feat) = live_feat_opt {
                 let macro_veto = check_macro_calendar_veto(bar.timestamp_ms);
                 let cb_veto = cluster_cb.evaluate_equity_drawdown(
@@ -2568,7 +2818,11 @@ pub fn run_engine_a_backtest_with_btc(
                                         false
                                     };
 
-                                if btc_veto.is_some() {
+                                // Package 9: Disable toxic RETEST_LIMIT adverse selection in native/live path
+                                // (RETEST_LIMIT only fills when the mean-reversion bounce fails: 46.2% WR, PF 0.44, -$2.26 vs JOIN_BOOK 80.0% WR, PF 2.21, +$1.47)
+                                if is_retest_limit && has_native_l2 {
+                                    is_armed = false;
+                                } else if btc_veto.is_some() {
                                     summary.btc_impulse_vetoes += 1;
                                     is_armed = false;
                                 } else if !obi_confirm_ok

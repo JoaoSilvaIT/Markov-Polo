@@ -1,7 +1,8 @@
 use crate::hyperliquid::{
     cancel_order, close_market_position_with_bbo, effective_tick_size, fetch_book_ticker,
     fetch_open_orders_for_coin, get_user_position, optimal_engine_b_tp_atr_multiple,
-    place_post_only_order, quantize_price, quantize_size_for_notional,
+    place_disaster_stop_trigger_order, place_ioc_entry_order, place_post_only_order,
+    quantize_price, quantize_size_for_notional,
 };
 use crate::state::{
     assert_current_lease, clear_order_intent, release_cluster_lease_authenticated, save_order_intent_atomic,
@@ -632,6 +633,255 @@ pub async fn place_trend_breakout_entry(
     crate::discord::send_alert(discord_url.as_deref(), &msg).await;
 
     Ok(json!({"status": "DISPATCHED", "order_id": oid, "side": side.to_string()}))
+}
+
+/// Package 9 Engine B v2 (`1H EMA50 Pullback-in-Trend`):
+/// Submits a slippage-capped IOC entry order, immediately attaches an exchange-native StopMarket SL,
+/// and leaves TP uncapped (`take_profit_price = 0.0`) so the monotonic 4.0*ATR_1h Chandelier trails runners.
+#[allow(clippy::too_many_arguments)]
+pub async fn place_trend_1h_ioc_entry(
+    state_file_path: &str,
+    exchange: &ExchangeClient,
+    info: &InfoClient,
+    state: &mut StateMap,
+    symbol: &str,
+    side: Side,
+    signal_stop_dist: f64,
+    atr_1h: f64,
+    trail_atr_mult: f64,
+    position_size_usdc: f64,
+    sz_decimals: u32,
+    discord_url: Option<String>,
+) -> Result<Value, String> {
+    let position_size_usdc = position_size_usdc.max(12.0);
+    if state.len() >= crate::state::max_concurrent_cluster_positions() {
+        return Ok(json!({"status": "REJECTED", "reason": "Max concurrent trades reached."}));
+    }
+    if state.contains_key(symbol) {
+        return Ok(json!({
+            "status": "REJECTED",
+            "reason": format!("Already hold or have open order for {}.", symbol)
+        }));
+    }
+
+    let lease_uuid = format!("{}_{}", symbol, Utc::now().timestamp_micros());
+    let side_upper = match side {
+        Side::Long => "LONG",
+        Side::Short => "SHORT",
+    };
+    let (acquired, fencing_token) = try_acquire_cluster_lease_with_side(
+        symbol,
+        "EngineB1h",
+        side_upper,
+        &lease_uuid,
+        3600,
+    );
+    if !acquired {
+        return Ok(json!({
+            "status": "REJECTED",
+            "reason": "Cluster lock currently acquired by another portfolio symbol."
+        }));
+    }
+
+    let (top_bid, top_ask) = match fetch_book_ticker(info, symbol).await {
+        Ok(quotes) => quotes,
+        Err(e) => {
+            let _ = release_cluster_lease_authenticated(symbol, Some(&lease_uuid), Some(fencing_token));
+            return Err(format!("Failed to query live book ticker: {}", e));
+        }
+    };
+    if top_bid <= 0.0 || top_ask <= 0.0 || top_bid >= top_ask {
+        let _ = release_cluster_lease_authenticated(symbol, Some(&lease_uuid), Some(fencing_token));
+        return Err(format!(
+            "Invalid or crossed book ticker quotes: bid={}, ask={}",
+            top_bid, top_ask
+        ));
+    }
+
+    let is_buy = side == Side::Long;
+    let ioc_raw_px = if is_buy {
+        top_ask * 1.0015
+    } else {
+        top_bid * 0.9985
+    };
+    let ioc_limit_px = quantize_price(ioc_raw_px, sz_decimals);
+    let ref_px = if is_buy { top_ask } else { top_bid };
+    let amount_f = quantize_size_for_notional(position_size_usdc, ref_px, sz_decimals);
+    if amount_f <= 0.0 {
+        let _ = release_cluster_lease_authenticated(symbol, Some(&lease_uuid), Some(fencing_token));
+        return Err(format!(
+            "Calculated size {:.6} is zero or below minimum size decimals {}",
+            position_size_usdc / ref_px, sz_decimals
+        ));
+    }
+
+    let capped_sl_dist = signal_stop_dist.min(ref_px * 0.032).max(ref_px * 0.0040);
+    let est_sl_px = quantize_price(
+        if is_buy {
+            (ref_px - capped_sl_dist).max(effective_tick_size(ref_px, sz_decimals))
+        } else {
+            ref_px + capped_sl_dist
+        },
+        sz_decimals,
+    );
+
+    let cloid_uuid = uuid::Uuid::new_v4();
+    let client_order_id = format!("{}_1h_{}", symbol, Utc::now().timestamp_millis());
+
+    let mut order_intent = OrderIntent {
+        symbol: symbol.to_string(),
+        client_order_id: client_order_id.clone(),
+        cloid_hex: Some(cloid_uuid.to_string()),
+        owner_uuid: lease_uuid.clone(),
+        fencing_token,
+        engine_type: "EngineB1h".to_string(),
+        side: side.clone(),
+        limit_px: ioc_limit_px,
+        sz: amount_f,
+        sz_decimals,
+        target_tp: 0.0,
+        stop_loss: est_sl_px,
+        half_life_minutes: 0.0,
+        position_size_usdc,
+        status: OrderIntentStatus::PendingSubmission,
+        exchange_order_id: None,
+        created_at_ms: Utc::now().timestamp_millis() as u64,
+        updated_at_ms: Utc::now().timestamp_millis() as u64,
+    };
+    save_order_intent_atomic(&order_intent)?;
+
+    if let Err(e) = assert_current_lease(symbol, &lease_uuid, fencing_token) {
+        order_intent.status = OrderIntentStatus::Aborted;
+        let _ = save_order_intent_atomic(&order_intent);
+        clear_order_intent(symbol);
+        let _ = release_cluster_lease_authenticated(symbol, Some(&lease_uuid), Some(fencing_token));
+        return Err(format!("Order boundary fencing assertion rejected: {}", e));
+    }
+
+    let (oid, fill_px, fill_sz) = match place_ioc_entry_order(
+        exchange,
+        symbol,
+        is_buy,
+        ioc_limit_px,
+        amount_f,
+        Some(cloid_uuid),
+    )
+    .await
+    {
+        Ok(res) => res,
+        Err(e) => {
+            order_intent.status = OrderIntentStatus::Aborted;
+            let _ = save_order_intent_atomic(&order_intent);
+            clear_order_intent(symbol);
+            let _ = release_cluster_lease_authenticated(symbol, Some(&lease_uuid), Some(fencing_token));
+            return Err(e);
+        }
+    };
+
+    let eff_fill_px = if fill_px > 0.0 { fill_px } else { ref_px };
+    let eff_fill_sz = if fill_sz > 0.0 { fill_sz } else { amount_f };
+    let final_sl_dist = signal_stop_dist
+        .min(eff_fill_px * 0.032)
+        .max(eff_fill_px * 0.0040);
+    let final_sl_px = quantize_price(
+        if is_buy {
+            (eff_fill_px - final_sl_dist).max(effective_tick_size(eff_fill_px, sz_decimals))
+        } else {
+            eff_fill_px + final_sl_dist
+        },
+        sz_decimals,
+    );
+
+    // Immediately attach exchange-native StopMarket disaster stop for full filled size
+    let sl_cloid = uuid::Uuid::new_v4();
+    let disaster_stop_oid = match place_disaster_stop_trigger_order(
+        exchange,
+        symbol,
+        !is_buy,
+        final_sl_px,
+        eff_fill_sz,
+        sz_decimals,
+        Some(sl_cloid),
+    )
+    .await
+    {
+        Ok(sl_id) => Some(sl_id),
+        Err(e) => {
+            eprintln!(
+                "⚠️ [ENGINE B 1H SL WARN] Initial StopMarket placement failed for {} (Fast-Sentinel will retry): {}",
+                symbol, e
+            );
+            None
+        }
+    };
+
+    let new_state = PositionState {
+        symbol: symbol.to_string(),
+        side: side.to_string(),
+        order_id: oid.to_string(),
+        tp_order_id: "".to_string(),
+        entry_price: eff_fill_px,
+        amount: eff_fill_sz,
+        stop_loss_price: final_sl_px,
+        take_profit_price: 0.0, // Uncapped 4.0*ATR_1h Chandelier runner
+        opened_at: Utc::now().to_rfc3339(),
+        risk_amount_usdc: eff_fill_sz * eff_fill_px,
+        is_filled: true,
+        half_life_minutes: 0.0,
+        client_order_id,
+        max_progress: 0.0,
+        max_favorable_price: eff_fill_px,
+        effective_tp: 0.0,
+        last_reprice_time: Utc::now().timestamp_millis(),
+        reprice_count: 0,
+        candidate_lower_count: 0,
+        engine_type: "EngineB1h".to_string(),
+        chandelier_stop: final_sl_px,
+        active_multiplier: trail_atr_mult,
+        current_atr: atr_1h,
+        lease_fencing_token: fencing_token,
+        lease_owner_uuid: lease_uuid,
+        lifecycle: PositionLifecycle::Active,
+        frozen_center_price: 0.0,
+        frozen_sigma_eq_log: 0.0,
+        consecutive_ou_breach_5m_bars: 0,
+        consecutive_shock_bars: 0,
+        breakeven_ratchet_armed: false,
+        entry_ttl_mins: 0.0,
+        disaster_stop_oid,
+        disaster_stop_ratcheted_to_be: false,
+        last_fill_check: 0,
+        tranche1_tp_filled: false,
+        last_peak_mins: 0.0,
+        cusum_stat_1m: 0.0,
+        entry_sigma_1m: 0.0,
+    };
+
+    state.insert(symbol.to_string(), new_state);
+    let _ = save_state(state_file_path, state);
+
+    order_intent.exchange_order_id = Some(oid);
+    order_intent.status = OrderIntentStatus::Acknowledged;
+    order_intent.updated_at_ms = Utc::now().timestamp_millis() as u64;
+    let _ = save_order_intent_atomic(&order_intent);
+    clear_order_intent(symbol);
+
+    let side_label = if is_buy { "LONG" } else { "SHORT" };
+    let side_emoji = if is_buy { "🟢" } else { "🔴" };
+    let sl_bps = ((eff_fill_px - final_sl_px).abs() / eff_fill_px.max(1e-9)) * 1e4;
+    let msg = format!(
+        "{} **ENGINE B v2 (1H EMA50 PULLBACK-IN-TREND) {} FILLED:** {}\n**Fill:** ${:.4} | **Size:** {:.5} (${:.2})\n**Initial SL:** ${:.4} (-{:.0} bps) | **Trail:** {:.1}x ATR_1h (${:.4}) | **Max Hold:** 96h",
+        side_emoji, side_label, symbol, eff_fill_px, eff_fill_sz, eff_fill_sz * eff_fill_px, final_sl_px, sl_bps, trail_atr_mult, atr_1h
+    );
+    spawn_discord_alert(discord_url, msg);
+
+    Ok(json!({
+        "status": "FILLED",
+        "order_id": oid,
+        "side": side.to_string(),
+        "entry_px": eff_fill_px,
+        "stop_loss": final_sl_px
+    }))
 }
 
 fn spawn_discord_alert(discord_url: Option<String>, msg: String) {
