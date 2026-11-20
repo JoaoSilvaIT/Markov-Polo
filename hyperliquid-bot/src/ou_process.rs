@@ -4778,13 +4778,15 @@ impl AssetFeeSchedule {
                 taker_bps: 8.64,
                 stop_slippage_bps: 0.60,
             },
-            // Growth-Mode HIP-3 Equities, Index & SILVER: scaleIfHip3 = 2.0, growthModeScale = 0.1
+            // Growth-Mode HIP-3 Equities, Index, Energy & SILVER: scaleIfHip3 = 2.0, growthModeScale = 0.1
             "XYZ:NVDA" | "NVDA" | "XYZ:TSLA" | "TSLA" | "XYZ:XYZ100" | "XYZ100" | "XYZ:SILVER"
-            | "SILVER" | "XYZ:AAPL" | "AAPL" => Self {
-                maker_bps: 0.288,
-                taker_bps: 0.864,
-                stop_slippage_bps: 0.50,
-            },
+            | "SILVER" | "XYZ:CL" | "CL" | "XYZ:BRENTOIL" | "BRENTOIL" | "XYZ:AAPL" | "AAPL" => {
+                Self {
+                    maker_bps: 0.288,
+                    taker_bps: 0.864,
+                    stop_slippage_bps: 0.50,
+                }
+            }
             // Native Validator Perps (VIP0 + 4% Referral Discount)
             _ => Self {
                 maker_bps: 1.44,
@@ -4829,7 +4831,14 @@ pub fn evaluate_session_lifecycle_gate(
     );
     let is_cme_metal = matches!(
         s_upper.as_str(),
-        "XYZ:GOLD" | "GOLD" | "XYZ:SILVER" | "SILVER"
+        "XYZ:GOLD"
+            | "GOLD"
+            | "XYZ:SILVER"
+            | "SILVER"
+            | "XYZ:CL"
+            | "CL"
+            | "XYZ:BRENTOIL"
+            | "BRENTOIL"
     );
 
     if !is_us_equity && !is_cme_metal {

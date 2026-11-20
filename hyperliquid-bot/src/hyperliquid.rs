@@ -84,12 +84,16 @@ pub async fn register_hip3_dex_assets(
         coin_to_asset.insert("xyz:NVDA".to_string(), compute_hip3_asset_id(eff_fallback_idx, 2));
         coin_to_asset.insert("xyz:GOLD".to_string(), compute_hip3_asset_id(eff_fallback_idx, 3));
         coin_to_asset.insert("xyz:SILVER".to_string(), compute_hip3_asset_id(eff_fallback_idx, 26));
+        coin_to_asset.insert("xyz:CL".to_string(), compute_hip3_asset_id(eff_fallback_idx, 29));
+        coin_to_asset.insert("xyz:BRENTOIL".to_string(), compute_hip3_asset_id(eff_fallback_idx, 49));
 
         sz_map.insert("xyz:XYZ100".to_string(), 4);
         sz_map.insert("xyz:TSLA".to_string(), 3);
         sz_map.insert("xyz:NVDA".to_string(), 3);
         sz_map.insert("xyz:GOLD".to_string(), 4);
         sz_map.insert("xyz:SILVER".to_string(), 2);
+        sz_map.insert("xyz:CL".to_string(), 3);
+        sz_map.insert("xyz:BRENTOIL".to_string(), 2);
     }
 
     // 2. Dynamically resolve `perp_dex_index` from Hyperliquid `perpDexs` endpoint
@@ -1060,13 +1064,15 @@ pub fn calculate_risk_scaled_notional(
         .min(max_notional)
 }
 
-/// Markov-Polo V2.1 Zero-Liquidation Macro Position Sizer:
+/// Markov-Polo V2.3 Two-Tier Zero-Liquidation Macro Position Sizer:
 /// Enforces two simultaneous hard mathematical caps:
-/// 1. Risk-parity sizing at `risk_fraction_of_equity` (default `0.45%` = `~$2.50` stop on `$556`).
-/// 2. Zero-Liquidation Per-Slot Cap: `<= equity / max_slots` (`<= 20%` of equity at `max_slots = 5`),
-///    plus remaining unleveraged cluster budget `(equity - existing_cluster_notional)`,
-///    guaranteeing total combined portfolio exposure across all concurrent positions NEVER exceeds `1.00x` equity!
+/// 1. Risk-parity sizing at `risk_fraction_of_equity` (default `0.75%` = `~$4.20` stop on `$560`).
+/// 2. Two-Tier Per-Slot Cap: `<= equity / max_slots` (`<= 20%`) for high-vol crypto and
+///    `<= 35%` of equity for low-vol TradFi HIP-3 diversifiers (`xyz:*`) to eliminate volatility truncation,
+///    ALWAYS intersected with remaining unleveraged cluster budget `(equity - existing_cluster_notional)`
+///    so total combined portfolio exposure across ALL active positions NEVER exceeds `1.00x` equity!
 pub fn calculate_zero_liquidation_macro_notional(
+    symbol: &str,
     account_value: f64,
     existing_cluster_notional: f64,
     max_concurrent_positions: usize,
@@ -1080,7 +1086,13 @@ pub fn calculate_zero_liquidation_macro_notional(
         return None;
     }
     let slots = max_concurrent_positions.max(1) as f64;
-    let per_slot_zero_liq_cap = (account_value / slots).min(config_max_position_usdc);
+    let is_hip3_tradfi = symbol.to_ascii_lowercase().starts_with("xyz:");
+    let per_slot_frac = if is_hip3_tradfi {
+        (1.0 / slots).max(0.35)
+    } else {
+        1.0 / slots
+    };
+    let per_slot_zero_liq_cap = (account_value * per_slot_frac).min(config_max_position_usdc);
     let remaining_unleveraged_budget = (account_value - existing_cluster_notional.max(0.0)).max(0.0);
     let hard_cap = per_slot_zero_liq_cap.min(remaining_unleveraged_budget);
     if hard_cap < 12.0 {
@@ -1261,29 +1273,35 @@ pub mod tests {
     fn test_zero_liquidation_macro_notional_never_exceeds_1x_equity() {
         let eq = 560.0;
         let max_slots = 5;
-        // 1. Tight 1.0% stop would normally risk-size to ~$232 -> HARD CAPPED to $112.00 (20% of equity)
-        let n_tight = calculate_zero_liquidation_macro_notional(eq, 0.0, max_slots, 350.0, 0.0045, 100.0, 99.0, 3)
+        // 1. Tight 1.0% stop on Crypto -> HARD CAPPED to $112.00 (20% of equity)
+        let n_tight = calculate_zero_liquidation_macro_notional("ETH", eq, 0.0, max_slots, 350.0, 0.0075, 100.0, 99.0, 3)
             .expect("should size tight stop");
         assert!((n_tight - 112.0).abs() < 1e-6);
 
-        // 2. Normal 4.0% 4H stop -> risk-sized to ~$61.68 (< $112.00 cap)
-        let n_normal = calculate_zero_liquidation_macro_notional(eq, 0.0, max_slots, 350.0, 0.0045, 100.0, 96.0, 3)
-            .expect("should size normal 4h stop");
-        assert!(n_normal > 58.0 && n_normal < 65.0);
+        // 2. Low-vol TradFi HIP-3 (`xyz:CL` / `xyz:XYZ100`) -> Two-tier cap allows up to 35% ($196.00)
+        //    so low-vol macro diversifiers reach full risk parity while total portfolio stays <= 1.00x!
+        let n_tradfi = calculate_zero_liquidation_macro_notional("xyz:CL", eq, 0.0, max_slots, 350.0, 0.0075, 100.0, 99.0, 3)
+            .expect("should size low-vol TradFi up to 35%");
+        assert!((n_tradfi - 196.0).abs() < 1e-6);
 
-        // 3. Even across 5 concurrent max-sized slots, total portfolio exposure <= 1.00x equity!
+        // 3. Normal 4.0% 4H stop on Crypto -> risk-sized to ~$102.81 (< $112.00 cap)
+        let n_normal = calculate_zero_liquidation_macro_notional("BTC", eq, 0.0, max_slots, 350.0, 0.0075, 100.0, 96.0, 3)
+            .expect("should size normal 4h stop");
+        assert!(n_normal > 98.0 && n_normal < 106.0);
+
+        // 4. Even mixing TradFi (35%) + Crypto (20%) slots, total portfolio exposure NEVER exceeds 1.00x equity!
         let mut deployed = 0.0;
-        for _ in 0..max_slots {
-            let n = calculate_zero_liquidation_macro_notional(eq, deployed, max_slots, 350.0, 0.0045, 100.0, 99.0, 3)
-                .expect("slot fits within 1.00x");
-            deployed += n;
+        for sym in ["xyz:CL", "xyz:XYZ100", "BTC", "ETH", "SOL"] {
+            if let Some(n) = calculate_zero_liquidation_macro_notional(sym, eq, deployed, max_slots, 350.0, 0.0075, 100.0, 99.0, 3) {
+                deployed += n;
+            }
         }
         assert!(deployed <= eq + 1e-6, "Total deployed ${:.2} must never exceed 1.00x equity ${:.2}", deployed, eq);
 
-        // 4. Once 1.00x equity is deployed, any additional entry is strictly rejected (None)
-        assert!(calculate_zero_liquidation_macro_notional(eq, deployed, max_slots, 350.0, 0.0045, 100.0, 96.0, 3).is_none());
+        // 5. Once 1.00x equity is deployed, any additional entry is strictly rejected (None)
+        assert!(calculate_zero_liquidation_macro_notional("AVAX", eq, deployed, max_slots, 350.0, 0.0075, 100.0, 96.0, 3).is_none());
 
-        // 5. Macro drawdown multiplier: full 1.0x up to 15% DD, gentle taper > 15% DD down to 0.60x floor
+        // 6. Macro drawdown multiplier: full 1.0x up to 15% DD, gentle taper > 15% DD down to 0.60x floor
         assert_eq!(compute_macro_drawdown_risk_multiplier(560.0, 560.0), 1.0);
         assert_eq!(compute_macro_drawdown_risk_multiplier(500.0, 560.0), 1.0); // 10.7% DD -> full power
         let deep = compute_macro_drawdown_risk_multiplier(448.0, 560.0); // 20.0% DD

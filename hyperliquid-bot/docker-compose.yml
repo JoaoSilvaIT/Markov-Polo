@@ -3,7 +3,7 @@ x-bot-env: &bot-env
   HL_IS_CROSS: ${HL_IS_CROSS:-true}
   HL_TREND_ENGINE_MODE: ${HL_TREND_ENGINE_MODE:-live}
   HL_LIVE_SYMBOLS: ${HL_LIVE_SYMBOLS:-BTC,ETH,SOL,AVAX}
-  HL_PORTFOLIO_SYMBOLS: ${HL_PORTFOLIO_SYMBOLS:-BTC,ETH,SOL,AVAX,HYPE,NEAR,XRP,SUI,LINK,xyz:NVDA,xyz:GOLD,xyz:XYZ100,xyz:TSLA,xyz:SILVER,ZEC}
+  HL_PORTFOLIO_SYMBOLS: ${HL_PORTFOLIO_SYMBOLS:-BTC,ETH,SOL,AVAX,HYPE,NEAR,XRP,SUI,LINK,xyz:NVDA,xyz:GOLD,xyz:XYZ100,xyz:CL,xyz:SILVER,ZEC}
   HL_MAX_CONCURRENT_POSITIONS: ${HL_MAX_CONCURRENT_POSITIONS:-5}
   HL_DONCHIAN_PERIOD: ${HL_DONCHIAN_PERIOD:-12}
   HL_CHANDELIER_ATR_MULT: ${HL_CHANDELIER_ATR_MULT:-2.0}
@@ -89,7 +89,7 @@ services:
       - hl_cluster_shm:/var/run/hl_cluster_lock
     environment:
       HL_IS_MAINNET: ${HL_IS_MAINNET:-true}
-      HL_PORTFOLIO_SYMBOLS: ${HL_PORTFOLIO_SYMBOLS:-BTC,ETH,SOL,AVAX,HYPE,NEAR,XRP,SUI,LINK,xyz:NVDA,xyz:GOLD,xyz:XYZ100,xyz:TSLA,xyz:SILVER,ZEC}
+      HL_PORTFOLIO_SYMBOLS: ${HL_PORTFOLIO_SYMBOLS:-BTC,ETH,SOL,AVAX,HYPE,NEAR,XRP,SUI,LINK,xyz:NVDA,xyz:GOLD,xyz:XYZ100,xyz:CL,xyz:SILVER,ZEC}
       HL_CLUSTER_LOCK_DIR: /var/run/hl_cluster_lock
       HL_MUX_BIND: 0.0.0.0:9001
     command: ["hyperliquid-bot", "--mux"]
@@ -183,12 +183,12 @@ services:
       <<: *bot-env
       HL_TRADING_SYMBOL: xyz:XYZ100
 
-  hl_bot_tsla:
+  hl_bot_cl:
     <<: *bot-common
-    container_name: hl_bot_tsla
+    container_name: hl_bot_cl
     environment:
       <<: *bot-env
-      HL_TRADING_SYMBOL: xyz:TSLA
+      HL_TRADING_SYMBOL: xyz:CL
 
   hl_bot_silver:
     <<: *bot-common

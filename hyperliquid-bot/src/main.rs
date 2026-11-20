@@ -494,8 +494,9 @@ async fn main() {
             "xyz:NVDA",
             "xyz:GOLD",
             "xyz:XYZ100",
-            "xyz:TSLA",
+            "xyz:CL",
             "xyz:SILVER",
+            "xyz:TSLA",
         ];
         let symbols_vec: Vec<&str> = if native_only {
             all_symbols
@@ -890,12 +891,12 @@ async fn main() {
             use chrono::Datelike;
             use std::collections::BTreeMap;
 
-            let run_compounded = |label: &str, start_eq: f64, pos_cap_usd: f64, extra_fee_mult: f64, show_yearly: bool| {
+            let run_compounded = |label: &str, start_eq: f64, pos_cap_usd: f64, extra_fee_mult: f64, max_same_dir_cap: usize, show_yearly: bool| {
                 let mut sorted_trades: Vec<&crate::backtest::SimulatedTradeResult> = all_trades.clone();
                 sorted_trades.sort_by_key(|t| (t.entry_time_ms, t.exit_time_ms));
 
                 let max_slots = crate::state::max_concurrent_cluster_positions();
-                let max_same_dir = crate::state::max_same_direction_macro_positions(max_slots);
+                let max_same_dir = max_same_dir_cap;
 
                 struct ActiveSlot {
                     symbol: String,
@@ -1033,9 +1034,10 @@ async fn main() {
                 } else {
                     0.0
                 };
+                let calmar = if max_dd_pct > 0.1 { cagr_pct / max_dd_pct } else { 0.0 };
                 println!(
-                    "💰 [COMPOUNDED - {}] Start: ${:.2} -> Final: ${:.2} ({:+.1}%, CAGR: {:+.1}%/yr) | Trades: {} ({:.1}% WR) | MaxDD: {:.1}% | MaxLev: {:.2}x",
-                    label, start_eq, eq, tot_ret_pct, cagr_pct, taken, wr, max_dd_pct, max_lev
+                    "💰 [COMPOUNDED - {}] Start: ${:.2} -> Final: ${:.2} ({:+.1}%, CAGR: {:+.1}%/yr) | Trades: {} ({:.1}% WR) | MaxDD: {:.1}% | Calmar: {:.2} | MaxLev: {:.2}x",
+                    label, start_eq, eq, tot_ret_pct, cagr_pct, taken, wr, max_dd_pct, calmar, max_lev
                 );
                 if show_yearly && yearly.len() > 1 {
                     let mut prev_end = start_eq;
@@ -1051,8 +1053,10 @@ async fn main() {
                 }
             };
 
-            run_compounded("V2.2 Zero-Liq Uncapped (<=20%/slot, <=1.00x)", 560.69, 1_000_000.0, 0.0, true);
-            run_compounded("V2.2 Zero-Liq 2x Fee Stress Test (Uncapped)", 560.69, 1_000_000.0, 1.0, false);
+            let total_fund_all: f64 = all_trades.iter().map(|t| t.funding_usd).sum();
+            println!("   ↳ [FUNDING ALREADY DEDUCTED IN NET PNL]: ${:+.2} USDC across {} trades", total_fund_all, all_trades.len());
+            run_compounded("V2.3 Zero-Liq (max=5, dir<=4, <=1.00x)", 560.69, 1_000_000.0, 0.0, 4, true);
+            run_compounded("V2.3 Zero-Liq 2x Fee Stress (dir<=4)  ", 560.69, 1_000_000.0, 1.0, 4, false);
         }
 
         if run_mc {
@@ -1083,7 +1087,7 @@ async fn main() {
         "xyz:NVDA" => 18000,
         "xyz:GOLD" => 20000,
         "xyz:XYZ100" => 22000,
-        "xyz:TSLA" => 24000,
+        "xyz:CL" | "xyz:TSLA" => 24000,
         "xyz:SILVER" => 26000,
         "ZEC" => 28000,
         _ => 1500,
@@ -3297,14 +3301,15 @@ async fn main() {
     let max_slots_cfg = crate::state::max_concurrent_cluster_positions();
     let max_same_dir_cfg = crate::state::max_same_direction_macro_positions(max_slots_cfg);
     println!(
-        "⚙️ [STARTUP CONFIG] Symbol: {} | MARKOV-POLO V2.2 ZERO-LIQ DUAL-PILLAR: {} (4H SuperTrend-3.0 + 1H EMA50 Pullback | 0.75% risk/tr, {} slots / max {}/dir, Hard Cap <= 1.00x Equity [<= {:.0}%/slot], Macro DD-Taper >15%, 4.0x ATR Trail) | Exchange Leverage: {}x",
+        "⚙️ [STARTUP CONFIG] Symbol: {} | MARKOV-POLO V2.3 ZERO-LIQ DUAL-PILLAR: {} (4H SuperTrend-3.0 + 1H EMA50 Pullback [GOLD 4H-only] | 0.75% risk/tr, {} slots / max {}/dir, Two-Tier <=20% Crypto / <=35% TradFi, Hard Cap <=1.00x Equity, Mark-Oracle + Funding-Squeeze Guards, Macro DD-Taper >15%, 4.0x ATR Trail) | Exchange Leverage: {}x",
         trading_symbol,
         trend_engine_mode.to_uppercase(),
         max_slots_cfg,
         max_same_dir_cfg,
-        100.0 / (max_slots_cfg.max(1) as f64),
         config.hl_leverage,
     );
+    let mut consecutive_squeeze_funding_hours: u32 = 0;
+    let mut last_squeeze_funding_hour_bucket: u64 = 0;
     let cached_equity_loop = cached_account_equity.clone();
     let mut controller = load_controller_state(&trading_symbol);
     let mut current_5m_bar: Option<CandleBar> = initial_5m_bar;
@@ -4488,6 +4493,8 @@ async fn main() {
                     //   Priority 2: 4H Donchian-40 Breakout (7Y PF 1.24, 7/7 yrs)
                     //   Priority 3: 1H EMA50 Pullback-in-Trend (7Y PF 1.24, 7/7 yrs)
                     // ------------------------------------------------------------------
+                    let is_non_growth_gold = symbol_clone.eq_ignore_ascii_case("xyz:GOLD")
+                        || symbol_clone.eq_ignore_ascii_case("GOLD");
                     let macro_dispatch_opt: Option<(&'static str, &'static str, Side, f64, f64, f64, f64, f64, usize)> =
                         if let Some(ref s4) = engine_b_4h_sig_opt {
                             let lbl = if s4.policy_tag == "ENGINE_B_4H_ST3" {
@@ -4506,7 +4513,7 @@ async fn main() {
                                 s4.max_sl_frac,
                                 s4.max_hold_hours,
                             ))
-                        } else {
+                        } else if !is_non_growth_gold {
                             engine_b_1h_sig_opt.as_ref().map(|s1| {
                                 (
                                     "EngineB1h",
@@ -4520,6 +4527,8 @@ async fn main() {
                                     s1.max_hold_hours,
                                 )
                             })
+                        } else {
+                            None
                         };
 
                     if let Some((eng_tag, reason_lbl, sig_side, ref_px, init_sl_px, sig_atr, trail_m, max_sl_f, max_hold_h)) =
@@ -4533,6 +4542,24 @@ async fn main() {
                         let side_label_m = if sig_side == Side::Long { "LONG" } else { "SHORT" };
                         let macro_cluster_veto_m =
                             crate::state::has_active_macro_cluster_veto(&symbol_clone, side_label_m);
+                        // Live Mark-Oracle Dislocation Guard: defer IOC entries during flash-crash liquidity vacuums
+                        // (> 75 bps crypto, > 40 bps HIP-3 TradFi)
+                        let (mark_chk, oracle_chk) = {
+                            let cg = crowding_tracker.read().await;
+                            (cg.mark_px, cg.oracle_px)
+                        };
+                        let mark_oracle_div_bps = if mark_chk > 0.0 && oracle_chk > 0.0 {
+                            ((mark_chk - oracle_chk).abs() / oracle_chk) * 1e4
+                        } else {
+                            0.0
+                        };
+                        let max_disloc_bps = if symbol_clone.to_ascii_lowercase().starts_with("xyz:") {
+                            40.0
+                        } else {
+                            75.0
+                        };
+                        let mark_oracle_dislocated = mark_oracle_div_bps > max_disloc_bps;
+
                         let mut state_lock_m = state_clone.lock().await;
                         let already_in_pos_m = state_lock_m.contains_key(&symbol_clone);
                         if !already_in_pos_m
@@ -4540,6 +4567,7 @@ async fn main() {
                             && !candle_feed_degraded
                             && !is_candle_gap
                             && !is_cb_paused
+                            && !mark_oracle_dislocated
                             && macro_cluster_veto_m.is_none()
                             && macro_veto_m.is_none()
                             && trend_engine_mode == "live"
@@ -4556,18 +4584,19 @@ async fn main() {
 
                             if let Some(notional_m) =
                                 crate::hyperliquid::calculate_zero_liquidation_macro_notional(
+                                    &symbol_clone,
                                     live_eq_m,
                                     existing_cluster_ntl,
                                     max_slots_m,
                                     config.max_position_size_usdc,
-                                    0.0075 * dd_mult_m, // 0.75% equity risk/trade (~$4.20 on $560), hard-capped <= 1.00x total portfolio equity
+                                    0.0075 * dd_mult_m, // 0.75% equity risk/trade (~$4.20 on $560), Two-Tier <=20%/<=35%, hard-capped <=1.00x total equity
                                     ref_px,
                                     init_sl_px,
                                     config.hl_leverage,
                                 )
                             {
                                 println!(
-                                    "🚀 [MARKOV-POLO V2.1 {}] {} {:?} | Ref: ${:.4} | SL: ${:.4} | ATR=${:.4} | Notional=${:.2} (ClusterExp: ${:.2}/${:.2} <= 1.00x) | MaxHold={}h",
+                                    "🚀 [MARKOV-POLO V2.3 {}] {} {:?} | Ref: ${:.4} | SL: ${:.4} | ATR=${:.4} | Notional=${:.2} (ClusterExp: ${:.2}/${:.2} <= 1.00x) | MaxHold={}h",
                                     reason_lbl,
                                     symbol_clone,
                                     sig_side,
@@ -4602,14 +4631,14 @@ async fn main() {
                                     Ok(res) => {
                                         funnel_counters.engine_b_orders_placed += 1;
                                         println!(
-                                            "✅ [MARKOV-POLO V2.1 ENTRY EXECUTED] {} ({}) -> {:?}",
+                                            "✅ [MARKOV-POLO V2.3 ENTRY EXECUTED] {} ({}) -> {:?}",
                                             symbol_clone, reason_lbl, res
                                         );
                                     }
                                     Err(e) => {
                                         funnel_counters.engine_b_orders_rejected += 1;
                                         eprintln!(
-                                            "❌ [MARKOV-POLO V2.1 ENTRY ERROR] {} ({}): {}",
+                                            "❌ [MARKOV-POLO V2.3 ENTRY ERROR] {} ({}): {}",
                                             symbol_clone, reason_lbl, e
                                         );
                                     }
@@ -4622,13 +4651,14 @@ async fn main() {
                             }
                         } else {
                             println!(
-                                "⏸️ [MARKOV-POLO V2.1 SIGNAL GATED] {} {} {:?} (pos={}, sess={}, cb={}, cluster_veto={:?}, macro={})",
+                                "⏸️ [MARKOV-POLO V2.3 SIGNAL GATED] {} {} {:?} (pos={}, sess={}, cb={}, mark_div={:.1}bps, cluster_veto={:?}, macro={})",
                                 symbol_clone,
                                 reason_lbl,
                                 sig_side,
                                 already_in_pos_m,
                                 session_ok_m,
                                 is_cb_paused,
+                                mark_oracle_div_bps,
                                 macro_cluster_veto_m,
                                 macro_veto_m.is_some()
                             );
@@ -4746,10 +4776,37 @@ async fn main() {
                                     {
                                         pos.max_favorable_price = low_price;
                                     }
-                                    let trail_m = if pos.active_multiplier > 0.0 {
+                                    // Live Adverse Funding Squeeze Breaker:
+                                    // Hyperliquid allows up to 50 bps/hr (4,380% APR). If our open position pays >= 15 bps/hr
+                                    // (1,314% APR) for 2 consecutive hourly buckets, tighten Chandelier trail to 1.5x ATR immediately.
+                                    let cur_hr_bucket = completed_bar.time_open / 3_600_000;
+                                    if cur_hr_bucket > last_squeeze_funding_hour_bucket {
+                                        last_squeeze_funding_hour_bucket = cur_hr_bucket;
+                                        let adv_fund_bps_hr = if is_long_m {
+                                            current_funding_1h * 1e4
+                                        } else {
+                                            -current_funding_1h * 1e4
+                                        };
+                                        if adv_fund_bps_hr >= 15.0 {
+                                            consecutive_squeeze_funding_hours =
+                                                consecutive_squeeze_funding_hours.saturating_add(1);
+                                            println!(
+                                                "⚠️ [FUNDING SQUEEZE WATCH] {} {} paying {:.2} bps/hr adverse funding (streak: {}/2 hrs)",
+                                                symbol_clone, pos.side, adv_fund_bps_hr, consecutive_squeeze_funding_hours
+                                            );
+                                        } else {
+                                            consecutive_squeeze_funding_hours = 0;
+                                        }
+                                    }
+                                    let base_trail_m = if pos.active_multiplier > 0.0 {
                                         pos.active_multiplier
                                     } else {
                                         4.0
+                                    };
+                                    let trail_m = if consecutive_squeeze_funding_hours >= 2 {
+                                        base_trail_m.min(1.5)
+                                    } else {
+                                        base_trail_m
                                     };
                                     let cur_atr_m = if is_4h_pos {
                                         if engine_b_4h.atr_4h > 0.0 {
@@ -4921,11 +4978,13 @@ async fn main() {
                             }
                             save_circuit_breaker(&cb_path_clone, &cb_lock);
                             let time_msg = format!(
-                                "⏱️ **MARKOV-POLO V2.1 MAX-HOLD EXIT:** {} held {:.1}h (limit {:.0}h). Closed @ ${:.4} (Entry: ${:.4}).",
+                                "⏱️ **MARKOV-POLO V2.3 MAX-HOLD EXIT:** {} held {:.1}h (limit {:.0}h). Closed @ ${:.4} (Entry: ${:.4}).",
                                 symbol_clone, elapsed_mins / 60.0, max_allowed_mins / 60.0, close_price, ent_px
                             );
                             crate::discord::send_alert(discord_clone.as_deref(), &time_msg).await;
                         }
+                    } else {
+                        consecutive_squeeze_funding_hours = 0;
                     }
 
                     // Advance rolling window with finalized 1m close & shared Fast-Sentinel price

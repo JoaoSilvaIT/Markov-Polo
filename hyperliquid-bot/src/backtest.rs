@@ -1335,7 +1335,8 @@ pub fn run_engine_a_backtest_with_btc(
                 || pos.policy == "ENGINE_B_4H_ST3"
                 || pos.policy == "ENGINE_B_4H_D40"
             {
-                // Markov-Polo V2 (Package 10): Unified 1H/4H Macro Trend monotonic 4.0*ATR Chandelier + max hold
+                // Markov-Polo V2.3: Proven flat monotonic 4.0*ATR Chandelier + 96h/288h max hold
+                // (Empirically beat both Conditional Stagnation Exits and Blow-Off Ratchets across 7Y + Native L1)
                 let sl_hit_macro = match pos.side {
                     Side::Long => bar.low <= pos.hard_stop_px,
                     Side::Short => bar.high >= pos.hard_stop_px,
@@ -2211,6 +2212,8 @@ pub fn run_engine_a_backtest_with_btc(
         //    Priority 3: 1H EMA50 Pullback-in-Trend (7Y PF 1.24, 7/7 yrs)
         // ------------------------------------------------------------------
         if open_pos.is_none() && resting_entry.is_none() && !session_blocks_entries {
+            let is_non_growth_gold =
+                symbol.eq_ignore_ascii_case("xyz:GOLD") || symbol.eq_ignore_ascii_case("GOLD");
             let macro_entry_opt: Option<(&'static str, Side, f64, f64, f64, f64)> =
                 if let Some(ref s4) = engine_b_4h_sig_opt {
                     Some((
@@ -2221,7 +2224,7 @@ pub fn run_engine_a_backtest_with_btc(
                         s4.trail_atr_mult,
                         s4.max_sl_frac,
                     ))
-                } else {
+                } else if !is_non_growth_gold {
                     engine_b_1h_sig_opt.as_ref().map(|s1| {
                         (
                             "ENGINE_B_1H_PULLBACK",
@@ -2232,6 +2235,8 @@ pub fn run_engine_a_backtest_with_btc(
                             0.032,
                         )
                     })
+                } else {
+                    None
                 };
 
             if let Some((policy_tag, sig_side, raw_sl_dist, sig_atr, trail_mult, max_sl_f)) =
@@ -2264,14 +2269,15 @@ pub fn run_engine_a_backtest_with_btc(
                     };
                     let sl_px = quantize_price(raw_sl, sim_cfg.sz_decimals);
                     let base_eq_m = sim_cfg.account_equity_usdc;
-                    // Markov-Polo V2.2 Hard Zero-Liquidation Cap:
-                    // 0.75% equity risk/trade (~$4.20 on $560), each slot <= (1.00 / max_slots) of equity (20% at max=5) -> total combined portfolio exposure <= 1.00x equity!
+                    // Markov-Polo V2.3 Two-Tier Zero-Liquidation Cap:
+                    // 0.75% equity risk/trade (~$4.20 on $560), <= 20% crypto / <= 35% low-vol TradFi -> total portfolio <= 1.00x equity!
                     let notional = crate::hyperliquid::calculate_zero_liquidation_macro_notional(
+                        symbol,
                         base_eq_m,
                         0.0,
                         crate::state::max_concurrent_cluster_positions(),
                         350.0,
-                        0.0075, // 0.75% equity risk per trade (7Y $560 -> $4,739, Calmar 1.30, MaxLev <= 1.00x)
+                        0.0075,
                         entry_px,
                         sl_px,
                         3,

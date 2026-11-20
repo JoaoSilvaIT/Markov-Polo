@@ -1211,7 +1211,8 @@ pub fn asset_cluster(symbol: &str) -> AssetCluster {
         "XRP" | "DOGE" | "WLD" => AssetCluster::Momentum,
         "XYZ:NVDA" | "NVDA" | "XYZ:TSLA" | "TSLA" | "XYZ:XYZ100" | "XYZ100" | "XYZ:AAPL"
         | "AAPL" => AssetCluster::UsEquity,
-        "XYZ:GOLD" | "GOLD" | "XYZ:SILVER" | "SILVER" => AssetCluster::PreciousMetals,
+        "XYZ:GOLD" | "GOLD" | "XYZ:SILVER" | "SILVER" | "XYZ:CL" | "CL" | "XYZ:BRENTOIL"
+        | "BRENTOIL" => AssetCluster::PreciousMetals,
         _ => AssetCluster::AltL1,
     }
 }
@@ -1220,6 +1221,7 @@ pub fn asset_cluster(symbol: &str) -> AssetCluster {
 pub fn asset_downside_semibeta(symbol: &str) -> f64 {
     match symbol.to_uppercase().as_str() {
         "XYZ:GOLD" | "GOLD" => 0.20,
+        "XYZ:CL" | "CL" | "XYZ:BRENTOIL" | "BRENTOIL" => 0.25,
         "XYZ:SILVER" | "SILVER" => 0.35,
         "XYZ:XYZ100" | "XYZ100" => 0.45,
         "XYZ:NVDA" | "NVDA" => 0.65,
@@ -1420,7 +1422,7 @@ pub fn configured_portfolio_symbols() -> Vec<String> {
         "xyz:NVDA".to_string(),
         "xyz:GOLD".to_string(),
         "xyz:XYZ100".to_string(),
-        "xyz:TSLA".to_string(),
+        "xyz:CL".to_string(),
         "xyz:SILVER".to_string(),
         "ZEC".to_string(),
     ]
