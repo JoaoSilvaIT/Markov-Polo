@@ -3234,18 +3234,12 @@ async fn main() {
         position_size_usdc,
     );
     println!(
-        "⚙️ [STARTUP CONFIG] Symbol: {} | Engine A: LIVE (Maker Post-Only, {:.0}% eq -> ${:.2}) | Engine B (Policy C): {} ({:?}, {:.2}x risk -> ${:.2} cap ${:.2}, Squeeze <= {:.2}, RelVol >= {:.2}x, Retest TTL {}s) | Leverage: {}x",
+        "⚙️ [STARTUP CONFIG] Symbol: {} | Engine A: LIVE (JOIN_BOOK Maker Post-Only, {:.0}% eq -> ${:.2}) | Engine B v2: {} (1H EMA50 Pullback-in-Trend, cap ${:.2}, SL 2.5x/3.2%, Trail 4.0x ATR_1h, legacy 5m Donchian=SHADOW) | Leverage: {}x",
         trading_symbol,
         eff_eq_frac_loop * 100.0,
         initial_trade_bank,
         trend_engine_mode.to_uppercase(),
-        trend_cfg.tier,
-        trend_cfg.trend_risk_fraction,
-        trend_cfg.compute_trend_notional_usdc(initial_equity),
         trend_cfg.max_trend_notional_usdc,
-        trend_cfg.max_squeeze_ratio,
-        trend_cfg.min_rel_volume,
-        trend_cfg.retest_ttl_secs,
         config.hl_leverage,
     );
     let cached_equity_loop = cached_account_equity.clone();
@@ -4490,20 +4484,11 @@ async fn main() {
                                     open_price.max(chandelier.current_stop)
                                 };
                                 let net_pnl = record_shadow_exit(&mut shadow_trade, exit_price, "Monotone Dynamic Chandelier Trailing Stop");
-                                controller.notify_trend_stopped_out();
-                                save_controller_state(&symbol_clone, &controller);
                                 let ret_bps = shadow_trade.return_bps.unwrap_or(0.0);
                                 println!(
                                     "🛑 [SHADOW-TREND EXIT] {} stopped out at ${:.2}! Net PnL: ${:.2} ({:.1} bps).",
                                     symbol_clone, exit_price, net_pnl, ret_bps
                                 );
-                                crate::discord::send_alert(
-                                    discord_clone.as_deref(),
-                                    &format!(
-                                        "🛑 **[PHASE 0 SHADOW-TREND EXIT]** {} {}\n**Exit Price:** ${:.2} (Stop: ${:.2})\n**Net PnL:** ${:.2} ({:.1} bps)\n**Reason:** Monotone Dynamic Chandelier Trailing Stop",
-                                        symbol_clone, shadow_trade.side, exit_price, new_stop, net_pnl, ret_bps
-                                    ),
-                                ).await;
                             }
                         }
                     }
