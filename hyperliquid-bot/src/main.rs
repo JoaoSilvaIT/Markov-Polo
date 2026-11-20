@@ -1843,6 +1843,9 @@ async fn main() {
                 if pos.stop_loss_price <= 0.0 {
                     pos.stop_loss_price = default_sl;
                 }
+                if pos.initial_stop_loss_price <= 0.0 {
+                    pos.initial_stop_loss_price = pos.stop_loss_price;
+                }
                 if pos.chandelier_stop <= 0.0 {
                     pos.chandelier_stop = pos.stop_loss_price;
                 }
@@ -1907,6 +1910,9 @@ async fn main() {
                         last_peak_mins: 0.0,
                         cusum_stat_1m: 0.0,
                         entry_sigma_1m: 0.0,
+                        initial_stop_loss_price: default_sl,
+                        accrued_funding_usd: 0.0,
+                        timeout_disabled: false,
                     },
                 );
             }
@@ -1997,6 +2003,9 @@ async fn main() {
                                 last_peak_mins: 0.0,
                                 cusum_stat_1m: 0.0,
                                 entry_sigma_1m: 0.0,
+                                initial_stop_loss_price: intent.stop_loss,
+                                accrued_funding_usd: 0.0,
+                                timeout_disabled: false,
                             };
                             state_lock.insert(trading_symbol.clone(), reconstructed);
                             let _ = save_state(&state_file_path, &state_lock);
@@ -4560,6 +4569,16 @@ async fn main() {
                         };
                         let mark_oracle_dislocated = mark_oracle_div_bps > max_disloc_bps;
 
+                        // Oil Goldman Roll Guard (NY business days 5–9 on xyz:CL / xyz:BRENTOIL):
+                        // Veto 1H_PB entries and veto 4H_ST3 shorts when funding < -0.003%/hr (-0.30 bps/hr)
+                        // so downward roll price steps don't trigger false shorts into -100% APR short carry.
+                        let is_oil_sym = symbol_clone.eq_ignore_ascii_case("xyz:CL")
+                            || symbol_clone.eq_ignore_ascii_case("xyz:BRENTOIL");
+                        let oil_roll_vetoed = is_oil_sym
+                            && crate::ou_process::is_oil_goldman_roll_window(now_ms_cb as i64)
+                            && (eng_tag == "EngineB1h"
+                                || (sig_side == Side::Short && current_funding_1h < -0.00003));
+
                         let mut state_lock_m = state_clone.lock().await;
                         let already_in_pos_m = state_lock_m.contains_key(&symbol_clone);
                         if !already_in_pos_m
@@ -4568,6 +4587,7 @@ async fn main() {
                             && !is_candle_gap
                             && !is_cb_paused
                             && !mark_oracle_dislocated
+                            && !oil_roll_vetoed
                             && macro_cluster_veto_m.is_none()
                             && macro_veto_m.is_none()
                             && trend_engine_mode == "live"
@@ -4776,17 +4796,21 @@ async fn main() {
                                     {
                                         pos.max_favorable_price = low_price;
                                     }
-                                    // Live Adverse Funding Squeeze Breaker:
+                                    // Live Hourly Funding Accrual + Adverse Funding Squeeze Breaker:
                                     // Hyperliquid allows up to 50 bps/hr (4,380% APR). If our open position pays >= 15 bps/hr
                                     // (1,314% APR) for 2 consecutive hourly buckets, tighten Chandelier trail to 1.5x ATR immediately.
                                     let cur_hr_bucket = completed_bar.time_open / 3_600_000;
                                     if cur_hr_bucket > last_squeeze_funding_hour_bucket {
                                         last_squeeze_funding_hour_bucket = cur_hr_bucket;
-                                        let adv_fund_bps_hr = if is_long_m {
-                                            current_funding_1h * 1e4
+                                        let signed_fund_cost = if is_long_m {
+                                            current_funding_1h
                                         } else {
-                                            -current_funding_1h * 1e4
+                                            -current_funding_1h
                                         };
+                                        if pos.amount > 0.0 && close_price > 0.0 && signed_fund_cost.is_finite() {
+                                            pos.accrued_funding_usd += pos.amount * close_price * signed_fund_cost;
+                                        }
+                                        let adv_fund_bps_hr = signed_fund_cost * 1e4;
                                         if adv_fund_bps_hr >= 15.0 {
                                             consecutive_squeeze_funding_hours =
                                                 consecutive_squeeze_funding_hours.saturating_add(1);
@@ -4855,8 +4879,33 @@ async fn main() {
                                     } else {
                                         96.0 * 60.0
                                     };
-                                    if elapsed_mins >= max_allowed_mins {
-                                        time_stop_triggered = true;
+                                    // One-Time Latch Winner Uncapping (evaluated EXACTLY ONCE at timeout bar, net of accrued funding):
+                                    if !pos.timeout_disabled && elapsed_mins >= max_allowed_mins {
+                                        let init_sl_ref = if pos.initial_stop_loss_price > 0.0 {
+                                            pos.initial_stop_loss_price
+                                        } else {
+                                            pos.stop_loss_price
+                                        };
+                                        let init_sl_dist = (pos.entry_price - init_sl_ref)
+                                            .abs()
+                                            .max(pos.entry_price * 0.005);
+                                        let raw_unreal_usd = if is_long_m {
+                                            (close_price - pos.entry_price) * pos.amount
+                                        } else {
+                                            (pos.entry_price - close_price) * pos.amount
+                                        };
+                                        let net_unreal_usd = raw_unreal_usd - pos.accrued_funding_usd;
+                                        let init_risk_usd = (init_sl_dist * pos.amount).max(1e-6);
+                                        let r_net = net_unreal_usd / init_risk_usd;
+                                        if r_net >= 1.5 {
+                                            pos.timeout_disabled = true;
+                                            println!(
+                                                "🏆 [ONE-TIME LATCH UNCAPPED] {} {} reached {:.2}R net at {:.0}h timeout (accrued funding: ${:+.2}). Timeout disabled permanently — riding 4.0x ATR trail uncapped!",
+                                                symbol_clone, pos.side, r_net, max_allowed_mins / 60.0, pos.accrued_funding_usd
+                                            );
+                                        } else {
+                                            time_stop_triggered = true;
+                                        }
                                     }
                                     println!(
                                         "🚀 [MARKOV-POLO V2.1 {} RUNNER] {} {} | Px: ${:.4} | Trail SL: ${:.4} | Extreme: ${:.4} | Hold: {:.1}h/{:.0}h",

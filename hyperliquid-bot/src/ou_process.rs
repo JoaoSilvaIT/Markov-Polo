@@ -4831,17 +4831,14 @@ pub fn evaluate_session_lifecycle_gate(
     );
     let is_cme_metal = matches!(
         s_upper.as_str(),
-        "XYZ:GOLD"
-            | "GOLD"
-            | "XYZ:SILVER"
-            | "SILVER"
-            | "XYZ:CL"
-            | "CL"
-            | "XYZ:BRENTOIL"
-            | "BRENTOIL"
+        "XYZ:GOLD" | "GOLD" | "XYZ:SILVER" | "SILVER"
+    );
+    let is_cme_oil = matches!(
+        s_upper.as_str(),
+        "XYZ:CL" | "CL" | "XYZ:BRENTOIL" | "BRENTOIL"
     );
 
-    if !is_us_equity && !is_cme_metal {
+    if !is_us_equity && !is_cme_metal && !is_cme_oil {
         return SessionLifecycleAction::AllowNormalTrading;
     }
 
@@ -4870,6 +4867,32 @@ pub fn evaluate_session_lifecycle_gate(
         }
         if total_day_mins >= rth_close - 30 {
             return SessionLifecycleAction::BlockNewEntriesAndRatchetTp("US_EQUITY_PRE_CLOSE_30M");
+        }
+    } else if is_cme_oil {
+        // CME NYMEX Oil (`xyz:CL` / `xyz:BRENTOIL`):
+        // 1. Weekend Flatten: Fri 15:55 ET -> Sun 18:15 ET (eliminates +16.4% Sunday CME reopen snap!)
+        // 2. Daily CME Maintenance Pause (Mon-Thu 16:45-18:15 ET): block NEW entries only (let multi-day oil runners hold!)
+        // 3. EIA Crude Oil Inventory Embargo: Wed 10:25-10:40 ET
+        let (fri_flat, maint_start, maint_end, eia_start, eia_end) = if is_us_dst {
+            // EDT = UTC-4: 15:55 ET = 19:55 UTC (1195), 16:45 ET = 1245, 18:15 ET = 1335, 10:25-10:40 ET = 865..880
+            (1195, 1245, 1335, 865, 880)
+        } else {
+            // EST = UTC-5: 15:55 ET = 20:55 UTC (1255), 16:45 ET = 1305, 18:15 ET = 1395, 10:25-10:40 ET = 925..940
+            (1255, 1305, 1395, 925, 940)
+        };
+        if day_of_week == 6
+            || (day_of_week == 5 && total_day_mins >= fri_flat)
+            || (day_of_week == 0 && total_day_mins < maint_end)
+        {
+            return SessionLifecycleAction::ForceFlat("CME_OIL_WEEKEND_CLOSED");
+        }
+        if total_day_mins >= maint_start && total_day_mins < maint_end {
+            return SessionLifecycleAction::BlockNewEntriesAndRatchetTp("CME_OIL_DAILY_MAINT");
+        }
+        if day_of_week == 3 && total_day_mins >= eia_start && total_day_mins < eia_end {
+            return SessionLifecycleAction::BlockNewEntriesAndRatchetTp(
+                "OIL_EIA_INVENTORY_EMBARGO",
+            );
         }
     } else if is_cme_metal {
         // CME Globex daily maintenance: 17:00 - 18:00 ET -> EDT: 1260..1320, EST: 1320..1380
@@ -4906,6 +4929,30 @@ pub fn evaluate_session_lifecycle_gate(
     }
 
     SessionLifecycleAction::AllowNormalTrading
+}
+
+/// Returns `true` during the monthly 5-day WTI/Brent "Goldman Roll" window (NY business days 5–9).
+/// During backwardated roll days on `trade.xyz` (`xyz:CL` / `xyz:BRENTOIL`), oracle price steps downward
+/// while funding goes deeply negative (-100% APR), which can trigger false OHLCV short signals into heavy short carry.
+pub fn is_oil_goldman_roll_window(utc_timestamp_ms: i64) -> bool {
+    use chrono::{Datelike, NaiveDate, TimeZone, Utc};
+    let dt = match Utc.timestamp_millis_opt(utc_timestamp_ms).single() {
+        Some(d) => d,
+        None => return false,
+    };
+    let year = dt.year();
+    let month = dt.month();
+    let cur_day = dt.day();
+    let mut biz_days = 0u32;
+    for d in 1..=cur_day {
+        if let Some(nd) = NaiveDate::from_ymd_opt(year, month, d) {
+            let dow = nd.weekday().num_days_from_monday(); // 0=Mon..4=Fri, 5=Sat, 6=Sun
+            if dow < 5 {
+                biz_days += 1;
+            }
+        }
+    }
+    (5..=9).contains(&biz_days)
 }
 
 /// Bailey & López de Prado (2012) Probabilistic Sharpe Ratio `PSR(0)` accounting for
@@ -5957,6 +6004,48 @@ mod tests {
             evaluate_session_lifecycle_gate("BTC", ts_est_flat),
             SessionLifecycleAction::AllowNormalTrading
         );
+
+        // xyz:CL Oil: Fri 15:55 ET -> ForceFlat; Wed 10:30 ET EIA -> BlockNewEntries; Mon 17:10 ET -> BlockNewEntries (not ForceFlat!)
+        let cl_fri_flat = Utc
+            .with_ymd_and_hms(2026, 11, 20, 20, 56, 0)
+            .unwrap()
+            .timestamp_millis(); // Fri 15:56 EST
+        assert_eq!(
+            evaluate_session_lifecycle_gate("xyz:CL", cl_fri_flat),
+            SessionLifecycleAction::ForceFlat("CME_OIL_WEEKEND_CLOSED")
+        );
+        let cl_wed_eia = Utc
+            .with_ymd_and_hms(2026, 11, 18, 15, 30, 0)
+            .unwrap()
+            .timestamp_millis(); // Wed 10:30 EST
+        assert_eq!(
+            evaluate_session_lifecycle_gate("xyz:CL", cl_wed_eia),
+            SessionLifecycleAction::BlockNewEntriesAndRatchetTp("OIL_EIA_INVENTORY_EMBARGO")
+        );
+        let cl_mon_maint = Utc
+            .with_ymd_and_hms(2026, 11, 16, 22, 10, 0)
+            .unwrap()
+            .timestamp_millis(); // Mon 17:10 EST
+        assert_eq!(
+            evaluate_session_lifecycle_gate("xyz:CL", cl_mon_maint),
+            SessionLifecycleAction::BlockNewEntriesAndRatchetTp("CME_OIL_DAILY_MAINT")
+        );
+        // Goldman Roll window: Nov 2026 -> 1st is Sun, biz day 1 = Nov 2, biz days 5..9 = Nov 6..12
+        let roll_day5 = Utc
+            .with_ymd_and_hms(2026, 11, 6, 14, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        let non_roll_day4 = Utc
+            .with_ymd_and_hms(2026, 11, 5, 14, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        let non_roll_day10 = Utc
+            .with_ymd_and_hms(2026, 11, 13, 14, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        assert!(is_oil_goldman_roll_window(roll_day5));
+        assert!(!is_oil_goldman_roll_window(non_roll_day4));
+        assert!(!is_oil_goldman_roll_window(non_roll_day10));
 
         // 3. F-07 Engine A Disaster Stop decoupling (> min_soft_inv_bps + 35 bps, >= 85 bps)
         let btc_sl_dist = compute_engine_a_disaster_stop_distance("BTC", 70_000.0, 70_175.0); // 25 bps TP

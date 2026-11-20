@@ -155,6 +155,16 @@ pub struct PositionState {
     pub cusum_stat_1m: f64,
     #[serde(default)]
     pub entry_sigma_1m: f64,
+    /// Original initial stop-loss price captured at fill so 1R stays invariant as trailing stop ratchets.
+    #[serde(default)]
+    pub initial_stop_loss_price: f64,
+    /// Cumulative realized hourly funding paid (positive = cost paid, negative = carry received) in USD.
+    #[serde(default)]
+    pub accrued_funding_usd: f64,
+    /// One-Time Latch: set permanently true when R_net >= 1.5 at the 96h/288h timeout bar,
+    /// letting confirmed macro winners ride the 4.0x ATR Chandelier trail uncapped.
+    #[serde(default)]
+    pub timeout_disabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1997,6 +2007,9 @@ mod tests {
             last_peak_mins: 0.0,
             cusum_stat_1m: 0.0,
             entry_sigma_1m: 0.0,
+            initial_stop_loss_price: 0.0,
+            accrued_funding_usd: 0.0,
+            timeout_disabled: false,
         };
         assert!(!empty_pos.is_occupied());
 

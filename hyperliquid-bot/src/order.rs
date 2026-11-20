@@ -310,6 +310,9 @@ pub async fn place_ou_maker_entry(
         last_peak_mins: 0.0,
         cusum_stat_1m: 0.0,
         entry_sigma_1m: 0.0,
+        initial_stop_loss_price: stop_loss_price,
+        accrued_funding_usd: 0.0,
+        timeout_disabled: false,
     };
 
     state.insert(symbol.to_string(), new_state.clone());
@@ -616,6 +619,9 @@ pub async fn place_trend_breakout_entry(
         last_peak_mins: 0.0,
         cusum_stat_1m: 0.0,
         entry_sigma_1m: 0.0,
+        initial_stop_loss_price: initial_stop,
+        accrued_funding_usd: 0.0,
+        timeout_disabled: false,
     };
 
     state.insert(symbol.to_string(), new_state.clone());
@@ -864,6 +870,9 @@ pub async fn place_macro_trend_ioc_entry(
         last_peak_mins: 0.0,
         cusum_stat_1m: 0.0,
         entry_sigma_1m: 0.0,
+        initial_stop_loss_price: final_sl_px,
+        accrued_funding_usd: 0.0,
+        timeout_disabled: false,
     };
 
     state.insert(symbol.to_string(), new_state);
