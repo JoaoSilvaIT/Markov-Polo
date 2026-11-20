@@ -29,7 +29,7 @@ use crate::telemetry::{
 };
 use crate::hmm::{compute_hmm_posteriors, train_hmm_offline, GaussianHMM};
 use crate::hyperliquid::{
-    calculate_dynamic_notional, cancel_order, compute_drawdown_risk_multiplier,
+    calculate_dynamic_notional, cancel_order, compute_macro_drawdown_risk_multiplier,
     effective_tick_size, fetch_book_ticker, fetch_open_orders_for_coin, fetch_sz_decimals_map,
     get_account_value, get_user_position, place_disaster_stop_trigger_order,
     place_reduce_only_tp_order, quantize_price, round_to_decimals,
@@ -883,6 +883,176 @@ async fn main() {
                 "      • {:<45} : {:4} trades | Net: ${:+.2} ({:+.1} bps)",
                 reason, cnt, net_usd, net_bps
             );
+        }
+
+        // Synchronized Chronological Compounding Portfolio Replay (Exact V2.2 Zero-Liquidation Rules)
+        {
+            use chrono::Datelike;
+            use std::collections::BTreeMap;
+
+            let run_compounded = |label: &str, start_eq: f64, pos_cap_usd: f64, extra_fee_mult: f64, show_yearly: bool| {
+                let mut sorted_trades: Vec<&crate::backtest::SimulatedTradeResult> = all_trades.clone();
+                sorted_trades.sort_by_key(|t| (t.entry_time_ms, t.exit_time_ms));
+
+                let max_slots = crate::state::max_concurrent_cluster_positions();
+                let max_same_dir = crate::state::max_same_direction_macro_positions(max_slots);
+
+                struct ActiveSlot {
+                    symbol: String,
+                    side: Side,
+                    exit_time_ms: u64,
+                    notional: f64,
+                    pnl_usd: f64,
+                    is_win: bool,
+                }
+
+                let mut active: Vec<ActiveSlot> = Vec::new();
+                let mut eq = start_eq;
+                let mut hwm = start_eq;
+                let mut max_dd_pct = 0.0_f64;
+                let mut max_lev = 0.0_f64;
+                let mut taken = 0usize;
+                let mut wins = 0usize;
+                let mut yearly: BTreeMap<i32, (f64, usize, usize, f64)> = BTreeMap::new();
+                let mut year_hwm: BTreeMap<i32, f64> = BTreeMap::new();
+
+                let close_expired = |now_ms: u64,
+                                     active: &mut Vec<ActiveSlot>,
+                                     eq: &mut f64,
+                                     hwm: &mut f64,
+                                     max_dd_pct: &mut f64,
+                                     wins: &mut usize,
+                                     yearly: &mut BTreeMap<i32, (f64, usize, usize, f64)>,
+                                     year_hwm: &mut BTreeMap<i32, f64>| {
+                    active.sort_by_key(|a| a.exit_time_ms);
+                    let mut remaining = Vec::new();
+                    for s in active.drain(..) {
+                        if s.exit_time_ms <= now_ms {
+                            let eq_before = (*eq).max(1e-9);
+                            *eq += s.pnl_usd;
+                            if s.is_win {
+                                *wins += 1;
+                            }
+                            if *eq > *hwm {
+                                *hwm = *eq;
+                            }
+                            let dd = ((*hwm - *eq) / (*hwm).max(1e-9)) * 100.0;
+                            if dd > *max_dd_pct {
+                                *max_dd_pct = dd;
+                            }
+                            let yr = chrono::DateTime::from_timestamp_millis(s.exit_time_ms as i64)
+                                .map(|d| d.year())
+                                .unwrap_or(2026);
+                            let entry = yearly.entry(yr).or_insert((*eq, 0, 0, 0.0));
+                            entry.0 = *eq;
+                            entry.1 += 1;
+                            if s.is_win {
+                                entry.2 += 1;
+                            }
+                            let y_hwm = year_hwm.entry(yr).or_insert(eq_before);
+                            if *eq > *y_hwm {
+                                *y_hwm = *eq;
+                            }
+                            let y_dd = ((*y_hwm - *eq) / (*y_hwm).max(1e-9)) * 100.0;
+                            if y_dd > entry.3 {
+                                entry.3 = y_dd;
+                            }
+                        } else {
+                            remaining.push(s);
+                        }
+                    }
+                    *active = remaining;
+                };
+
+                for t in sorted_trades {
+                    close_expired(
+                        t.entry_time_ms,
+                        &mut active,
+                        &mut eq,
+                        &mut hwm,
+                        &mut max_dd_pct,
+                        &mut wins,
+                        &mut yearly,
+                        &mut year_hwm,
+                    );
+                    if active.len() >= max_slots || active.iter().any(|a| a.symbol == t.symbol) {
+                        continue;
+                    }
+                    if active.iter().filter(|a| a.side == t.side).count() >= max_same_dir {
+                        continue;
+                    }
+                    let open_ntl: f64 = active.iter().map(|a| a.notional).sum();
+                    let dd_mult = compute_macro_drawdown_risk_multiplier(eq, hwm);
+                    let base_ntl_560 = (t.qty * t.entry_px).max(12.0);
+                    let risk_frac_of_eq = (base_ntl_560 / 560.0) * dd_mult;
+                    let slot_cap = (eq / max_slots as f64).min(pos_cap_usd);
+                    let rem_budget = (eq - open_ntl).max(0.0);
+                    let hard_cap = slot_cap.min(rem_budget);
+                    if hard_cap < 12.0 {
+                        continue;
+                    }
+                    let ntl = (eq * risk_frac_of_eq).min(hard_cap).max(12.0).min(hard_cap);
+                    let scale = ntl / base_ntl_560;
+                    let adj_pnl = (t.net_pnl_usd - t.fees_usd * extra_fee_mult) * scale;
+
+                    let new_lev = (open_ntl + ntl) / eq.max(1e-9);
+                    if new_lev > max_lev {
+                        max_lev = new_lev;
+                    }
+                    taken += 1;
+                    active.push(ActiveSlot {
+                        symbol: t.symbol.clone(),
+                        side: t.side.clone(),
+                        exit_time_ms: t.exit_time_ms,
+                        notional: ntl,
+                        pnl_usd: adj_pnl,
+                        is_win: adj_pnl > 0.0,
+                    });
+                }
+
+                close_expired(
+                    u64::MAX,
+                    &mut active,
+                    &mut eq,
+                    &mut hwm,
+                    &mut max_dd_pct,
+                    &mut wins,
+                    &mut yearly,
+                    &mut year_hwm,
+                );
+
+                let tot_ret_pct = ((eq / start_eq) - 1.0) * 100.0;
+                let years = yearly.len().max(1) as f64;
+                let cagr_pct = if eq > 0.0 {
+                    ((eq / start_eq).powf(1.0 / years) - 1.0) * 100.0
+                } else {
+                    0.0
+                };
+                let wr = if taken > 0 {
+                    (wins as f64 / taken as f64) * 100.0
+                } else {
+                    0.0
+                };
+                println!(
+                    "💰 [COMPOUNDED - {}] Start: ${:.2} -> Final: ${:.2} ({:+.1}%, CAGR: {:+.1}%/yr) | Trades: {} ({:.1}% WR) | MaxDD: {:.1}% | MaxLev: {:.2}x",
+                    label, start_eq, eq, tot_ret_pct, cagr_pct, taken, wr, max_dd_pct, max_lev
+                );
+                if show_yearly && yearly.len() > 1 {
+                    let mut prev_end = start_eq;
+                    for (yr, (end_eq, n_tr, n_w, y_dd)) in &yearly {
+                        let y_ret = ((end_eq / prev_end) - 1.0) * 100.0;
+                        let y_wr = if *n_tr > 0 { (*n_w as f64 / *n_tr as f64) * 100.0 } else { 0.0 };
+                        println!(
+                            "      • {}: ${:8.2} -> ${:8.2} ({:+6.1}%) | {:4} trades ({:4.1}% WR) | Year MaxDD: {:4.1}%",
+                            yr, prev_end, end_eq, y_ret, n_tr, y_wr, y_dd
+                        );
+                        prev_end = *end_eq;
+                    }
+                }
+            };
+
+            run_compounded("V2.2 Zero-Liq Uncapped (<=20%/slot, <=1.00x)", 560.69, 1_000_000.0, 0.0, true);
+            run_compounded("V2.2 Zero-Liq 2x Fee Stress Test (Uncapped)", 560.69, 1_000_000.0, 1.0, false);
         }
 
         if run_mc {
@@ -3127,7 +3297,7 @@ async fn main() {
     let max_slots_cfg = crate::state::max_concurrent_cluster_positions();
     let max_same_dir_cfg = crate::state::max_same_direction_macro_positions(max_slots_cfg);
     println!(
-        "⚙️ [STARTUP CONFIG] Symbol: {} | MARKOV-POLO V2.1 ZERO-LIQ MACRO TREND: {} (4H SuperTrend-3.0 + 4H Donchian-40 + 1H EMA50 Pullback | 0.45% risk/tr, {} slots / max {}/dir, Hard Cap <= 1.00x Equity [<= {:.0}%/slot], 4.0x ATR Trail) | Exchange Leverage: {}x",
+        "⚙️ [STARTUP CONFIG] Symbol: {} | MARKOV-POLO V2.2 ZERO-LIQ DUAL-PILLAR: {} (4H SuperTrend-3.0 + 1H EMA50 Pullback | 0.75% risk/tr, {} slots / max {}/dir, Hard Cap <= 1.00x Equity [<= {:.0}%/slot], Macro DD-Taper >15%, 4.0x ATR Trail) | Exchange Leverage: {}x",
         trading_symbol,
         trend_engine_mode.to_uppercase(),
         max_slots_cfg,
@@ -4378,7 +4548,7 @@ async fn main() {
                             let _ = resolve_trade_bank(&info_clone, user_address, &config, &cached_equity_loop).await;
                             let live_eq_m = *cached_equity_loop.read().await;
                             let hwm_eq_m = *high_water_mark_equity.read().await;
-                            let dd_mult_m = compute_drawdown_risk_multiplier(live_eq_m, hwm_eq_m);
+                            let dd_mult_m = compute_macro_drawdown_risk_multiplier(live_eq_m, hwm_eq_m);
                             let sl_dist_m = (ref_px - init_sl_px).abs();
                             let existing_cluster_ntl =
                                 crate::state::total_active_cluster_notional_excluding(&symbol_clone);
@@ -4390,7 +4560,7 @@ async fn main() {
                                     existing_cluster_ntl,
                                     max_slots_m,
                                     config.max_position_size_usdc,
-                                    0.0045 * dd_mult_m, // 0.45% equity risk/trade (~$2.50 on $556), hard-capped <= 1.00x total portfolio equity
+                                    0.0075 * dd_mult_m, // 0.75% equity risk/trade (~$4.20 on $560), hard-capped <= 1.00x total portfolio equity
                                     ref_px,
                                     init_sl_px,
                                     config.hl_leverage,

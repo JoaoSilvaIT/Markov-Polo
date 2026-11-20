@@ -3080,24 +3080,6 @@ impl MacroTrend4hEngine {
             self.st_band = self.st_band.min(dn_b);
         }
 
-        // Compute prior 40-bar Donchian strictly BEFORE pushing current bar (zero lookahead!)
-        let prior_donch = if self.bars.len() >= 40 {
-            let start = self.bars.len() - 40;
-            let mut hi = 0.0_f64;
-            let mut lo = f64::MAX;
-            for b in self.bars.iter().skip(start) {
-                if b.high > hi {
-                    hi = b.high;
-                }
-                if b.low < lo {
-                    lo = b.low;
-                }
-            }
-            Some((hi, lo))
-        } else {
-            None
-        };
-
         self.bars.push_back(bar.clone());
         if self.bars.len() > 50 {
             self.bars.pop_front();
@@ -3110,7 +3092,8 @@ impl MacroTrend4hEngine {
 
         let sl_dist = (self.sl_atr * self.atr_4h).min(bar.close * self.max_sl_frac);
 
-        // Priority 1: 4H SuperTrend 3.0 Flip aligned with EMA20/EMA100 (7Y PF 1.49, 7/7 yrs)
+        // Markov-Polo V2.2 Elite 4H Pillar: SuperTrend 3.0 Flip aligned with EMA20/EMA100
+        // (7Y PF 1.46, +119.2 bps/trade; Native L1 PF 18.19; weak 4H Donchian-40 retired to prevent slot crowding)
         if self.st_dir == 1 && self.prev_st_dir == -1 && self.ema20 > self.ema100 {
             return Some(MacroTrend4hSignal {
                 policy_tag: "ENGINE_B_4H_ST3",
@@ -3138,38 +3121,6 @@ impl MacroTrend4hEngine {
                 max_sl_frac: self.max_sl_frac,
                 max_hold_hours: 288,
             });
-        }
-
-        // Priority 2: 4H Donchian-40 (160h) Breakout (7Y PF 1.24, 7/7 yrs)
-        if let Some((hi40, lo40)) = prior_donch {
-            if bar.close > hi40 {
-                return Some(MacroTrend4hSignal {
-                    policy_tag: "ENGINE_B_4H_D40",
-                    side: Side::Long,
-                    ref_price: bar.close,
-                    atr_4h: self.atr_4h,
-                    ema20: self.ema20,
-                    ema100: self.ema100,
-                    initial_stop_px: (bar.close - sl_dist).max(1e-9),
-                    trail_atr_mult: self.trail_atr,
-                    max_sl_frac: self.max_sl_frac,
-                    max_hold_hours: 360, // 90 x 4h = 15 days
-                });
-            }
-            if bar.close < lo40 {
-                return Some(MacroTrend4hSignal {
-                    policy_tag: "ENGINE_B_4H_D40",
-                    side: Side::Short,
-                    ref_price: bar.close,
-                    atr_4h: self.atr_4h,
-                    ema20: self.ema20,
-                    ema100: self.ema100,
-                    initial_stop_px: bar.close + sl_dist,
-                    trail_atr_mult: self.trail_atr,
-                    max_sl_frac: self.max_sl_frac,
-                    max_hold_hours: 360,
-                });
-            }
         }
 
         None
@@ -4622,15 +4573,15 @@ mod tests {
     }
 
     #[test]
-    fn test_package10_macro_trend_4h_supertrend_and_donchian40() {
+    fn test_package10_macro_trend_4h_supertrend_flip_only() {
         let mut eng = MacroTrend4hEngine::new();
         let mut bars = Vec::new();
-        // 65 bars of calm sideways consolidation around 100.0 (range 99..101)
+        // 65 bars of calm uptrend (100 -> 132) so EMA20 > EMA100 and st_dir = +1
         for i in 0..65u64 {
-            let c = 100.0 + if i % 2 == 0 { 0.4 } else { -0.4 };
+            let c = 100.0 + (i as f64) * 0.5;
             bars.push(CandleBar {
                 time_open: i * 14_400_000,
-                open: c,
+                open: c - 0.2,
                 high: c + 0.5,
                 low: c - 0.5,
                 close: c,
@@ -4639,25 +4590,53 @@ mod tests {
         }
         eng.warmup_from_4h_bars(&bars);
         assert_eq!(eng.bars_seen, 65);
+        assert_eq!(eng.st_dir, 1);
 
-        // Bar 65: clean Donchian-40 upside breakout above 100.9 -> must emit ENGINE_B_4H_D40 Long!
-        let bo = CandleBar {
+        // Bar 65: regular Donchian high breakout while already st_dir=+1 must NOT emit (retired 4H_D40!)
+        let cont = CandleBar {
             time_open: 65 * 14_400_000,
-            open: 100.4,
-            high: 104.0,
-            low: 100.3,
-            close: 103.5,
-            volume: 250.0,
+            open: 132.5,
+            high: 136.0,
+            low: 132.0,
+            close: 135.5,
+            volume: 200.0,
+        };
+        assert!(
+            eng.on_4h_bar_close(&cont, true).is_none(),
+            "4H_D40 continuation breakout without SuperTrend flip must be retired"
+        );
+
+        // Pullback sharp enough to flip st_dir to -1 while EMA20 stays > EMA100
+        let dip = CandleBar {
+            time_open: 66 * 14_400_000,
+            open: 135.0,
+            high: 135.0,
+            low: 120.0,
+            close: 121.0,
+            volume: 300.0,
+        };
+        let _ = eng.on_4h_bar_close(&dip, false);
+        assert_eq!(eng.st_dir, -1);
+        assert!(eng.ema20 > eng.ema100);
+
+        // Reversal bar flipping st_dir -1 -> +1 aligned with EMA20 > EMA100 must emit ENGINE_B_4H_ST3 Long!
+        let flip_up = CandleBar {
+            time_open: 67 * 14_400_000,
+            open: 122.0,
+            high: 145.0,
+            low: 122.0,
+            close: 144.0,
+            volume: 400.0,
         };
         let sig = eng
-            .on_4h_bar_close(&bo, true)
-            .expect("Expected 4H Donchian-40 Long breakout signal");
-        assert_eq!(sig.policy_tag, "ENGINE_B_4H_D40");
+            .on_4h_bar_close(&flip_up, true)
+            .expect("Expected 4H SuperTrend-3.0 Long flip signal");
+        assert_eq!(sig.policy_tag, "ENGINE_B_4H_ST3");
         assert_eq!(sig.side, Side::Long);
         assert!(sig.initial_stop_px < sig.ref_price);
         assert!((sig.ref_price - sig.initial_stop_px) / sig.ref_price <= 0.0501);
 
         // Duplicate timestamp must be idempotent
-        assert!(eng.on_4h_bar_close(&bo, true).is_none());
+        assert!(eng.on_4h_bar_close(&flip_up, true).is_none());
     }
 }

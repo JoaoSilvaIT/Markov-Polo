@@ -1104,9 +1104,8 @@ pub fn calculate_zero_liquidation_macro_notional(
     }
 }
 
-/// Computes the continuous-time drawdown-constrained Kelly risk multiplier:
-/// When drawdown from high-water mark exceeds 2.5%, applies an exponential taper exp(-10 * DD),
-/// bounded to [0.40, 1.0] to preserve trading continuity while protecting capital.
+/// Computes the continuous-time drawdown-constrained Kelly risk multiplier (legacy 5m scalping curve).
+#[allow(dead_code)]
 pub fn compute_drawdown_risk_multiplier(current_equity: f64, high_water_mark: f64) -> f64 {
     if !current_equity.is_finite()
         || !high_water_mark.is_finite()
@@ -1119,6 +1118,26 @@ pub fn compute_drawdown_risk_multiplier(current_equity: f64, high_water_mark: f6
     let dd = (high_water_mark - current_equity) / high_water_mark;
     if dd > 0.025 {
         (-10.0 * dd).exp().clamp(0.40, 1.0)
+    } else {
+        1.0
+    }
+}
+
+/// Markov-Polo V2.2 Macro Trend Drawdown Risk Multiplier:
+/// Normal 4H macro trend pullbacks (5%–15% DD) stay at full `1.00x` sizing so winning breakouts
+/// are never starved; only deep drawdowns `> 15%` apply a gentle smooth taper down to `0.60x`.
+pub fn compute_macro_drawdown_risk_multiplier(current_equity: f64, high_water_mark: f64) -> f64 {
+    if !current_equity.is_finite()
+        || !high_water_mark.is_finite()
+        || current_equity <= 0.0
+        || high_water_mark <= 0.0
+        || current_equity >= high_water_mark
+    {
+        return 1.0;
+    }
+    let dd = (high_water_mark - current_equity) / high_water_mark;
+    if dd > 0.15 {
+        (-3.0 * (dd - 0.15)).exp().clamp(0.60, 1.0)
     } else {
         1.0
     }
@@ -1263,6 +1282,12 @@ pub mod tests {
 
         // 4. Once 1.00x equity is deployed, any additional entry is strictly rejected (None)
         assert!(calculate_zero_liquidation_macro_notional(eq, deployed, max_slots, 350.0, 0.0045, 100.0, 96.0, 3).is_none());
+
+        // 5. Macro drawdown multiplier: full 1.0x up to 15% DD, gentle taper > 15% DD down to 0.60x floor
+        assert_eq!(compute_macro_drawdown_risk_multiplier(560.0, 560.0), 1.0);
+        assert_eq!(compute_macro_drawdown_risk_multiplier(500.0, 560.0), 1.0); // 10.7% DD -> full power
+        let deep = compute_macro_drawdown_risk_multiplier(448.0, 560.0); // 20.0% DD
+        assert!(deep < 0.90 && deep > 0.80);
     }
 
     #[tokio::test]

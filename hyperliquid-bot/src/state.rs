@@ -398,7 +398,7 @@ pub fn save_circuit_breaker(file_path: &str, cb: &CircuitBreaker) {
 
 pub const CLUSTER_CB_FILE: &str = "hl_cluster_circuit_breaker.json";
 pub const CLUSTER_CB_LOCK_FILE: &str = "hl_cluster_circuit_breaker.lock";
-pub const DEFAULT_MAX_DAILY_CLUSTER_DD_FRAC: f64 = 0.0275; // 2.75% daily cross-margin drawdown cap
+pub const DEFAULT_MAX_DAILY_CLUSTER_DD_FRAC: f64 = 0.045; // 4.50% daily cross-margin drawdown cap (accommodates 5x 0.75% macro stops)
 
 /// Cross-Margin Rolling 24h / Daily Cluster Drawdown & Consecutive Stop-Out Circuit Breaker.
 /// Protects the shared 3x Cross-Margin collateral pool across BTC, ETH, SOL, and AVAX.

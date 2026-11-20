@@ -2264,14 +2264,14 @@ pub fn run_engine_a_backtest_with_btc(
                     };
                     let sl_px = quantize_price(raw_sl, sim_cfg.sz_decimals);
                     let base_eq_m = sim_cfg.account_equity_usdc;
-                    // Markov-Polo V2.1 Hard Zero-Liquidation Cap:
-                    // Each slot <= (1.00 / max_slots) of equity (20% at max=5) -> total combined portfolio exposure <= 1.00x equity!
+                    // Markov-Polo V2.2 Hard Zero-Liquidation Cap:
+                    // 0.75% equity risk/trade (~$4.20 on $560), each slot <= (1.00 / max_slots) of equity (20% at max=5) -> total combined portfolio exposure <= 1.00x equity!
                     let notional = crate::hyperliquid::calculate_zero_liquidation_macro_notional(
                         base_eq_m,
                         0.0,
                         crate::state::max_concurrent_cluster_positions(),
                         350.0,
-                        0.0045, // 0.45% equity risk per trade (~$2.50 on $556, Calmar 1.83 sweet spot)
+                        0.0075, // 0.75% equity risk per trade (7Y $560 -> $4,739, Calmar 1.30, MaxLev <= 1.00x)
                         entry_px,
                         sl_px,
                         3,
