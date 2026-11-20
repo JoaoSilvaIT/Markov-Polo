@@ -690,7 +690,21 @@ pub fn max_concurrent_cluster_positions() -> usize {
         .or_else(|_| std::env::var("MAX_CONCURRENT_POSITIONS"))
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(2)
+        .unwrap_or(5)
+        .max(1)
+}
+
+/// Markov-Polo V2.1 directional cap for multi-slot macro trend portfolios:
+/// At `max=5` slots (each hard-capped at `<= 20%` equity so total exposure `<= 1.00x`),
+/// permits up to `4` same-direction positions (`Calmar 1.83`, 7/7 years positive).
+#[inline]
+pub fn max_same_direction_macro_positions(max_allowed: usize) -> usize {
+    match max_allowed {
+        0..=2 => max_allowed.max(1),
+        3 => 2,
+        4 => 3,
+        _ => max_allowed.saturating_sub(1),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -983,7 +997,29 @@ fn try_acquire_cluster_lease_with_side_internal(
     }
 
     if max_allowed > 1 {
-        if let Some(corr_reason) = is_cluster_slot_correlated_veto_with_context(
+        let is_macro_v2 = engine_owner == "EngineB1h" || engine_owner == "EngineB4h";
+        if is_macro_v2 {
+            let max_same_dir = max_same_direction_macro_positions(max_allowed);
+            if let Some(c_side) = candidate_side.filter(|s| !s.is_empty()) {
+                let same_dir_cnt = other_active_sides
+                    .values()
+                    .filter(|o_side| {
+                        o_side
+                            .as_deref()
+                            .map(|s| s.eq_ignore_ascii_case(c_side))
+                            .unwrap_or(false)
+                    })
+                    .count();
+                if same_dir_cnt >= max_same_dir {
+                    eprintln!(
+                        "⏸️ [MACRO V2 DIRECTIONAL CAP] Symbol {} ({}) blocked: already {} active {} slots (max_same_dir={}/{}).",
+                        symbol, c_side, same_dir_cnt, c_side, max_same_dir, max_allowed
+                    );
+                    let _ = write_leases_atomic(&leases);
+                    return (false, 0);
+                }
+            }
+        } else if let Some(corr_reason) = is_cluster_slot_correlated_veto_with_context(
             symbol,
             candidate_side,
             &other_active_sides,
@@ -1490,6 +1526,116 @@ pub fn has_active_cluster_position_for_side(
     } else {
         None
     }
+}
+
+/// Markov-Polo V2.1 cluster capacity & directional pre-check for `EngineB1h` / `EngineB4h`:
+/// Enforces `max_concurrent_cluster_positions()` (default 5) and `max_same_direction_macro_positions()` (4 at max=5).
+pub fn has_active_macro_cluster_veto(current_symbol: &str, proposed_side: &str) -> Option<String> {
+    let now = chrono::Utc::now();
+    let max_allowed = max_concurrent_cluster_positions();
+    let max_same_dir = max_same_direction_macro_positions(max_allowed);
+    let mut other_active_sides: HashMap<String, Option<String>> = HashMap::new();
+
+    let leases = load_cluster_leases();
+    for (owner_sym, lease) in &leases {
+        if owner_sym != current_symbol {
+            let owner_state_file = format!("hl_hmm_state_{}.json", owner_sym);
+            let owner_pos = load_state(&owner_state_file)
+                .ok()
+                .and_then(|s| s.get(owner_sym).cloned())
+                .filter(|p| p.is_occupied());
+            if let Some(p) = owner_pos {
+                let eff_side = if !p.side.is_empty() {
+                    Some(p.side.to_uppercase())
+                } else {
+                    lease.side.clone()
+                };
+                other_active_sides.insert(owner_sym.clone(), eff_side);
+            } else if let Ok(exp_dt) = chrono::DateTime::parse_from_rfc3339(&lease.expires_at) {
+                if now < exp_dt.with_timezone(&chrono::Utc) {
+                    other_active_sides.insert(owner_sym.clone(), lease.side.clone());
+                }
+            }
+        }
+    }
+    for sym in configured_portfolio_symbols() {
+        if sym == current_symbol || other_active_sides.contains_key(&sym) {
+            continue;
+        }
+        let state_file = format!("hl_hmm_state_{}.json", sym);
+        if let Ok(state) = load_state(&state_file) {
+            if let Some(pos) = state.get(&sym) {
+                if pos.is_occupied() {
+                    other_active_sides.insert(
+                        sym,
+                        if pos.side.is_empty() {
+                            None
+                        } else {
+                            Some(pos.side.to_uppercase())
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    if other_active_sides.len() >= max_allowed {
+        let mut sorted: Vec<String> = other_active_sides.into_keys().collect();
+        sorted.sort();
+        return Some(format!(
+            "MAX_SLOTS({}/{}):{}",
+            sorted.len(),
+            max_allowed,
+            sorted.join(",")
+        ));
+    }
+    let same_dir_cnt = other_active_sides
+        .values()
+        .filter(|s| {
+            s.as_deref()
+                .map(|x| x.eq_ignore_ascii_case(proposed_side))
+                .unwrap_or(false)
+        })
+        .count();
+    if same_dir_cnt >= max_same_dir {
+        return Some(format!(
+            "MAX_SAME_DIR({}: {}/{})",
+            proposed_side.to_uppercase(),
+            same_dir_cnt,
+            max_same_dir
+        ));
+    }
+    None
+}
+
+/// Computes total live notional (USD) currently deployed across all OTHER active portfolio positions,
+/// used to enforce Markov-Polo V2.1's Zero-Liquidation `<= 1.00x` total portfolio exposure invariant.
+pub fn total_active_cluster_notional_excluding(current_symbol: &str) -> f64 {
+    let mut total_notional = 0.0;
+    let mut counted: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for sym in configured_portfolio_symbols() {
+        if sym == current_symbol || counted.contains(&sym) {
+            continue;
+        }
+        let state_file = format!("hl_hmm_state_{}.json", sym);
+        if let Ok(state) = load_state(&state_file) {
+            if let Some(pos) = state.get(&sym) {
+                if pos.is_occupied() {
+                    let ntl = if pos.amount > 0.0 && pos.entry_price > 0.0 {
+                        pos.amount * pos.entry_price
+                    } else {
+                        pos.risk_amount_usdc.max(0.0)
+                    };
+                    if ntl.is_finite() && ntl > 0.0 {
+                        total_notional += ntl;
+                    }
+                    counted.insert(sym);
+                }
+            }
+        }
+    }
+    total_notional
 }
 
 /// Appends a single JSONL line to `file_path` and automatically rotates/trims the oldest 50%
@@ -2213,5 +2359,61 @@ mod tests {
         );
         assert!(lines.last().unwrap().contains("\"idx\":19"));
         let _ = fs::remove_file(p);
+    }
+
+    #[test]
+    fn test_macro_v2_five_slot_four_same_dir_cluster_lease() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let _ = fs::remove_file(CLUSTER_LOCK_FILE);
+        let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
+        let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
+        std::env::set_var("HL_MAX_CONCURRENT_POSITIONS", "5");
+
+        // 4 same-direction SHORT macro slots must be allowed across correlated crypto/HIP-3
+        let shorts = ["BTC", "ETH", "SOL", "AVAX"];
+        let mut tokens = Vec::new();
+        for sym in shorts {
+            let uuid = format!("u_{}", sym);
+            let (ok, tok) =
+                try_acquire_cluster_lease_with_side(sym, "EngineB4h", "SHORT", &uuid, 60);
+            assert!(ok, "Macro V2 SHORT slot {} should succeed", sym);
+            tokens.push((sym, uuid, tok));
+        }
+
+        // 5th SHORT must be blocked by max_same_dir=4
+        let (ok_5th_short, _) =
+            try_acquire_cluster_lease_with_side("LINK", "EngineB1h", "SHORT", "u_LINK", 60);
+        assert!(
+            !ok_5th_short,
+            "5th same-direction SHORT must be blocked by max_same_dir=4"
+        );
+        assert!(has_active_macro_cluster_veto("LINK", "SHORT").is_some());
+
+        // 5th slot in OPPOSITE direction (LONG) must succeed (total = 5/5)
+        assert!(has_active_macro_cluster_veto("xyz:GOLD", "LONG").is_none());
+        let (ok_gold_long, tok_gold) =
+            try_acquire_cluster_lease_with_side("xyz:GOLD", "EngineB4h", "LONG", "u_GOLD", 60);
+        assert!(
+            ok_gold_long,
+            "5th opposite-direction LONG slot must succeed"
+        );
+        tokens.push(("xyz:GOLD", "u_GOLD".to_string(), tok_gold));
+
+        // 6th slot in ANY direction must be blocked by max=5
+        let (ok_6th, _) =
+            try_acquire_cluster_lease_with_side("xyz:SILVER", "EngineB4h", "LONG", "u_SIL", 60);
+        assert!(!ok_6th, "6th slot must be blocked by max_concurrent=5");
+
+        for (sym, uuid, tok) in tokens {
+            assert!(release_cluster_lease_authenticated(
+                sym,
+                Some(&uuid),
+                Some(tok)
+            ));
+        }
+        std::env::remove_var("HL_MAX_CONCURRENT_POSITIONS");
+        let _ = fs::remove_file(CLUSTER_LOCK_FILE);
+        let _ = fs::remove_file(CLUSTER_LOCK_GUARD_FILE);
+        let _ = fs::remove_file(CLUSTER_COUNTER_FILE);
     }
 }

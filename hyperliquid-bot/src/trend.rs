@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::state::{sync_parent_dir, FlockGuard, Side};
 use chrono::{Datelike, TimeZone, Utc};
 use serde::{Deserialize, Serialize};

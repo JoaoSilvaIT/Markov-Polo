@@ -4672,6 +4672,7 @@ pub fn compute_engine_a_soft_risk_capped_notional(
 /// and both Kalman slope velocity and L2 OBI oppose the position (d * eff_l2_obi <= -0.25),
 /// triggers soft invalidation on K=1 instead of waiting 5 more minutes for K=2.
 #[inline]
+#[allow(dead_code)]
 pub fn check_single_bar_adverse_acceleration_override(
     side: &Side,
     adverse_bps_from_entry: f64,

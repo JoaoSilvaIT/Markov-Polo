@@ -14,8 +14,10 @@ pub struct Config {
     pub hmm_config_path: String,
     pub state_file_path: String,
     pub trend_engine_mode: String,
+    #[allow(dead_code)]
     pub trend_risk_fraction: f64,
     pub donchian_period: usize,
+    #[allow(dead_code)]
     pub chandelier_atr_mult: f64,
     pub sizing_mode: String,
     pub equity_fraction: f64,

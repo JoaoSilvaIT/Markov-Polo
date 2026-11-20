@@ -234,6 +234,7 @@ pub fn effective_tick_size(price: f64, sz_decimals: u32) -> f64 {
 }
 
 /// Places a Post-Only (Alo) or GTC Limit Order
+#[allow(dead_code)]
 pub async fn place_post_only_order(
     exchange: &ExchangeClient,
     coin: &str,
@@ -1059,6 +1060,50 @@ pub fn calculate_risk_scaled_notional(
         .min(max_notional)
 }
 
+/// Markov-Polo V2.1 Zero-Liquidation Macro Position Sizer:
+/// Enforces two simultaneous hard mathematical caps:
+/// 1. Risk-parity sizing at `risk_fraction_of_equity` (default `0.45%` = `~$2.50` stop on `$556`).
+/// 2. Zero-Liquidation Per-Slot Cap: `<= equity / max_slots` (`<= 20%` of equity at `max_slots = 5`),
+///    plus remaining unleveraged cluster budget `(equity - existing_cluster_notional)`,
+///    guaranteeing total combined portfolio exposure across all concurrent positions NEVER exceeds `1.00x` equity!
+pub fn calculate_zero_liquidation_macro_notional(
+    account_value: f64,
+    existing_cluster_notional: f64,
+    max_concurrent_positions: usize,
+    config_max_position_usdc: f64,
+    risk_fraction_of_equity: f64,
+    entry_price: f64,
+    stop_price: f64,
+    leverage: u32,
+) -> Option<f64> {
+    if !account_value.is_finite() || account_value < 12.0 {
+        return None;
+    }
+    let slots = max_concurrent_positions.max(1) as f64;
+    let per_slot_zero_liq_cap = (account_value / slots).min(config_max_position_usdc);
+    let remaining_unleveraged_budget = (account_value - existing_cluster_notional.max(0.0)).max(0.0);
+    let hard_cap = per_slot_zero_liq_cap.min(remaining_unleveraged_budget);
+    if hard_cap < 12.0 {
+        return None;
+    }
+    let sized = calculate_risk_scaled_notional(
+        account_value,
+        hard_cap,
+        risk_fraction_of_equity,
+        entry_price,
+        stop_price,
+        leverage,
+        max_concurrent_positions,
+        12.0,
+        hard_cap,
+    );
+    if sized >= 12.0 {
+        Some(sized.min(hard_cap))
+    } else {
+        None
+    }
+}
+
 /// Computes the continuous-time drawdown-constrained Kelly risk multiplier:
 /// When drawdown from high-water mark exceeds 2.5%, applies an exponential taper exp(-10 * DD),
 /// bounded to [0.40, 1.0] to preserve trading continuity while protecting capital.
@@ -1081,6 +1126,7 @@ pub fn compute_drawdown_risk_multiplier(current_equity: f64, high_water_mark: f6
 
 /// Checks if Hyperliquid's $11.00 minimum notional floor causes excessive step-function risk inflation
 /// on a micro-account when the stop-loss distance is unusually wide.
+#[allow(dead_code)]
 pub fn exceeds_micro_account_step_risk(
     account_value: f64,
     notional_usdc: f64,
@@ -1190,6 +1236,33 @@ pub mod tests {
         assert!(exceeds_micro_account_step_risk(150.0, 11.0, 100.0, 75.0, 0.0175));
         // Normal 2.0% stop loss on $11 floor = $0.23 loss (0.15% <= 1.75% max cap) -> allowed!
         assert!(!exceeds_micro_account_step_risk(150.0, 11.0, 100.0, 98.0, 0.0175));
+    }
+
+    #[test]
+    fn test_zero_liquidation_macro_notional_never_exceeds_1x_equity() {
+        let eq = 560.0;
+        let max_slots = 5;
+        // 1. Tight 1.0% stop would normally risk-size to ~$232 -> HARD CAPPED to $112.00 (20% of equity)
+        let n_tight = calculate_zero_liquidation_macro_notional(eq, 0.0, max_slots, 350.0, 0.0045, 100.0, 99.0, 3)
+            .expect("should size tight stop");
+        assert!((n_tight - 112.0).abs() < 1e-6);
+
+        // 2. Normal 4.0% 4H stop -> risk-sized to ~$61.68 (< $112.00 cap)
+        let n_normal = calculate_zero_liquidation_macro_notional(eq, 0.0, max_slots, 350.0, 0.0045, 100.0, 96.0, 3)
+            .expect("should size normal 4h stop");
+        assert!(n_normal > 58.0 && n_normal < 65.0);
+
+        // 3. Even across 5 concurrent max-sized slots, total portfolio exposure <= 1.00x equity!
+        let mut deployed = 0.0;
+        for _ in 0..max_slots {
+            let n = calculate_zero_liquidation_macro_notional(eq, deployed, max_slots, 350.0, 0.0045, 100.0, 99.0, 3)
+                .expect("slot fits within 1.00x");
+            deployed += n;
+        }
+        assert!(deployed <= eq + 1e-6, "Total deployed ${:.2} must never exceed 1.00x equity ${:.2}", deployed, eq);
+
+        // 4. Once 1.00x equity is deployed, any additional entry is strictly rejected (None)
+        assert!(calculate_zero_liquidation_macro_notional(eq, deployed, max_slots, 350.0, 0.0045, 100.0, 96.0, 3).is_none());
     }
 
     #[tokio::test]

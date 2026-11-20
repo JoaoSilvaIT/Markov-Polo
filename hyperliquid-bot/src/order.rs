@@ -14,6 +14,7 @@ use ethers::types::H160;
 use hyperliquid_rust_sdk::{ExchangeClient, InfoClient};
 use serde_json::{json, Value};
 
+#[allow(dead_code)]
 pub async fn place_ou_maker_entry(
     state_file_path: &str,
     exchange: &ExchangeClient,
@@ -332,6 +333,7 @@ pub async fn place_ou_maker_entry(
     Ok(json!({"status": "DISPATCHED", "order_id": oid, "side": side.to_string()}))
 }
 
+#[allow(dead_code)]
 pub async fn place_trend_breakout_entry(
     state_file_path: &str,
     exchange: &ExchangeClient,
@@ -658,7 +660,8 @@ pub async fn place_macro_trend_ioc_entry(
     discord_url: Option<String>,
 ) -> Result<Value, String> {
     let position_size_usdc = position_size_usdc.max(12.0);
-    if state.len() >= crate::state::max_concurrent_cluster_positions() {
+    let max_slots = crate::state::max_concurrent_cluster_positions();
+    if state.len() >= max_slots {
         return Ok(json!({"status": "REJECTED", "reason": "Max concurrent trades reached."}));
     }
     if state.contains_key(symbol) {
