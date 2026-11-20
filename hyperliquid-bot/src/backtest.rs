@@ -326,7 +326,6 @@ struct OpenSimulatedPosition {
     is_engine_b: bool,
     chandelier_opt: Option<ChandelierExitState>,
     entry_atr: f64,
-    timeout_disabled: bool,
 }
 
 /// Runs a causal, discrete-event simulation of Engine A across a sequence of 1-minute `HistoricalMarketBarRecord`s
@@ -1163,7 +1162,6 @@ pub fn run_engine_a_backtest_with_btc(
                     is_engine_b: entry_ord.is_engine_b,
                     chandelier_opt,
                     entry_atr: entry_ord.entry_atr,
-                    timeout_disabled: false,
                 });
             } else if age_bars >= entry_ord.ttl_bars {
                 summary.orders_expired_unfilled += 1;
@@ -1348,32 +1346,9 @@ pub fn run_engine_a_backtest_with_btc(
                     "ENGINE_B_4H_D40" => 360.0 * 60.0,
                     _ => (engine_b_1h.max_hold_hours as f64) * 60.0,
                 };
-                // Markov-Polo V2.3.1 One-Time Latch Winner Uncapping (empirically improved 7/7 years + Native L1):
-                // Evaluated EXACTLY ONCE at timeout bar (net of accrued funding):
-                // R_net >= 1.5 -> permanently latch `timeout_disabled = true` to ride 4.0x ATR trail uncapped;
-                // R_net < 1.5 -> close stalled position cleanly.
-                let mut hit_time_exit = false;
-                if !sl_hit_macro && !pos.timeout_disabled && elapsed_mins_1m >= max_hold_mins_macro
-                {
-                    let init_sl_dist_m = pos
-                        .chandelier_opt
-                        .as_ref()
-                        .map(|c| (pos.entry_px - c.initial_stop).abs())
-                        .unwrap_or(pos.entry_px * 0.03)
-                        .max(pos.entry_px * 0.005);
-                    let raw_unreal_usd = match pos.side {
-                        Side::Long => (bar.close - pos.entry_px) * pos.qty,
-                        Side::Short => (pos.entry_px - bar.close) * pos.qty,
-                    };
-                    let net_unreal_usd = raw_unreal_usd - pos.accrued_funding_usd;
-                    let init_risk_usd = (init_sl_dist_m * pos.qty).max(1e-6);
-                    let r_net = net_unreal_usd / init_risk_usd;
-                    if r_net >= 1.5 {
-                        pos.timeout_disabled = true;
-                    } else {
-                        hit_time_exit = true;
-                    }
-                }
+                // Markov-Polo V2.3: Clean hard 96h/288h time-stop + flat monotonic 4.0*ATR Chandelier
+                // (Empirically beat Conditional Stagnation, Blow-Off Ratchet, AND One-Time Latch across 7Y + Native L1)
+                let hit_time_exit = !sl_hit_macro && elapsed_mins_1m >= max_hold_mins_macro;
                 if sl_hit_macro {
                     let is_profit_locked = match pos.side {
                         Side::Long => pos.hard_stop_px > pos.entry_px,
@@ -2363,7 +2338,6 @@ pub fn run_engine_a_backtest_with_btc(
                         is_engine_b: true,
                         chandelier_opt: Some(chand_m),
                         entry_atr: sig_atr,
-                        timeout_disabled: false,
                     });
                 }
             }

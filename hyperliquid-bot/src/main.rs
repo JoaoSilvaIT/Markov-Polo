@@ -4879,33 +4879,8 @@ async fn main() {
                                     } else {
                                         96.0 * 60.0
                                     };
-                                    // One-Time Latch Winner Uncapping (evaluated EXACTLY ONCE at timeout bar, net of accrued funding):
-                                    if !pos.timeout_disabled && elapsed_mins >= max_allowed_mins {
-                                        let init_sl_ref = if pos.initial_stop_loss_price > 0.0 {
-                                            pos.initial_stop_loss_price
-                                        } else {
-                                            pos.stop_loss_price
-                                        };
-                                        let init_sl_dist = (pos.entry_price - init_sl_ref)
-                                            .abs()
-                                            .max(pos.entry_price * 0.005);
-                                        let raw_unreal_usd = if is_long_m {
-                                            (close_price - pos.entry_price) * pos.amount
-                                        } else {
-                                            (pos.entry_price - close_price) * pos.amount
-                                        };
-                                        let net_unreal_usd = raw_unreal_usd - pos.accrued_funding_usd;
-                                        let init_risk_usd = (init_sl_dist * pos.amount).max(1e-6);
-                                        let r_net = net_unreal_usd / init_risk_usd;
-                                        if r_net >= 1.5 {
-                                            pos.timeout_disabled = true;
-                                            println!(
-                                                "🏆 [ONE-TIME LATCH UNCAPPED] {} {} reached {:.2}R net at {:.0}h timeout (accrued funding: ${:+.2}). Timeout disabled permanently — riding 4.0x ATR trail uncapped!",
-                                                symbol_clone, pos.side, r_net, max_allowed_mins / 60.0, pos.accrued_funding_usd
-                                            );
-                                        } else {
-                                            time_stop_triggered = true;
-                                        }
+                                    if elapsed_mins >= max_allowed_mins {
+                                        time_stop_triggered = true;
                                     }
                                     println!(
                                         "🚀 [MARKOV-POLO V2.1 {} RUNNER] {} {} | Px: ${:.4} | Trail SL: ${:.4} | Extreme: ${:.4} | Hold: {:.1}h/{:.0}h",
