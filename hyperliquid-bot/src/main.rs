@@ -38,7 +38,7 @@ use crate::hyperliquid::{
     get_user_position, optimal_engine_b_tp_atr_multiple, place_disaster_stop_trigger_order,
     place_reduce_only_tp_order, quantize_price, round_to_decimals,
 };
-use crate::order::{emergency_flatten_fast, place_ou_maker_entry, place_trend_1h_ioc_entry};
+use crate::order::{emergency_flatten_fast, place_macro_trend_ioc_entry, place_ou_maker_entry};
 use crate::ou_process::{
     asset_calibration, calculate_directional_edge_bps, calculate_features_with_funding_at,
     check_engine_a_us_open_blackout, check_kalman_velocity_entry_guard, check_macro_calendar_veto,
@@ -60,8 +60,8 @@ use crate::trend::{
     check_trend_alignment, compute_rolling_5m_impulse_metrics, load_shadow_trade,
     record_shadow_entry, record_shadow_exit, save_shadow_trade, BreakoutTelemetry, CandleBar,
     ChandelierExitState, EngineBCandidateLog, EngineBTrendManager, L2ObiTracker,
-    MarketCrowdingTracker, TrendAlignment, TrendEngineConfig, TrendOrderAction,
-    TrendPullback1hEngine,
+    MacroTrend4hEngine, MarketCrowdingTracker, TrendAlignment, TrendEngineConfig,
+    TrendOrderAction, TrendPullback1hEngine,
 };
 
 const L2_ORDERBOOK_FRESH_MS: u64 = 16_500;
@@ -669,6 +669,7 @@ async fn main() {
                     sz_decimals: sz_dec,
                     notional_usdc: 560.0 * eq_frac,
                     account_equity_usdc: 560.0,
+                    enable_legacy_engine_a: false, // 100% Live-Backtest Parity (Markov-Polo V2 Macro Trend)
                     ..Default::default()
                 };
                 let res = crate::backtest::run_engine_a_backtest_with_btc(
@@ -813,6 +814,8 @@ async fn main() {
             .filter(|t| {
                 t.entry_policy == "ENGINE_B_TREND"
                     || t.entry_policy == "ENGINE_B_1H_PULLBACK"
+                    || t.entry_policy == "ENGINE_B_4H_ST3"
+                    || t.entry_policy == "ENGINE_B_4H_D40"
                     || t.entry_policy == "ENGINE_B_HANDOFF"
                     || t.entry_policy == "ENGINE_B_US_OPEN_ORB"
             })
@@ -851,15 +854,19 @@ async fn main() {
                 name, n, w, l, wr, payoff, avg_win, avg_loss, net_usd, fees_usd
             );
         }
-        if native_only {
+        {
             const SPLIT_MS: u64 = 1_794_096_000_000; // 2026-11-08 00:00 UTC
-            for (label, filt) in [
-                ("Policy JOIN_BOOK   ", all_trades.iter().filter(|t| t.entry_policy == "JOIN_BOOK").copied().collect::<Vec<_>>()),
-                ("Policy RETEST_LIMIT", all_trades.iter().filter(|t| t.entry_policy == "RETEST_LIMIT").copied().collect::<Vec<_>>()),
-                ("Policy 1H_PULLBACK ", all_trades.iter().filter(|t| t.entry_policy == "ENGINE_B_1H_PULLBACK").copied().collect::<Vec<_>>()),
-                ("H1 (< Nov 08 UTC)  ", all_trades.iter().filter(|t| t.entry_time_ms < SPLIT_MS).copied().collect::<Vec<_>>()),
-                ("H2 (>= Nov 08 UTC) ", all_trades.iter().filter(|t| t.entry_time_ms >= SPLIT_MS).copied().collect::<Vec<_>>()),
-            ] {
+            let mut splits: Vec<(&str, Vec<&crate::backtest::SimulatedTradeResult>)> = vec![
+                ("Pillar 4H_ST3      ", all_trades.iter().filter(|t| t.entry_policy == "ENGINE_B_4H_ST3").copied().collect()),
+                ("Pillar 4H_D40      ", all_trades.iter().filter(|t| t.entry_policy == "ENGINE_B_4H_D40").copied().collect()),
+                ("Pillar 1H_PB       ", all_trades.iter().filter(|t| t.entry_policy == "ENGINE_B_1H_PULLBACK").copied().collect()),
+                ("Policy JOIN_BOOK   ", all_trades.iter().filter(|t| t.entry_policy == "JOIN_BOOK").copied().collect()),
+            ];
+            if native_only {
+                splits.push(("H1 (< Nov 08 UTC)  ", all_trades.iter().filter(|t| t.entry_time_ms < SPLIT_MS).copied().collect()));
+                splits.push(("H2 (>= Nov 08 UTC) ", all_trades.iter().filter(|t| t.entry_time_ms >= SPLIT_MS).copied().collect()));
+            }
+            for (label, filt) in splits {
                 if filt.is_empty() { continue; }
                 let n = filt.len();
                 let w = filt.iter().filter(|t| t.net_bps > 0.0).count();
@@ -869,7 +876,7 @@ async fn main() {
                 let gl: f64 = filt.iter().filter(|t| t.net_pnl_usd <= 0.0).map(|t| t.net_pnl_usd.abs()).sum();
                 let pf = if gl > 1e-9 { gp / gl } else if gp > 0.0 { 99.9 } else { 0.0 };
                 println!(
-                    "   ↳ [SPLIT] {}: {:3} trades ({:2}W/{:2}L, {:5.1}% WR) | PF: {:5.2} | Net: ${:+6.2} ({:+6.1} bps, {:+.1}/tr)",
+                    "   ↳ [SPLIT] {}: {:4} trades ({:4}W/{:4}L, {:5.1}% WR) | PF: {:5.2} | Net: ${:+8.2} ({:+8.1} bps, {:+.1}/tr)",
                     label, n, w, n - w, (w as f64 / n as f64) * 100.0, pf, net_u, net_b, net_b / n as f64
                 );
             }
@@ -1455,6 +1462,79 @@ async fn main() {
         }
     }
 
+    // Markov-Polo V2 (Package 10): Pre-fill 260 historical 4h bars (~43 days) for MacroTrend4hEngine (4H_ST3 + 4H_D40)
+    let mut engine_b_4h = MacroTrend4hEngine::new();
+    let mut current_4h_bar: Option<CandleBar> = None;
+    let start_4h_ms = now_ms.saturating_sub(260 * 4 * 60 * 60 * 1000);
+    println!(
+        "⏳ [INGESTION] Pre-filling 260x4h (~43d) historical 4h candles for {} via Hyperliquid REST...",
+        trading_symbol
+    );
+    let mut res_4h_candles = Err("Unattempted".to_string());
+    for attempt in 0..3 {
+        match info_client
+            .candles_snapshot(trading_symbol.clone(), "4h".to_string(), start_4h_ms, now_ms)
+            .await
+        {
+            Ok(c) => {
+                res_4h_candles = Ok(c);
+                break;
+            }
+            Err(e) => {
+                res_4h_candles = Err(format!("{:?}", e));
+                if attempt < 2 {
+                    tokio::time::sleep(Duration::from_millis(500 * (1 << attempt))).await;
+                }
+            }
+        }
+    }
+    match res_4h_candles {
+        Ok(mut candles) => {
+            candles.sort_by_key(|c| c.time_open);
+            candles.dedup_by_key(|c| c.time_open);
+            let mut bars_4h_init = Vec::with_capacity(candles.len());
+            for c in candles {
+                if let (Ok(open_f), Ok(high_f), Ok(low_f), Ok(close_f)) = (
+                    c.open.parse::<f64>(),
+                    c.high.parse::<f64>(),
+                    c.low.parse::<f64>(),
+                    c.close.parse::<f64>(),
+                ) {
+                    let vol_f = c.vlm.parse::<f64>().unwrap_or(0.0);
+                    let bar_4h = CandleBar {
+                        time_open: c.time_open,
+                        open: open_f,
+                        high: high_f,
+                        low: low_f,
+                        close: close_f,
+                        volume: vol_f,
+                    };
+                    if c.time_open + 14_400_000 > now_ms {
+                        current_4h_bar = Some(bar_4h);
+                    } else {
+                        bars_4h_init.push(bar_4h);
+                    }
+                }
+            }
+            engine_b_4h.warmup_from_4h_bars(&bars_4h_init);
+            println!(
+                "✅ [INGESTION] Warmed up Markov-Polo V2 4H Macro Engine (ST3 + Donchian40) with {} closed 4h bars for {} (EMA20=${:.2}, EMA100=${:.2}, ST_dir={}, ATR_4h=${:.4}).",
+                engine_b_4h.bars_seen,
+                trading_symbol,
+                engine_b_4h.ema20,
+                engine_b_4h.ema100,
+                engine_b_4h.st_dir,
+                engine_b_4h.atr_4h
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "❌ [INGESTION ERROR] Failed to fetch 4h candles for {}: {}",
+                trading_symbol, e
+            );
+        }
+    }
+
     crate::discord::send_alert(
         discord_url.as_deref(),
         &format!(
@@ -1593,7 +1673,10 @@ async fn main() {
                 if pos.stop_loss_price <= 0.0 {
                     pos.stop_loss_price = default_sl;
                 }
-                if pos.take_profit_price <= 0.0 && pos.engine_type != "EngineB1h" {
+                if pos.take_profit_price <= 0.0
+                    && pos.engine_type != "EngineB1h"
+                    && pos.engine_type != "EngineB4h"
+                {
                     let base_px = if pos.entry_price > 0.0 { pos.entry_price } else { ep };
                     let k_tp = optimal_engine_b_tp_atr_multiple(&trading_symbol);
                     let tp_dist = (k_tp * pos.current_atr).max(base_px * 0.0045);
@@ -1732,12 +1815,15 @@ async fn main() {
                                 engine_type: intent.engine_type.clone(),
                                 chandelier_stop: if intent.engine_type == "EngineB"
                                     || intent.engine_type == "EngineB1h"
+                                    || intent.engine_type == "EngineB4h"
                                 {
                                     intent.stop_loss
                                 } else {
                                     0.0
                                 },
-                                active_multiplier: if intent.engine_type == "EngineB1h" {
+                                active_multiplier: if intent.engine_type == "EngineB1h"
+                                    || intent.engine_type == "EngineB4h"
+                                {
                                     4.0
                                 } else if intent.engine_type == "EngineB" {
                                     2.0
@@ -2661,7 +2747,7 @@ async fn main() {
                         }
                     }
                 } else if pos_exists
-                    && pos.engine_type == "EngineB1h"
+                    && (pos.engine_type == "EngineB1h" || pos.engine_type == "EngineB4h")
                     && pos.stop_loss_price > 0.0
                     && pos.disaster_stop_oid.is_none()
                 {
@@ -2691,8 +2777,8 @@ async fn main() {
                             let _ = save_state(&watcher_state_path, &state_lock);
                         }
                         println!(
-                            "🛡️ [FAST-SENTINEL] Placed missing Exchange-Native StopMarket for EngineB1h {} at ${:.4} (oid: {}, sz: {:.4})",
-                            watcher_symbol, sl_px, sl_oid, total_amt
+                            "🛡️ [FAST-SENTINEL] Placed missing Exchange-Native StopMarket for {} {} at ${:.4} (oid: {}, sz: {:.4})",
+                            pos.engine_type, watcher_symbol, sl_px, sl_oid, total_amt
                         );
                     }
                 } else if is_truly_dead {
@@ -2882,6 +2968,7 @@ async fn main() {
                         let sl_px_sync = if pos.disaster_stop_ratcheted_to_be
                             || pos.engine_type == "EngineB"
                             || pos.engine_type == "EngineB1h"
+                            || pos.engine_type == "EngineB4h"
                         {
                             quantize_price(pos.stop_loss_price, watcher_sz_decimals)
                         } else {
@@ -3226,20 +3313,21 @@ async fn main() {
         trend_risk_fraction,
     );
     let mut engine_b_mgr = EngineBTrendManager::new();
-    let initial_trade_bank = calculate_dynamic_notional(
+    let _initial_trade_bank = calculate_dynamic_notional(
         initial_equity,
         eff_eq_frac_loop,
         11.0,
         config.max_position_size_usdc,
         position_size_usdc,
     );
+    let legacy_engine_a_enabled =
+        std::env::var("HL_ENABLE_LEGACY_ENGINE_A").as_deref() == Ok("true");
     println!(
-        "⚙️ [STARTUP CONFIG] Symbol: {} | Engine A: LIVE (JOIN_BOOK Maker Post-Only, {:.0}% eq -> ${:.2}) | Engine B v2: {} (1H EMA50 Pullback-in-Trend, cap ${:.2}, SL 2.5x/3.2%, Trail 4.0x ATR_1h, legacy 5m Donchian=SHADOW) | Leverage: {}x",
+        "⚙️ [STARTUP CONFIG] Symbol: {} | MARKOV-POLO V2 MACRO TREND: {} (4H SuperTrend-3.0 + 4H Donchian-40 + 1H EMA50 Pullback | 0.60% risk/tr, max slot 55% eq / ${:.0}, 4.0x ATR Trail) | Legacy 5m Engine A: {} | Leverage: {}x",
         trading_symbol,
-        eff_eq_frac_loop * 100.0,
-        initial_trade_bank,
         trend_engine_mode.to_uppercase(),
-        trend_cfg.max_trend_notional_usdc,
+        config.max_position_size_usdc,
+        if legacy_engine_a_enabled { "ENABLED" } else { "DISABLED (RETIRED)" },
         config.hl_leverage,
     );
     let cached_equity_loop = cached_account_equity.clone();
@@ -3874,6 +3962,56 @@ async fn main() {
                     .as_ref()
                     .and_then(|b1h| engine_b_1h.on_1h_bar_close(b1h, true));
 
+                // Markov-Polo V2 (Package 10): Aggregate finalized 4-hour candles for MacroTrend4hEngine (4H_ST3 + 4H_D40)
+                let candle_bucket_4h = (completed_bar.time_open / 14_400_000) * 14_400_000;
+                let is_last_1m_of_4h = completed_bar.time_open + 60_000 >= candle_bucket_4h + 14_400_000;
+                let mut finalized_4h_bar: Option<CandleBar> = None;
+                if let Some(mut cur_4h) = current_4h_bar.take() {
+                    if cur_4h.time_open == candle_bucket_4h {
+                        cur_4h.high = cur_4h.high.max(high_price);
+                        cur_4h.low = cur_4h.low.min(low_price);
+                        cur_4h.close = close_price;
+                        cur_4h.volume += vol_val;
+                        if is_last_1m_of_4h {
+                            finalized_4h_bar = Some(cur_4h);
+                        } else {
+                            current_4h_bar = Some(cur_4h);
+                        }
+                    } else {
+                        finalized_4h_bar = Some(cur_4h);
+                        let nb4h = CandleBar {
+                            time_open: candle_bucket_4h,
+                            open: open_price,
+                            high: high_price,
+                            low: low_price,
+                            close: close_price,
+                            volume: vol_val,
+                        };
+                        if is_last_1m_of_4h {
+                            finalized_4h_bar = Some(nb4h);
+                        } else {
+                            current_4h_bar = Some(nb4h);
+                        }
+                    }
+                } else {
+                    let nb4h = CandleBar {
+                        time_open: candle_bucket_4h,
+                        open: open_price,
+                        high: high_price,
+                        low: low_price,
+                        close: close_price,
+                        volume: vol_val,
+                    };
+                    if is_last_1m_of_4h {
+                        finalized_4h_bar = Some(nb4h);
+                    } else {
+                        current_4h_bar = Some(nb4h);
+                    }
+                }
+                let engine_b_4h_sig_opt = finalized_4h_bar
+                    .as_ref()
+                    .and_then(|b4h| engine_b_4h.on_4h_bar_close(b4h, true));
+
                 let exchange_clone = exchange.clone();
                 let info_clone = info_client.clone();
                 let state_clone = active_state.clone();
@@ -4494,67 +4632,108 @@ async fn main() {
                     }
 
                     // ------------------------------------------------------------------
-                    // ENGINE B v2 (PACKAGE 9): 1-Hour Macro EMA12/EMA50/EMA200 Pullback-in-Trend
-                    // Replaces negative-edge 5m/15m Donchian breakouts (16.7% WR) with
-                    // 7-year & 2026 Native L1 verified 1H macro trend pullbacks (PF 2.40 native, PF 1.20+ 7y).
+                    // MARKOV-POLO V2 (PACKAGE 10): TRIPLE-PILLAR MACRO TREND ENGINE
+                    //   Priority 1: 4H SuperTrend-3.0 Flip (7Y PF 1.49, 7/7 yrs)
+                    //   Priority 2: 4H Donchian-40 Breakout (7Y PF 1.24, 7/7 yrs)
+                    //   Priority 3: 1H EMA50 Pullback-in-Trend (7Y PF 1.24, 7/7 yrs)
                     // ------------------------------------------------------------------
-                    if let Some(ref sig_1h) = engine_b_1h_sig_opt {
-                        let session_ok_1h = matches!(
+                    let macro_dispatch_opt: Option<(&'static str, &'static str, Side, f64, f64, f64, f64, f64, usize)> =
+                        if let Some(ref s4) = engine_b_4h_sig_opt {
+                            let lbl = if s4.policy_tag == "ENGINE_B_4H_ST3" {
+                                "4H SUPERTREND 3.0 FLIP"
+                            } else {
+                                "4H DONCHIAN-40 BREAKOUT"
+                            };
+                            Some((
+                                "EngineB4h",
+                                lbl,
+                                s4.side.clone(),
+                                s4.ref_price,
+                                s4.initial_stop_px,
+                                s4.atr_4h,
+                                s4.trail_atr_mult,
+                                s4.max_sl_frac,
+                                s4.max_hold_hours,
+                            ))
+                        } else {
+                            engine_b_1h_sig_opt.as_ref().map(|s1| {
+                                (
+                                    "EngineB1h",
+                                    "1H EMA50 PULLBACK",
+                                    s1.side.clone(),
+                                    s1.ref_price,
+                                    s1.initial_stop_px,
+                                    s1.atr_1h,
+                                    s1.trail_atr_mult,
+                                    0.032,
+                                    s1.max_hold_hours,
+                                )
+                            })
+                        };
+
+                    if let Some((eng_tag, reason_lbl, sig_side, ref_px, init_sl_px, sig_atr, trail_m, max_sl_f, max_hold_h)) =
+                        macro_dispatch_opt
+                    {
+                        let session_ok_m = matches!(
                             evaluate_session_lifecycle_gate(&symbol_clone, now_ms_cb as i64),
                             SessionLifecycleAction::AllowNormalTrading
                         );
-                        let macro_veto_1h = check_macro_calendar_veto(now_ms_cb);
-                        let side_label_1h = if sig_1h.side == Side::Long { "LONG" } else { "SHORT" };
-                        let side_cluster_blocked_1h = has_active_cluster_position_for_side(
+                        let macro_veto_m = check_macro_calendar_veto(now_ms_cb);
+                        let side_label_m = if sig_side == Side::Long { "LONG" } else { "SHORT" };
+                        let side_cluster_blocked_m = has_active_cluster_position_for_side(
                             &symbol_clone,
-                            Some(side_label_1h),
+                            Some(side_label_m),
                         )
                         .is_some();
-                        let mut state_lock_1h = state_clone.lock().await;
-                        let already_in_pos_1h = state_lock_1h.contains_key(&symbol_clone);
-                        if !already_in_pos_1h
-                            && session_ok_1h
+                        let mut state_lock_m = state_clone.lock().await;
+                        let already_in_pos_m = state_lock_m.contains_key(&symbol_clone);
+                        if !already_in_pos_m
+                            && session_ok_m
                             && !candle_feed_degraded
                             && !is_candle_gap
                             && !is_cb_paused
                             && !is_cluster_blocked
-                            && !side_cluster_blocked_1h
-                            && macro_veto_1h.is_none()
+                            && !side_cluster_blocked_m
+                            && macro_veto_m.is_none()
                             && trend_engine_mode == "live"
                             && is_symbol_live_capital_enabled(&symbol_clone)
                         {
                             let _ = resolve_trade_bank(&info_clone, user_address, &config, &cached_equity_loop).await;
-                            let live_eq_1h = *cached_equity_loop.read().await;
-                            let hwm_eq_1h = *high_water_mark_equity.read().await;
-                            let dd_mult_1h = compute_drawdown_risk_multiplier(live_eq_1h, hwm_eq_1h);
-                            let sl_dist_1h = (sig_1h.ref_price - sig_1h.initial_stop_px).abs();
-                            let notional_1h = calculate_risk_scaled_notional(
-                                live_eq_1h,
-                                trend_cfg.max_trend_notional_usdc,
-                                0.0022 * dd_mult_1h, // 0.22% equity risk (~$1.22 loss-parity with Engine A)
-                                sig_1h.ref_price,
-                                sig_1h.initial_stop_px,
+                            let live_eq_m = *cached_equity_loop.read().await;
+                            let hwm_eq_m = *high_water_mark_equity.read().await;
+                            let dd_mult_m = compute_drawdown_risk_multiplier(live_eq_m, hwm_eq_m);
+                            let sl_dist_m = (ref_px - init_sl_px).abs();
+                            let max_slot_ntl = config.max_position_size_usdc.min(live_eq_m * 0.55).max(22.0);
+                            let notional_m = calculate_risk_scaled_notional(
+                                live_eq_m,
+                                max_slot_ntl,
+                                0.0060 * dd_mult_m, // 0.60% equity risk per trade (~$3.34 on $556)
+                                ref_px,
+                                init_sl_px,
                                 config.hl_leverage,
                                 crate::state::max_concurrent_cluster_positions(),
                                 22.0,
-                                trend_cfg.max_trend_notional_usdc,
+                                max_slot_ntl,
                             );
                             println!(
-                                "🚀 [ENGINE B v2 1H PULLBACK SIGNAL] {} {:?} | Ref: ${:.4} | SL: ${:.4} | EMA12=${:.2} EMA50=${:.2} EMA200=${:.2} | Slope12h={:+.2}*ATR | ATR_1h=${:.4} | Notional=${:.2}",
-                                symbol_clone, sig_1h.side, sig_1h.ref_price, sig_1h.initial_stop_px,
-                                sig_1h.ema12, sig_1h.ema50, sig_1h.ema200, sig_1h.slope_12h_atr, sig_1h.atr_1h, notional_1h
+                                "🚀 [MARKOV-POLO V2 {}] {} {:?} | Ref: ${:.4} | SL: ${:.4} | ATR=${:.4} | Notional=${:.2} | MaxHold={}h",
+                                reason_lbl, symbol_clone, sig_side, ref_px, init_sl_px, sig_atr, notional_m, max_hold_h
                             );
-                            match place_trend_1h_ioc_entry(
+                            match place_macro_trend_ioc_entry(
                                 &state_path_clone,
                                 &exchange_clone,
                                 &info_clone,
-                                &mut state_lock_1h,
+                                &mut state_lock_m,
                                 &symbol_clone,
-                                sig_1h.side.clone(),
-                                sl_dist_1h,
-                                sig_1h.atr_1h,
-                                sig_1h.trail_atr_mult,
-                                notional_1h,
+                                eng_tag,
+                                reason_lbl,
+                                sig_side,
+                                sl_dist_m,
+                                sig_atr,
+                                trail_m,
+                                max_sl_f,
+                                max_hold_h,
+                                notional_m,
                                 sz_decimals,
                                 discord_clone.clone(),
                             )
@@ -4567,18 +4746,18 @@ async fn main() {
                                         armed_clear.is_armed = false;
                                         save_armed_signal(&arm_path_clone, &armed_clear);
                                     }
-                                    println!("✅ [ENGINE B v2 1H ENTRY EXECUTED] {} -> {:?}", symbol_clone, res);
+                                    println!("✅ [MARKOV-POLO V2 ENTRY EXECUTED] {} ({}) -> {:?}", symbol_clone, reason_lbl, res);
                                 }
                                 Err(e) => {
                                     funnel_counters.engine_b_orders_rejected += 1;
-                                    eprintln!("❌ [ENGINE B v2 1H ENTRY ERROR] {}: {}", symbol_clone, e);
+                                    eprintln!("❌ [MARKOV-POLO V2 ENTRY ERROR] {} ({}): {}", symbol_clone, reason_lbl, e);
                                 }
                             }
                         } else {
                             println!(
-                                "⏸️ [ENGINE B v2 1H SIGNAL GATED] {} {:?} (pos={}, sess={}, cb={}, cluster={}, side_blk={}, macro={})",
-                                symbol_clone, sig_1h.side, already_in_pos_1h, session_ok_1h, is_cb_paused,
-                                is_cluster_blocked, side_cluster_blocked_1h, macro_veto_1h.is_some()
+                                "⏸️ [MARKOV-POLO V2 SIGNAL GATED] {} {} {:?} (pos={}, sess={}, cb={}, cluster={}, side_blk={}, macro={})",
+                                symbol_clone, reason_lbl, sig_side, already_in_pos_m, session_ok_m, is_cb_paused,
+                                is_cluster_blocked, side_cluster_blocked_m, macro_veto_m.is_some()
                             );
                         }
                     }
@@ -5432,23 +5611,24 @@ async fn main() {
                                         if elapsed_mins >= ttl_limit {
                                             entry_ttl_expired = true;
                                         }
-                                    } else if pos.engine_type == "EngineB1h" {
-                                        // Package 9 Engine B v2: 1H EMA50 Pullback-in-Trend monotonic 4.0*ATR_1h Chandelier + 96h max hold
+                                    } else if pos.engine_type == "EngineB1h" || pos.engine_type == "EngineB4h" {
+                                        // Markov-Polo V2 (Package 10): Unified 1H/4H Macro Trend monotonic 4.0*ATR Chandelier
+                                        let is_4h_pos = pos.engine_type == "EngineB4h";
                                         let side_enum = if pos.side == "LONG" { Side::Long } else { Side::Short };
-                                        let is_long_1h = pos.side == "LONG";
+                                        let is_long_m = pos.side == "LONG";
                                         let prev_stop = if pos.chandelier_stop > 0.0 {
                                             pos.chandelier_stop
                                         } else {
                                             pos.stop_loss_price
                                         };
-                                        if (is_long_1h && (low_price <= prev_stop || close_price <= prev_stop))
-                                            || (!is_long_1h && (high_price >= prev_stop || close_price >= prev_stop))
+                                        if (is_long_m && (low_price <= prev_stop || close_price <= prev_stop))
+                                            || (!is_long_m && (high_price >= prev_stop || close_price >= prev_stop))
                                         {
                                             chandelier_stopped = true;
                                         } else {
-                                            if is_long_1h && high_price > pos.max_favorable_price {
+                                            if is_long_m && high_price > pos.max_favorable_price {
                                                 pos.max_favorable_price = high_price;
-                                            } else if !is_long_1h
+                                            } else if !is_long_m
                                                 && (pos.max_favorable_price <= 0.0 || low_price < pos.max_favorable_price)
                                             {
                                                 pos.max_favorable_price = low_price;
@@ -5456,9 +5636,11 @@ async fn main() {
                                             let trail_m = if pos.active_multiplier > 0.0 {
                                                 pos.active_multiplier
                                             } else {
-                                                engine_b_1h.trail_atr
+                                                4.0
                                             };
-                                            let cur_atr_1h = if engine_b_1h.atr_1h > 0.0 {
+                                            let cur_atr_m = if is_4h_pos {
+                                                if engine_b_4h.atr_4h > 0.0 { engine_b_4h.atr_4h } else { pos.current_atr }
+                                            } else if engine_b_1h.atr_1h > 0.0 {
                                                 engine_b_1h.atr_1h
                                             } else {
                                                 pos.current_atr
@@ -5468,14 +5650,14 @@ async fn main() {
                                                     &side_enum,
                                                     prev_stop,
                                                     pos.max_favorable_price,
-                                                    cur_atr_1h,
+                                                    cur_atr_m,
                                                     pos.current_atr,
                                                     trail_m,
                                                 ),
                                                 sz_decimals,
                                             );
                                             let stop_improved_bps = if prev_stop > 0.0 {
-                                                let d_s = if is_long_1h { 1.0 } else { -1.0 };
+                                                let d_s = if is_long_m { 1.0 } else { -1.0 };
                                                 d_s * ((new_stop - prev_stop) / prev_stop) * 1e4
                                             } else {
                                                 0.0
@@ -5488,17 +5670,23 @@ async fn main() {
                                                 sl_ratchet_sync_opt = Some((
                                                     new_stop,
                                                     pos.amount,
-                                                    !is_long_1h,
+                                                    !is_long_m,
                                                     pos.disaster_stop_oid,
                                                 ));
                                             }
-                                            max_allowed_mins = (engine_b_1h.max_hold_hours as f64) * 60.0;
+                                            max_allowed_mins = if pos.half_life_minutes >= 60.0 {
+                                                pos.half_life_minutes
+                                            } else if is_4h_pos {
+                                                288.0 * 60.0
+                                            } else {
+                                                96.0 * 60.0
+                                            };
                                             if elapsed_mins >= max_allowed_mins {
                                                 time_stop_triggered = true;
                                             }
                                             println!(
-                                                "🚀 [ENGINE B v2 1H RUNNER] {} {} | Px: ${:.4} | Trail SL: ${:.4} | Extreme: ${:.4} | Hold: {:.1}h/96h",
-                                                symbol_clone, pos.side, close_price, pos.stop_loss_price, pos.max_favorable_price, elapsed_mins / 60.0
+                                                "🚀 [MARKOV-POLO V2 {} RUNNER] {} {} | Px: ${:.4} | Trail SL: ${:.4} | Extreme: ${:.4} | Hold: {:.1}h/{:.0}h",
+                                                pos.engine_type, symbol_clone, pos.side, close_price, pos.stop_loss_price, pos.max_favorable_price, elapsed_mins / 60.0, max_allowed_mins / 60.0
                                             );
                                         }
                                     } else if pos.engine_type == "EngineB" {
@@ -6420,10 +6608,11 @@ async fn main() {
                                 }
                                 crate::discord::send_alert(discord_clone.as_deref(), &time_msg).await;
                             }
-                        } else if !has_position {
+                        } else if !has_position && legacy_engine_a_enabled {
                             // ------------------------------------------------------------------
-                            // BI-DIRECTIONAL 5M O-U + 1M MULTI-BAR REVERSAL-CONFIRMED ENTRY PROTOCOL
-                            // (`O-U Mean Reversion Audit.md` Sections 3 & 4 + `Hyperliquid OU Audit...md`)
+                            // LEGACY 5M O-U MEAN REVERSION (RETIRED BY DEFAULT IN MARKOV-POLO V2)
+                            // Negative structural edge across 7 years (-$33.46) and live (-$3.16).
+                            // Opt-in only via HL_ENABLE_LEGACY_ENGINE_A=true.
                             // ------------------------------------------------------------------
                             let mut armed_state = load_armed_signal(&arm_path_clone);
                             let ou_cfg = crate::ou_process::asset_ou_config(&symbol_clone);

@@ -635,20 +635,24 @@ pub async fn place_trend_breakout_entry(
     Ok(json!({"status": "DISPATCHED", "order_id": oid, "side": side.to_string()}))
 }
 
-/// Package 9 Engine B v2 (`1H EMA50 Pullback-in-Trend`):
+/// Markov-Polo V2 (Package 10) Macro Trend IOC Entry (`EngineB1h` & `EngineB4h`):
 /// Submits a slippage-capped IOC entry order, immediately attaches an exchange-native StopMarket SL,
-/// and leaves TP uncapped (`take_profit_price = 0.0`) so the monotonic 4.0*ATR_1h Chandelier trails runners.
+/// and leaves TP uncapped (`take_profit_price = 0.0`) so the monotonic 4.0*ATR Chandelier trails runners.
 #[allow(clippy::too_many_arguments)]
-pub async fn place_trend_1h_ioc_entry(
+pub async fn place_macro_trend_ioc_entry(
     state_file_path: &str,
     exchange: &ExchangeClient,
     info: &InfoClient,
     state: &mut StateMap,
     symbol: &str,
+    engine_type_tag: &str, // "EngineB1h" or "EngineB4h"
+    reason_label: &str,    // e.g. "1H EMA50 PULLBACK", "4H SUPERTREND 3.0 FLIP", "4H DONCHIAN-40 BREAKOUT"
     side: Side,
     signal_stop_dist: f64,
-    atr_1h: f64,
+    atr_ref: f64,
     trail_atr_mult: f64,
+    max_sl_frac: f64,
+    max_hold_hours: usize,
     position_size_usdc: f64,
     sz_decimals: u32,
     discord_url: Option<String>,
@@ -671,7 +675,7 @@ pub async fn place_trend_1h_ioc_entry(
     };
     let (acquired, fencing_token) = try_acquire_cluster_lease_with_side(
         symbol,
-        "EngineB1h",
+        engine_type_tag,
         side_upper,
         &lease_uuid,
         3600,
@@ -715,7 +719,9 @@ pub async fn place_trend_1h_ioc_entry(
         ));
     }
 
-    let capped_sl_dist = signal_stop_dist.min(ref_px * 0.032).max(ref_px * 0.0040);
+    let capped_sl_dist = signal_stop_dist
+        .min(ref_px * max_sl_frac)
+        .max(ref_px * 0.0050);
     let est_sl_px = quantize_price(
         if is_buy {
             (ref_px - capped_sl_dist).max(effective_tick_size(ref_px, sz_decimals))
@@ -726,7 +732,7 @@ pub async fn place_trend_1h_ioc_entry(
     );
 
     let cloid_uuid = uuid::Uuid::new_v4();
-    let client_order_id = format!("{}_1h_{}", symbol, Utc::now().timestamp_millis());
+    let client_order_id = format!("{}_{}_{}", symbol, engine_type_tag, Utc::now().timestamp_millis());
 
     let mut order_intent = OrderIntent {
         symbol: symbol.to_string(),
@@ -734,14 +740,14 @@ pub async fn place_trend_1h_ioc_entry(
         cloid_hex: Some(cloid_uuid.to_string()),
         owner_uuid: lease_uuid.clone(),
         fencing_token,
-        engine_type: "EngineB1h".to_string(),
+        engine_type: engine_type_tag.to_string(),
         side: side.clone(),
         limit_px: ioc_limit_px,
         sz: amount_f,
         sz_decimals,
         target_tp: 0.0,
         stop_loss: est_sl_px,
-        half_life_minutes: 0.0,
+        half_life_minutes: (max_hold_hours as f64) * 60.0,
         position_size_usdc,
         status: OrderIntentStatus::PendingSubmission,
         exchange_order_id: None,
@@ -781,8 +787,8 @@ pub async fn place_trend_1h_ioc_entry(
     let eff_fill_px = if fill_px > 0.0 { fill_px } else { ref_px };
     let eff_fill_sz = if fill_sz > 0.0 { fill_sz } else { amount_f };
     let final_sl_dist = signal_stop_dist
-        .min(eff_fill_px * 0.032)
-        .max(eff_fill_px * 0.0040);
+        .min(eff_fill_px * max_sl_frac)
+        .max(eff_fill_px * 0.0050);
     let final_sl_px = quantize_price(
         if is_buy {
             (eff_fill_px - final_sl_dist).max(effective_tick_size(eff_fill_px, sz_decimals))
@@ -808,8 +814,8 @@ pub async fn place_trend_1h_ioc_entry(
         Ok(sl_id) => Some(sl_id),
         Err(e) => {
             eprintln!(
-                "⚠️ [ENGINE B 1H SL WARN] Initial StopMarket placement failed for {} (Fast-Sentinel will retry): {}",
-                symbol, e
+                "⚠️ [{} SL WARN] Initial StopMarket placement failed for {} (Fast-Sentinel will retry): {}",
+                engine_type_tag, symbol, e
             );
             None
         }
@@ -823,11 +829,11 @@ pub async fn place_trend_1h_ioc_entry(
         entry_price: eff_fill_px,
         amount: eff_fill_sz,
         stop_loss_price: final_sl_px,
-        take_profit_price: 0.0, // Uncapped 4.0*ATR_1h Chandelier runner
+        take_profit_price: 0.0, // Uncapped 4.0*ATR Chandelier runner
         opened_at: Utc::now().to_rfc3339(),
         risk_amount_usdc: eff_fill_sz * eff_fill_px,
         is_filled: true,
-        half_life_minutes: 0.0,
+        half_life_minutes: (max_hold_hours as f64) * 60.0, // Store exact max hold mins for EngineB1h/EngineB4h
         client_order_id,
         max_progress: 0.0,
         max_favorable_price: eff_fill_px,
@@ -835,10 +841,10 @@ pub async fn place_trend_1h_ioc_entry(
         last_reprice_time: Utc::now().timestamp_millis(),
         reprice_count: 0,
         candidate_lower_count: 0,
-        engine_type: "EngineB1h".to_string(),
+        engine_type: engine_type_tag.to_string(),
         chandelier_stop: final_sl_px,
         active_multiplier: trail_atr_mult,
-        current_atr: atr_1h,
+        current_atr: atr_ref,
         lease_fencing_token: fencing_token,
         lease_owner_uuid: lease_uuid,
         lifecycle: PositionLifecycle::Active,
@@ -870,14 +876,16 @@ pub async fn place_trend_1h_ioc_entry(
     let side_emoji = if is_buy { "🟢" } else { "🔴" };
     let sl_bps = ((eff_fill_px - final_sl_px).abs() / eff_fill_px.max(1e-9)) * 1e4;
     let msg = format!(
-        "{} **ENGINE B v2 (1H EMA50 PULLBACK-IN-TREND) {} FILLED:** {}\n**Fill:** ${:.4} | **Size:** {:.5} (${:.2})\n**Initial SL:** ${:.4} (-{:.0} bps) | **Trail:** {:.1}x ATR_1h (${:.4}) | **Max Hold:** 96h",
-        side_emoji, side_label, symbol, eff_fill_px, eff_fill_sz, eff_fill_sz * eff_fill_px, final_sl_px, sl_bps, trail_atr_mult, atr_1h
+        "{} **MARKOV-POLO V2 ({}) {} FILLED:** {}\n**Fill:** ${:.4} | **Size:** {:.5} (${:.2})\n**Initial SL:** ${:.4} (-{:.0} bps) | **Trail:** {:.1}x ATR (${:.4}) | **Max Hold:** {}h",
+        side_emoji, reason_label, side_label, symbol, eff_fill_px, eff_fill_sz, eff_fill_sz * eff_fill_px, final_sl_px, sl_bps, trail_atr_mult, atr_ref, max_hold_hours
     );
     spawn_discord_alert(discord_url, msg);
 
     Ok(json!({
         "status": "FILLED",
         "order_id": oid,
+        "engine": engine_type_tag,
+        "reason": reason_label,
         "side": side.to_string(),
         "entry_px": eff_fill_px,
         "stop_loss": final_sl_px

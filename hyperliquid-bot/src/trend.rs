@@ -2752,13 +2752,16 @@ pub struct TrendPullback1hSignal {
     pub side: Side,
     pub ref_price: f64,
     pub atr_1h: f64,
+    #[allow(dead_code)]
     pub ema12: f64,
+    #[allow(dead_code)]
     pub ema50: f64,
+    #[allow(dead_code)]
     pub ema200: f64,
+    #[allow(dead_code)]
     pub slope_12h_atr: f64,
     pub initial_stop_px: f64,
     pub trail_atr_mult: f64,
-    #[allow(dead_code)]
     pub max_hold_hours: usize,
 }
 
@@ -2949,6 +2952,225 @@ impl TrendPullback1hEngine {
                 }
             }
         }
+    }
+}
+
+/// Markov-Polo V2 (Package 10) 4-Hour Macro Trend Signal:
+/// Unifies Pillar 2 (`4H_ST3`: SuperTrend 3.0 Flip aligned with EMA20/EMA100, 7Y PF 1.49, 7/7 yrs)
+/// and Pillar 3 (`4H_D40`: 40-bar / 160h Donchian Breakout, 7Y PF 1.24, 7/7 yrs).
+#[derive(Debug, Clone)]
+pub struct MacroTrend4hSignal {
+    pub policy_tag: &'static str, // "ENGINE_B_4H_ST3" or "ENGINE_B_4H_D40"
+    pub side: Side,
+    pub ref_price: f64,
+    pub atr_4h: f64,
+    #[allow(dead_code)]
+    pub ema20: f64,
+    #[allow(dead_code)]
+    pub ema100: f64,
+    pub initial_stop_px: f64,
+    pub trail_atr_mult: f64,
+    pub max_sl_frac: f64,
+    pub max_hold_hours: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct MacroTrend4hEngine {
+    pub bars: std::collections::VecDeque<CandleBar>,
+    pub ema20: f64,
+    pub ema100: f64,
+    pub atr_4h: f64,
+    pub st_dir: i32,
+    pub prev_st_dir: i32,
+    pub st_band: f64,
+    pub st_mult: f64,
+    pub sl_atr: f64,
+    pub trail_atr: f64,
+    pub max_sl_frac: f64,
+    pub bars_seen: usize,
+    pub last_bucket_ms: u64,
+}
+
+impl Default for MacroTrend4hEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MacroTrend4hEngine {
+    pub fn new() -> Self {
+        Self {
+            bars: std::collections::VecDeque::with_capacity(55),
+            ema20: 0.0,
+            ema100: 0.0,
+            atr_4h: 0.0,
+            st_dir: 0,
+            prev_st_dir: 0,
+            st_band: 0.0,
+            st_mult: 3.0,
+            sl_atr: 2.5,
+            trail_atr: 4.0,
+            max_sl_frac: 0.050, // Cap initial 4H stop at 5.0%
+            bars_seen: 0,
+            last_bucket_ms: 0,
+        }
+    }
+
+    pub fn warmup_from_4h_bars(&mut self, bars_4h: &[CandleBar]) {
+        for b in bars_4h {
+            let _ = self.on_4h_bar_close(b, false);
+        }
+    }
+
+    pub fn on_4h_bar_close(
+        &mut self,
+        bar: &CandleBar,
+        emit_signal: bool,
+    ) -> Option<MacroTrend4hSignal> {
+        if !bar.close.is_finite() || bar.close <= 0.0 || bar.high < bar.low {
+            return None;
+        }
+        if self.bars_seen > 0 && bar.time_open <= self.last_bucket_ms {
+            return None;
+        }
+        self.last_bucket_ms = bar.time_open;
+
+        if self.bars_seen == 0 {
+            self.ema20 = bar.close;
+            self.ema100 = bar.close;
+            self.atr_4h = (bar.high - bar.low).max(bar.close * 0.004);
+            self.st_dir = 1;
+            self.prev_st_dir = 1;
+            self.st_band = bar.close - self.st_mult * self.atr_4h;
+            self.bars.push_back(bar.clone());
+            self.bars_seen = 1;
+            return None;
+        }
+
+        let prev_c = self.bars.back().map(|b| b.close).unwrap_or(bar.close);
+        let tr = (bar.high - bar.low)
+            .max((bar.high - prev_c).abs())
+            .max((bar.low - prev_c).abs());
+        self.atr_4h = if self.bars_seen == 1 {
+            tr.max(bar.close * 0.002)
+        } else {
+            0.05 * tr + 0.95 * self.atr_4h
+        };
+
+        self.ema20 = (2.0 / 21.0) * bar.close + (19.0 / 21.0) * self.ema20;
+        self.ema100 = (2.0 / 101.0) * bar.close + (99.0 / 101.0) * self.ema100;
+
+        self.prev_st_dir = self.st_dir;
+        let hl2 = 0.5 * (bar.high + bar.low);
+        let up_b = hl2 - self.st_mult * self.atr_4h;
+        let dn_b = hl2 + self.st_mult * self.atr_4h;
+        if self.st_dir >= 0 {
+            if bar.close < self.st_band {
+                self.st_dir = -1;
+                self.st_band = dn_b;
+            } else {
+                self.st_band = self.st_band.max(up_b);
+            }
+        } else if bar.close > self.st_band {
+            self.st_dir = 1;
+            self.st_band = up_b;
+        } else {
+            self.st_band = self.st_band.min(dn_b);
+        }
+
+        // Compute prior 40-bar Donchian strictly BEFORE pushing current bar (zero lookahead!)
+        let prior_donch = if self.bars.len() >= 40 {
+            let start = self.bars.len() - 40;
+            let mut hi = 0.0_f64;
+            let mut lo = f64::MAX;
+            for b in self.bars.iter().skip(start) {
+                if b.high > hi {
+                    hi = b.high;
+                }
+                if b.low < lo {
+                    lo = b.low;
+                }
+            }
+            Some((hi, lo))
+        } else {
+            None
+        };
+
+        self.bars.push_back(bar.clone());
+        if self.bars.len() > 50 {
+            self.bars.pop_front();
+        }
+        self.bars_seen += 1;
+
+        if !emit_signal || self.bars_seen < 60 || self.atr_4h <= 1e-9 {
+            return None;
+        }
+
+        let sl_dist = (self.sl_atr * self.atr_4h).min(bar.close * self.max_sl_frac);
+
+        // Priority 1: 4H SuperTrend 3.0 Flip aligned with EMA20/EMA100 (7Y PF 1.49, 7/7 yrs)
+        if self.st_dir == 1 && self.prev_st_dir == -1 && self.ema20 > self.ema100 {
+            return Some(MacroTrend4hSignal {
+                policy_tag: "ENGINE_B_4H_ST3",
+                side: Side::Long,
+                ref_price: bar.close,
+                atr_4h: self.atr_4h,
+                ema20: self.ema20,
+                ema100: self.ema100,
+                initial_stop_px: (bar.close - sl_dist).max(1e-9),
+                trail_atr_mult: self.trail_atr,
+                max_sl_frac: self.max_sl_frac,
+                max_hold_hours: 288, // 72 x 4h = 12 days
+            });
+        }
+        if self.st_dir == -1 && self.prev_st_dir == 1 && self.ema20 < self.ema100 {
+            return Some(MacroTrend4hSignal {
+                policy_tag: "ENGINE_B_4H_ST3",
+                side: Side::Short,
+                ref_price: bar.close,
+                atr_4h: self.atr_4h,
+                ema20: self.ema20,
+                ema100: self.ema100,
+                initial_stop_px: bar.close + sl_dist,
+                trail_atr_mult: self.trail_atr,
+                max_sl_frac: self.max_sl_frac,
+                max_hold_hours: 288,
+            });
+        }
+
+        // Priority 2: 4H Donchian-40 (160h) Breakout (7Y PF 1.24, 7/7 yrs)
+        if let Some((hi40, lo40)) = prior_donch {
+            if bar.close > hi40 {
+                return Some(MacroTrend4hSignal {
+                    policy_tag: "ENGINE_B_4H_D40",
+                    side: Side::Long,
+                    ref_price: bar.close,
+                    atr_4h: self.atr_4h,
+                    ema20: self.ema20,
+                    ema100: self.ema100,
+                    initial_stop_px: (bar.close - sl_dist).max(1e-9),
+                    trail_atr_mult: self.trail_atr,
+                    max_sl_frac: self.max_sl_frac,
+                    max_hold_hours: 360, // 90 x 4h = 15 days
+                });
+            }
+            if bar.close < lo40 {
+                return Some(MacroTrend4hSignal {
+                    policy_tag: "ENGINE_B_4H_D40",
+                    side: Side::Short,
+                    ref_price: bar.close,
+                    atr_4h: self.atr_4h,
+                    ema20: self.ema20,
+                    ema100: self.ema100,
+                    initial_stop_px: bar.close + sl_dist,
+                    trail_atr_mult: self.trail_atr,
+                    max_sl_frac: self.max_sl_frac,
+                    max_hold_hours: 360,
+                });
+            }
+        }
+
+        None
     }
 }
 
@@ -4395,5 +4617,45 @@ mod tests {
         );
         assert!(sl1 > sig.initial_stop_px);
         assert!((sl2 - sl1).abs() < 1e-12, "Trailing stop must be monotonic");
+    }
+
+    #[test]
+    fn test_package10_macro_trend_4h_supertrend_and_donchian40() {
+        let mut eng = MacroTrend4hEngine::new();
+        let mut bars = Vec::new();
+        // 65 bars of calm sideways consolidation around 100.0 (range 99..101)
+        for i in 0..65u64 {
+            let c = 100.0 + if i % 2 == 0 { 0.4 } else { -0.4 };
+            bars.push(CandleBar {
+                time_open: i * 14_400_000,
+                open: c,
+                high: c + 0.5,
+                low: c - 0.5,
+                close: c,
+                volume: 100.0,
+            });
+        }
+        eng.warmup_from_4h_bars(&bars);
+        assert_eq!(eng.bars_seen, 65);
+
+        // Bar 65: clean Donchian-40 upside breakout above 100.9 -> must emit ENGINE_B_4H_D40 Long!
+        let bo = CandleBar {
+            time_open: 65 * 14_400_000,
+            open: 100.4,
+            high: 104.0,
+            low: 100.3,
+            close: 103.5,
+            volume: 250.0,
+        };
+        let sig = eng
+            .on_4h_bar_close(&bo, true)
+            .expect("Expected 4H Donchian-40 Long breakout signal");
+        assert_eq!(sig.policy_tag, "ENGINE_B_4H_D40");
+        assert_eq!(sig.side, Side::Long);
+        assert!(sig.initial_stop_px < sig.ref_price);
+        assert!((sig.ref_price - sig.initial_stop_px) / sig.ref_price <= 0.0501);
+
+        // Duplicate timestamp must be idempotent
+        assert!(eng.on_4h_bar_close(&bo, true).is_none());
     }
 }

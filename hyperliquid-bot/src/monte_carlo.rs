@@ -974,6 +974,7 @@ pub fn run_portfolio_monte_carlo_and_sensitivity(
                 notional_usdc: 133.5,
                 account_equity_usdc: 534.0,
                 sz_decimals: sz_dec,
+                enable_legacy_engine_a: false,
             };
             let res = run_engine_a_backtest_with_btc(sym, bars, Some(btc_bars), &cfg);
             sc_wins += res.wins;
