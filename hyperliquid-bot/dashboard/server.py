@@ -35,19 +35,17 @@ SCALEUP_EPOCH_MS = CLEAN_SLATE_EPOCH_MS
 ACTIVE_V23_UNIVERSE = {
     "BTC",
     "ETH",
-    "SOL",
-    "AVAX",
     "HYPE",
-    "NEAR",
-    "XRP",
-    "SUI",
-    "LINK",
     "ZEC",
-    "xyz:XYZ100",
-    "xyz:NVDA",
+    "SOL",
+    "XRP",
+    "NEAR",
+    "SUI",
+    "AVAX",
     "xyz:CL",
     "xyz:SILVER",
-    "xyz:GOLD",
+    "xyz:XYZ100",
+    "xyz:NVDA",
 }
 
 SEARCH_DIRS = [

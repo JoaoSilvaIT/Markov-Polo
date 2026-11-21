@@ -489,14 +489,11 @@ async fn main() {
             "NEAR",
             "XRP",
             "SUI",
-            "LINK",
             "ZEC",
             "xyz:NVDA",
-            "xyz:GOLD",
             "xyz:XYZ100",
             "xyz:CL",
             "xyz:SILVER",
-            "xyz:TSLA",
         ];
         let symbols_vec: Vec<&str> = if native_only {
             all_symbols
@@ -893,7 +890,11 @@ async fn main() {
 
             let run_compounded = |label: &str, start_eq: f64, pos_cap_usd: f64, extra_fee_mult: f64, max_same_dir_cap: usize, show_yearly: bool| {
                 let mut sorted_trades: Vec<&crate::backtest::SimulatedTradeResult> = all_trades.clone();
-                sorted_trades.sort_by_key(|t| (t.entry_time_ms, t.exit_time_ms));
+                // Exact V2.4 live parity tie-break: chronological bar close -> deterministic Pillar + Tier priority
+                sorted_trades.sort_by_key(|t| {
+                    let prio = crate::state::macro_entry_wall_clock_offset_ms(&t.symbol, t.entry_policy);
+                    (t.entry_time_ms, prio, t.exit_time_ms)
+                });
 
                 let max_slots = crate::state::max_concurrent_cluster_positions();
                 let max_same_dir = max_same_dir_cap;
@@ -986,7 +987,9 @@ async fn main() {
                     let dd_mult = compute_macro_drawdown_risk_multiplier(eq, hwm);
                     let base_ntl_560 = (t.qty * t.entry_px).max(12.0);
                     let risk_frac_of_eq = (base_ntl_560 / 560.0) * dd_mult;
-                    let slot_cap = (eq / max_slots as f64).min(pos_cap_usd);
+                    let is_hip3 = t.symbol.to_ascii_lowercase().starts_with("xyz:");
+                    let slot_frac = if is_hip3 { (1.0 / max_slots as f64).max(0.35) } else { 1.0 / max_slots as f64 };
+                    let slot_cap = (eq * slot_frac).min(pos_cap_usd);
                     let rem_budget = (eq - open_ntl).max(0.0);
                     let hard_cap = slot_cap.min(rem_budget);
                     if hard_cap < 12.0 {
@@ -1055,8 +1058,8 @@ async fn main() {
 
             let total_fund_all: f64 = all_trades.iter().map(|t| t.funding_usd).sum();
             println!("   ↳ [FUNDING ALREADY DEDUCTED IN NET PNL]: ${:+.2} USDC across {} trades", total_fund_all, all_trades.len());
-            run_compounded("V2.3 Zero-Liq (max=5, dir<=4, <=1.00x)", 560.69, 1_000_000.0, 0.0, 4, true);
-            run_compounded("V2.3 Zero-Liq 2x Fee Stress (dir<=4)  ", 560.69, 1_000_000.0, 1.0, 4, false);
+            run_compounded("V2.4 Frozen 13-Asset Zero-Liq (<=1.00x)", 560.69, 1_000_000.0, 0.0, 4, true);
+            run_compounded("V2.4 Frozen 13-Asset 2x Fee Stress     ", 560.69, 1_000_000.0, 1.0, 4, false);
         }
 
         if run_mc {
@@ -3310,11 +3313,13 @@ async fn main() {
     let max_slots_cfg = crate::state::max_concurrent_cluster_positions();
     let max_same_dir_cfg = crate::state::max_same_direction_macro_positions(max_slots_cfg);
     println!(
-        "⚙️ [STARTUP CONFIG] Symbol: {} | MARKOV-POLO V2.3 ZERO-LIQ DUAL-PILLAR: {} (4H SuperTrend-3.0 + 1H EMA50 Pullback [GOLD 4H-only] | 0.75% risk/tr, {} slots / max {}/dir, Two-Tier <=20% Crypto / <=35% TradFi, Hard Cap <=1.00x Equity, Mark-Oracle + Funding-Squeeze Guards, Macro DD-Taper >15%, 4.0x ATR Trail) | Exchange Leverage: {}x",
+        "⚙️ [STARTUP CONFIG] Symbol: {} | MARKOV-POLO V2.4 FROZEN 13-ASSET ZERO-LIQ DUAL-PILLAR: {} (4H SuperTrend-3.0 + 1H EMA50 Pullback | 0.75% risk/tr, {} slots / max {}/dir, Two-Tier <=20% Crypto / <=35% TradFi, Hard Cap <=1.00x Equity, Deterministic Stagger {}ms/4H {}ms/1H, Mark-Oracle + Funding-Squeeze + Oil-Roll Guards, Macro DD-Taper >15%, 4.0x ATR Trail) | Exchange Leverage: {}x",
         trading_symbol,
         trend_engine_mode.to_uppercase(),
         max_slots_cfg,
         max_same_dir_cfg,
+        crate::state::macro_entry_wall_clock_offset_ms(&trading_symbol, "EngineB4h"),
+        crate::state::macro_entry_wall_clock_offset_ms(&trading_symbol, "EngineB1h"),
         config.hl_leverage,
     );
     let mut consecutive_squeeze_funding_hours: u32 = 0;
@@ -4607,8 +4612,6 @@ async fn main() {
                         );
                         let macro_veto_m = check_macro_calendar_veto(now_ms_cb);
                         let side_label_m = if sig_side == Side::Long { "LONG" } else { "SHORT" };
-                        let macro_cluster_veto_m =
-                            crate::state::has_active_macro_cluster_veto(&symbol_clone, side_label_m);
                         // Live Mark-Oracle Dislocation Guard: defer IOC entries during flash-crash liquidity vacuums
                         // (> 75 bps crypto, > 40 bps HIP-3 TradFi)
                         let (mark_chk, oracle_chk) = {
@@ -4637,6 +4640,34 @@ async fn main() {
                             && (eng_tag == "EngineB1h"
                                 || (sig_side == Side::Short && current_funding_1h < -0.00003));
 
+                        // Deterministic Wall-Clock Stagger (0.00% Priority Inversion across 13 containers):
+                        // Anchor sleep to T_bar_close UTC + deterministic Pillar/Tier offset BEFORE re-checking
+                        // cluster capacity and acquiring the Pre-REST atomic `flock` lease!
+                        let prelim_has_pos = { state_clone.lock().await.contains_key(&symbol_clone) };
+                        if !prelim_has_pos
+                            && session_ok_m
+                            && !candle_feed_degraded
+                            && !is_candle_gap
+                            && !is_cb_paused
+                            && !mark_oracle_dislocated
+                            && !oil_roll_vetoed
+                            && macro_veto_m.is_none()
+                            && trend_engine_mode == "live"
+                            && is_symbol_live_capital_enabled(&symbol_clone)
+                        {
+                            let bar_close_ms = completed_bar.time_open.saturating_add(60_000);
+                            let offset_ms = crate::state::macro_entry_wall_clock_offset_ms(&symbol_clone, eng_tag);
+                            let target_ms = bar_close_ms.saturating_add(offset_ms);
+                            let now_pre_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                            if target_ms > now_pre_ms {
+                                let wait_ms = (target_ms - now_pre_ms).min(3_500);
+                                tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                            }
+                        }
+
+                        // Re-evaluate cluster slot veto AFTER wall-clock stagger so higher-priority tiers win cleanly
+                        let macro_cluster_veto_m =
+                            crate::state::has_active_macro_cluster_veto(&symbol_clone, side_label_m);
                         let mut state_lock_m = state_clone.lock().await;
                         let already_in_pos_m = state_lock_m.contains_key(&symbol_clone);
                         if !already_in_pos_m

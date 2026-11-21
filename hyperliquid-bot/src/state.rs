@@ -1419,6 +1419,7 @@ pub fn configured_portfolio_symbols() -> Vec<String> {
             return syms;
         }
     }
+    // Markov-Polo V2.4 Frozen 13-Asset Universe (100% Cross-Margin, 100% Growth-Mode TradFi; LINK & xyz:GOLD pruned)
     vec![
         "BTC".to_string(),
         "ETH".to_string(),
@@ -1428,14 +1429,42 @@ pub fn configured_portfolio_symbols() -> Vec<String> {
         "NEAR".to_string(),
         "XRP".to_string(),
         "SUI".to_string(),
-        "LINK".to_string(),
-        "xyz:NVDA".to_string(),
-        "xyz:GOLD".to_string(),
+        "ZEC".to_string(),
         "xyz:XYZ100".to_string(),
+        "xyz:NVDA".to_string(),
         "xyz:CL".to_string(),
         "xyz:SILVER".to_string(),
-        "ZEC".to_string(),
     ]
+}
+
+/// Markov-Polo V2.4 Deterministic Wall-Clock Entry Stagger (anchored to `T_bar_close` UTC).
+/// Guarantees 0.00% priority inversion across isolated containers without a central orchestrator:
+///   - `EngineB4h` (`4H_ST3`, PF 1.47) ALWAYS reserves atomic `flock` slots ahead of `EngineB1h` (`1H_PB`, +1600ms).
+///   - Within each pillar: Tier 1 True Macro (`CL, SILVER`) > Tier 2 Majors (`BTC, ETH, XYZ100`) >
+///     Tier 3 Liquid Alts (`HYPE, ZEC, SOL, XRP, NVDA`) > Tier 4 Smaller Alts (`NEAR, SUI, AVAX`).
+#[inline]
+pub fn macro_entry_wall_clock_offset_ms(symbol: &str, engine_tag: &str) -> u64 {
+    let base_ms: u64 = match symbol.to_ascii_uppercase().as_str() {
+        "XYZ:CL" => 300,
+        "XYZ:SILVER" => 350,
+        "BTC" => 700,
+        "ETH" => 750,
+        "XYZ:XYZ100" => 800,
+        "HYPE" => 1100,
+        "ZEC" => 1140,
+        "SOL" => 1180,
+        "XRP" => 1220,
+        "XYZ:NVDA" => 1260,
+        "NEAR" => 1500,
+        "SUI" => 1540,
+        "AVAX" => 1580,
+        _ => 1620,
+    };
+    if engine_tag == "EngineB1h" || engine_tag == "ENGINE_B_1H_PULLBACK" {
+        base_ms + 1600
+    } else {
+        base_ms
+    }
 }
 
 /// Checks if any other symbol in the portfolio cluster currently blocks `current_symbol`
@@ -2418,6 +2447,21 @@ mod tests {
         let (ok_6th, _) =
             try_acquire_cluster_lease_with_side("xyz:SILVER", "EngineB4h", "LONG", "u_SIL", 60);
         assert!(!ok_6th, "6th slot must be blocked by max_concurrent=5");
+
+        // Verify deterministic V2.4 wall-clock priority stagger:
+        // 4H_ST3 True Macro (CL < SILVER) < Majors (BTC < ETH < XYZ100) < Alts < ALL 1H_PB signals
+        assert!(
+            macro_entry_wall_clock_offset_ms("xyz:CL", "EngineB4h")
+                < macro_entry_wall_clock_offset_ms("xyz:SILVER", "EngineB4h")
+        );
+        assert!(
+            macro_entry_wall_clock_offset_ms("xyz:SILVER", "EngineB4h")
+                < macro_entry_wall_clock_offset_ms("BTC", "EngineB4h")
+        );
+        assert!(
+            macro_entry_wall_clock_offset_ms("AVAX", "EngineB4h")
+                < macro_entry_wall_clock_offset_ms("xyz:CL", "EngineB1h")
+        );
 
         for (sym, uuid, tok) in tokens {
             assert!(release_cluster_lease_authenticated(

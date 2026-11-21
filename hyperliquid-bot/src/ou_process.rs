@@ -4851,22 +4851,53 @@ pub fn evaluate_session_lifecycle_gate(
     let day_of_week = dt.weekday().num_days_from_sunday(); // 0=Sun, 6=Sat
 
     if is_us_equity {
-        if day_of_week == 0 || day_of_week == 6 {
+        // Markov-Polo V2.4 Macro Trend Session Rules for US Equity / Index Perps (`trade.xyz` 23/5 external oracles):
+        // - Mon–Thu: HOLD OPEN multi-day 4H/1H macro trends overnight (no daily 15:57 ET churn!)
+        // - Friday 15:55 ET -> Sunday 18:15 ET (Index) / 20:05 ET (Single-Stock NVDA): ForceFlat to avoid weekend gaps.
+        let is_index = matches!(s_upper.as_str(), "XYZ:XYZ100" | "XYZ100");
+        let (fri_flat, maint_start, maint_end, sun_open, rth_open, ats_start, ats_end) =
+            if is_us_dst {
+                // EDT = UTC-4: 15:55 ET=1195, 16:45-18:15 ET=1245..1335, Sun 20:05 ET=1445(wrap)->use 1439, 09:30 ET=810, 20:00-04:00 ET=0..480
+                (
+                    1195,
+                    1245,
+                    1335,
+                    if is_index { 1335 } else { 1435 },
+                    810,
+                    0,
+                    480,
+                )
+            } else {
+                // EST = UTC-5: 15:55 ET=1255, 16:45-18:15 ET=1305..1395, Sun 18:15 ET=1395 / 20:05 ET=1435, 09:30 ET=870, 20:00-04:00 ET=60..540
+                (
+                    1255,
+                    1305,
+                    1395,
+                    if is_index { 1395 } else { 1435 },
+                    870,
+                    60,
+                    540,
+                )
+            };
+        if day_of_week == 6
+            || (day_of_week == 5 && total_day_mins >= fri_flat)
+            || (day_of_week == 0 && total_day_mins < sun_open)
+        {
             return SessionLifecycleAction::ForceFlat("US_EQUITY_WEEKEND");
         }
-        // US RTH: 09:30 - 16:00 ET -> EDT: 810..1200 UTC mins, EST: 870..1260 UTC mins
-        // Package 7 Legacy Gap Quarantine: +15m open / -30m close
-        let (rth_open, rth_close) = if is_us_dst { (810, 1200) } else { (870, 1260) };
-        if total_day_mins < rth_open || total_day_mins >= rth_close - 3 {
-            return SessionLifecycleAction::ForceFlat("US_EQUITY_RTH_CLOSE");
+        // Daily CME NQ / US cash-to-futures 16:45-18:15 ET maintenance pause: block NEW entries only
+        if total_day_mins >= maint_start && total_day_mins < maint_end {
+            return SessionLifecycleAction::BlockNewEntriesAndRatchetTp("US_EQUITY_DAILY_MAINT");
         }
-        if total_day_mins < rth_open + 15 {
+        // US Cash open auction 15m volatility shield (09:30-09:45 ET)
+        if total_day_mins >= rth_open && total_day_mins < rth_open + 15 {
             return SessionLifecycleAction::BlockNewEntriesAndRatchetTp(
                 "US_EQUITY_OPEN_AUCTION_15M",
             );
         }
-        if total_day_mins >= rth_close - 30 {
-            return SessionLifecycleAction::BlockNewEntriesAndRatchetTp("US_EQUITY_PRE_CLOSE_30M");
+        // Single-stock (NVDA/TSLA): block new entries in thin overnight ATS (20:00-04:00 ET), hold existing trends
+        if !is_index && total_day_mins >= ats_start && total_day_mins < ats_end {
+            return SessionLifecycleAction::BlockNewEntriesAndRatchetTp("US_EQUITY_THIN_ATS");
         }
     } else if is_cme_oil {
         // CME NYMEX Oil (`xyz:CL` / `xyz:BRENTOIL`):
@@ -4874,10 +4905,8 @@ pub fn evaluate_session_lifecycle_gate(
         // 2. Daily CME Maintenance Pause (Mon-Thu 16:45-18:15 ET): block NEW entries only (let multi-day oil runners hold!)
         // 3. EIA Crude Oil Inventory Embargo: Wed 10:25-10:40 ET
         let (fri_flat, maint_start, maint_end, eia_start, eia_end) = if is_us_dst {
-            // EDT = UTC-4: 15:55 ET = 19:55 UTC (1195), 16:45 ET = 1245, 18:15 ET = 1335, 10:25-10:40 ET = 865..880
             (1195, 1245, 1335, 865, 880)
         } else {
-            // EST = UTC-5: 15:55 ET = 20:55 UTC (1255), 16:45 ET = 1305, 18:15 ET = 1395, 10:25-10:40 ET = 925..940
             (1255, 1305, 1395, 925, 940)
         };
         if day_of_week == 6
@@ -4895,32 +4924,31 @@ pub fn evaluate_session_lifecycle_gate(
             );
         }
     } else if is_cme_metal {
-        // CME Globex daily maintenance: 17:00 - 18:00 ET -> EDT: 1260..1320, EST: 1320..1380
-        let (maint_start, maint_end) = if is_us_dst {
-            (1260, 1320)
+        // CME Metals (`xyz:SILVER` / `xyz:GOLD`):
+        // - Weekend Flatten: Fri 16:55 ET -> Sun 18:15 ET
+        // - Mon–Thu Daily 1h CME Pause (16:45–18:15 ET): block NEW entries ONLY so multi-day 4H trends hold overnight!
+        let (fri_flat, maint_start, maint_end) = if is_us_dst {
+            (1255, 1245, 1335)
         } else {
-            (1320, 1380)
+            (1315, 1305, 1395)
         };
         if day_of_week == 6
-            || (day_of_week == 5 && total_day_mins >= maint_start - 5)
-            || (day_of_week == 0 && total_day_mins < maint_end + 5)
+            || (day_of_week == 5 && total_day_mins >= fri_flat)
+            || (day_of_week == 0 && total_day_mins < maint_end)
         {
             return SessionLifecycleAction::ForceFlat("CME_WEEKEND_CLOSED");
         }
-        if total_day_mins >= maint_start - 5 && total_day_mins < maint_end + 5 {
-            return SessionLifecycleAction::ForceFlat("CME_DAILY_MAINTENANCE");
+        if total_day_mins >= maint_start && total_day_mins < maint_end {
+            return SessionLifecycleAction::BlockNewEntriesAndRatchetTp("CME_DAILY_MAINTENANCE");
         }
-        if total_day_mins >= maint_start - 20 && total_day_mins < maint_start - 5 {
-            return SessionLifecycleAction::BlockNewEntriesAndRatchetTp("CME_PRE_MAINT_20M");
-        }
-        // Package 8B: 08:20-08:40 ET COMEX cash open & US Tier-1 macro release window
-        let comex_open_start = if is_us_dst { 740 } else { 800 }; // 12:20 UTC EDT / 13:20 UTC EST
+        // 08:20-08:40 ET COMEX cash open & US Tier-1 macro release window
+        let comex_open_start = if is_us_dst { 740 } else { 800 };
         if total_day_mins >= comex_open_start && total_day_mins < comex_open_start + 20 {
             return SessionLifecycleAction::BlockNewEntriesAndRatchetTp(
                 "CME_COMEX_OPEN_MACRO_SHIELD",
             );
         }
-        // Package 8B: 02:00-06:00 UTC Asian illiquidity / thin-book spread expansion window
+        // 02:00-06:00 UTC Asian illiquidity / thin-book spread expansion window
         if (120..360).contains(&total_day_mins) {
             return SessionLifecycleAction::BlockNewEntriesAndRatchetTp(
                 "CME_ASIAN_ILLIQUIDITY_WINDOW",
@@ -5937,7 +5965,7 @@ mod tests {
 
         // 2. DST-Aware US Equity Session Lifecycle Gate:
         use chrono::{TimeZone, Utc};
-        // EST (Nov 11, 2026): RTH 14:30 - 21:00 UTC
+        // EST (Wed Nov 11, 2026): Mon–Thu holds open overnight; Fri 15:55 ET -> ForceFlat!
         let ts_est_open_auction = Utc
             .with_ymd_and_hms(2026, 11, 11, 14, 32, 0)
             .unwrap()
@@ -5946,14 +5974,14 @@ mod tests {
             .with_ymd_and_hms(2026, 11, 11, 15, 30, 0)
             .unwrap()
             .timestamp_millis();
-        let ts_est_preclose = Utc
-            .with_ymd_and_hms(2026, 11, 11, 20, 45, 0)
+        let ts_est_maint = Utc
+            .with_ymd_and_hms(2026, 11, 11, 22, 10, 0)
             .unwrap()
-            .timestamp_millis();
-        let ts_est_flat = Utc
-            .with_ymd_and_hms(2026, 11, 11, 20, 58, 0)
+            .timestamp_millis(); // Wed 17:10 EST
+        let ts_est_fri_flat = Utc
+            .with_ymd_and_hms(2026, 11, 13, 20, 56, 0)
             .unwrap()
-            .timestamp_millis();
+            .timestamp_millis(); // Fri 15:56 EST
         assert_eq!(
             evaluate_session_lifecycle_gate("xyz:NVDA", ts_est_open_auction),
             SessionLifecycleAction::BlockNewEntriesAndRatchetTp("US_EQUITY_OPEN_AUCTION_15M")
@@ -5963,21 +5991,29 @@ mod tests {
             SessionLifecycleAction::AllowNormalTrading
         );
         assert_eq!(
-            evaluate_session_lifecycle_gate("xyz:NVDA", ts_est_preclose),
-            SessionLifecycleAction::BlockNewEntriesAndRatchetTp("US_EQUITY_PRE_CLOSE_30M")
+            evaluate_session_lifecycle_gate("xyz:NVDA", ts_est_maint),
+            SessionLifecycleAction::BlockNewEntriesAndRatchetTp("US_EQUITY_DAILY_MAINT")
         );
         assert_eq!(
-            evaluate_session_lifecycle_gate("xyz:NVDA", ts_est_flat),
-            SessionLifecycleAction::ForceFlat("US_EQUITY_RTH_CLOSE")
+            evaluate_session_lifecycle_gate("xyz:NVDA", ts_est_fri_flat),
+            SessionLifecycleAction::ForceFlat("US_EQUITY_WEEKEND")
+        );
+        assert_eq!(
+            evaluate_session_lifecycle_gate("xyz:XYZ100", ts_est_maint),
+            SessionLifecycleAction::BlockNewEntriesAndRatchetTp("US_EQUITY_DAILY_MAINT")
+        );
+        assert_eq!(
+            evaluate_session_lifecycle_gate("xyz:XYZ100", ts_est_fri_flat),
+            SessionLifecycleAction::ForceFlat("US_EQUITY_WEEKEND")
         );
 
-        // EDT (July 15, 2026): RTH 13:30 - 20:00 UTC
+        // EDT (Wed July 15, 2026): holds Mon–Thu; Fri July 17 15:56 EDT -> ForceFlat
         let ts_edt_active = Utc
-            .with_ymd_and_hms(2026, 7, 15, 13, 45, 0)
+            .with_ymd_and_hms(2026, 7, 15, 13, 50, 0)
             .unwrap()
             .timestamp_millis();
-        let ts_edt_flat = Utc
-            .with_ymd_and_hms(2026, 7, 15, 19, 58, 0)
+        let ts_edt_fri_flat = Utc
+            .with_ymd_and_hms(2026, 7, 17, 19, 56, 0)
             .unwrap()
             .timestamp_millis();
         assert_eq!(
@@ -5985,23 +6021,31 @@ mod tests {
             SessionLifecycleAction::AllowNormalTrading
         );
         assert_eq!(
-            evaluate_session_lifecycle_gate("xyz:TSLA", ts_edt_flat),
-            SessionLifecycleAction::ForceFlat("US_EQUITY_RTH_CLOSE")
+            evaluate_session_lifecycle_gate("xyz:TSLA", ts_edt_fri_flat),
+            SessionLifecycleAction::ForceFlat("US_EQUITY_WEEKEND")
         );
 
-        // CME Metal maintenance: 17:00-18:00 ET (EST = 22:00-23:00 UTC)
+        // CME Metal Mon–Thu maintenance (16:45-18:15 ET): BlockNewEntries only (holds multi-day 4H trends!); Fri 16:56 ET -> ForceFlat
         let ts_cme_maint = Utc
             .with_ymd_and_hms(2026, 11, 11, 22, 10, 0)
             .unwrap()
             .timestamp_millis();
+        let ts_cme_fri_flat = Utc
+            .with_ymd_and_hms(2026, 11, 13, 21, 56, 0)
+            .unwrap()
+            .timestamp_millis(); // Fri 16:56 EST
         assert_eq!(
-            evaluate_session_lifecycle_gate("xyz:GOLD", ts_cme_maint),
-            SessionLifecycleAction::ForceFlat("CME_DAILY_MAINTENANCE")
+            evaluate_session_lifecycle_gate("xyz:SILVER", ts_cme_maint),
+            SessionLifecycleAction::BlockNewEntriesAndRatchetTp("CME_DAILY_MAINTENANCE")
+        );
+        assert_eq!(
+            evaluate_session_lifecycle_gate("xyz:SILVER", ts_cme_fri_flat),
+            SessionLifecycleAction::ForceFlat("CME_WEEKEND_CLOSED")
         );
 
         // Native Crypto always AllowNormalTrading
         assert_eq!(
-            evaluate_session_lifecycle_gate("BTC", ts_est_flat),
+            evaluate_session_lifecycle_gate("BTC", ts_est_fri_flat),
             SessionLifecycleAction::AllowNormalTrading
         );
 

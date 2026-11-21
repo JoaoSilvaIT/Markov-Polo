@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Markov-Polo V2.3 — Stats</title>
+  <title>Markov-Polo V2.4 — Stats</title>
   <style>
     :root {
       --bg: #0b0e14;
@@ -130,7 +130,7 @@
 </head>
 <body>
   <header>
-    <div class="title">MARKOV-POLO V2.3 &mdash; HYPERLIQUID L1 (4H ST3 + 1H EMA50 PB)</div>
+    <div class="title">MARKOV-POLO V2.4 &mdash; HYPERLIQUID L1 (13 ASSETS: 4H ST3 + 1H EMA50 PB)</div>
     <div class="meta" id="header-meta">A carregar telemetria...</div>
   </header>
 
@@ -191,7 +191,7 @@
     </table>
   </div>
 
-  <h2>Ativos &amp; Métricas de Entrada em Tempo Real (15 Ativos)</h2>
+  <h2>Ativos &amp; Métricas de Entrada em Tempo Real (13 Ativos — 100% Cross &amp; Growth Mode)</h2>
   <div class="table-wrap">
     <table>
       <thead>
@@ -242,8 +242,10 @@
 
   <script>
     const ASSET_ORDER = [
-      "BTC", "ETH", "SOL", "AVAX", "HYPE", "NEAR", "XRP", "SUI", "LINK", "ZEC",
-      "xyz:XYZ100", "xyz:NVDA", "xyz:CL", "xyz:SILVER", "xyz:GOLD"
+      "xyz:CL", "xyz:SILVER",
+      "BTC", "ETH", "xyz:XYZ100",
+      "HYPE", "ZEC", "SOL", "XRP", "xyz:NVDA",
+      "NEAR", "SUI", "AVAX"
     ];
 
     function fmtPx(px) {
