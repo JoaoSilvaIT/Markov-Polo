@@ -4378,6 +4378,52 @@ async fn main() {
                         )
                     };
 
+                    let (oi_snap, mark_snap, oracle_snap) = {
+                        let cg = crowding_tracker.read().await;
+                        (cg.open_interest, cg.mark_px, cg.oracle_px)
+                    };
+                    let mark_oracle_div_telem = if mark_snap > 0.0 && oracle_snap > 0.0 {
+                        ((mark_snap - oracle_snap).abs() / oracle_snap) * 1e4
+                    } else {
+                        0.0
+                    };
+                    let is_gold_telem = symbol_clone.eq_ignore_ascii_case("xyz:GOLD")
+                        || symbol_clone.eq_ignore_ascii_case("GOLD");
+                    let is_hip3_telem = symbol_clone.to_ascii_lowercase().starts_with("xyz:");
+                    let pb_sep_atr = if engine_b_1h.atr_1h > 1e-9 {
+                        (engine_b_1h.ema12 - engine_b_1h.ema50).abs() / engine_b_1h.atr_1h
+                    } else {
+                        0.0
+                    };
+                    let pb_slope_atr = if engine_b_1h.atr_1h > 1e-9 && engine_b_1h.ema50_hist.len() >= 12 {
+                        let old_50 = engine_b_1h.ema50_hist.front().copied().unwrap_or(engine_b_1h.ema50);
+                        (engine_b_1h.ema50 - old_50).abs() / engine_b_1h.atr_1h
+                    } else {
+                        0.0
+                    };
+                    let pb_status_str = if is_gold_telem {
+                        "4H_ONLY".to_string()
+                    } else if engine_b_1h.ema12 > engine_b_1h.ema50
+                        && engine_b_1h.ema50 > engine_b_1h.ema200
+                        && pb_sep_atr > engine_b_1h.sep_atr
+                        && pb_slope_atr >= engine_b_1h.min_slope_atr
+                    {
+                        "BULL_READY".to_string()
+                    } else if engine_b_1h.ema12 < engine_b_1h.ema50
+                        && engine_b_1h.ema50 < engine_b_1h.ema200
+                        && pb_sep_atr > engine_b_1h.sep_atr
+                        && pb_slope_atr >= engine_b_1h.min_slope_atr
+                    {
+                        "BEAR_READY".to_string()
+                    } else {
+                        "WAIT_TREND".to_string()
+                    };
+                    let sess_status_str = match evaluate_session_lifecycle_gate(&symbol_clone, now_ms_cb as i64) {
+                        SessionLifecycleAction::AllowNormalTrading => "OPEN".to_string(),
+                        SessionLifecycleAction::BlockNewEntriesAndRatchetTp(r) => r.to_string(),
+                        SessionLifecycleAction::ForceFlat(r) => r.to_string(),
+                    };
+
                     let telemetry_data = LiveTelemetry {
                         symbol: symbol_clone.clone(),
                         timestamp_ms: chrono::Utc::now().timestamp_millis() as u64,
@@ -4460,16 +4506,28 @@ async fn main() {
                         } else {
                             0.0
                         },
+                        st_4h_dir: st_dir_str.to_string(),
+                        st_4h_band: engine_b_4h.st_band,
+                        ema20_4h: engine_b_4h.ema20,
+                        ema100_4h: engine_b_4h.ema100,
+                        atr_4h: engine_b_4h.atr_4h,
+                        ema12_1h: engine_b_1h.ema12,
+                        ema50_1h: engine_b_1h.ema50,
+                        ema200_1h: engine_b_1h.ema200,
+                        atr_1h: engine_b_1h.atr_1h,
+                        pb_1h_sep_atr: pb_sep_atr,
+                        pb_1h_slope_atr: pb_slope_atr,
+                        pb_1h_status: pb_status_str,
+                        funding_1h_bps: current_funding_1h * 1e4,
+                        mark_oracle_div_bps: mark_oracle_div_telem,
+                        session_status: sess_status_str,
+                        slot_cap_pct: if is_hip3_telem { 35.0 } else { 20.0 },
                     };
                     save_telemetry(&symbol_clone, &telemetry_data);
 
                     // Continuous NAS Market History Recorder (`hl_history_{symbol}.jsonl`):
                     // Persists 1m OHLCV + L2 Bid/Ask/OBI + Hourly Funding + Open Interest + Mark/Oracle prices
                     {
-                        let (oi_snap, mark_snap, oracle_snap) = {
-                            let cg = crowding_tracker.read().await;
-                            (cg.open_interest, cg.mark_px, cg.oracle_px)
-                        };
                         let tick_rec = effective_tick_size(close_price, sz_decimals);
                         crate::backtest::append_historical_bar_record(
                             &crate::backtest::HistoricalMarketBarRecord {

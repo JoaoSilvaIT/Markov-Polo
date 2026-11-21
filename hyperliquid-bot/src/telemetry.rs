@@ -74,6 +74,40 @@ pub struct LiveTelemetry {
     pub ret_30m_bps: f64,
     #[serde(default)]
     pub ret_60m_bps: f64,
+
+    // Markov-Polo V2.3 Dual-Pillar Macro Trend Telemetry (4H SuperTrend-3.0 + 1H EMA50 Pullback)
+    #[serde(default)]
+    pub st_4h_dir: String,
+    #[serde(default)]
+    pub st_4h_band: f64,
+    #[serde(default)]
+    pub ema20_4h: f64,
+    #[serde(default)]
+    pub ema100_4h: f64,
+    #[serde(default)]
+    pub atr_4h: f64,
+    #[serde(default)]
+    pub ema12_1h: f64,
+    #[serde(default)]
+    pub ema50_1h: f64,
+    #[serde(default)]
+    pub ema200_1h: f64,
+    #[serde(default)]
+    pub atr_1h: f64,
+    #[serde(default)]
+    pub pb_1h_sep_atr: f64,
+    #[serde(default)]
+    pub pb_1h_slope_atr: f64,
+    #[serde(default)]
+    pub pb_1h_status: String,
+    #[serde(default)]
+    pub funding_1h_bps: f64,
+    #[serde(default)]
+    pub mark_oracle_div_bps: f64,
+    #[serde(default)]
+    pub session_status: String,
+    #[serde(default)]
+    pub slot_cap_pct: f64,
 }
 
 pub fn save_telemetry(symbol: &str, telemetry: &LiveTelemetry) {

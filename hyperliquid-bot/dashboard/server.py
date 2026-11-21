@@ -16,7 +16,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 PORT = int(os.environ.get("DASHBOARD_PORT", 8088))
-MAX_CONCURRENT = int(os.environ.get("HL_MAX_CONCURRENT_POSITIONS", 2))
+MAX_CONCURRENT = int(os.environ.get("HL_MAX_CONCURRENT_POSITIONS", 5))
 WALLET_ADDRESS = os.environ.get("HL_WALLET_ADDRESS", "").strip()
 IS_MAINNET = os.environ.get("HL_IS_MAINNET", "true").strip().lower() != "false"
 HL_INFO_URL = (
@@ -24,10 +24,31 @@ HL_INFO_URL = (
     if IS_MAINNET
     else "https://api.hyperliquid-testnet.xyz/info"
 )
-# Clean-slate cutoff: 2026-10-29 15:30 UTC major quant architecture upgrade (5m Kalman O-U + Excursion Caps + Ratchet)
-CLEAN_SLATE_EPOCH_MS = int(os.environ.get("HL_CLEAN_SLATE_EPOCH_MS", "1793287800000"))
-# Scale-up cutoff: 2026-11-01 19:00 UTC ($534 USDC capital scale-up epoch)
-SCALEUP_EPOCH_MS = int(os.environ.get("HL_SCALEUP_EPOCH_MS", "1793559600000"))
+# Markov-Polo V2.0/V2.3 Clean-Slate Reset Epoch: 2026-11-20 15:00 UTC (1795186800000)
+V2_LAUNCH_EPOCH_MS = 1795186800000
+CLEAN_SLATE_EPOCH_MS = max(
+    int(os.environ.get("HL_CLEAN_SLATE_EPOCH_MS", str(V2_LAUNCH_EPOCH_MS))),
+    V2_LAUNCH_EPOCH_MS,
+)
+SCALEUP_EPOCH_MS = CLEAN_SLATE_EPOCH_MS
+
+ACTIVE_V23_UNIVERSE = {
+    "BTC",
+    "ETH",
+    "SOL",
+    "AVAX",
+    "HYPE",
+    "NEAR",
+    "XRP",
+    "SUI",
+    "LINK",
+    "ZEC",
+    "xyz:XYZ100",
+    "xyz:NVDA",
+    "xyz:CL",
+    "xyz:SILVER",
+    "xyz:GOLD",
+}
 
 SEARCH_DIRS = [
     "/app/data",  # Docker container mount
@@ -1069,15 +1090,58 @@ def get_telemetry_data():
     if not valid_dirs:
         valid_dirs = ["."]
 
-    # 1. Load telemetry, armed signals, controllers, and funnels for all symbols (BTC, ETH, SOL, AVAX)
+    # 1. Load telemetry, armed signals, controllers, and funnels for all active V2.3 symbols
     for d in valid_dirs:
         for path in glob.glob(os.path.join(d, "hl_telemetry_*.json")):
             base = os.path.basename(path)
-            sym = base.replace("hl_telemetry_", "").replace(".json", "")
+            sym = normalize_hl_symbol(
+                base.replace("hl_telemetry_", "").replace(".json", "")
+            )
+            if sym not in ACTIVE_V23_UNIVERSE:
+                continue
             if sym not in results["assets"]:
                 try:
                     with open(path, "r", encoding="utf-8") as f:
-                        results["assets"][sym] = json.load(f)
+                        telem = json.load(f)
+                        # Fallback enrichment from proximity_summary if container hasn't emitted V2.3 fields yet
+                        if not telem.get("st_4h_dir"):
+                            psum = str(telem.get("proximity_summary", ""))
+                            if "4H ST:" in psum:
+                                try:
+                                    st_part = (
+                                        psum.split("4H ST:")[1].split("|")[0].strip()
+                                    )
+                                    telem["st_4h_dir"] = st_part
+                                except Exception:
+                                    pass
+                            if "1H EMA50: $" in psum:
+                                try:
+                                    e_part = (
+                                        psum.split("1H EMA50: $")[1]
+                                        .split(" ")[0]
+                                        .strip()
+                                    )
+                                    telem["ema50_1h"] = float(e_part)
+                                except Exception:
+                                    pass
+                            if "ATR4h: $" in psum:
+                                try:
+                                    a_part = (
+                                        psum.split("ATR4h: $")[1].split(" ")[0].strip()
+                                    )
+                                    telem["atr_4h"] = float(a_part)
+                                except Exception:
+                                    pass
+                        if not telem.get("slot_cap_pct"):
+                            telem["slot_cap_pct"] = (
+                                35.0 if sym.lower().startswith("xyz:") else 20.0
+                            )
+                        if not telem.get("pb_1h_status") and sym.upper() in (
+                            "XYZ:GOLD",
+                            "GOLD",
+                        ):
+                            telem["pb_1h_status"] = "4H_ONLY"
+                        results["assets"][sym] = telem
                         results["data_dir"] = d
                 except Exception:
                     pass
@@ -1156,7 +1220,8 @@ def get_telemetry_data():
                 with open(path, "r", encoding="utf-8") as f:
                     state_map = json.load(f)
                 if isinstance(state_map, dict):
-                    for sym, pos in state_map.items():
+                    for raw_sym, pos in state_map.items():
+                        sym = normalize_hl_symbol(raw_sym)
                         if not isinstance(pos, dict):
                             continue
                         lifecycle = pos.get("lifecycle", "Active")
