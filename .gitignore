@@ -22,6 +22,7 @@ rust-bot/target/
 research/
 hyperliquid-bot/INSTITUTIONAL_CODE_AND_QUANT_AUDIT_REPORT.md
 hyperliquid-bot/RESEARCH_PROMPTS_ROADMAP.md
+hyperliquid-bot/MARKOV_POLO_V2_2_QUANT_RESEARCH.md
 audit_harness/venv/
 audit_harness/data/
 audit_harness/catalog/

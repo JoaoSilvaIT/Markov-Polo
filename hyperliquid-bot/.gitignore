@@ -3,7 +3,6 @@ target/
 *.json
 *.lock
 !Cargo.lock
-!hl_portfolio_cluster.lock
 *.log
 *.jsonl
 .env
@@ -13,3 +12,4 @@ hl_bot_data/
 audit_8days*
 INSTITUTIONAL_CODE_AND_QUANT_AUDIT_REPORT.md
 RESEARCH_PROMPTS_ROADMAP.md
+MARKOV_POLO_V2_2_QUANT_RESEARCH.md

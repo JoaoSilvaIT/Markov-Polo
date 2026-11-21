@@ -108,7 +108,7 @@ hyperliquid-bot/
 │   └── index.html         # Real-time 4-asset readiness & gate-checklist web terminal
 ├── .env.example           # Template environment configuration file
 ├── Dockerfile             # Multi-stage Debian Bookworm build (cached deps + minimal runtime)
-└── docker-compose.yml     # 4-asset cluster + read-only dashboard service (OMV / Linux NAS ready)
+└── docker-compose.yml     # Multi-asset cluster + read-only dashboard service
 ```
 
 ---
@@ -161,7 +161,7 @@ cargo run --release -- --backtest
 cargo build --release
 ```
 
-### 3. Production Deployment (Docker Compose / OpenMediaVault)
+### 3. Production Deployment (Docker Compose)
 ```bash
 docker compose up -d --build
 ```

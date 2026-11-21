@@ -26,7 +26,7 @@ TradingAI/audit_harness/
 
 ### 1. Run Audit on a Single Asset (e.g., SOL or ETH)
 ```bash
-cd /home/admin/Projects/TradingAI/audit_harness
+cd audit_harness
 ./venv/bin/python run_nautilus_audit.py SOL
 ```
 
