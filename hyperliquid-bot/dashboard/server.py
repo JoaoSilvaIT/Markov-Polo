@@ -1252,6 +1252,98 @@ def get_telemetry_data():
                                 pos_copy["unrealized_pnl_usd"] = round(pnl_usd, 4)
                                 pos_copy["unrealized_pnl_bps"] = round(pnl_bps, 2)
                                 pos_copy["current_price"] = cur_px
+
+                            # Exit mechanics computation
+                            eng_type = str(pos.get("engine_type") or "EngineB1h")
+                            is_4h = eng_type == "EngineB4h"
+                            atr = float(pos.get("current_atr", 0.0) or 0.0)
+                            if atr <= 0.0:
+                                atr = float(
+                                    asset_telem.get(
+                                        "atr_4h" if is_4h else "atr_1h", 0.0
+                                    )
+                                    or 0.0
+                                )
+                            trail_mult = float(pos.get("active_multiplier", 4.0) or 4.0)
+                            extreme_px = float(
+                                pos.get("max_favorable_price", 0.0) or entry_px
+                            )
+                            current_sl = float(
+                                pos.get("stop_loss_price", 0.0)
+                                or pos.get("chandelier_stop", 0.0)
+                                or 0.0
+                            )
+                            initial_sl = float(
+                                pos.get("initial_stop_loss_price", 0.0) or current_sl
+                            )
+
+                            max_hold_mins = float(
+                                pos.get("half_life_minutes", 0.0)
+                                or (288.0 * 60 if is_4h else 96.0 * 60)
+                            )
+                            max_hold_hours = max_hold_mins / 60.0
+
+                            opened_dt = parse_iso_time(pos.get("opened_at"))
+                            elapsed_h = (
+                                max(
+                                    0.0,
+                                    (now_ms / 1000.0 - opened_dt.timestamp()) / 3600.0,
+                                )
+                                if opened_dt
+                                else 0.0
+                            )
+                            remaining_h = max(0.0, max_hold_hours - elapsed_h)
+
+                            eval_px = cur_px if (cur_px and cur_px > 0) else entry_px
+                            if side == "SHORT":
+                                ratchet_trigger = (
+                                    max(0.0, current_sl - trail_mult * atr)
+                                    if atr > 0
+                                    else 0.0
+                                )
+                                be_trigger = (
+                                    max(0.0, entry_px - trail_mult * atr)
+                                    if atr > 0
+                                    else 0.0
+                                )
+                                is_profit_locked = (
+                                    current_sl < entry_px and current_sl > 0.0
+                                )
+                                sl_dist_pct = (
+                                    ((current_sl - eval_px) / eval_px) * 100.0
+                                    if eval_px > 0
+                                    else 0.0
+                                )
+                            else:
+                                ratchet_trigger = (
+                                    current_sl + trail_mult * atr if atr > 0 else 0.0
+                                )
+                                be_trigger = (
+                                    entry_px + trail_mult * atr if atr > 0 else 0.0
+                                )
+                                is_profit_locked = (
+                                    current_sl > entry_px and current_sl > 0.0
+                                )
+                                sl_dist_pct = (
+                                    ((eval_px - current_sl) / eval_px) * 100.0
+                                    if eval_px > 0
+                                    else 0.0
+                                )
+
+                            pos_copy["exit_stats"] = {
+                                "extreme_price": round(extreme_px, 4),
+                                "current_sl": round(current_sl, 4),
+                                "initial_sl": round(initial_sl, 4),
+                                "sl_dist_pct": round(sl_dist_pct, 2),
+                                "atr": round(atr, 4),
+                                "trail_mult": trail_mult,
+                                "ratchet_trigger_price": round(ratchet_trigger, 4),
+                                "breakeven_trigger_price": round(be_trigger, 4),
+                                "is_profit_locked": is_profit_locked,
+                                "elapsed_hours": round(elapsed_h, 1),
+                                "max_hold_hours": round(max_hold_hours, 1),
+                                "remaining_hours": round(remaining_h, 1),
+                            }
                             results["positions"][sym] = pos_copy
             except Exception:
                 pass

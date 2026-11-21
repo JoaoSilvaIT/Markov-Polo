@@ -179,14 +179,16 @@
           <th class="num">Nocional ($ / % Banca)</th>
           <th class="num">Entrada</th>
           <th class="num">Preço Atual</th>
-          <th class="num">Stop Loss (Dist %)</th>
-          <th class="num">uPnL ($)</th>
-          <th class="num">uPnL (bps)</th>
-          <th class="num">Tempo</th>
+          <th class="num">Stop Loss na Exchange (Folga %)</th>
+          <th class="num">Mín/Máx Atingido</th>
+          <th class="num">Gatilho p/ Stop Descer</th>
+          <th class="num">Alvo Risco Zero</th>
+          <th class="num">uPnL ($ / bps)</th>
+          <th class="num">Tempo (Hold / Max)</th>
         </tr>
       </thead>
       <tbody id="open-positions-body">
-        <tr><td colspan="11" class="empty-msg">Sem posições abertas.</td></tr>
+        <tr><td colspan="13" class="empty-msg">Sem posições abertas.</td></tr>
       </tbody>
     </table>
   </div>
@@ -360,7 +362,7 @@
       // 1. Render Open Positions
       const openBody = document.getElementById("open-positions-body");
       if (openList.length === 0) {
-        openBody.innerHTML = `<tr><td colspan="11" class="empty-msg">Sem posições abertas (0 / ${maxSlots} slots).</td></tr>`;
+        openBody.innerHTML = `<tr><td colspan="13" class="empty-msg">Sem posições abertas (0 / ${maxSlots} slots).</td></tr>`;
       } else {
         openBody.innerHTML = openList.map(p => {
           const sym = p.symbol || "";
@@ -376,6 +378,30 @@
           const uUsd = Number(p.unrealized_pnl_usd || 0);
           const uBps = Number(p.unrealized_pnl_bps || 0);
           const sideCls = side === "LONG" ? "tag-long" : "tag-short";
+
+          const ext = p.exit_stats || {};
+          const extremePx = Number(ext.extreme_price || cur);
+          const ratchetPx = Number(ext.ratchet_trigger_price || 0);
+          const bePx = Number(ext.breakeven_trigger_price || 0);
+          const isLocked = Boolean(ext.is_profit_locked);
+          const elapsedH = Number(ext.elapsed_hours || 0);
+          const maxHoldH = Number(ext.max_hold_hours || (eng === "EngineB4h" ? 288 : 96));
+          const slLabel = isLocked ? `<span class="pos">🔒 ${fmtPx(sl)}</span>` : fmtPx(sl);
+
+          let ratchetStr = "--";
+          if (ratchetPx > 0 && cur > 0) {
+            const dPct = ((Math.abs(cur - ratchetPx) / cur) * 100).toFixed(2);
+            ratchetStr = `${fmtPx(ratchetPx)} <span class="muted">(${dPct}%)</span>`;
+          }
+
+          let beStr = "--";
+          if (isLocked) {
+            beStr = `<span class="pos">✓ Trancado</span>`;
+          } else if (bePx > 0 && cur > 0) {
+            const dBePct = ((Math.abs(cur - bePx) / cur) * 100).toFixed(2);
+            beStr = `${fmtPx(bePx)} <span class="muted">(${dBePct}%)</span>`;
+          }
+
           return `<tr class="active-row">
             <td><strong>${sym}</strong></td>
             <td>${eng}</td>
@@ -384,10 +410,12 @@
             <td class="num">${fmtUsd(ntl)} (${eqPct.toFixed(1)}%)</td>
             <td class="num">${fmtPx(ep)}</td>
             <td class="num">${fmtPx(cur)}</td>
-            <td class="num">${fmtPx(sl)} <span class="muted">(${slDistPct.toFixed(2)}%)</span></td>
-            <td class="num ${clsPnl(uUsd)}"><strong>${fmtUsd(uUsd, true)}</strong></td>
-            <td class="num ${clsPnl(uBps)}">${fmtBps(uBps)}</td>
-            <td class="num">${fmtHoldHours(p.opened_at)}</td>
+            <td class="num">${slLabel} <span class="muted">(${slDistPct.toFixed(2)}%)</span></td>
+            <td class="num">${fmtPx(extremePx)}</td>
+            <td class="num">${ratchetStr}</td>
+            <td class="num">${beStr}</td>
+            <td class="num ${clsPnl(uUsd)}"><strong>${fmtUsd(uUsd, true)}</strong> <span class="muted">(${fmtBps(uBps)})</span></td>
+            <td class="num">${elapsedH.toFixed(1)}h / ${maxHoldH.toFixed(0)}h</td>
           </tr>`;
         }).join("");
       }
