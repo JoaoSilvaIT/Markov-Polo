@@ -340,10 +340,21 @@ pub fn is_symbol_live_capital_enabled(symbol: &str) -> bool {
         return true;
     }
     let sym_norm = crate::config::normalize_trading_symbol(symbol);
-    trimmed.split(',').any(|tok| {
+    let has_exact = trimmed.split(',').any(|tok| {
         let t = tok.trim();
         !t.is_empty() && crate::config::normalize_trading_symbol(t) == sym_norm
-    })
+    });
+    if has_exact {
+        return true;
+    }
+    // Seamless V2.4 migration: if a legacy .env lists xyz:TSLA, automatically enable its replacement xyz:CL
+    if sym_norm == "xyz:CL" {
+        return trimmed.split(',').any(|tok| {
+            let t = tok.trim();
+            !t.is_empty() && crate::config::normalize_trading_symbol(t) == "xyz:TSLA"
+        });
+    }
+    false
 }
 
 /// Package 8B Fast-Sentinel intrabar escape guard for live Engine A positions:
@@ -1680,7 +1691,7 @@ async fn main() {
             }
             engine_b_4h.warmup_from_4h_bars(&bars_4h_init);
             println!(
-                "✅ [INGESTION] Warmed up Markov-Polo V2 4H Macro Engine (ST3 + Donchian40) with {} closed 4h bars for {} (EMA20=${:.2}, EMA100=${:.2}, ST_dir={}, ATR_4h=${:.4}).",
+                "✅ [INGESTION] Warmed up Markov-Polo V2.4 4H Macro Engine (SuperTrend-3.0) with {} closed 4h bars for {} (EMA20=${:.2}, EMA100=${:.2}, ST_dir={}, ATR_4h=${:.4}).",
                 engine_b_4h.bars_seen,
                 trading_symbol,
                 engine_b_4h.ema20,
@@ -1700,7 +1711,7 @@ async fn main() {
     crate::discord::send_alert(
         discord_url.as_deref(),
         &format!(
-            "🚀 **Hyperliquid Perpetual Bot Online**\nSymbol: **{}** | Bi-Directional O-U + Post-Only Maker Engine Active.",
+            "🚀 **Markov-Polo V2.4 Online**\nSymbol: **{}** | Dual-Pillar 4H ST3 + 1H EMA50 Pullback (<= 1.00x Zero-Liquidation).",
             trading_symbol
         ),
     )
@@ -2101,11 +2112,13 @@ async fn main() {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(1500));
         let mut stop_breach_streak: u8 = 0;
+        let mut last_rest_pos_poll_ms: u64 = 0;
+        let mut cached_rest_szi: Option<f64> = None;
         loop {
-            tokio::select! {
-                _ = interval.tick() => {},
-                _ = watcher_notify.notified() => {},
-            }
+            let woke_by_ws_event = tokio::select! {
+                _ = interval.tick() => false,
+                _ = watcher_notify.notified() => true,
+            };
 
             // 1. Snapshot state quickly without holding lock during network calls
             let pos_opt = {
@@ -2117,20 +2130,44 @@ async fn main() {
                 Some(p) => p,
                 None => {
                     stop_breach_streak = 0;
+                    cached_rest_szi = None;
+                    last_rest_pos_poll_ms = 0;
                     continue;
                 }
             };
 
-            // Cross-reference user position on live exchange (Fail-Closed)
-            let (mut current_szi, _) = match get_user_position(&watcher_info, user_address, &watcher_symbol).await {
-                Ok(res) => res,
-                Err(e) => {
-                    eprintln!(
-                        "⚠️ [FAST-SENTINEL] API failure fetching position for {}: {}. Retaining state (fail-closed).",
-                        watcher_symbol, e
-                    );
-                    continue;
+            // Event-driven + 10s throttled REST position check (eliminates HTTP 429s while keeping
+            // 1.5s WebSocket stop-loss monitoring and 0ms reaction to WS OrderUpdates/UserFills):
+            let now_poll_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+            let needs_rest_pos_poll = woke_by_ws_event
+                || cached_rest_szi.is_none()
+                || !pos.is_filled
+                || pos.disaster_stop_oid.is_none()
+                || now_poll_ms.saturating_sub(last_rest_pos_poll_ms) >= 10_000;
+
+            let mut current_szi = if needs_rest_pos_poll {
+                match get_user_position(&watcher_info, user_address, &watcher_symbol).await {
+                    Ok((szi, _)) => {
+                        cached_rest_szi = Some(szi);
+                        last_rest_pos_poll_ms = now_poll_ms;
+                        szi
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "⚠️ [FAST-SENTINEL] API failure fetching position for {}: {}. Retaining state (fail-closed).",
+                            watcher_symbol, e
+                        );
+                        continue;
+                    }
                 }
+            } else {
+                cached_rest_szi.unwrap_or_else(|| {
+                    if pos.side == "LONG" {
+                        pos.amount.abs()
+                    } else {
+                        -pos.amount.abs()
+                    }
+                })
             };
             let pos_exists = if pos.side == "LONG" {
                 current_szi > 0.0

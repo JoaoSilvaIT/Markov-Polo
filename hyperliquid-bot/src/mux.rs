@@ -400,7 +400,7 @@ async fn run_account_state_poller(address: H160, is_mainnet: bool) {
             }
         }
 
-        let sleep_ms = if err_streak >= 3 { 4000 } else { 1500 };
+        let sleep_ms = if err_streak >= 2 { 12_000 } else { 6_000 };
         tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
     }
 }
