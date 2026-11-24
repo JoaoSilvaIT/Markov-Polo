@@ -61,6 +61,10 @@ async fn backfill_missing_1m_candles(
     current_5m_bar: &mut Option<CandleBar>,
     rolling_15m_bars: &mut Vec<CandleBar>,
     current_15m_bar: &mut Option<CandleBar>,
+    current_1h_bar: &mut Option<CandleBar>,
+    engine_b_1h: &mut TrendPullback1hEngine,
+    current_4h_bar: &mut Option<CandleBar>,
+    engine_b_4h: &mut MacroTrend4hEngine,
 ) -> Result<usize, String> {
     if start_ms >= end_ms {
         return Ok(0);
@@ -192,6 +196,97 @@ async fn backfill_missing_1m_candles(
                 close: close_f,
                 volume: vol_f,
             });
+        }
+
+        // Feed recovered 1m bar into 1h & 4h accumulators (emit_signal=false) so EMA/ATR/ST never drift across WS gaps
+        let candle_bucket_1h = (c.time_open / 3_600_000) * 3_600_000;
+        let is_last_1m_of_1h = c.time_open + 60_000 >= candle_bucket_1h + 3_600_000;
+        if let Some(mut cur_1h) = current_1h_bar.take() {
+            if cur_1h.time_open == candle_bucket_1h {
+                cur_1h.high = cur_1h.high.max(high_f);
+                cur_1h.low = cur_1h.low.min(low_f);
+                cur_1h.close = close_f;
+                cur_1h.volume += vol_f;
+                if is_last_1m_of_1h {
+                    let _ = engine_b_1h.on_1h_bar_close(&cur_1h, false);
+                } else {
+                    *current_1h_bar = Some(cur_1h);
+                }
+            } else {
+                let _ = engine_b_1h.on_1h_bar_close(&cur_1h, false);
+                let nb1h = CandleBar {
+                    time_open: candle_bucket_1h,
+                    open: open_f,
+                    high: high_f,
+                    low: low_f,
+                    close: close_f,
+                    volume: vol_f,
+                };
+                if is_last_1m_of_1h {
+                    let _ = engine_b_1h.on_1h_bar_close(&nb1h, false);
+                } else {
+                    *current_1h_bar = Some(nb1h);
+                }
+            }
+        } else {
+            let nb1h = CandleBar {
+                time_open: candle_bucket_1h,
+                open: open_f,
+                high: high_f,
+                low: low_f,
+                close: close_f,
+                volume: vol_f,
+            };
+            if is_last_1m_of_1h {
+                let _ = engine_b_1h.on_1h_bar_close(&nb1h, false);
+            } else {
+                *current_1h_bar = Some(nb1h);
+            }
+        }
+
+        let candle_bucket_4h = (c.time_open / 14_400_000) * 14_400_000;
+        let is_last_1m_of_4h = c.time_open + 60_000 >= candle_bucket_4h + 14_400_000;
+        if let Some(mut cur_4h) = current_4h_bar.take() {
+            if cur_4h.time_open == candle_bucket_4h {
+                cur_4h.high = cur_4h.high.max(high_f);
+                cur_4h.low = cur_4h.low.min(low_f);
+                cur_4h.close = close_f;
+                cur_4h.volume += vol_f;
+                if is_last_1m_of_4h {
+                    let _ = engine_b_4h.on_4h_bar_close(&cur_4h, false);
+                } else {
+                    *current_4h_bar = Some(cur_4h);
+                }
+            } else {
+                let _ = engine_b_4h.on_4h_bar_close(&cur_4h, false);
+                let nb4h = CandleBar {
+                    time_open: candle_bucket_4h,
+                    open: open_f,
+                    high: high_f,
+                    low: low_f,
+                    close: close_f,
+                    volume: vol_f,
+                };
+                if is_last_1m_of_4h {
+                    let _ = engine_b_4h.on_4h_bar_close(&nb4h, false);
+                } else {
+                    *current_4h_bar = Some(nb4h);
+                }
+            }
+        } else {
+            let nb4h = CandleBar {
+                time_open: candle_bucket_4h,
+                open: open_f,
+                high: high_f,
+                low: low_f,
+                close: close_f,
+                volume: vol_f,
+            };
+            if is_last_1m_of_4h {
+                let _ = engine_b_4h.on_4h_bar_close(&nb4h, false);
+            } else {
+                *current_4h_bar = Some(nb4h);
+            }
         }
         backfilled_count += 1;
     }
@@ -1517,7 +1612,7 @@ async fn main() {
     );
     let window_15m_start_ms = now_ms.saturating_sub(100 * 15 * 60 * 1000);
     let mut res_15m_candles = Err("uninitialized".to_string());
-    for attempt in 0..3 {
+    for attempt in 0..5 {
         match info_client
             .candles_snapshot(
                 trading_symbol.clone(),
@@ -1534,8 +1629,9 @@ async fn main() {
             Err(e) => {
                 let err_str = e.to_string();
                 res_15m_candles = Err(err_str);
-                if attempt < 2 {
-                    tokio::time::sleep(Duration::from_millis(500 * (1 << attempt))).await;
+                if attempt < 4 {
+                    let wait_ms = (1_000 * (1u64 << attempt)).min(15_000) + (boot_stagger_ms % 700);
+                    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                 }
             }
         }
@@ -1626,6 +1722,16 @@ async fn main() {
                         }
                     }
                 }
+                if bars_1h_init.is_empty() {
+                    attempt_1h = attempt_1h.saturating_add(1);
+                    let wait_ms = (1_500 * (1u64 << attempt_1h.min(4))).min(30_000) + (boot_stagger_ms % 1_000);
+                    eprintln!(
+                        "❌ [INGESTION ERROR] Received 0 closed 1h bars for {} (attempt {}). Fail-closed retry in {}ms...",
+                        trading_symbol, attempt_1h, wait_ms
+                    );
+                    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                    continue;
+                }
                 engine_b_1h.warmup_from_1h_bars(&bars_1h_init);
                 println!(
                     "✅ [INGESTION] Warmed up Engine B v2 (1H EMA50 Pullback) with {} closed 1h bars for {} (EMA12=${:.2}, EMA50=${:.2}, EMA200=${:.2}, ATR_1h=${:.4}).",
@@ -1692,6 +1798,16 @@ async fn main() {
                             bars_4h_init.push(bar_4h);
                         }
                     }
+                }
+                if bars_4h_init.is_empty() {
+                    attempt_4h = attempt_4h.saturating_add(1);
+                    let wait_ms = (1_500 * (1u64 << attempt_4h.min(4))).min(30_000) + (boot_stagger_ms % 1_000);
+                    eprintln!(
+                        "❌ [INGESTION ERROR] Received 0 closed 4h bars for {} (attempt {}). Fail-closed retry in {}ms...",
+                        trading_symbol, attempt_4h, wait_ms
+                    );
+                    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                    continue;
                 }
                 engine_b_4h.warmup_from_4h_bars(&bars_4h_init);
                 println!(
@@ -1886,6 +2002,18 @@ async fn main() {
                 {
                     pos.tp_order_id.clear();
                 }
+                if let Some(sl_oid) = pos.disaster_stop_oid {
+                    if !symbol_open_orders.iter().any(|o| o.oid == sl_oid) {
+                        println!(
+                            "⚠️ [STARTUP RECONCILIATION] Recorded StopMarket oid {} missing on Hyperliquid for {}. Clearing so Fast-Sentinel re-places immediately.",
+                            sl_oid, trading_symbol
+                        );
+                        pos.disaster_stop_oid = None;
+                        pos.exchange_stop_price = 0.0;
+                    } else if pos.exchange_stop_price <= 0.0 {
+                        pos.exchange_stop_price = pos.stop_loss_price;
+                    }
+                }
             } else {
                 println!(
                     "⚠️ [STARTUP RECONCILIATION] Found unmanaged live position on Hyperliquid for {} (size: {:.5}, entry: ${:.4}). Adopting as Markov-Polo V2 EngineB4h runner with 3.5% SL (${:.4}) and 4.0x ATR trail.",
@@ -1936,6 +2064,7 @@ async fn main() {
                         initial_stop_loss_price: default_sl,
                         accrued_funding_usd: 0.0,
                         timeout_disabled: false,
+                        exchange_stop_price: 0.0,
                     },
                 );
             }
@@ -2029,6 +2158,7 @@ async fn main() {
                                 initial_stop_loss_price: intent.stop_loss,
                                 accrued_funding_usd: 0.0,
                                 timeout_disabled: false,
+                                exchange_stop_price: 0.0,
                             };
                             state_lock.insert(trading_symbol.clone(), reconstructed);
                             let _ = save_state(&state_file_path, &state_lock);
@@ -2821,6 +2951,7 @@ async fn main() {
                         let mut state_lock = watcher_state.lock().await;
                         if let Some(p) = state_lock.get_mut(&watcher_symbol) {
                             p.disaster_stop_oid = Some(sl_oid);
+                            p.exchange_stop_price = sl_px;
                             p.amount = total_amt;
                             let _ = save_state(&watcher_state_path, &state_lock);
                         }
@@ -3783,6 +3914,10 @@ async fn main() {
                         &mut current_5m_bar,
                         &mut rolling_15m_bars,
                         &mut current_15m_bar,
+                        &mut current_1h_bar,
+                        &mut engine_b_1h,
+                        &mut current_4h_bar,
+                        &mut engine_b_4h,
                     ).await;
 
                     match backfill_res {
@@ -5001,9 +5136,20 @@ async fn main() {
                                         pos.chandelier_stop = new_stop;
                                         pos.stop_loss_price = new_stop;
                                     }
-                                    if stop_improved_bps >= 15.0 {
+                                    let exchange_sync_ref = if pos.exchange_stop_price > 0.0 {
+                                        pos.exchange_stop_price
+                                    } else {
+                                        prev_stop
+                                    };
+                                    let sync_improved_bps = if exchange_sync_ref > 0.0 {
+                                        let d_s = if is_long_m { 1.0 } else { -1.0 };
+                                        d_s * ((pos.stop_loss_price - exchange_sync_ref) / exchange_sync_ref) * 1e4
+                                    } else {
+                                        0.0
+                                    };
+                                    if sync_improved_bps >= 15.0 {
                                         sl_ratchet_sync_opt = Some((
-                                            new_stop,
+                                            pos.stop_loss_price,
                                             pos.amount,
                                             !is_long_m,
                                             pos.disaster_stop_oid,
@@ -5051,6 +5197,7 @@ async fn main() {
                             {
                                 if let Some(p) = state_lock.get_mut(&symbol_clone) {
                                     p.disaster_stop_oid = Some(new_sl_oid);
+                                    p.exchange_stop_price = new_sl_px;
                                     let _ = crate::state::save_state(&state_path_clone, &state_lock);
                                 }
                                 println!(

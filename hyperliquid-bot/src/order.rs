@@ -313,6 +313,7 @@ pub async fn place_ou_maker_entry(
         initial_stop_loss_price: stop_loss_price,
         accrued_funding_usd: 0.0,
         timeout_disabled: false,
+        exchange_stop_price: 0.0,
     };
 
     state.insert(symbol.to_string(), new_state.clone());
@@ -622,6 +623,7 @@ pub async fn place_trend_breakout_entry(
         initial_stop_loss_price: initial_stop,
         accrued_funding_usd: 0.0,
         timeout_disabled: false,
+        exchange_stop_price: 0.0,
     };
 
     state.insert(symbol.to_string(), new_state.clone());
@@ -873,6 +875,7 @@ pub async fn place_macro_trend_ioc_entry(
         initial_stop_loss_price: final_sl_px,
         accrued_funding_usd: 0.0,
         timeout_disabled: false,
+        exchange_stop_price: if disaster_stop_oid.is_some() { final_sl_px } else { 0.0 },
     };
 
     state.insert(symbol.to_string(), new_state);

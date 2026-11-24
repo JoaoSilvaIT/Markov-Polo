@@ -165,6 +165,9 @@ pub struct PositionState {
     /// letting confirmed macro winners ride the 4.0x ATR Chandelier trail uncapped.
     #[serde(default)]
     pub timeout_disabled: bool,
+    /// Last trigger price confirmed synced to Hyperliquid's resting Exchange-Native StopMarket.
+    #[serde(default)]
+    pub exchange_stop_price: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2039,6 +2042,7 @@ mod tests {
             initial_stop_loss_price: 0.0,
             accrued_funding_usd: 0.0,
             timeout_disabled: false,
+            exchange_stop_price: 0.0,
         };
         assert!(!empty_pos.is_occupied());
 
