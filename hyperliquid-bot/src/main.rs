@@ -1164,8 +1164,8 @@ async fn main() {
 
             let total_fund_all: f64 = all_trades.iter().map(|t| t.funding_usd).sum();
             println!("   ↳ [FUNDING ALREADY DEDUCTED IN NET PNL]: ${:+.2} USDC across {} trades", total_fund_all, all_trades.len());
-            run_compounded("V2.4 Frozen 13-Asset Zero-Liq (<=1.00x)", 560.69, 1_000_000.0, 0.0, 4, true);
-            run_compounded("V2.4 Frozen 13-Asset 2x Fee Stress     ", 560.69, 1_000_000.0, 1.0, 4, false);
+            run_compounded("V2.4 Asym Q-Kelly (0.75% 4H / 0.40% 1H)", 560.69, 1_000_000.0, 0.0, 4, true);
+            run_compounded("V2.4 Asym Q-Kelly 2x Fee Stress         ", 560.69, 1_000_000.0, 1.0, 4, false);
         }
 
         if run_mc {
@@ -4748,8 +4748,10 @@ async fn main() {
                     //   Priority 2: 4H Donchian-40 Breakout (7Y PF 1.24, 7/7 yrs)
                     //   Priority 3: 1H EMA50 Pullback-in-Trend (7Y PF 1.24, 7/7 yrs)
                     // ------------------------------------------------------------------
-                    let is_non_growth_gold = symbol_clone.eq_ignore_ascii_case("xyz:GOLD")
-                        || symbol_clone.eq_ignore_ascii_case("GOLD");
+                    let is_1h_pb_excluded = symbol_clone.eq_ignore_ascii_case("xyz:GOLD")
+                        || symbol_clone.eq_ignore_ascii_case("GOLD")
+                        || symbol_clone.eq_ignore_ascii_case("xyz:CL")
+                        || symbol_clone.eq_ignore_ascii_case("CL");
                     let macro_dispatch_opt: Option<(&'static str, &'static str, Side, f64, f64, f64, f64, f64, usize)> =
                         if let Some(ref s4) = engine_b_4h_sig_opt {
                             let lbl = if s4.policy_tag == "ENGINE_B_4H_ST3" {
@@ -4768,7 +4770,7 @@ async fn main() {
                                 s4.max_sl_frac,
                                 s4.max_hold_hours,
                             ))
-                        } else if !is_non_growth_gold {
+                        } else if !is_1h_pb_excluded {
                             engine_b_1h_sig_opt.as_ref().map(|s1| {
                                 (
                                     "EngineB1h",
@@ -4874,6 +4876,11 @@ async fn main() {
                                 crate::state::total_active_cluster_notional_excluding(&symbol_clone);
                             let max_slots_m = crate::state::max_concurrent_cluster_positions();
 
+                            let base_risk_frac = if eng_tag == "EngineB4h" {
+                                0.0075
+                            } else {
+                                0.0040
+                            };
                             if let Some(notional_m) =
                                 crate::hyperliquid::calculate_zero_liquidation_macro_notional(
                                     &symbol_clone,
@@ -4881,7 +4888,7 @@ async fn main() {
                                     existing_cluster_ntl,
                                     max_slots_m,
                                     config.max_position_size_usdc,
-                                    0.0075 * dd_mult_m, // 0.75% equity risk/trade (~$4.20 on $560), Two-Tier <=20%/<=35%, hard-capped <=1.00x total equity
+                                    base_risk_frac * dd_mult_m, // Asymmetric Quarter Cluster-Kelly: 0.75% 4H_ST3 / 0.40% 1H_PB, Two-Tier <=20%/<=35%, hard-capped <=1.00x
                                     ref_px,
                                     init_sl_px,
                                     config.hl_leverage,

@@ -2215,8 +2215,10 @@ pub fn run_engine_a_backtest_with_btc(
         //    Priority 3: 1H EMA50 Pullback-in-Trend (7Y PF 1.24, 7/7 yrs)
         // ------------------------------------------------------------------
         if open_pos.is_none() && resting_entry.is_none() && !session_blocks_entries {
-            let is_non_growth_gold =
-                symbol.eq_ignore_ascii_case("xyz:GOLD") || symbol.eq_ignore_ascii_case("GOLD");
+            let is_1h_pb_excluded = symbol.eq_ignore_ascii_case("xyz:GOLD")
+                || symbol.eq_ignore_ascii_case("GOLD")
+                || symbol.eq_ignore_ascii_case("xyz:CL")
+                || symbol.eq_ignore_ascii_case("CL");
             let macro_entry_opt: Option<(&'static str, Side, f64, f64, f64, f64)> =
                 if let Some(ref s4) = engine_b_4h_sig_opt {
                     Some((
@@ -2227,7 +2229,7 @@ pub fn run_engine_a_backtest_with_btc(
                         s4.trail_atr_mult,
                         s4.max_sl_frac,
                     ))
-                } else if !is_non_growth_gold {
+                } else if !is_1h_pb_excluded {
                     engine_b_1h_sig_opt.as_ref().map(|s1| {
                         (
                             "ENGINE_B_1H_PULLBACK",
@@ -2272,15 +2274,19 @@ pub fn run_engine_a_backtest_with_btc(
                     };
                     let sl_px = quantize_price(raw_sl, sim_cfg.sz_decimals);
                     let base_eq_m = sim_cfg.account_equity_usdc;
-                    // Markov-Polo V2.3 Two-Tier Zero-Liquidation Cap:
-                    // 0.75% equity risk/trade (~$4.20 on $560), <= 20% crypto / <= 35% low-vol TradFi -> total portfolio <= 1.00x equity!
+                    // Asymmetric Quarter Cluster-Kelly (0.75% 4H_ST3 / 0.40% 1H_PB) + Two-Tier <=20%/<=35% -> <= 1.00x total equity!
+                    let base_risk_frac = if policy_tag == "ENGINE_B_4H_ST3" {
+                        0.0075
+                    } else {
+                        0.0040
+                    };
                     let notional = crate::hyperliquid::calculate_zero_liquidation_macro_notional(
                         symbol,
                         base_eq_m,
                         0.0,
                         crate::state::max_concurrent_cluster_positions(),
                         350.0,
-                        0.0075,
+                        base_risk_frac,
                         entry_px,
                         sl_px,
                         3,

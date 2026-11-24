@@ -322,7 +322,7 @@
       document.getElementById("max-slots").textContent = String(maxSlots);
       document.getElementById("open-count").textContent = String(openList.length);
       document.getElementById("header-meta").textContent =
-        `Atualizado: ${new Date().toISOString().replace("T", " ").slice(0, 19)} UTC | Risco: 0.75%/trade | Max ${maxSlots} slots (<= 1.00x)`;
+        `Atualizado: ${new Date().toISOString().replace("T", " ").slice(0, 19)} UTC | Risco: 0.75% 4H / 0.40% 1H (xyz:CL 4H-only) | Max ${maxSlots} slots (<= 1.00x)`;
 
       document.getElementById("st-equity").textContent = fmtUsd(eq);
       document.getElementById("st-cash").textContent = `Cash realizado: ${fmtUsd(cash)}`;
