@@ -1315,8 +1315,28 @@ async fn main() {
     });
 
     // ------------------------------------------------------------------------
-    // INGESTION: Pre-fill 960 1m historical candles via REST
+    // INGESTION: Deterministic boot stagger + Fail-Closed REST Pre-fill
+    // Prevents 13 containers from firing 39+ simultaneous candles_snapshot calls
+    // at docker compose up (HTTP 429) and never allows unwarmed EMA200/EMA100 live trading.
     // ------------------------------------------------------------------------
+    let boot_stagger_ms: u64 = crate::state::configured_portfolio_symbols()
+        .iter()
+        .position(|s| s.eq_ignore_ascii_case(&trading_symbol))
+        .map(|idx| (idx as u64) * 700)
+        .unwrap_or_else(|| {
+            let h: u64 = trading_symbol
+                .bytes()
+                .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+            (h % 13) * 700
+        });
+    if boot_stagger_ms > 0 {
+        println!(
+            "⏳ [INGESTION STAGGER] {} sleeping {}ms before REST warmup to prevent startup 429 stampede...",
+            trading_symbol, boot_stagger_ms
+        );
+        tokio::time::sleep(Duration::from_millis(boot_stagger_ms)).await;
+    }
+
     let mut rolling_closes: Vec<f64> = Vec::with_capacity(960);
     let mut prev_kalman_vel_bps_min: f64 = 0.0;
     println!(
@@ -1333,7 +1353,7 @@ async fn main() {
     let mut initial_last_1m_open: u64 = 0;
 
     let mut res_1m_candles = Err("uninitialized".to_string());
-    for attempt in 0..3 {
+    for attempt in 0..5 {
         match info_client
             .candles_snapshot(
                 trading_symbol.clone(),
@@ -1350,8 +1370,9 @@ async fn main() {
             Err(e) => {
                 let err_str = e.to_string();
                 res_1m_candles = Err(err_str);
-                if attempt < 2 {
-                    tokio::time::sleep(Duration::from_millis(500 * (1 << attempt))).await;
+                if attempt < 4 {
+                    let wait_ms = (1_000 * (1u64 << attempt)).min(15_000) + (boot_stagger_ms % 700);
+                    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                 }
             }
         }
@@ -1562,149 +1583,137 @@ async fn main() {
         }
     }
 
-    // Package 9: Pre-fill 260 historical 1h bars for Engine B v2 (1H EMA12/EMA50/EMA200 Pullback-in-Trend)
+    // Package 9: Pre-fill 500 historical 1h bars (~21d) for Engine B v2 (1H EMA12/EMA50/EMA200 Pullback-in-Trend)
+    // Fail-closed retry loop: NEVER enter live trading with an unwarmed EMA200!
     let mut engine_b_1h = TrendPullback1hEngine::new();
     let mut current_1h_bar: Option<CandleBar> = None;
-    let start_1h_ms = now_ms.saturating_sub(260 * 60 * 60 * 1000);
     println!(
-        "⏳ [INGESTION] Pre-filling 260h historical 1h candles for {} via Hyperliquid REST...",
+        "⏳ [INGESTION] Pre-filling 500h historical 1h candles for {} via Hyperliquid REST...",
         trading_symbol
     );
-    let mut res_1h_candles = Err("Unattempted".to_string());
-    for attempt in 0..3 {
+    let mut attempt_1h: u32 = 0;
+    loop {
+        let now_1h_ms = chrono::Utc::now().timestamp_millis() as u64;
+        let start_1h_ms = now_1h_ms.saturating_sub(500 * 60 * 60 * 1000);
         match info_client
-            .candles_snapshot(trading_symbol.clone(), "1h".to_string(), start_1h_ms, now_ms)
+            .candles_snapshot(trading_symbol.clone(), "1h".to_string(), start_1h_ms, now_1h_ms)
             .await
         {
-            Ok(c) => {
-                res_1h_candles = Ok(c);
+            Ok(mut candles) => {
+                candles.sort_by_key(|c| c.time_open);
+                candles.dedup_by_key(|c| c.time_open);
+                let mut bars_1h_init = Vec::with_capacity(candles.len());
+                for c in candles {
+                    if let (Ok(open_f), Ok(high_f), Ok(low_f), Ok(close_f)) = (
+                        c.open.parse::<f64>(),
+                        c.high.parse::<f64>(),
+                        c.low.parse::<f64>(),
+                        c.close.parse::<f64>(),
+                    ) {
+                        let vol_f = c.vlm.parse::<f64>().unwrap_or(0.0);
+                        let bar_1h = CandleBar {
+                            time_open: c.time_open,
+                            open: open_f,
+                            high: high_f,
+                            low: low_f,
+                            close: close_f,
+                            volume: vol_f,
+                        };
+                        if c.time_open + 3_600_000 > now_1h_ms {
+                            current_1h_bar = Some(bar_1h);
+                        } else {
+                            bars_1h_init.push(bar_1h);
+                        }
+                    }
+                }
+                engine_b_1h.warmup_from_1h_bars(&bars_1h_init);
+                println!(
+                    "✅ [INGESTION] Warmed up Engine B v2 (1H EMA50 Pullback) with {} closed 1h bars for {} (EMA12=${:.2}, EMA50=${:.2}, EMA200=${:.2}, ATR_1h=${:.4}).",
+                    engine_b_1h.bars_seen,
+                    trading_symbol,
+                    engine_b_1h.ema12,
+                    engine_b_1h.ema50,
+                    engine_b_1h.ema200,
+                    engine_b_1h.atr_1h
+                );
                 break;
             }
             Err(e) => {
-                res_1h_candles = Err(format!("{:?}", e));
-                if attempt < 2 {
-                    tokio::time::sleep(Duration::from_millis(500 * (1 << attempt))).await;
-                }
+                attempt_1h = attempt_1h.saturating_add(1);
+                let wait_ms = (1_500 * (1u64 << attempt_1h.min(4))).min(30_000) + (boot_stagger_ms % 1_000);
+                eprintln!(
+                    "❌ [INGESTION ERROR] Failed to fetch 1h candles for {} (attempt {}): {:?}. Fail-closed retry in {}ms...",
+                    trading_symbol, attempt_1h, e, wait_ms
+                );
+                tokio::time::sleep(Duration::from_millis(wait_ms)).await;
             }
-        }
-    }
-    match res_1h_candles {
-        Ok(mut candles) => {
-            candles.sort_by_key(|c| c.time_open);
-            candles.dedup_by_key(|c| c.time_open);
-            let mut bars_1h_init = Vec::with_capacity(candles.len());
-            for c in candles {
-                if let (Ok(open_f), Ok(high_f), Ok(low_f), Ok(close_f)) = (
-                    c.open.parse::<f64>(),
-                    c.high.parse::<f64>(),
-                    c.low.parse::<f64>(),
-                    c.close.parse::<f64>(),
-                ) {
-                    let vol_f = c.vlm.parse::<f64>().unwrap_or(0.0);
-                    let bar_1h = CandleBar {
-                        time_open: c.time_open,
-                        open: open_f,
-                        high: high_f,
-                        low: low_f,
-                        close: close_f,
-                        volume: vol_f,
-                    };
-                    if c.time_open + 3_600_000 > now_ms {
-                        current_1h_bar = Some(bar_1h);
-                    } else {
-                        bars_1h_init.push(bar_1h);
-                    }
-                }
-            }
-            engine_b_1h.warmup_from_1h_bars(&bars_1h_init);
-            println!(
-                "✅ [INGESTION] Warmed up Engine B v2 (1H EMA50 Pullback) with {} closed 1h bars for {} (EMA12=${:.2}, EMA50=${:.2}, EMA200=${:.2}, ATR_1h=${:.4}).",
-                engine_b_1h.bars_seen,
-                trading_symbol,
-                engine_b_1h.ema12,
-                engine_b_1h.ema50,
-                engine_b_1h.ema200,
-                engine_b_1h.atr_1h
-            );
-        }
-        Err(e) => {
-            eprintln!(
-                "❌ [INGESTION ERROR] Failed to fetch 1h candles for {}: {}",
-                trading_symbol, e
-            );
         }
     }
 
-    // Markov-Polo V2 (Package 10): Pre-fill 260 historical 4h bars (~43 days) for MacroTrend4hEngine (4H_ST3 + 4H_D40)
+    // Markov-Polo V2 (Package 10): Pre-fill 400 historical 4h bars (~67 days) for MacroTrend4hEngine (4H_ST3)
+    // Fail-closed retry loop: NEVER enter live trading with an unwarmed EMA100 / SuperTrend!
     let mut engine_b_4h = MacroTrend4hEngine::new();
     let mut current_4h_bar: Option<CandleBar> = None;
-    let start_4h_ms = now_ms.saturating_sub(260 * 4 * 60 * 60 * 1000);
     println!(
-        "⏳ [INGESTION] Pre-filling 260x4h (~43d) historical 4h candles for {} via Hyperliquid REST...",
+        "⏳ [INGESTION] Pre-filling 400x4h (~67d) historical 4h candles for {} via Hyperliquid REST...",
         trading_symbol
     );
-    let mut res_4h_candles = Err("Unattempted".to_string());
-    for attempt in 0..3 {
+    let mut attempt_4h: u32 = 0;
+    loop {
+        let now_4h_ms = chrono::Utc::now().timestamp_millis() as u64;
+        let start_4h_ms = now_4h_ms.saturating_sub(400 * 4 * 60 * 60 * 1000);
         match info_client
-            .candles_snapshot(trading_symbol.clone(), "4h".to_string(), start_4h_ms, now_ms)
+            .candles_snapshot(trading_symbol.clone(), "4h".to_string(), start_4h_ms, now_4h_ms)
             .await
         {
-            Ok(c) => {
-                res_4h_candles = Ok(c);
+            Ok(mut candles) => {
+                candles.sort_by_key(|c| c.time_open);
+                candles.dedup_by_key(|c| c.time_open);
+                let mut bars_4h_init = Vec::with_capacity(candles.len());
+                for c in candles {
+                    if let (Ok(open_f), Ok(high_f), Ok(low_f), Ok(close_f)) = (
+                        c.open.parse::<f64>(),
+                        c.high.parse::<f64>(),
+                        c.low.parse::<f64>(),
+                        c.close.parse::<f64>(),
+                    ) {
+                        let vol_f = c.vlm.parse::<f64>().unwrap_or(0.0);
+                        let bar_4h = CandleBar {
+                            time_open: c.time_open,
+                            open: open_f,
+                            high: high_f,
+                            low: low_f,
+                            close: close_f,
+                            volume: vol_f,
+                        };
+                        if c.time_open + 14_400_000 > now_4h_ms {
+                            current_4h_bar = Some(bar_4h);
+                        } else {
+                            bars_4h_init.push(bar_4h);
+                        }
+                    }
+                }
+                engine_b_4h.warmup_from_4h_bars(&bars_4h_init);
+                println!(
+                    "✅ [INGESTION] Warmed up Markov-Polo V2.4 4H Macro Engine (SuperTrend-3.0) with {} closed 4h bars for {} (EMA20=${:.2}, EMA100=${:.2}, ST_dir={}, ATR_4h=${:.4}).",
+                    engine_b_4h.bars_seen,
+                    trading_symbol,
+                    engine_b_4h.ema20,
+                    engine_b_4h.ema100,
+                    engine_b_4h.st_dir,
+                    engine_b_4h.atr_4h
+                );
                 break;
             }
             Err(e) => {
-                res_4h_candles = Err(format!("{:?}", e));
-                if attempt < 2 {
-                    tokio::time::sleep(Duration::from_millis(500 * (1 << attempt))).await;
-                }
+                attempt_4h = attempt_4h.saturating_add(1);
+                let wait_ms = (1_500 * (1u64 << attempt_4h.min(4))).min(30_000) + (boot_stagger_ms % 1_000);
+                eprintln!(
+                    "❌ [INGESTION ERROR] Failed to fetch 4h candles for {} (attempt {}): {:?}. Fail-closed retry in {}ms...",
+                    trading_symbol, attempt_4h, e, wait_ms
+                );
+                tokio::time::sleep(Duration::from_millis(wait_ms)).await;
             }
-        }
-    }
-    match res_4h_candles {
-        Ok(mut candles) => {
-            candles.sort_by_key(|c| c.time_open);
-            candles.dedup_by_key(|c| c.time_open);
-            let mut bars_4h_init = Vec::with_capacity(candles.len());
-            for c in candles {
-                if let (Ok(open_f), Ok(high_f), Ok(low_f), Ok(close_f)) = (
-                    c.open.parse::<f64>(),
-                    c.high.parse::<f64>(),
-                    c.low.parse::<f64>(),
-                    c.close.parse::<f64>(),
-                ) {
-                    let vol_f = c.vlm.parse::<f64>().unwrap_or(0.0);
-                    let bar_4h = CandleBar {
-                        time_open: c.time_open,
-                        open: open_f,
-                        high: high_f,
-                        low: low_f,
-                        close: close_f,
-                        volume: vol_f,
-                    };
-                    if c.time_open + 14_400_000 > now_ms {
-                        current_4h_bar = Some(bar_4h);
-                    } else {
-                        bars_4h_init.push(bar_4h);
-                    }
-                }
-            }
-            engine_b_4h.warmup_from_4h_bars(&bars_4h_init);
-            println!(
-                "✅ [INGESTION] Warmed up Markov-Polo V2.4 4H Macro Engine (SuperTrend-3.0) with {} closed 4h bars for {} (EMA20=${:.2}, EMA100=${:.2}, ST_dir={}, ATR_4h=${:.4}).",
-                engine_b_4h.bars_seen,
-                trading_symbol,
-                engine_b_4h.ema20,
-                engine_b_4h.ema100,
-                engine_b_4h.st_dir,
-                engine_b_4h.atr_4h
-            );
-        }
-        Err(e) => {
-            eprintln!(
-                "❌ [INGESTION ERROR] Failed to fetch 4h candles for {}: {}",
-                trading_symbol, e
-            );
         }
     }
 
@@ -3984,9 +3993,10 @@ async fn main() {
                         current_1h_bar = Some(nb1h);
                     }
                 }
+                let allow_1h_signal = engine_b_1h.bars_seen >= 199;
                 let engine_b_1h_sig_opt = finalized_1h_bar
                     .as_ref()
-                    .and_then(|b1h| engine_b_1h.on_1h_bar_close(b1h, true));
+                    .and_then(|b1h| engine_b_1h.on_1h_bar_close(b1h, allow_1h_signal));
 
                 // Markov-Polo V2 (Package 10): Aggregate finalized 4-hour candles for MacroTrend4hEngine (4H_ST3 + 4H_D40)
                 let candle_bucket_4h = (completed_bar.time_open / 14_400_000) * 14_400_000;
@@ -4034,9 +4044,10 @@ async fn main() {
                         current_4h_bar = Some(nb4h);
                     }
                 }
+                let allow_4h_signal = engine_b_4h.bars_seen >= 99;
                 let engine_b_4h_sig_opt = finalized_4h_bar
                     .as_ref()
-                    .and_then(|b4h| engine_b_4h.on_4h_bar_close(b4h, true));
+                    .and_then(|b4h| engine_b_4h.on_4h_bar_close(b4h, allow_4h_signal));
 
                 let exchange_clone = exchange.clone();
                 let info_clone = info_client.clone();
