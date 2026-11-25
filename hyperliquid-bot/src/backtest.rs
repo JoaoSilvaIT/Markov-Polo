@@ -2215,10 +2215,13 @@ pub fn run_engine_a_backtest_with_btc(
         //    Priority 3: 1H EMA50 Pullback-in-Trend (7Y PF 1.24, 7/7 yrs)
         // ------------------------------------------------------------------
         if open_pos.is_none() && resting_entry.is_none() && !session_blocks_entries {
-            let is_1h_pb_excluded = symbol.eq_ignore_ascii_case("xyz:GOLD")
+            // Hypothesis C (7Y TradFi Validation): All `xyz:*` TradFi assets run 4H_ST3-only!
+            let is_1h_pb_excluded = symbol.to_ascii_lowercase().starts_with("xyz:")
                 || symbol.eq_ignore_ascii_case("GOLD")
-                || symbol.eq_ignore_ascii_case("xyz:CL")
-                || symbol.eq_ignore_ascii_case("CL");
+                || symbol.eq_ignore_ascii_case("CL")
+                || symbol.eq_ignore_ascii_case("SILVER")
+                || symbol.eq_ignore_ascii_case("XYZ100")
+                || symbol.eq_ignore_ascii_case("NVDA");
             let macro_entry_opt: Option<(&'static str, Side, f64, f64, f64, f64)> =
                 if let Some(ref s4) = engine_b_4h_sig_opt {
                     Some((

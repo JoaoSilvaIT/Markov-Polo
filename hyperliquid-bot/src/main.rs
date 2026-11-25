@@ -4748,10 +4748,14 @@ async fn main() {
                     //   Priority 2: 4H Donchian-40 Breakout (7Y PF 1.24, 7/7 yrs)
                     //   Priority 3: 1H EMA50 Pullback-in-Trend (7Y PF 1.24, 7/7 yrs)
                     // ------------------------------------------------------------------
-                    let is_1h_pb_excluded = symbol_clone.eq_ignore_ascii_case("xyz:GOLD")
+                    // Hypothesis C (7Y TradFi Validation): 1H_PB is structurally negative across session-gated
+                    // TradFi markets (SILVER PF 0.82, XYZ100 PF 0.85, CL NY-open whipsaws). All `xyz:*` run 4H_ST3-only!
+                    let is_1h_pb_excluded = symbol_clone.to_ascii_lowercase().starts_with("xyz:")
                         || symbol_clone.eq_ignore_ascii_case("GOLD")
-                        || symbol_clone.eq_ignore_ascii_case("xyz:CL")
-                        || symbol_clone.eq_ignore_ascii_case("CL");
+                        || symbol_clone.eq_ignore_ascii_case("CL")
+                        || symbol_clone.eq_ignore_ascii_case("SILVER")
+                        || symbol_clone.eq_ignore_ascii_case("XYZ100")
+                        || symbol_clone.eq_ignore_ascii_case("NVDA");
                     let macro_dispatch_opt: Option<(&'static str, &'static str, Side, f64, f64, f64, f64, f64, usize)> =
                         if let Some(ref s4) = engine_b_4h_sig_opt {
                             let lbl = if s4.policy_tag == "ENGINE_B_4H_ST3" {
