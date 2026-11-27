@@ -4756,6 +4756,7 @@ async fn main() {
                         || symbol_clone.eq_ignore_ascii_case("SILVER")
                         || symbol_clone.eq_ignore_ascii_case("XYZ100")
                         || symbol_clone.eq_ignore_ascii_case("NVDA");
+                    let chop_ok_m = !engine_b_4h.is_chop_blocked();
                     let macro_dispatch_opt: Option<(&'static str, &'static str, Side, f64, f64, f64, f64, f64, usize)> =
                         if let Some(ref s4) = engine_b_4h_sig_opt {
                             let lbl = if s4.policy_tag == "ENGINE_B_4H_ST3" {
@@ -4774,7 +4775,7 @@ async fn main() {
                                 s4.max_sl_frac,
                                 s4.max_hold_hours,
                             ))
-                        } else if !is_1h_pb_excluded {
+                        } else if !is_1h_pb_excluded && chop_ok_m {
                             engine_b_1h_sig_opt.as_ref().map(|s1| {
                                 (
                                     "EngineB1h",

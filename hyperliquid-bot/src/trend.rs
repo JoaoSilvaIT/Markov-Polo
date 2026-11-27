@@ -2991,6 +2991,8 @@ pub struct MacroTrend4hEngine {
     pub max_sl_frac: f64,
     pub bars_seen: usize,
     pub last_bucket_ms: u64,
+    /// Dreiss 14-bar 4H Choppiness Index (`0..100`). Values `> 58.0` indicate sideways/megaphone box chop.
+    pub chop_14: f64,
 }
 
 impl Default for MacroTrend4hEngine {
@@ -3015,7 +3017,13 @@ impl MacroTrend4hEngine {
             max_sl_frac: 0.050, // Cap initial 4H stop at 5.0%
             bars_seen: 0,
             last_bucket_ms: 0,
+            chop_14: 50.0,
         }
+    }
+
+    #[inline]
+    pub fn is_chop_blocked(&self) -> bool {
+        self.bars.len() >= 15 && self.chop_14 > 58.0
     }
 
     pub fn warmup_from_4h_bars(&mut self, bars_4h: &[CandleBar]) {
@@ -3084,9 +3092,34 @@ impl MacroTrend4hEngine {
         if self.bars.len() > 50 {
             self.bars.pop_front();
         }
+        if self.bars.len() >= 15 {
+            let n = self.bars.len();
+            let mut tr_sum = 0.0;
+            let mut max_h = f64::MIN;
+            let mut min_l = f64::MAX;
+            for k in (n - 14)..n {
+                let b = &self.bars[k];
+                let pc = self.bars[k - 1].close;
+                let tr_k = (b.high - b.low)
+                    .max((b.high - pc).abs())
+                    .max((b.low - pc).abs());
+                tr_sum += tr_k;
+                if b.high > max_h {
+                    max_h = b.high;
+                }
+                if b.low < min_l {
+                    min_l = b.low;
+                }
+            }
+            let range = (max_h - min_l).max(1e-9);
+            if tr_sum > 0.0 {
+                self.chop_14 =
+                    (100.0 * (tr_sum / range).log10() / (14.0_f64).log10()).clamp(0.0, 100.0);
+            }
+        }
         self.bars_seen += 1;
 
-        if !emit_signal || self.bars_seen < 60 || self.atr_4h <= 1e-9 {
+        if !emit_signal || self.bars_seen < 60 || self.atr_4h <= 1e-9 || self.is_chop_blocked() {
             return None;
         }
 
@@ -4638,5 +4671,28 @@ mod tests {
 
         // Duplicate timestamp must be idempotent
         assert!(eng.on_4h_bar_close(&flip_up, true).is_none());
+    }
+
+    #[test]
+    fn test_dreiss_4h_choppiness_index_blocks_megaphone_box() {
+        let mut eng = MacroTrend4hEngine::new();
+        // 65 bars of pure ping-pong inside a [95, 105] box: each bar traverses the full 10-pt range -> CHOP_14 -> ~100!
+        for i in 0..65u64 {
+            let up = i % 2 == 0;
+            let b = CandleBar {
+                time_open: i * 14_400_000,
+                open: if up { 96.0 } else { 104.0 },
+                high: 105.0,
+                low: 95.0,
+                close: if up { 104.5 } else { 95.5 },
+                volume: 100.0,
+            };
+            let _ = eng.on_4h_bar_close(&b, false);
+        }
+        assert!(
+            eng.chop_14 > 58.0 && eng.is_chop_blocked(),
+            "Expected CHOP_14 > 58.0 in pure sideways box, got {:.2}",
+            eng.chop_14
+        );
     }
 }

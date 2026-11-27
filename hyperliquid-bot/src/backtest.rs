@@ -2222,6 +2222,7 @@ pub fn run_engine_a_backtest_with_btc(
                 || symbol.eq_ignore_ascii_case("SILVER")
                 || symbol.eq_ignore_ascii_case("XYZ100")
                 || symbol.eq_ignore_ascii_case("NVDA");
+            let chop_ok_bt = !engine_b_4h.is_chop_blocked();
             let macro_entry_opt: Option<(&'static str, Side, f64, f64, f64, f64)> =
                 if let Some(ref s4) = engine_b_4h_sig_opt {
                     Some((
@@ -2232,7 +2233,7 @@ pub fn run_engine_a_backtest_with_btc(
                         s4.trail_atr_mult,
                         s4.max_sl_frac,
                     ))
-                } else if !is_1h_pb_excluded {
+                } else if !is_1h_pb_excluded && chop_ok_bt {
                     engine_b_1h_sig_opt.as_ref().map(|s1| {
                         (
                             "ENGINE_B_1H_PULLBACK",
