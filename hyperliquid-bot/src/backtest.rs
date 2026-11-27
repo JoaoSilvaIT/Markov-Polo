@@ -143,7 +143,7 @@ impl Default for SimulatedExchangeConfig {
         Self {
             maker_fee_bps: 1.44,
             taker_fee_bps: 4.32,
-            stop_slippage_bps: 0.5,
+            stop_slippage_bps: 3.5, // Calibrated directly to realized live Hyperliquid IOC/StopMarket fills (+6.06 bps RT)
             strict_trade_through_fills: false,
             trade_through_ticks: 0.0,
             bar_adaptive_high_low_ordering: true,
